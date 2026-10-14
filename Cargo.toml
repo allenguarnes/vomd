@@ -1,0 +1,39 @@
+[package]
+name = "vomd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "View-Only Markdown: a tiny, fast Markdown viewer"
+license = "MIT"
+publish = false
+
+[workspace]
+members = ["xtask"]
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle",
+] }
+softbuffer = { version = "0.4", default-features = false, features = [
+    "x11", "x11-dlopen", "wayland", "wayland-dlopen",
+] }
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+png = { version = "0.18", optional = true }
+zune-jpeg = { version = "0.5", optional = true }
+
+[features]
+default = ["images", "remote-images", "embed-fonts"]
+images = ["dep:png", "dep:zune-jpeg"]
+remote-images = ["images"] # no extra crates: uses system curl
+embed-fonts = []
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
+

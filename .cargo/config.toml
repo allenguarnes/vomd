@@ -1,0 +1,4 @@
+# Committed config: aliases only. Never put `target-cpu` here; release binaries must run on
+# baseline x86-64. Local `-C target-cpu=native` belongs in an uncommitted config.
+[alias]
+xtask = "run --quiet --package xtask --"
