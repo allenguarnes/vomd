@@ -1,0 +1,392 @@
+use std::time::{Duration, Instant};
+
+use super::*;
+use crate::text::fallback;
+
+fn fixture(name: &str) -> String {
+    std::fs::read_to_string(format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+}
+
+fn params(width: f32, scale: f32) -> Params {
+    Params {
+        width: width * scale,
+        scale,
+        ..Params::default()
+    }
+}
+
+/// Measure every block (idle until complete).
+fn complete(doc: &Doc, fonts: &Fonts, p: Params) -> Layout {
+    let mut l = Layout::new(doc, p);
+    while !l.idle(doc, fonts, Instant::now() + Duration::from_secs(5)) {}
+    assert!(l.complete());
+    l
+}
+
+fn check_geometry(l: &Layout) {
+    let mut y = 0.0;
+    for g in l.geoms() {
+        assert!((g.y - y).abs() < 1e-2, "blocks must be contiguous");
+        assert!(g.h >= 0.0 && g.h.is_finite());
+        y += g.h;
+    }
+    assert!((l.total_height() - y).abs() < 1e-2);
+}
+
+/// A stable fingerprint of all heights plus the content of blocks near the viewport.
+fn signature(l: &Layout) -> Vec<String> {
+    l.geoms()
+        .iter()
+        .map(|g| {
+            let c = g.content.as_ref().map(|c| {
+                let gl: f32 = c.glyphs.iter().map(|g| g.x * 3.0 + g.y).sum();
+                format!(
+                    "{} {} {} {gl:.3}",
+                    c.glyphs.len(),
+                    c.rects.len(),
+                    c.lines.len()
+                )
+            });
+            format!("{:.3} {c:?}", g.h)
+        })
+        .collect()
+}
+
+#[test]
+fn spec_layout_is_deterministic_across_widths_and_scales() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("spec.md"));
+    for width in [480.0, 900.0, 1600.0] {
+        for scale in [1.0, 2.0] {
+            let run = || {
+                let mut l = complete(&doc, &fonts, params(width, scale));
+                let mid = l.anchor_at(l.total_height() / 2.0);
+                l.ensure(&doc, &fonts, mid, 1000.0 * scale);
+                check_geometry(&l);
+                signature(&l)
+            };
+            assert_eq!(run(), run(), "width {width} scale {scale}");
+        }
+    }
+}
+
+#[test]
+fn content_stays_in_column() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("readme.md"));
+    let mut l = complete(&doc, &fonts, params(900.0, 1.0));
+    let (_, col_w) = l.column();
+    let em = 16.0;
+    let mut y = 0.0;
+    while y < l.total_height() {
+        y = l.ensure(&doc, &fonts, l.anchor_at(y), 1000.0) + 1000.0;
+        for (i, g) in l.geoms().iter().enumerate() {
+            let Some(c) = &g.content else { continue };
+            let table = matches!(doc.blocks[i].kind, BlockKind::TableRow { .. });
+            for gl in &c.glyphs {
+                // Markers hang in the gutter, at most one list indent left of the column.
+                assert!(
+                    gl.x >= -LIST_INDENT * em - 1.0,
+                    "block {i} glyph at {}",
+                    gl.x
+                );
+                if !table {
+                    assert!(gl.x <= col_w + 1.0, "block {i} glyph at {} > {col_w}", gl.x);
+                }
+                assert!(
+                    gl.y >= 0.0 && gl.y <= g.h + 1.0,
+                    "block {i} glyph y {} / {}",
+                    gl.y,
+                    g.h
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ensure_measures_near_viewport_and_keeps_anchor() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("spec.md"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let anchor = Anchor {
+        block: 600,
+        frac: 0.5,
+    };
+    let y = l.ensure(&doc, &fonts, anchor, 1000.0);
+    assert!((y - l.y_of(anchor)).abs() < 1e-3);
+    assert!(l.geoms()[600].content.is_some() && l.geoms()[600].measured);
+    // Far-away blocks are neither shaped nor kept.
+    assert!(l.geoms()[0].content.is_none() && !l.geoms()[0].measured);
+    let live = l.geoms().iter().filter(|g| g.content.is_some()).count();
+    assert!(live < 300, "{live} blocks kept");
+    // A second call is a no-op.
+    assert_eq!(l.ensure(&doc, &fonts, anchor, 1000.0), y);
+    // Scrolling far away drops the old content.
+    l.ensure(&doc, &fonts, Anchor::TOP, 1000.0);
+    assert!(l.geoms()[600].content.is_none());
+    assert!(l.geoms()[0].content.is_some());
+}
+
+#[test]
+fn idle_heights_match_viewport_heights() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("readme.md"));
+    let mut l = complete(&doc, &fonts, params(900.0, 1.0));
+    let before: Vec<f32> = l.geoms().iter().map(|g| g.h).collect();
+    let mid = l.anchor_at(l.total_height() / 2.0);
+    l.ensure(&doc, &fonts, mid, 1000.0);
+    let after: Vec<f32> = l.geoms().iter().map(|g| g.h).collect();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn idle_respects_deadline() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("spec.md"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    // An expired deadline still makes progress (one block) but stops immediately.
+    assert!(!l.idle(&doc, &fonts, Instant::now()));
+    assert_eq!(l.geoms().iter().filter(|g| g.measured).count(), 1);
+}
+
+#[test]
+fn set_params_remeasures() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("readme.md"));
+    let mut l = complete(&doc, &fonts, params(900.0, 1.0));
+    let narrow_total = {
+        let mut n = complete(&doc, &fonts, params(500.0, 1.0));
+        n.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+        n.total_height()
+    };
+    l.set_params(params(500.0, 1.0));
+    assert!(!l.complete());
+    while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
+    assert!((l.total_height() - narrow_total).abs() < 1e-2);
+    assert!(narrow_total > complete(&doc, &fonts, params(900.0, 1.0)).total_height());
+}
+
+#[test]
+fn hit_test_finds_links() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("Click [here](https://example.com) now.");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let (col_x, _) = l.column();
+    let c = l.geoms()[0].content.as_ref().unwrap();
+    let line = &c.lines[0];
+    let link_hit = c
+        .hits
+        .iter()
+        .find(|h| c.styles[h.style as usize].link == 1)
+        .unwrap();
+    let x = col_x + (link_hit.x0 + link_hit.x1) / 2.0;
+    let y = (line.top + line.bottom) / 2.0;
+    let hit = l.hit(x, y).unwrap();
+    assert_eq!(hit.link, 1);
+    assert_eq!(
+        &doc.text[hit.doc as usize..hit.doc as usize + 1],
+        &doc.text[link_hit.doc as usize..][..1]
+    );
+    assert_eq!(l.hit(col_x + c.hits[0].x0 + 1.0, y).unwrap().link, 0);
+    assert!(l.hit(col_x - 50.0, y).is_none());
+}
+
+#[test]
+fn list_markers_hang_in_gutter() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("- one\n- two\n  1. nested\n\n- [x] done\n- [ ] todo\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let em = 16.0;
+    for (i, g) in l.geoms().iter().enumerate() {
+        let c = g.content.as_ref().unwrap();
+        let indent = doc.blocks[i].list as f32 * LIST_INDENT * em;
+        match doc.blocks[i].marker {
+            Marker::Bullet | Marker::Ordered(_) => {
+                assert!(
+                    c.glyphs.iter().any(|g| g.x < indent),
+                    "block {i} marker in gutter"
+                );
+            }
+            Marker::Task(checked) => {
+                let boxes: Vec<_> = c.rects.iter().filter(|r| r.x < indent).collect();
+                assert_eq!(boxes.len(), 1);
+                assert_eq!(boxes[0].kind == RectKind::Fill, checked);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn code_blocks_wrap_with_continuation_markers() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&format!("```\nshort\n{}\n```\n", "word ".repeat(60)));
+    let mut l = Layout::new(&doc, params(600.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let c = l.geoms()[0].content.as_ref().unwrap();
+    let conts = c.lines.iter().filter(|l| l.cont).count();
+    assert!(conts >= 2);
+    // One marker line per continuation (markers are appended as extra lines).
+    let markers = c
+        .lines
+        .iter()
+        .filter(|ln| ln.width > 0.0 && ln.hits.end - ln.hits.start == 1)
+        .count();
+    assert!(markers >= conts);
+    assert_eq!(c.rects[0].role, Role::CodeBg);
+}
+
+#[test]
+fn tabs_expand_to_four_columns() {
+    let mut p = Para::default();
+    let s = TextStyle {
+        bold: false,
+        italic: false,
+        mono: true,
+        size: 14.0,
+        role: Role::Text,
+        deco: 0,
+        shift: 0.0,
+        link: 0,
+    };
+    push_expanding_tabs(&mut p, "a\tb\n\tc\tdd", 10, s);
+    assert_eq!(p.text, "a   b\n    c   dd");
+    assert_eq!(p.doc_offset(1), 11); // expanded tab maps to the tab
+    assert_eq!(p.doc_offset(3), 11);
+    assert_eq!(p.doc_offset(4), 12); // 'b'
+}
+
+#[test]
+fn tables_lay_out_columns() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("| a | long header |\n|---|---:|\n| 1 | 2 |\n| x | y |\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let cols = l.table_cols[0].clone().unwrap();
+    assert_eq!(cols.len(), 2);
+    assert!(cols[1] > cols[0]);
+    // Rows are equal height and contiguous; the second data row is striped.
+    let hs: Vec<f32> = l.geoms().iter().map(|g| g.h).collect();
+    assert!((hs[1] - hs[2]).abs() < 1e-3);
+    let striped = |i: usize| {
+        l.geoms()[i]
+            .content
+            .as_ref()
+            .unwrap()
+            .rects
+            .iter()
+            .any(|r| r.role == Role::TableStripe)
+    };
+    assert!(!striped(1) && striped(2));
+    // Right-aligned column: cell text ends at the column's right padding.
+    let row = l.geoms()[1].content.as_ref().unwrap();
+    let last = row.hits.last().unwrap();
+    let right = cols[0] + cols[1] - CELL_PAD_X * 16.0;
+    assert!((last.x1 - right).abs() < 1.0, "{} vs {right}", last.x1);
+}
+
+#[test]
+fn wide_tables_share_space() {
+    let fonts = Fonts::new().unwrap();
+    let long = "lorem ipsum dolor sit amet ".repeat(10);
+    let doc = Doc::parse(&format!("| a | b |\n|---|---|\n| {long} | {long} |\n"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let (_, col_w) = l.column();
+    let total: f32 = l.table_cols[0].as_ref().unwrap().iter().sum();
+    assert!(total <= col_w + 2.0, "{total} > {col_w}");
+}
+
+#[test]
+fn headings_quotes_and_alerts() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("# Title\n\n> outer\n> > inner\n\n> [!WARNING]\n> careful\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let content = |i: usize| l.geoms()[i].content.as_ref().unwrap();
+    assert!(content(0).rects.iter().any(|r| r.role == Role::BorderMuted));
+    let bars = |i: usize, role: Role| content(i).rects.iter().filter(|r| r.role == role).count();
+    assert_eq!(bars(1, Role::QuoteBar), 1);
+    assert_eq!(bars(2, Role::QuoteBar), 2);
+    assert_eq!(bars(3, Role::AlertWarning), 1);
+    assert_eq!(bars(4, Role::AlertWarning), 1);
+    // Quote text is muted, alert text is not.
+    assert_eq!(content(1).styles[0].role, Role::Muted);
+    assert_eq!(content(4).styles[0].role, Role::Text);
+}
+
+#[test]
+fn heading_slugs_and_footnotes_lay_out() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("Ref[^1].\n\n[^1]: Note.\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let refs: Vec<_> = l.geoms()[0]
+        .content
+        .as_ref()
+        .unwrap()
+        .styles
+        .iter()
+        .filter(|s| s.shift > 0.0)
+        .collect();
+    assert_eq!(refs.len(), 1);
+    let note = l.geoms().last().unwrap().content.as_ref().unwrap();
+    assert!(note.styles.iter().all(|s| s.size < 16.0));
+}
+
+#[test]
+fn missing_characters_and_fallback() {
+    let fonts_embedded = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("cjk.md"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts_embedded, Anchor::TOP, 2000.0);
+    let missing = l.take_missing();
+    assert!(missing.contains(&'中'));
+    assert!(l.take_missing().is_empty());
+    assert!(l.geoms().iter().any(|g| g.missing));
+
+    // With system fallbacks (when the machine has them), the blocks remeasure cleanly.
+    let mut fonts = Fonts::new().unwrap();
+    let found = fallback::find_fallbacks(&missing, &|p, i| fonts_embedded.has_source(p, i));
+    if found.is_empty() {
+        return;
+    }
+    for f in &found {
+        fonts.add_fallback(&f.path, f.index);
+    }
+    l.invalidate_missing(&doc);
+    assert!(l.geoms().iter().all(|g| !g.missing));
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    let still = l.take_missing();
+    assert!(
+        !still.contains(&'中'),
+        "fallback should cover CJK: {still:?}"
+    );
+}
+
+#[test]
+fn empty_document() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("");
+    let mut l = Layout::new(&doc, Params::default());
+    assert_eq!(l.ensure(&doc, &fonts, Anchor::TOP, 800.0), 0.0);
+    assert!(l.idle(&doc, &fonts, Instant::now()));
+    assert_eq!(l.total_height(), 0.0);
+    assert_eq!(l.range(0.0, 100.0), 0..0);
+    assert!(l.hit(10.0, 10.0).is_none());
+    assert_eq!(l.anchor_at(50.0), Anchor::TOP);
+}
+
+#[test]
+fn narrow_and_tiny_windows_do_not_panic() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("tables.md"));
+    for width in [1.0, 10.0, 50.0, 200.0] {
+        let mut l = complete(&doc, &fonts, params(width, 1.0));
+        l.ensure(&doc, &fonts, Anchor::TOP, 100.0);
+        check_geometry(&l);
+    }
+}
