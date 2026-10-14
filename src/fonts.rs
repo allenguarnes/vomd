@@ -276,11 +276,22 @@ impl Fonts {
             .find(|&id| self.face(id).glyph(ch) != 0)
     }
 
-    /// First face drawing `base` with all of `marks`: the primary, then fallbacks.
-    pub fn select_sequence(&self, primary: FaceId, base: char, marks: &[char]) -> Option<FaceId> {
+    /// First face drawing `base` with all of `marks`: the primary, then fallbacks. `loose`
+    /// marks are separated from the base by an ignorable character (CGJ, ZWSP, ...), so they
+    /// never compose with it and need a glyph of their own.
+    pub fn select_sequence(
+        &self,
+        primary: FaceId,
+        base: char,
+        marks: &[char],
+        loose: &[char],
+    ) -> Option<FaceId> {
         std::iter::once(primary)
             .chain(self.fallbacks.iter().copied())
-            .find(|&id| self.face(id).covers_sequence(base, marks))
+            .find(|&id| {
+                let face = self.face(id);
+                face.covers_sequence(base, marks) && loose.iter().all(|&m| face.glyph(m) != 0)
+            })
     }
 
     pub fn has_source(&self, path: &Path, index: u32) -> bool {

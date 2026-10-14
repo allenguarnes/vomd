@@ -854,7 +854,7 @@ fn chunked_quotes_and_headings_stay_whole() {
 }
 
 #[test]
-fn table_rows_with_over_65535_styles_keep_their_links() {
+fn table_rows_with_over_65535_links_keep_them_across_fragments() {
     let fonts = Fonts::new().unwrap();
     const N: usize = 20_000;
     let cell = |from: usize| -> String {
@@ -868,42 +868,53 @@ fn table_rows_with_over_65535_styles_keep_their_links() {
         cell(N)
     ));
     assert_eq!(doc.links.len(), 2 * N);
+    // The row is split, so no block holds more styles than 16 KB of text can carry.
+    assert!(doc.blocks.len() > 10);
     let mut l = Layout::new(&doc, params(900.0, 1.0));
-    l.ensure(
-        &doc,
-        &fonts,
-        Anchor {
-            block: 1,
-            frac: 0.0,
-        },
-        800.0,
-    );
-    let c = l.geoms()[1].content.as_ref().unwrap();
-    // Two styles per link in each cell: well past what 16 bits can index.
-    assert!(
-        c.styles.len() > u16::MAX as usize + 1,
-        "{} styles",
-        c.styles.len()
-    );
-    // The last link of the second cell is the last link in the document.
-    let all = c.hits.iter().map(|h| c.styles[h.style as usize].link);
-    assert_eq!(all.max(), Some(2 * N as u32));
-    let last = c
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    let mut links = Vec::new();
+    for (i, g) in l.geoms().iter().enumerate().skip(1) {
+        let c = g.content.as_ref().unwrap();
+        // Each fragment's links index its own styles, and point at the right document text.
+        for h in &c.hits {
+            let link = c.styles[h.style as usize].link;
+            if link != 0 {
+                assert!(
+                    b"a b".contains(&doc.text.as_bytes()[h.doc as usize]),
+                    "block {i}"
+                );
+                links.push(link);
+            }
+        }
+    }
+    links.sort_unstable();
+    links.dedup();
+    assert_eq!(links, (1..=2 * N as u32).collect::<Vec<_>>());
+    assert_eq!(doc.links[2 * N - 1], format!("#{}", 2 * N - 1));
+    // Hits resolve to the link under them, in the last fragment too.
+    let last = l.geoms().len() - 1;
+    let c = l.geoms()[last].content.as_ref().unwrap();
+    let (hi, h) = c
         .hits
         .iter()
+        .enumerate()
         .rev()
-        .find(|h| c.styles[h.style as usize].link != 0)
+        .find(|(_, h)| c.styles[h.style as usize].link != 0)
         .unwrap();
-    assert_eq!(c.styles[last.style as usize].link, 2 * N as u32);
-    assert_eq!(doc.links[2 * N - 1], format!("#{}", 2 * N - 1));
-    // Hits resolve to the link under them at the far end of the row, too.
+    let line = c
+        .lines
+        .iter()
+        .find(|l| l.hits.contains(&(hi as u32)))
+        .unwrap();
     let (x, y) = (
-        l.column().0 + last.x0 + 0.5,
-        l.geoms()[1].y + c.lines.last().unwrap().baseline - 3.0,
+        l.column().0 + (h.x0 + h.x1) / 2.0,
+        l.geoms()[last].y + (line.top + line.bottom) / 2.0,
     );
-    if let Some(hit) = l.hit(x, y) {
-        assert_eq!(hit.link, 2 * N as u32);
-    }
+    let hit = l.hit(x, y).expect("link under the cursor");
+    assert_eq!(
+        (hit.block as usize, hit.link),
+        (last, c.styles[h.style as usize].link)
+    );
 }
 
 #[test]
@@ -931,4 +942,291 @@ fn tables_past_65535_lay_out_all_cells() {
         doc.text.rfind('2').unwrap() as u32,
     );
     assert!(docs.contains(&one) && docs.contains(&two), "{docs:?}");
+}
+
+/// Lines laid out across all blocks of a code run.
+fn code_lines(fonts: &Fonts, code: &str) -> (usize, usize) {
+    let doc = Doc::parse(&format!("```\n{code}\n```\n"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, fonts, Anchor::TOP, 1.0e9);
+    let lines = l
+        .geoms()
+        .iter()
+        .map(|g| g.content.as_ref().unwrap().lines.len())
+        .sum();
+    (doc.blocks.len(), lines)
+}
+
+#[test]
+fn chunk_boundaries_keep_every_line_and_blank_line() {
+    let fonts = Fonts::new().unwrap();
+    // The cut lands on the last newline within 16 KB: first the only one, then inside runs of
+    // two and three newlines.
+    let pairs = "a\n".repeat(8191);
+    for (tail, lines) in [("a\nb", 8193), ("\n\nb", 8194), ("\n\n\nb", 8195)] {
+        let code = format!("{pairs}{tail}");
+        let (blocks, got) = code_lines(&fonts, &code);
+        assert!(blocks > 1, "{tail:?}");
+        let want = code.matches('\n').count() + 1;
+        assert_eq!(want, lines);
+        assert_eq!(got, lines, "{tail:?}");
+    }
+    // A chunk ending in a newline has no empty line after it, and the estimate agrees.
+    let doc = Doc::parse(&format!("```\n{pairs}{}\n```\n", "x\n".repeat(100)));
+    let est = Layout::new(&doc, params(900.0, 1.0));
+    let l = complete(&doc, &fonts, params(900.0, 1.0));
+    assert!(doc.blocks.len() > 1);
+    for (i, (e, g)) in est.geoms().iter().zip(l.geoms()).enumerate() {
+        // Within a fraction of one line (19.7 px): an extra or missing line would show.
+        assert!((e.h - g.h).abs() < 5.0, "block {i}: {} vs {}", e.h, g.h);
+    }
+}
+
+/// A table with one row whose second cell is `cell`.
+fn table_with_cell(cell: &str) -> String {
+    format!("| a | b |\n|---|---|\n| x | {cell} |\n")
+}
+
+#[test]
+fn huge_table_cells_are_measured_in_bounded_row_fragments() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&table_with_cell(&"word ".repeat(BIG / 2)));
+    assert!(doc.blocks.len() >= 300, "{} blocks", doc.blocks.len());
+    assert!(
+        doc.blocks
+            .iter()
+            .all(|b| block_bytes(&doc, b) <= doc::MAX_BLOCK_BYTES)
+    );
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    // Every idle call with an expired deadline measures exactly one fragment (the first also
+    // measures the sampled rows for the column widths).
+    for done in 1..=5 {
+        assert!(!l.idle(&doc, &fonts, Instant::now()));
+        assert_eq!(l.geoms().iter().filter(|g| g.measured).count(), done);
+    }
+    // At the top, only the fragments near the viewport are built.
+    l.ensure(&doc, &fonts, Anchor::TOP, 1000.0);
+    let live = l.geoms().iter().filter(|g| g.content.is_some()).count();
+    assert!((2..=8).contains(&live), "{live} fragments built");
+    assert!(l.geoms().last().unwrap().content.is_none());
+    // And so are the ones in the middle.
+    let mid = l.anchor_at(l.total_height() / 2.0);
+    l.ensure(&doc, &fonts, mid, 1000.0);
+    let live = l.geoms().iter().filter(|g| g.content.is_some()).count();
+    assert!((1..=8).contains(&live), "{live} fragments built");
+    assert!(l.geoms()[mid.block as usize].content.is_some());
+    check_geometry(&l);
+}
+
+/// Horizontal rules of a row block (full-width borders).
+fn horizontal_rules(c: &BlockBox) -> usize {
+    c.rects
+        .iter()
+        .filter(|r| r.role == Role::Border && r.h <= 1.0 && r.w > 1.0)
+        .count()
+}
+
+#[test]
+fn row_fragments_share_stripes_borders_and_parity() {
+    let fonts = Fonts::new().unwrap();
+    let words = "alpha beta gamma ".repeat(2500);
+    let src =
+        format!("| a | b |\n|---|---|\n| 1 | 2 |\n| x | {words} |\n| 3 | 4 |\n| y | {words} |\n");
+    let doc = Doc::parse(&src);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    let n = doc.blocks.len();
+    assert!(doc.blocks.iter().filter(|b| b.joined).count() >= 4);
+    let py = CELL_PAD_Y * 16.0;
+    // Row index (header = 0) of every block; fragments of one row count once.
+    let mut row = 0;
+    for i in 0..n {
+        let (b, g) = (&doc.blocks[i], &l.geoms()[i]);
+        let c = g.content.as_ref().unwrap();
+        let header = matches!(b.kind, BlockKind::TableRow { header: true, .. });
+        if !b.joined && !header {
+            row += 1;
+        }
+        let striped = c.rects.iter().any(|r| r.role == Role::TableStripe);
+        assert_eq!(striped, row % 2 == 0 && !header, "block {i} (row {row})");
+        let last = i + 1 == n || !doc.blocks[i + 1].joined;
+        // Rules: the table's top above the header only, a bottom rule under each row's last
+        // fragment only, and the vertical rules run the whole fragment.
+        let want = (i == 0) as usize + last as usize;
+        assert_eq!(horizontal_rules(c), want, "block {i}");
+        let verticals: Vec<_> = c
+            .rects
+            .iter()
+            .filter(|r| r.role == Role::Border && r.w <= 1.0 && r.h > 1.0)
+            .collect();
+        assert_eq!(verticals.len(), 3, "block {i}");
+        assert!(
+            verticals.iter().all(|r| r.y == 0.0 && r.h == g.h),
+            "block {i}"
+        );
+        if let Some(s) = c.rects.iter().find(|r| r.role == Role::TableStripe) {
+            assert_eq!((s.y, s.h), (0.0, g.h), "block {i}");
+        }
+        // Padding only above the row's first fragment and below its last.
+        let top = c.lines.iter().map(|l| l.top).fold(f32::MAX, f32::min);
+        assert_eq!(top, if b.joined { 0.0 } else { py }, "block {i}");
+        let bottom = g.h - c.lines.iter().map(|l| l.bottom).fold(0.0, f32::max);
+        let want = if last { py } else { 0.0 };
+        assert!(
+            (bottom - want).abs() < 1e-3,
+            "block {i}: {bottom} vs {want}"
+        );
+        assert!(g.h > py);
+    }
+    // Fragments counted as one row each: four data rows.
+    assert_eq!(row, 4);
+}
+
+#[test]
+fn row_fragment_estimates_match_measured_heights() {
+    let fonts = Fonts::new().unwrap();
+    let words = "alpha beta gamma ".repeat(3000);
+    let doc = Doc::parse(&format!(
+        "| a | b |\n|---|---|\n| 1 | 2 |\n| x | {words} |\n| 3 | 4 |\n"
+    ));
+    assert!(doc.blocks.iter().filter(|b| b.joined).count() >= 4);
+    let est = Layout::new(&doc, params(900.0, 1.0));
+    let est: Vec<f32> = est.geoms().iter().map(|g| g.h).collect();
+    let l = complete(&doc, &fonts, params(900.0, 1.0));
+    for (i, (e, g)) in est.iter().zip(l.geoms()).enumerate() {
+        assert!(
+            *e > 0.0 && g.h > 0.0 && e / g.h < 2.0 && g.h / e < 2.0,
+            "block {i}: {e} vs {}",
+            g.h
+        );
+    }
+    // Short rows keep their exact one-line estimate.
+    assert!((est[1] - l.geoms()[1].h).abs() < 1e-3);
+}
+
+/// `rows` short data rows after a header; row `at` (if any) has `wide` in its second cell.
+fn long_table(rows: usize, at: usize, wide: &str) -> String {
+    let mut src = String::from("| key | value |\n|---|---|\n");
+    for r in 0..rows {
+        let cell = if r == at { wide } else { "v" };
+        src.push_str(&format!("| k{r} | {cell} |\n"));
+    }
+    src
+}
+
+#[test]
+fn table_columns_are_sized_from_the_first_rows_only() {
+    let fonts = Fonts::new().unwrap();
+    // 96k rows: the sample is a small prefix, so the first frame doesn't shape every row.
+    let doc = Doc::parse(&long_table(96_000, usize::MAX, ""));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let sample = l.table_sample(&doc, 0);
+    assert_eq!(sample.start, 0);
+    assert!(sample.len() <= TABLE_SAMPLE_ROWS, "{sample:?}");
+    assert!(sample.len() > 1);
+    l.ensure(&doc, &fonts, Anchor::TOP, 1000.0);
+    assert!(l.table_cols[0].is_some());
+    // A table of text-heavy rows is bounded by bytes instead.
+    let words = "alpha ".repeat(1000);
+    let heavy = Doc::parse(&format!(
+        "| a |\n|---|\n{}",
+        (0..200)
+            .map(|_| format!("| {words} |\n"))
+            .collect::<String>()
+    ));
+    let l = Layout::new(&heavy, params(900.0, 1.0));
+    let bytes: usize = l
+        .table_sample(&heavy, 0)
+        .map(|r| text_bytes(&heavy, &heavy.blocks[r as usize]))
+        .sum();
+    assert!(
+        bytes < TABLE_SAMPLE_BYTES + 6000 + 1,
+        "{bytes} bytes sampled"
+    );
+    assert!(l.table_sample(&heavy, 0).len() < 20);
+
+    // A cell far past the sample doesn't change the columns: the table sizes like one that
+    // stops at the sample.
+    let wide = "wideword".repeat(12);
+    let long = Doc::parse(&long_table(1000, 600, &wide));
+    let short = Doc::parse(&long_table(300, usize::MAX, ""));
+    let cols = |doc: &Doc| {
+        let mut l = Layout::new(doc, params(900.0, 1.0));
+        l.ensure(doc, &fonts, Anchor::TOP, 800.0);
+        l.table_cols[0].clone().unwrap()
+    };
+    assert_eq!(cols(&long), cols(&short));
+
+    // The wide row still lays out completely, wrapped inside the sampled columns.
+    let mut l = Layout::new(&long, params(900.0, 1.0));
+    let row = 1 + 600;
+    let widths = cols(&long);
+    l.ensure(
+        &long,
+        &fonts,
+        Anchor {
+            block: row,
+            frac: 0.0,
+        },
+        800.0,
+    );
+    let c = l.geoms()[row as usize].content.as_ref().unwrap();
+    assert!(c.lines.len() > 1, "the cell wraps");
+    let start = long.text.find(&wide).unwrap() as u32;
+    let mut seen: Vec<u32> = c
+        .hits
+        .iter()
+        .map(|h| h.doc)
+        .filter(|d| (start..start + wide.len() as u32).contains(d))
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert!(
+        seen.len() >= wide.len() - 4,
+        "{} of {}",
+        seen.len(),
+        wide.len()
+    );
+    assert_eq!(seen[0], start);
+    let right = widths[0] + widths[1] - CELL_PAD_X * 16.0;
+    for g in &c.glyphs {
+        assert!(
+            g.x <= right + 1.0,
+            "glyph at {} past column edge {right}",
+            g.x
+        );
+    }
+}
+
+#[test]
+fn rows_past_the_sample_get_slack_instead_of_wrapping() {
+    let fonts = Fonts::new().unwrap();
+    // The sampled rows are narrow; a later row is a bit wider than any of them.
+    let doc = Doc::parse(&long_table(1000, 600, "vvvvvvvvvv"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let row = 1 + 600;
+    l.ensure(
+        &doc,
+        &fonts,
+        Anchor {
+            block: row,
+            frac: 0.0,
+        },
+        800.0,
+    );
+    let c = l.geoms()[row as usize].content.as_ref().unwrap();
+    // One line per cell: neither wrapped.
+    assert_eq!(c.lines.len(), 2, "fits on one line");
+    let (_, col_w) = l.column();
+    let total: f32 = l.table_cols[0].as_ref().unwrap().iter().sum();
+    assert!(
+        total <= col_w + 2.0 && total > col_w * 0.9,
+        "{total} of {col_w}"
+    );
+    // A table that ends inside the sample keeps its natural widths.
+    let doc = Doc::parse(&long_table(10, usize::MAX, ""));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let total: f32 = l.table_cols[0].as_ref().unwrap().iter().sum();
+    assert!(total < col_w * 0.5, "{total}");
 }

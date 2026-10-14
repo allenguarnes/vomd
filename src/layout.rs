@@ -36,6 +36,11 @@ const KEEP_SCREENS: f32 = 4.0;
 const MEASURE_SCREENS: f32 = 2.0;
 /// Line width for text that must never wrap (list markers).
 const NO_WRAP: f32 = 1.0e6;
+/// A table's column widths come from its first rows only: at most this many blocks (row
+/// fragments) or this many bytes of cell text, whichever runs out first, so a huge table can't
+/// block the first frame. Later rows wrap within the sampled widths.
+const TABLE_SAMPLE_ROWS: usize = 256;
+const TABLE_SAMPLE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
@@ -156,7 +161,7 @@ pub struct BlockGeom {
 struct Meta {
     /// Alert whose quote this block belongs to, and that quote's depth.
     alert: Option<(Alert, u8)>,
-    /// Even data row of a table (striped background).
+    /// Even data row of a table (striped background); all fragments of a row agree.
     stripe: bool,
     first_row: bool,
     /// Part of the footnote section at the end of the document.
@@ -295,15 +300,17 @@ impl Layout {
     }
 
     /// Fallback faces were added: remeasure blocks that had uncovered characters (even ones
-    /// already reported). A table
-    /// is remeasured whole, since its column widths depend on every row.
+    /// already reported). A table whose sampled rows were affected is remeasured whole, since
+    /// its column widths depend on them.
     pub fn invalidate_missing(&mut self, doc: &Doc) {
         for i in 0..self.geoms.len() {
             if !self.geoms[i].missing {
                 continue;
             }
             let rows = match doc.blocks[i].kind {
-                BlockKind::TableRow { table, .. } => {
+                BlockKind::TableRow { table, .. }
+                    if self.table_sample(doc, table as usize).contains(&(i as u32)) =>
+                {
                     self.table_cols[table as usize] = None;
                     self.table_rows[table as usize].clone()
                 }
@@ -360,7 +367,14 @@ impl Layout {
                 } else {
                     r.end = i as u32 + 1;
                 }
-                row = if header { 0 } else { row + 1 };
+                // Fragments of one row (`joined`) share its parity.
+                row = if header {
+                    0
+                } else if b.joined {
+                    row
+                } else {
+                    row + 1
+                };
                 meta[i].stripe = !header && row.is_multiple_of(2);
                 meta[i].first_row = r.start == i as u32;
             }
@@ -593,8 +607,7 @@ impl Layout {
             BlockKind::TableRow { table, .. } => self.table_row(
                 doc,
                 fonts,
-                block,
-                meta,
+                (block, meta, last),
                 table as usize,
                 indent,
                 gap,
@@ -862,13 +875,14 @@ impl Layout {
         h
     }
 
+    /// One table row, or one fragment of a split row: a fragment has no rule or padding where
+    /// it joins its neighbor, but keeps the row's stripe and vertical rules.
     #[allow(clippy::too_many_arguments)]
     fn table_row(
         &mut self,
         doc: &Doc,
         fonts: &Fonts,
-        block: &Block,
-        meta: Meta,
+        (block, meta, last): (&Block, Meta, bool),
         table: usize,
         indent: f32,
         gap: f32,
@@ -878,6 +892,10 @@ impl Layout {
         let em = self.em;
         let cols = self.table_cols(doc, fonts, table, indent);
         let (px, py) = (CELL_PAD_X * em, CELL_PAD_Y * em);
+        let (top, bottom) = (
+            if block.joined { 0.0 } else { py },
+            if last { py } else { 0.0 },
+        );
         let header = matches!(block.kind, BlockKind::TableRow { header: true, .. });
         let body = TextStyle {
             bold: header,
@@ -902,7 +920,7 @@ impl Layout {
             );
             missing.extend_from_slice(&pl.missing);
             row_h = row_h.max(pl.height);
-            cells.push((pl, self.para.styles.clone()));
+            cells.push((pl, std::mem::take(&mut self.para.styles)));
         }
         if cells.is_empty() {
             self.para.clear();
@@ -912,7 +930,7 @@ impl Layout {
                 .layout(fonts, &self.para, 1.0, Align::Start, BODY_LH);
             row_h = pl.height;
         }
-        let h = row_h + 2.0 * py;
+        let h = row_h + top + bottom;
         let width: f32 = cols.iter().sum();
         let line = self.hairline();
         if meta.stripe {
@@ -921,12 +939,15 @@ impl Layout {
         if meta.first_row {
             out.rect(indent, gap, width, line, Role::Border);
         }
-        out.rect(indent, gap + h - line, width, line, Role::Border);
+        if last {
+            out.rect(indent, gap + h - line, width, line, Role::Border);
+        }
         let mut x = indent;
         out.rect(x, gap, line, h, Role::Border);
-        for (c, w) in cols.iter().enumerate() {
-            if let Some((pl, styles)) = cells.get(c).cloned() {
-                out.append(pl, &styles, x + px, gap + py);
+        let mut cells = cells.into_iter();
+        for w in &cols {
+            if let Some((pl, styles)) = cells.next() {
+                out.append(pl, &styles, x + px, gap + top);
             }
             x += w;
             out.rect(x - line, gap, line, h, Role::Border);
@@ -934,9 +955,28 @@ impl Layout {
         h
     }
 
-    /// Column widths for a table (cell padding included), from the min/natural widths of
-    /// every cell: natural widths if they fit, otherwise the slack is shared in proportion
-    /// to how much each column wants to grow (CSS auto-layout, simplified).
+    /// The blocks of a table whose cells size its columns: its first rows, up to
+    /// [`TABLE_SAMPLE_ROWS`] blocks or [`TABLE_SAMPLE_BYTES`] of text (always at least the
+    /// header).
+    fn table_sample(&self, doc: &Doc, table: usize) -> Range<u32> {
+        let rows = self.table_rows[table].clone();
+        let (mut end, mut bytes) = (rows.start, 0);
+        while end < rows.end
+            && ((end - rows.start) as usize) < TABLE_SAMPLE_ROWS
+            && bytes < TABLE_SAMPLE_BYTES
+        {
+            bytes += text_bytes(doc, &doc.blocks[end as usize]);
+            end += 1;
+        }
+        rows.start..end
+    }
+
+    /// Column widths for a table (cell padding included), from the min/natural widths of the
+    /// cells in its [`table_sample`](Self::table_sample): natural widths if they fit,
+    /// otherwise the slack is shared in proportion to how much each column wants to grow (CSS
+    /// auto-layout, simplified). Rows past the sample never influence the columns; their text
+    /// wraps within them (a table that fits and has such rows is stretched to the full width,
+    /// leaving them room).
     fn table_cols(&mut self, doc: &Doc, fonts: &Fonts, table: usize, indent: f32) -> Vec<f32> {
         if let Some(cols) = &self.table_cols[table] {
             return cols.clone();
@@ -945,8 +985,9 @@ impl Layout {
         let px = CELL_PAD_X * em;
         let n = doc.tables[table].aligns.len().max(1);
         let (mut min, mut max) = (vec![0.0f32; n], vec![0.0f32; n]);
-        let rows = self.table_rows[table].clone();
-        for r in rows.start..rows.end.max(rows.start) {
+        let sample = self.table_sample(doc, table);
+        let truncated = sample.end < self.table_rows[table].end;
+        for r in sample {
             let block = &doc.blocks[r as usize];
             let header = matches!(block.kind, BlockKind::TableRow { header: true, .. });
             let body = TextStyle {
@@ -963,7 +1004,13 @@ impl Layout {
         let avail = (self.col_w - indent - n as f32 * 2.0 * px).max(0.0);
         let (sum_min, sum_max): (f32, f32) = (min.iter().sum(), max.iter().sum());
         let widths: Vec<f32> = if sum_max <= avail {
-            max
+            if truncated && sum_max > 0.0 {
+                // Rows past the sample may be a little wider than any in it: spend the slack
+                // on the columns instead of wrapping them for a digit.
+                max.iter().map(|w| w * avail / sum_max).collect()
+            } else {
+                max
+            }
         } else if sum_min >= avail || sum_max <= sum_min {
             min
         } else {
@@ -1022,11 +1069,7 @@ impl Layout {
         let em = self.em;
         let gap = self.gap_before(doc, i) * em;
         let avail = (self.col_w - self.indent(doc, block, self.meta[i])).max(em);
-        let chars: usize = doc
-            .block_spans(block)
-            .iter()
-            .map(|s| (s.end - s.start) as usize)
-            .sum();
+        let chars = text_bytes(doc, block);
         let lines = |size: f32| ((chars as f32 * CHAR_EM * size) / avail).ceil().max(1.0);
         gap + match block.kind {
             BlockKind::Paragraph | BlockKind::AlertTitle(_) => lines(em) * BODY_LH * em,
@@ -1035,20 +1078,36 @@ impl Layout {
                 lines(size) * HEADING_LH * size
             }
             BlockKind::Code => {
-                let text_lines = doc
-                    .block_spans(block)
+                // A chunk ending in a newline has no empty line after it.
+                let spans = doc.block_spans(block);
+                let newlines: usize = spans
                     .iter()
                     .map(|s| doc.span_text(s).matches('\n').count())
-                    .sum::<usize>()
-                    + 1;
+                    .sum();
+                let ends_line = spans
+                    .last()
+                    .is_some_and(|s| doc.span_text(s).ends_with('\n'));
+                let text_lines = newlines + !ends_line as usize;
                 let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
                 (text_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em
                     + pads as f32 * em
             }
             BlockKind::Rule => 0.25 * em,
-            BlockKind::TableRow { .. } => BODY_LH * em + 2.0 * CELL_PAD_Y * em,
+            // The cells share the width: a row is about as tall as its text set on one line.
+            BlockKind::TableRow { .. } => {
+                let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
+                lines(em) * BODY_LH * em + pads as f32 * CELL_PAD_Y * em
+            }
         }
     }
+}
+
+/// Bytes of text in a block's spans.
+fn text_bytes(doc: &Doc, block: &Block) -> usize {
+    doc.block_spans(block)
+        .iter()
+        .map(|s| (s.end - s.start) as usize)
+        .sum()
 }
 
 /// The next block continues this one (see [`Block::joined`]).

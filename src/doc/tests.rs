@@ -372,9 +372,9 @@ fn split_prefers_newline_then_whitespace_then_char_boundary() {
             .map(|c| c.into_iter().map(|(t, ..)| t).collect())
             .collect()
     };
-    // The last newline in reach wins over a later space; the newline itself is dropped.
-    assert_eq!(t("ab\ncd ef gh", 8), ["ab", "cd ef gh"]);
-    assert_eq!(t("aa\nbb\ncc\ndd", 8), ["aa\nbb", "cc\ndd"]);
+    // The last newline in reach wins over a later space; the newline ends its chunk.
+    assert_eq!(t("ab\ncd ef gh", 8), ["ab\n", "cd ef gh"]);
+    assert_eq!(t("aa\nbb\ncc\ndd", 8), ["aa\nbb\n", "cc\ndd"]);
     // No newline: after the last whitespace.
     assert_eq!(t("abc def ghi jkl", 9), ["abc def ", "ghi jkl"]);
     // No whitespace: at the limit.
@@ -387,7 +387,12 @@ fn split_prefers_newline_then_whitespace_then_char_boundary() {
     // Multi-byte whitespace counts too (U+3000 is 3 bytes).
     assert_eq!(t("ab\u{3000}cdef", 7), ["ab\u{3000}", "cdef"]);
     // A leading newline is a blank line of its own.
-    assert_eq!(t("\nabcdefgh", 4), ["", "abcd", "efgh"]);
+    assert_eq!(t("\nabcdefgh", 4), ["\n", "abcd", "efgh"]);
+    // Blank lines survive a cut: a cut never lands right before a newline (that would make
+    // the end of the line a blank line), so the newline moves in or the last char moves out.
+    assert_eq!(t("ab\n\n\ncd", 5), ["ab\n\n\n", "cd"]);
+    assert_eq!(t("aaa bbb \nccc", 8), ["aaa ", "bbb \nccc"]);
+    assert_eq!(t("abcdef\nghi", 6), ["abcde", "f\nghi"]);
     // Short text is a single chunk.
     assert_eq!(t("short", 8), ["short"]);
 }
@@ -431,7 +436,8 @@ fn split_cuts_spans_at_the_boundary() {
     assert_eq!(joined, text);
 }
 
-/// `(kind, text)` of every block, with chunk runs rejoined.
+/// `(kind, text)` of every block, with chunk runs rejoined (chunks keep their newlines, so
+/// they concatenate back to the original text).
 fn runs(doc: &Doc) -> Vec<(BlockKind, String)> {
     let mut out: Vec<(BlockKind, String)> = Vec::new();
     for b in &doc.blocks {
@@ -441,10 +447,7 @@ fn runs(doc: &Doc) -> Vec<(BlockKind, String)> {
             .map(|s| doc.span_text(s))
             .collect();
         match out.last_mut() {
-            Some((_, t)) if b.joined => {
-                t.push('\n');
-                t.push_str(&text);
-            }
+            Some((_, t)) if b.joined => t.push_str(&text),
             _ => out.push((b.kind, text)),
         }
     }
@@ -470,7 +473,7 @@ fn oversized_code_block_is_chunked() {
         let first = doc.span_text(&doc.block_spans(b)[0]);
         assert!(first.starts_with("line "), "{first:?}");
     }
-    // Rejoining with the dropped newlines restores the code (minus its trailing newline).
+    // Rejoining the chunks restores the code (minus its trailing newline).
     let runs = runs(&doc);
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].1, code.trim_end());
@@ -536,6 +539,142 @@ fn chunked_headings_and_footnotes_anchor_at_the_first_chunk() {
         doc.block_spans(end)
             .last()
             .is_some_and(|s| doc.span_text(s) == " ↩")
+    );
+}
+
+/// Text of each cell of a table row block.
+fn cell_texts(doc: &Doc, block: &Block) -> Vec<String> {
+    doc.row_cells(block)
+        .map(|spans| spans.iter().map(|s| doc.span_text(s)).collect())
+        .collect()
+}
+
+/// Bytes of text in a block's spans.
+fn block_bytes(doc: &Doc, block: &Block) -> usize {
+    doc.block_spans(block)
+        .iter()
+        .map(|s| (s.end - s.start) as usize)
+        .sum()
+}
+
+#[test]
+fn oversized_table_rows_split_into_fragments() {
+    let big = "alpha beta ".repeat(5000);
+    let big = big.trim_end();
+    let doc = Doc::parse(&format!(
+        "| h1 | h2 |\n|:--|--:|\n| small | {big} |\n| tail | x |\n"
+    ));
+    check_invariants(&doc);
+    // Header, the row's fragments, the next row.
+    let n = doc.blocks.len();
+    assert!(n > 5, "{n} blocks");
+    let row = &doc.blocks[1..n - 1];
+    assert!(!doc.blocks[0].joined && !row[0].joined && !doc.blocks[n - 1].joined);
+    assert!(row[1..].iter().all(|b| b.joined));
+    let mut cells: [String; 2] = Default::default();
+    for (k, b) in row.iter().enumerate() {
+        let BlockKind::TableRow {
+            table,
+            header,
+            cells: count,
+            ..
+        } = b.kind
+        else {
+            panic!("fragment {k} is a table row");
+        };
+        assert_eq!((table, header, count), (0, false, 2), "fragment {k}");
+        assert!(block_bytes(&doc, b) <= MAX_BLOCK_BYTES, "fragment {k}");
+        let texts = cell_texts(&doc, b);
+        // The short cell is in the first fragment; later fragments hold an empty cell.
+        assert_eq!(texts[0], if k == 0 { "small" } else { "" }, "fragment {k}");
+        for (all, t) in cells.iter_mut().zip(&texts) {
+            all.push_str(t);
+        }
+    }
+    // Rejoined, the pieces are the original cells; pieces break at whitespace, never in words.
+    assert_eq!(cells, ["small", big]);
+    for b in row {
+        let t = &cell_texts(&doc, b)[1];
+        assert!(t.split_whitespace().all(|w| w == "alpha" || w == "beta"));
+    }
+    // The next row is intact, and the table has its one alignment list.
+    assert_eq!(cell_texts(&doc, &doc.blocks[n - 1]), ["tail", "x"]);
+    assert_eq!(doc.tables[0].aligns, [Align::Left, Align::Right]);
+    // Small rows are never split.
+    let doc = Doc::parse("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n");
+    assert_eq!(doc.blocks.len(), 3);
+    assert!(doc.blocks.iter().all(|b| !b.joined));
+}
+
+#[test]
+fn table_row_fragments_cut_on_char_boundaries_and_keep_headers() {
+    // 3-byte chars with no whitespace: the cell budget lands inside characters.
+    let wide = "語".repeat(12_000);
+    let doc = Doc::parse(&format!("| {wide} | b |\n|---|---|\n| 1 | {wide} |\n"));
+    check_invariants(&doc);
+    let (head, body): (Vec<_>, Vec<_>) = doc
+        .blocks
+        .iter()
+        .partition(|b| matches!(b.kind, BlockKind::TableRow { header: true, .. }));
+    assert!(head.len() > 2 && body.len() > 2);
+    // A header split into fragments stays a header; the body row after it starts fresh.
+    assert!(!head[0].joined && head[1..].iter().all(|b| b.joined));
+    assert!(!body[0].joined && body[1..].iter().all(|b| b.joined));
+    assert!(!std::ptr::eq(head[0], body[0]));
+    for (group, cell) in [(&head, 0), (&body, 1)] {
+        let text: String = group
+            .iter()
+            .map(|b| cell_texts(&doc, b)[cell].clone())
+            .collect();
+        assert_eq!(text, wide);
+    }
+    // Fragments keep every cell range valid, even exhausted (empty) ones.
+    for b in &doc.blocks {
+        assert_eq!(cell_texts(&doc, b).len(), 2);
+    }
+}
+
+#[test]
+fn footnote_back_links_target_the_chunk_with_the_reference() {
+    let words = "word ".repeat(10_000);
+    let doc = Doc::parse(&format!("{words} ref[^n]\n\n[^n]: def\n"));
+    check_invariants(&doc);
+    let target = doc
+        .anchors
+        .iter()
+        .find(|(s, _)| s == "fnref-n")
+        .map(|(_, b)| *b as usize)
+        .unwrap();
+    assert!(target > 1, "the reference is in a later chunk: {target}");
+    assert!(
+        doc.block_spans(&doc.blocks[target])
+            .iter()
+            .any(|s| s.style & style::FOOTREF != 0)
+    );
+    // Only that chunk holds the reference.
+    let refs = doc.blocks.iter().filter(|b| {
+        doc.block_spans(b)
+            .iter()
+            .any(|s| s.style & style::FOOTREF != 0)
+    });
+    assert_eq!(refs.count(), 1);
+    // A reference inside a split table row resolves to its fragment too.
+    let big = "alpha ".repeat(6000);
+    let doc = Doc::parse(&format!(
+        "| a | b |\n|---|---|\n| {big} | {big} end[^m] |\n\n[^m]: def\n"
+    ));
+    check_invariants(&doc);
+    let target = doc
+        .anchors
+        .iter()
+        .find(|(s, _)| s == "fnref-m")
+        .map(|(_, b)| *b as usize)
+        .unwrap();
+    assert!(doc.blocks[target].joined);
+    assert!(
+        doc.block_spans(&doc.blocks[target])
+            .iter()
+            .any(|s| s.style & style::FOOTREF != 0)
     );
 }
 

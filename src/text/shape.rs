@@ -96,6 +96,62 @@ fn is_default_ignorable(c: char) -> bool {
         | '\u{E0000}'..='\u{E0FFF}')
 }
 
+/// The combining marks after a base, and where they end.
+struct Marks {
+    /// Directly after the base (or after joiners and variation selectors): they may compose
+    /// with it.
+    composable: Vec<char>,
+    /// After another ignorable character (CGJ, ZWSP, ...): never composed.
+    loose: Vec<char>,
+    /// End of everything that stays with the base.
+    end: usize,
+}
+
+impl Marks {
+    fn is_empty(&self) -> bool {
+        self.composable.is_empty() && self.loose.is_empty()
+    }
+
+    /// Marks no face draws at all (composition aside), to report as missing.
+    fn uncovered<'a>(
+        &'a self,
+        fonts: &'a Fonts,
+        primary: FaceId,
+    ) -> impl Iterator<Item = char> + 'a {
+        let all = self.composable.iter().chain(&self.loose).copied();
+        all.filter(move |&m| fonts.select(primary, m).is_none())
+    }
+}
+
+/// Everything after the base ending at `from` (up to `end`) that stays in the base's face:
+/// attaching characters and ignorables, with the visible combining marks among them.
+fn marks_after(text: &str, from: usize, end: usize) -> Marks {
+    let mut seq = Marks {
+        composable: Vec::new(),
+        loose: Vec::new(),
+        end: from,
+    };
+    let mut blocked = false;
+    for c in text[from..end].chars() {
+        if is_combining_mark(c) {
+            let list = if blocked {
+                &mut seq.loose
+            } else {
+                &mut seq.composable
+            };
+            list.push(c);
+        } else if is_default_ignorable(c) {
+            // Joiners and variation selectors are transparent; anything else (CGJ, ZWSP, ...)
+            // stands between the base and the marks after it.
+            blocked |= !attaches_to_previous(c);
+        } else if !attaches_to_previous(c) {
+            break;
+        }
+        seq.end += c.len_utf8();
+    }
+    seq
+}
+
 fn is_regional_indicator(c: char) -> bool {
     ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
 }
@@ -144,6 +200,8 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
         let style = &para.styles[item.style as usize];
         let primary = fonts.primary(style.bold, style.italic, style.mono);
         let mut prev: Option<char> = None;
+        // Marks before this offset were already checked together with their base.
+        let mut checked = 0;
         for (off, c) in text[range.clone()].char_indices() {
             let at = range.start + off;
             let level = level_at(at);
@@ -152,28 +210,48 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 && (attaches_to_previous(c)
                     || prev.is_some_and(|p| is_regional_indicator(p) && is_regional_indicator(c)));
             let face = match (inherit, last) {
+                (true, Some(r)) if is_combining_mark(c) && at >= checked => {
+                    // No base vouched for this mark (it follows a control character or an
+                    // ignorable one): the face it would inherit must draw it.
+                    let covered = |id| fonts.face(id).glyph(c) != 0;
+                    if covered(r.face) {
+                        r.face
+                    } else {
+                        fonts.select(primary, c).unwrap_or_else(|| {
+                            out.missing.push(c);
+                            r.face
+                        })
+                    }
+                }
                 (true, Some(r)) => r.face,
                 _ if c.is_control() || c.is_whitespace() || is_default_ignorable(c) => {
-                    last.map_or(primary, |r| r.face)
+                    let keep = last.map_or(primary, |r| r.face);
+                    if c.is_control() || !c.is_whitespace() {
+                        keep
+                    } else {
+                        // A space can carry marks too: its face must draw them.
+                        let seq = marks_after(text, at + c.len_utf8(), range.end);
+                        checked = seq.end;
+                        let face = (!seq.is_empty())
+                            .then(|| fonts.select_sequence(primary, c, &seq.composable, &seq.loose))
+                            .flatten();
+                        face.unwrap_or_else(|| {
+                            out.missing.extend(seq.uncovered(fonts, primary));
+                            keep
+                        })
+                    }
                 }
                 _ => {
                     // The marks that follow stay on this face, so it must draw all of them.
-                    let marks: Vec<char> = text[at + c.len_utf8()..range.end]
-                        .chars()
-                        .take_while(|&m| attaches_to_previous(m))
-                        .filter(|&m| is_combining_mark(m))
-                        .collect();
-                    let whole = (!marks.is_empty())
-                        .then(|| fonts.select_sequence(primary, c, &marks))
+                    let seq = marks_after(text, at + c.len_utf8(), range.end);
+                    checked = seq.end;
+                    let whole = (!seq.is_empty())
+                        .then(|| fonts.select_sequence(primary, c, &seq.composable, &seq.loose))
                         .flatten();
                     whole.unwrap_or_else(|| {
                         // No face draws the whole sequence: the base keeps its own face, and
                         // marks nothing draws are reported so a fallback gets searched.
-                        out.missing.extend(
-                            marks
-                                .iter()
-                                .filter(|&&m| fonts.select(primary, m).is_none()),
-                        );
+                        out.missing.extend(seq.uncovered(fonts, primary));
                         fonts.select(primary, c).unwrap_or_else(|| {
                             out.missing.push(c);
                             primary

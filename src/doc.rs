@@ -87,13 +87,18 @@ pub struct Block {
     pub quote_lists: Range<u32>,
     pub marker: Marker,
     /// Continues the previous block (an oversized block split at [`MAX_BLOCK_BYTES`]): same
-    /// kind and nesting, no marker, and no spacing in between.
+    /// kind and nesting, no marker, and no spacing in between. For a table row, fragment `k`
+    /// holds piece `k` of every cell (a cell that ran out is empty).
     pub joined: bool,
 }
 
 /// Paragraphs, headings and code blocks longer than this many text bytes are split into
 /// consecutive chunk blocks, so no single block needs a huge shaping pass or allocation.
 pub const MAX_BLOCK_BYTES: usize = 16 * 1024;
+
+/// Smallest per-cell share of [`MAX_BLOCK_BYTES`] when a table row is split, so rows with very
+/// many columns don't shatter into thousands of fragments.
+const MIN_CELL_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -203,6 +208,9 @@ struct Footnotes {
     defs: Vec<(u32, String, usize)>,
     /// Labels whose first reference already has a `fnref-` anchor.
     referenced: HashSet<String>,
+    /// `fnref-` anchors of the open block, as (index into `Doc::anchors`, text offset of the
+    /// reference): they get the block holding the reference once the block is split.
+    pending: Vec<(usize, u32)>,
     active: bool,
     /// Main-flow `quote_start` set aside while a definition is open.
     quote_start: u8,
@@ -579,20 +587,24 @@ impl Builder {
             self.doc.anchors.push((slug.clone(), block));
             self.doc.headings.push(Heading { level, block, slug });
         }
-        let splittable = matches!(
-            kind,
-            BlockKind::Paragraph | BlockKind::Heading(_) | BlockKind::Code
-        );
+        let first_block = self.doc.blocks.len();
         let block_spans = &self.doc.spans[spans.start as usize..];
         let bytes = match (block_spans.first(), block_spans.last()) {
             (Some(first), Some(last)) => last.end as usize - first.start as usize,
             _ => 0,
         };
-        if splittable && bytes > MAX_BLOCK_BYTES {
-            self.push_chunks(kind, spans.start as usize);
-        } else {
-            self.push_block(kind, spans);
+        match kind {
+            BlockKind::Paragraph | BlockKind::Heading(_) | BlockKind::Code
+                if bytes > MAX_BLOCK_BYTES =>
+            {
+                self.push_chunks(kind, spans.start as usize);
+            }
+            BlockKind::TableRow { first_cell, .. } if bytes > MAX_BLOCK_BYTES => {
+                self.push_row_fragments(kind, spans.start as usize, first_cell as usize);
+            }
+            _ => self.push_block(kind, spans),
         }
+        self.resolve_refs(first_block);
     }
 
     /// Split the open block's spans (everything from `first` on) into chunk blocks. The marker
@@ -604,6 +616,79 @@ impl Builder {
         for (i, chunk) in chunks.into_iter().enumerate() {
             let range = (first as u32 + chunk.start)..(first as u32 + chunk.end);
             self.push_joined(kind, range, i > 0);
+        }
+    }
+
+    /// Split an oversized table row (spans from `first_span`, cells from `first_cell`) into
+    /// fragment blocks: each cell is cut into pieces of at most its share of
+    /// [`MAX_BLOCK_BYTES`], and fragment `k` takes piece `k` of every cell, so the fragments
+    /// stay rectangular rows. The first fragment keeps the quote start; the rest are `joined`.
+    fn push_row_fragments(&mut self, kind: BlockKind, first_span: usize, first_cell: usize) {
+        let BlockKind::TableRow { table, header, .. } = kind else {
+            return;
+        };
+        let cells = self.doc.cells.split_off(first_cell);
+        let tail = self.doc.spans.split_off(first_span);
+        let budget = (MAX_BLOCK_BYTES / cells.len().max(1)).max(MIN_CELL_BYTES);
+        let pieces: Vec<_> = cells
+            .iter()
+            .map(|c| {
+                let spans = &tail[c.start as usize - first_span..c.end as usize - first_span];
+                split_spans(&self.doc.text, spans, budget)
+            })
+            .collect();
+        let count = pieces.iter().map(|(_, chunks)| chunks.len()).max();
+        for k in 0..count.unwrap_or(1) {
+            let (span_from, cell_from) = (self.doc.spans.len(), self.doc.cells.len());
+            for (spans, chunks) in &pieces {
+                let from = self.doc.spans.len() as u32;
+                if let Some(chunk) = chunks.get(k) {
+                    self.doc
+                        .spans
+                        .extend_from_slice(&spans[chunk.start as usize..chunk.end as usize]);
+                }
+                self.doc.cells.push(from..self.doc.spans.len() as u32);
+            }
+            let kind = BlockKind::TableRow {
+                table,
+                header,
+                first_cell: cell_from as u32,
+                cells: pieces.len() as u32,
+            };
+            let spans = span_from as u32..self.doc.spans.len() as u32;
+            self.push_joined(kind, spans, k > 0);
+        }
+    }
+
+    /// Point the `fnref-` anchors of the block just closed at the block (of the `first..` run it
+    /// was split into) that holds the reference.
+    fn resolve_refs(&mut self, first: usize) {
+        let pending = std::mem::take(&mut self.footnotes.pending);
+        let blocks = &self.doc.blocks[first.min(self.doc.blocks.len())..];
+        if pending.is_empty() || blocks.is_empty() {
+            return;
+        }
+        if blocks.len() == 1 {
+            for (anchor, _) in pending {
+                self.doc.anchors[anchor].1 = first as u32;
+            }
+            return;
+        }
+        // Spans of a run's blocks, ordered by text position (a row's fragments interleave).
+        let mut starts: Vec<(u32, u32)> = blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(k, b)| {
+                self.doc.spans[b.spans.start as usize..b.spans.end as usize]
+                    .iter()
+                    .map(move |s| (s.start, k as u32))
+            })
+            .collect();
+        starts.sort_unstable();
+        for (anchor, offset) in pending {
+            let at = starts.partition_point(|&(start, _)| start <= offset);
+            let k = at.checked_sub(1).map_or(0, |at| starts[at].1);
+            self.doc.anchors[anchor].1 = first as u32 + k;
         }
     }
 
@@ -731,14 +816,19 @@ impl Builder {
 
     fn footnote_ref(&mut self, label: &str) {
         let n = self.footnote_number(label);
-        if !self.footnotes.active && self.footnotes.referenced.insert(label.to_owned()) {
-            let block = self.doc.blocks.len() as u32;
-            self.doc.anchors.push((format!("fnref-{label}"), block));
-        }
+        let first = !self.footnotes.active && self.footnotes.referenced.insert(label.to_owned());
+        let offset = self.doc.text.len() as u32;
         let link = push_id(&mut self.doc.links, format!("#fn-{label}"));
         self.links.push(link);
         self.text(&n.to_string(), style::FOOTREF, 0);
         self.links.pop();
+        if first {
+            // The block isn't known until the open one is split, see `resolve_refs`.
+            self.footnotes
+                .pending
+                .push((self.doc.anchors.len(), offset));
+            self.doc.anchors.push((format!("fnref-{label}"), 0));
+        }
     }
 
     /// Append a "↩" link back to the reference at the end of the definition's last block.
@@ -961,8 +1051,8 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 /// Cut a block's `spans` (contiguous text) into chunks of at most `max` text bytes. Returns the
 /// re-cut spans (a span crossing a cut becomes two with the same style, link and image) and
 /// each chunk's range into them. A cut goes just after the last newline in reach (the newline
-/// itself is dropped: the chunk boundary is the line break), else after the last whitespace,
-/// else at the last char boundary.
+/// stays at the end of its chunk, so the line count is unchanged), else after the last
+/// whitespace, else at the last char boundary.
 fn split_spans(text: &str, spans: &[Span], max: usize) -> (Vec<Span>, Vec<Range<u32>>) {
     let (Some(first), Some(last)) = (spans.first(), spans.last()) else {
         return (Vec::new(), Vec::new());
@@ -972,10 +1062,10 @@ fn split_spans(text: &str, spans: &[Span], max: usize) -> (Vec<Span>, Vec<Range<
     let mut chunks = Vec::new();
     let mut next = 0;
     loop {
-        let (cut, resume) = if end - at > max {
+        let cut = if end - at > max {
             split_point(text, at, max)
         } else {
-            (end, end)
+            end
         };
         while next < spans.len() && spans[next].end as usize <= at {
             next += 1;
@@ -995,16 +1085,17 @@ fn split_spans(text: &str, spans: &[Span], max: usize) -> (Vec<Span>, Vec<Range<
             }
         }
         chunks.push(from..out.len() as u32);
-        if resume >= end {
+        if cut >= end {
             return (out, chunks);
         }
-        at = resume;
+        at = cut;
     }
 }
 
-/// Where to cut the chunk starting at `from` (at most `max` bytes): its end and the next
-/// chunk's start, which differ when a newline is dropped.
-fn split_point(text: &str, from: usize, max: usize) -> (usize, usize) {
+/// Where to cut the chunk starting at `from` (at most `max` bytes): the next chunk's start.
+/// A newline ends its line, so it stays with the chunk before the cut; a cut right before one
+/// would turn the end of a line into a blank line of its own.
+fn split_point(text: &str, from: usize, max: usize) -> usize {
     let mut limit = (from + max).min(text.len());
     while !text.is_char_boundary(limit) {
         limit -= 1;
@@ -1013,13 +1104,20 @@ fn split_point(text: &str, from: usize, max: usize) -> (usize, usize) {
         // `max` is smaller than the next char: take it whole.
         limit = from + text[from..].chars().next().map_or(0, char::len_utf8);
     }
-    let window = &text[from..limit];
-    if let Some(i) = window.rfind('\n') {
-        return (from + i, from + i + 1);
+    if let Some(i) = text[from..limit].rfind('\n') {
+        return from + i + 1;
     }
+    // The window has no newline: leave its last char to the next chunk if a newline follows.
+    if text[limit..].starts_with('\n')
+        && let Some(c) = text[from..limit].chars().next_back()
+        && limit - c.len_utf8() > from
+    {
+        limit -= c.len_utf8();
+    }
+    let window = &text[from..limit];
     match window.char_indices().rev().find(|(_, c)| c.is_whitespace()) {
-        Some((i, c)) => (from + i + c.len_utf8(), from + i + c.len_utf8()),
-        None => (limit, limit),
+        Some((i, c)) => from + i + c.len_utf8(),
+        None => limit,
     }
 }
 

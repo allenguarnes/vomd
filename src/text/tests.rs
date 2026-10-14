@@ -420,3 +420,61 @@ fn combining_marks_use_a_fallback_with_their_base() {
     let shaped = shape_with(&fonts, "e\u{0301}");
     assert_eq!(shaped.clusters[0].face, fonts.primary(false, false, false));
 }
+
+#[test]
+fn marks_after_cgj_and_whitespace_are_checked_for_coverage() {
+    let fonts = Fonts::new().unwrap();
+    // CGJ stops composition, and a space has nothing to compose with: Inter has no U+0301
+    // glyph, so the mark is missing either way (not silently drawn as .notdef).
+    for text in [
+        "q\u{034F}\u{0301}",
+        " \u{0301}",
+        "e\u{034F}\u{0301}",
+        "a\u{200B}\u{0301}",
+    ] {
+        let shaped = shape_with(&fonts, text);
+        assert_eq!(shaped.missing, vec!['\u{0301}'], "{text:?}");
+    }
+    // Marks after a control character have no base to inherit a face from either.
+    let shaped = shape_with(&fonts, "\n\u{0301}");
+    assert_eq!(shaped.missing, vec!['\u{0301}']);
+    // The invisible character itself is never reported, and a composable sequence still is
+    // not: `e` + acute composes into `é`.
+    let shaped = shape_with(&fonts, "e\u{0301}x\u{034F}");
+    assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
+    // Joiners and variation selectors don't block composition.
+    let shaped = shape_with(&fonts, "e\u{200D}\u{0301}");
+    assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
+}
+
+#[test]
+fn marks_after_cgj_and_whitespace_use_a_fallback() {
+    let base = Fonts::new().unwrap();
+    let found = fallback::find_fallbacks(&['\u{0301}'], &|p, i| base.has_source(p, i));
+    let mut fonts = Fonts::new().unwrap();
+    let ids: Vec<_> = found
+        .iter()
+        .filter_map(|f| fonts.add_fallback(&f.path, f.index))
+        .collect();
+    let covering = |ch: char| {
+        ids.iter()
+            .copied()
+            .find(|&id| fonts.face(id).glyph(ch) != 0)
+    };
+    let (q, space) = (covering('q'), covering(' '));
+    for (text, face) in [("q\u{034F}\u{0301}", q), (" \u{0301}", space)] {
+        // Needs an installed face with the mark and the base.
+        let Some(face) = face.filter(|&id| fonts.face(id).glyph('\u{0301}') != 0) else {
+            continue;
+        };
+        let shaped = shape_with(&fonts, text);
+        assert!(shaped.missing.is_empty(), "{text:?}: {:?}", shaped.missing);
+        assert!(
+            shaped.glyphs.iter().all(|g| g.id != 0),
+            "{text:?}: {:?}",
+            shaped.glyphs
+        );
+        // The base moved with its mark.
+        assert_eq!(shaped.clusters[0].face, face, "{text:?}");
+    }
+}
