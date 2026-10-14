@@ -1,0 +1,8 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"| Left | Center | Right |\\n|:-----|:------:|------:|\\n| a | **b** c | `d` |\\n| | x | [l](#y) |\\n\")"
+---
+Row(t0,head) | [ "Left" ] [ "Center" ] [ "Right" ]
+Row(t0) | [ "a" ] [ [B]"b" " c" ] [ [C]"d" ]
+Row(t0) | [ ] [ "x" ] [ [L1]"l" ]
+link 1: #y

@@ -1,0 +1,16 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"- one\\n- two\\n  - nested *a*\\n  - nested b\\n- three\\n\\n\\\n         3. third\\n4. fourth\\n\\n\\\n         - [x] done\\n- [ ] todo\\n\\n\\\n         1. loose\\n\\n   second para\\n\\n2. next\\n\")"
+---
+P list=1 Bullet | "one"
+P list=1 Bullet | "two"
+P list=2 Bullet | "nested " [I]"a"
+P list=2 Bullet | "nested b"
+P list=1 Bullet | "three"
+P list=1 Ordered(3) | "third"
+P list=1 Ordered(4) | "fourth"
+P list=1 Task(true) | "done"
+P list=1 Task(false) | "todo"
+P list=1 Ordered(1) | "loose"
+P list=1 | "second para"
+P list=1 Ordered(2) | "next"

@@ -1,0 +1,19 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"First[^b] and second[^a] and again[^b].\\n\\n[^a]: Note A.\\n[^b]: Note B with *style*.\\n\\n# After\\n\")"
+---
+P | "First" [LF1]"1" " and second" [LF2]"2" " and again" [LF3]"1" "."
+H1 | "After"
+Rule |
+P Footnote(1) | "Note B with " [I]"style" "." [L5]" ↩"
+P Footnote(2) | "Note A." [L4]" ↩"
+link 1: #fn-b
+link 2: #fn-a
+link 3: #fn-b
+link 4: #fnref-a
+link 5: #fnref-b
+anchor #fnref-b -> 0
+anchor #fnref-a -> 0
+anchor #after -> 1
+anchor #fn-b -> 3
+anchor #fn-a -> 4

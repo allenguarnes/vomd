@@ -1,0 +1,6 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"Plain *italic* **bold** ***both*** ~~strike~~ `code` and [a **bold** link](https://x.y).\\n\\\n         Soft\\nbreak and hard  \\nbreak.\")"
+---
+P | "Plain " [I]"italic" " " [B]"bold" " " [BI]"both" " " [S]"strike" " " [C]"code" " and " [L1]"a " [BL1]"bold" [L1]" link" ". Soft break and hard\nbreak."
+link 1: https://x.y

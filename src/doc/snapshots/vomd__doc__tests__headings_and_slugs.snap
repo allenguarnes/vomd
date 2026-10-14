@@ -1,0 +1,15 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"# Hello, World!\\n## Hello, World!\\n### Ünïcode & `code` — dash\\n#### foo-1\\n# Hello, World!\\n# \\n\")"
+---
+H1 | "Hello, World!"
+H2 | "Hello, World!"
+H3 | "Ünïcode & " [C]"code" " — dash"
+H4 | "foo-1"
+H1 | "Hello, World!"
+H1 |
+anchor #hello-world -> 0
+anchor #hello-world-1 -> 1
+anchor #ünïcode--code--dash -> 2
+anchor #foo-1 -> 3
+anchor #hello-world-2 -> 4

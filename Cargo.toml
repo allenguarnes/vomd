@@ -39,3 +39,6 @@ strip = true
 debug = false
 incremental = false
 
+
+[dev-dependencies]
+insta = "1"

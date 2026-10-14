@@ -1,0 +1,10 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"<p align=\\\"center\\\">\\n  <img src=\\\"logo.png\\\" alt=\\\"Logo &amp; mark\\\" width=200>\\n</p>\\n\\n\\\n         <!-- hidden comment -->\\n\\n\\\n         Inline <b>bold?</b> stays text, line<br>break, <img src='https://x.y/a.png'>.\\n\\n\\\n         <details>\\n<summary>More &lt;info&gt;</summary>\\n\\nMarkdown *inside*.\\n\\n</details>\\n\")"
+---
+P | [Mm1]"Logo & mark"
+P | "Inline bold? stays text, line\nbreak, " [Mm2]"image" "."
+P | "More <info>"
+P | "Markdown " [I]"inside" "."
+image 1: logo.png remote=false
+image 2: https://x.y/a.png remote=true

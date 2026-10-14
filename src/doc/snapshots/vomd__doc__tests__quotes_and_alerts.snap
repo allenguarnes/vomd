@@ -1,0 +1,10 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"> quoted\\n> > nested\\n\\n> [!WARNING]\\n> Be careful.\\n\\n> [!TIP]\\n> - item\\n\")"
+---
+P quote=1 | "quoted"
+P quote=2 | "nested"
+Alert(Warning) quote=1 |
+P quote=1 | "Be careful."
+Alert(Tip) quote=1 |
+P list=1 quote=1 Bullet | "item"

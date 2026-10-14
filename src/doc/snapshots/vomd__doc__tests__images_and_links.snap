@@ -1,0 +1,9 @@
+---
+source: src/doc/tests.rs
+expression: dump(&doc)
+---
+P | [Mm1]"alt text" " " [LM1m2]"badge" " " [Mm3]"image"
+link 1: https://ci
+image 1: local.png remote=false
+image 2: https://img.shields.io/x.svg remote=true
+image 3: http://a/b.jpg remote=true

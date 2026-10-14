@@ -1,0 +1,20 @@
+---
+source: src/doc/tests.rs
+expression: parse(src)
+---
+H2 | "Tables"
+Row(t0,head) | [ "Left" ] [ "Center" ] [ "Right" ]
+Row(t0) | [ "a" ] [ "b" ] [ "c" ]
+Row(t0) | [ "longer cell content that should wrap when the window is narrow" ] [ [C]"code" ] [ "1,234.56" ]
+Row(t0) | [ [B]"bold" ] [ [I]"italic" ] [ [S]"strike" ]
+Row(t1,head) | [ "Key" ] [ "Action" ]
+Row(t1) | [ [C]"j" " / " [C]"k" ] [ "Scroll one line" ]
+Row(t1) | [ [C]"Space" ] [ "Scroll one page" ]
+Row(t1) | [ [C]"g" " / " [C]"G" ] [ "Top / bottom" ]
+P list=1 Task(true) | "Task done"
+P list=1 Task(false) | "Task pending"
+Alert(Note) quote=1 |
+P quote=1 | "GitHub-style alert with a " [L1]"link" "."
+Code | [C]"fn main() {\n    println!(\"a code block with a very long line that will need to wrap somewhere along the way because it is long\");\n}"
+link 1: #tables
+anchor #tables -> 0

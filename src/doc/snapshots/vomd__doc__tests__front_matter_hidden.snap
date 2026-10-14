@@ -1,0 +1,6 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"---\\ntitle: Secret\\ntags: [a]\\n---\\n\\n# Title\\n\")"
+---
+H1 | "Title"
+anchor #title -> 0
