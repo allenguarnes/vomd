@@ -229,13 +229,9 @@ fn code_blocks_wrap_with_continuation_markers() {
     let c = l.geoms()[0].content.as_ref().unwrap();
     let conts = c.lines.iter().filter(|l| l.cont).count();
     assert!(conts >= 2);
-    // One marker line per continuation (markers are appended as extra lines).
-    let markers = c
-        .lines
-        .iter()
-        .filter(|ln| ln.width > 0.0 && ln.hits.end - ln.hits.start == 1)
-        .count();
-    assert!(markers >= conts);
+    // One marker glyph per continuation, in the left padding.
+    let markers = c.glyphs.iter().filter(|g| g.x < 16.0).count();
+    assert_eq!(markers, conts);
     assert_eq!(c.rects[0].role, Role::CodeBg);
 }
 
@@ -389,4 +385,133 @@ fn narrow_and_tiny_windows_do_not_panic() {
         l.ensure(&doc, &fonts, Anchor::TOP, 100.0);
         check_geometry(&l);
     }
+}
+
+/// x positions of a table row's vertical rules.
+fn rules(c: &BlockBox) -> Vec<f32> {
+    c.rects
+        .iter()
+        .filter(|r| r.role == Role::Border && r.w <= 1.0 && r.h > 1.0)
+        .map(|r| r.x)
+        .collect()
+}
+
+#[test]
+fn fallback_invalidation_remeasures_whole_tables() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("before\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let rows = l.table_rows[0].clone();
+    assert_eq!(rows.len(), 3);
+    l.take_missing();
+    l.cursor = l.geoms.len();
+    l.geoms[rows.start as usize + 1].missing = true;
+    l.invalidate_missing(&doc);
+    for r in rows.start..rows.end {
+        let g = &l.geoms[r as usize];
+        assert!(!g.measured && g.content.is_none() && !g.missing, "row {r}");
+    }
+    assert!(l.geoms[0].measured && l.table_cols[0].is_none());
+    assert_eq!(l.cursor, rows.start as usize);
+    assert!(l.live.iter().all(|&i| !rows.contains(&i)));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let xs: Vec<_> = rows
+        .map(|r| rules(l.geoms[r as usize].content.as_ref().unwrap()))
+        .collect();
+    assert_eq!(xs[0].len(), 3);
+    assert!(xs.iter().all(|x| *x == xs[0]), "{xs:?}");
+}
+
+#[test]
+fn long_ordered_markers_stay_on_one_line() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("100. hundred\n101. next\n\n10000. big");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let mut seen = 0;
+    for (i, g) in l.geoms().iter().enumerate() {
+        let c = g.content.as_ref().unwrap();
+        if !matches!(doc.blocks[i].marker, Marker::Ordered(_)) {
+            continue;
+        }
+        seen += 1;
+        assert!(c.glyphs.iter().all(|gl| gl.y <= g.h), "block {i} overflows");
+        // Marker glyphs (left of the text) share one baseline, right edge in the gutter.
+        let indent = LIST_INDENT * 16.0;
+        let marker: Vec<_> = c.glyphs.iter().filter(|gl| gl.x < indent - 8.0).collect();
+        assert!(marker.len() >= 4);
+        assert!(marker.iter().all(|gl| gl.y == marker[0].y));
+    }
+    assert_eq!(seen, 3);
+}
+
+#[test]
+fn quote_after_alert_is_a_separate_quote() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("> [!NOTE]\n> n\n\n> plain quote\n\n> [!TIP]\n> t\n> > nested\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let content = |i: usize| l.geoms()[i].content.as_ref().unwrap();
+    let bar = |i: usize, role: Role| content(i).rects.iter().find(|r| r.role == role);
+    assert!(bar(1, Role::AlertNote).is_some());
+    // The plain quote is a plain quote: its own bar starts below the gap and isn't an alert.
+    assert!(bar(2, Role::AlertNote).is_none());
+    let b = bar(2, Role::QuoteBar).unwrap();
+    assert!(b.y > 0.0);
+    assert_eq!(content(2).styles[0].role, Role::Muted);
+    // A nested quote inside an alert stays part of the alert.
+    assert!(bar(5, Role::AlertTip).is_some());
+    assert_eq!(content(5).styles[0].role, Role::Text);
+}
+
+#[test]
+fn decoration_text_is_not_hit_testable() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("- [x] item\n\n> [!NOTE]\n> n\n\n```\nshort\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let (col_x, _) = l.column();
+    // The bullet's glyphs exist, but no hit or line maps to them (they aren't document text).
+    let c = l.geoms()[0].content.as_ref().unwrap();
+    assert!(c.glyphs.iter().any(|g| g.x < LIST_INDENT * 16.0 - 8.0));
+    let y = l.geoms()[0].y + c.lines[0].baseline - 4.0;
+    assert!(l.hit(col_x + LIST_INDENT * 16.0 - 12.0, y).is_none());
+    // Real text still hits, at its own offset.
+    let text = l.hit(col_x + LIST_INDENT * 16.0 + 2.0, y).unwrap();
+    assert_eq!(text.doc as usize, doc.text.find("item").unwrap());
+    // Alert titles have no hits either.
+    let title = l.geoms()[1].content.as_ref().unwrap();
+    assert!(title.hits.is_empty() && title.lines.is_empty());
+}
+
+#[test]
+fn wrapped_code_shares_one_marker_style() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&format!("```\n{}\n```\n", "word ".repeat(2000)));
+    let mut l = Layout::new(&doc, params(300.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let c = l.geoms()[0].content.as_ref().unwrap();
+    let conts = c.lines.iter().filter(|l| l.cont).count();
+    assert!(conts > 100);
+    assert!(c.styles.len() <= 3, "{} styles", c.styles.len());
+    assert_eq!(c.glyphs.iter().filter(|g| g.x < 16.0).count(), conts);
+    assert!(c.glyphs.iter().all(|g| (g.style as usize) < c.styles.len()));
+}
+
+#[test]
+fn uncoverable_characters_are_reported_once() {
+    let fonts = Fonts::new().unwrap();
+    // Private use: no face covers it.
+    let doc = Doc::parse("a \u{E000} b\n\n| x | \u{E000} |\n|---|---|\n| 1 | 2 |\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    assert_eq!(l.take_missing(), vec!['\u{E000}']);
+    assert!(l.geoms().iter().any(|g| g.missing));
+    // A fallback scan finds nothing; remeasuring must not ask for it again.
+    l.invalidate_missing(&doc);
+    assert!(l.geoms().iter().all(|g| !g.missing));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    assert!(l.take_missing().is_empty());
+    assert!(l.geoms().iter().all(|g| !g.missing));
 }

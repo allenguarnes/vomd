@@ -1,0 +1,6 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"Text <img alt=\\\"a>b\\\" src='x>y.png'> after <span title=\\\"1 > 0\\\">span</span>.\\n\")"
+---
+P | "Text " [Mm1]"a>b" " after span."
+image 1: x>y.png remote=false

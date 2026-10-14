@@ -77,6 +77,19 @@ fn attaches_to_previous(c: char) -> bool {
         )
 }
 
+/// Default-ignorable code points (formatting characters, bidi controls, variation selectors):
+/// never drawn, so they never count as missing and take the face of their neighbors.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{180B}'..='\u{180F}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FEFF}'
+        | '\u{E0000}'..='\u{E0FFF}')
+}
+
 fn is_regional_indicator(c: char) -> bool {
     ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
 }
@@ -134,7 +147,9 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                     || prev.is_some_and(|p| is_regional_indicator(p) && is_regional_indicator(c)));
             let face = match (inherit, last) {
                 (true, Some(r)) => r.face,
-                _ if c.is_control() || c.is_whitespace() => last.map_or(primary, |r| r.face),
+                _ if c.is_control() || c.is_whitespace() || is_default_ignorable(c) => {
+                    last.map_or(primary, |r| r.face)
+                }
                 _ => fonts.select(primary, c).unwrap_or_else(|| {
                     out.missing.push(c);
                     primary
@@ -203,9 +218,14 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
         let glyphs = &mut out.glyphs;
         let clusters = &mut out.clusters;
         shaper.shape_with(|c| {
+            let start = base + c.source.start;
+            let end = base + c.source.end;
+            let src = &text[start as usize..end as usize];
+            // Invisible formatting characters render nothing, even when the face lacks them.
+            let invisible = src.chars().all(is_default_ignorable);
             let g0 = glyphs.len() as u32;
             let mut advance = 0.0;
-            for g in c.glyphs {
+            for g in c.glyphs.iter().filter(|g| !(invisible && g.id == 0)) {
                 glyphs.push(Glyph {
                     id: g.id,
                     x: g.x,
@@ -214,9 +234,6 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 });
                 advance += g.advance;
             }
-            let start = base + c.source.start;
-            let end = base + c.source.end;
-            let src = &text[start as usize..end as usize];
             let mut f = 0;
             if !src.is_empty() && src.chars().all(char::is_whitespace) {
                 f |= flags::SPACE;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::fonts::Fonts;
+use crate::text::fallback;
 
 fn style(size: f32) -> TextStyle {
     TextStyle {
@@ -224,12 +225,64 @@ fn decorations() {
 fn emoji_sequences_stay_together() {
     // ZWJ family + skin tone: the joiners/modifiers inherit the face of the base character,
     // so the sequence isn't split across faces.
-    let fonts = Fonts::new().unwrap();
-    let shaped = TextCtx::default().shape(&fonts, &para("👨‍👩‍👧 👋🏽"));
-    let faces: Vec<_> = shaped.clusters.iter().map(|c| c.face).collect();
-    assert!(faces.windows(2).all(|w| w[0] == w[1]) || faces.len() <= 3);
+    let text = "👨‍👩‍👧 👋🏽";
+    let base = Fonts::new().unwrap();
+    let shaped = TextCtx::default().shape(&base, &para(text));
     assert!(!shaped.missing.contains(&'\u{200D}'));
     assert!(!shaped.missing.contains(&'\u{1F3FD}'));
+
+    // The embedded fonts have no emoji, so check the rule against system fallbacks.
+    let found = fallback::find_fallbacks(&shaped.missing, &|p, i| base.has_source(p, i));
+    if found.is_empty() {
+        return;
+    }
+    let mut fonts = Fonts::new().unwrap();
+    for f in &found {
+        fonts.add_fallback(&f.path, f.index);
+    }
+    let shaped = TextCtx::default().shape(&fonts, &para(text));
+    let face_at = |byte: usize| {
+        let c = shaped
+            .clusters
+            .iter()
+            .find(|c| (c.start as usize..c.end as usize).contains(&byte))
+            .expect("every byte is in a cluster");
+        c.face
+    };
+    let mut checked = 0;
+    for (i, c) in text.char_indices() {
+        if matches!(c, '\u{200D}' | '\u{1F3FD}') {
+            let prev = text[..i].char_indices().next_back().unwrap().0;
+            assert_eq!(
+                face_at(i),
+                face_at(prev),
+                "{c:?} at {i} left its base's face"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 3);
+}
+
+#[test]
+fn default_ignorables_are_invisible() {
+    let text = "a\u{200F}b\u{00AD}c\u{FEFF}";
+    let fonts = Fonts::new().unwrap();
+    let shaped = TextCtx::default().shape(&fonts, &para(text));
+    assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
+    for c in &shaped.clusters {
+        let src = &text[c.start as usize..c.end as usize];
+        if src.chars().all(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        for g in &shaped.glyphs[c.glyphs.start as usize..c.glyphs.end as usize] {
+            assert!(g.id != 0 || g.advance == 0.0, "{src:?} drew tofu");
+        }
+        assert_eq!(c.advance, 0.0, "{src:?} takes space");
+    }
+    // Only the three letters are drawn.
+    let l = TextCtx::default().layout(&fonts, &para(text), 1000.0, Align::Start, 1.5);
+    assert_eq!(l.glyphs.len(), 3);
 }
 
 #[test]

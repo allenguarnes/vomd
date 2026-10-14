@@ -1,0 +1,17 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"x[^a] y[^b]\\n\\n[^a]: - item\\n[^b]:\\n\")"
+---
+P | "x" [LF1]"1" " y" [LF2]"2"
+Rule |
+P Footnote(1) |
+P list=1 Bullet | "item" [L3]" ↩"
+P Footnote(2) | [L4]" ↩"
+link 1: #fn-a
+link 2: #fn-b
+link 3: #fnref-a
+link 4: #fnref-b
+anchor #fnref-a -> 0
+anchor #fnref-b -> 0
+anchor #fn-a -> 2
+anchor #fn-b -> 4

@@ -13,7 +13,7 @@ Row(t1) | [ [C]"Space" ] [ "Scroll one page" ]
 Row(t1) | [ [C]"g" " / " [C]"G" ] [ "Top / bottom" ]
 P list=1 Task(true) | "Task done"
 P list=1 Task(false) | "Task pending"
-Alert(Note) quote=1 |
+Alert(Note) quote=1 qstart=1 |
 P quote=1 | "GitHub-style alert with a " [L1]"link" "."
 Code | [C]"fn main() {\n    println!(\"a code block with a very long line that will need to wrap somewhere along the way because it is long\");\n}"
 link 1: #tables

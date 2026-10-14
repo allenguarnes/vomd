@@ -1,7 +1,7 @@
 use super::*;
 
 /// Human-readable IR dump for snapshots, one block per line:
-/// `<kind> [list=N] [quote=N] [marker] | [style]"text" ...`
+/// `<kind> [list=N] [quote=N] [qstart=N] [marker] | [style]"text" ...`
 fn dump(doc: &Doc) -> String {
     let mut out = String::new();
     for block in &doc.blocks {
@@ -21,6 +21,9 @@ fn dump(doc: &Doc) -> String {
         }
         if block.quote > 0 {
             out.push_str(&format!(" quote={}", block.quote));
+        }
+        if block.quote_start > 0 {
+            out.push_str(&format!(" qstart={}", block.quote_start));
         }
         if block.marker != Marker::None {
             out.push_str(&format!(" {:?}", block.marker));
@@ -275,4 +278,32 @@ fn fixtures_parse() {
 fn fixture_tables_snapshot() {
     let src = include_str!("../../fixtures/tables.md");
     insta::assert_snapshot!(parse(src));
+}
+
+#[test]
+fn empty_items_keep_their_marker() {
+    insta::assert_snapshot!(parse("- a\n-\n\nNext para\n"));
+    insta::assert_snapshot!(parse("1. a\n2.\n\n# Heading\n"));
+    // An empty item whose only content is a nested list keeps its own marker.
+    insta::assert_snapshot!(parse("-\n  - b\n"));
+}
+
+#[test]
+fn quote_boundaries() {
+    insta::assert_snapshot!(parse(
+        "> [!NOTE]\n> n\n\n> plain quote\n\n> a\n>\n> > inner\n\n>\n\nafter empty quote\n"
+    ));
+}
+
+#[test]
+fn footnote_edge_cases() {
+    insta::assert_snapshot!(parse("x[^a] y[^b]\n\n[^a]: - item\n[^b]:\n"));
+    insta::assert_snapshot!(parse("x[^a] y[^b]\n\n[^a]:\n[^b]: text\n"));
+}
+
+#[test]
+fn html_tag_with_gt_in_attribute() {
+    insta::assert_snapshot!(parse(
+        "Text <img alt=\"a>b\" src='x>y.png'> after <span title=\"1 > 0\">span</span>.\n"
+    ));
 }

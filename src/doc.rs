@@ -79,6 +79,9 @@ pub struct Block {
     pub list: u8,
     /// Blockquote nesting depth.
     pub quote: u8,
+    /// Depth of the outermost blockquote that begins at this block (0 = none), so adjacent
+    /// quotes stay distinct.
+    pub quote_start: u8,
     pub marker: Marker,
 }
 
@@ -197,6 +200,8 @@ struct Builder {
     /// Next number for each open list (`None` = bullet list).
     lists: Vec<Option<u64>>,
     quote: u8,
+    /// Outermost quote depth started since the last block was pushed (0 = none).
+    quote_start: u8,
     marker: Marker,
     /// Open image: (image id, alt text collected so far).
     image: Option<(u16, String)>,
@@ -222,6 +227,7 @@ impl Builder {
             links: Vec::new(),
             lists: Vec::new(),
             quote: 0,
+            quote_start: 0,
             marker: Marker::None,
             image: None,
             html_block: None,
@@ -292,6 +298,9 @@ impl Builder {
             Tag::BlockQuote(kind) => {
                 self.close();
                 self.quote = self.quote.saturating_add(1);
+                if self.quote_start == 0 {
+                    self.quote_start = self.quote;
+                }
                 if let Some(kind) = kind {
                     let alert = match kind {
                         BlockQuoteKind::Note => Alert::Note,
@@ -305,10 +314,12 @@ impl Builder {
             }
             Tag::List(start) => {
                 self.close();
+                self.flush_marker();
                 self.lists.push(start);
             }
             Tag::Item => {
                 self.close();
+                self.flush_marker();
                 self.marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
                         let m = Marker::Ordered((*n).min(u32::MAX as u64) as u32);
@@ -380,19 +391,27 @@ impl Builder {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::Item => {
-                self.close()
+            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => self.close(),
+            TagEnd::Item => {
+                self.close();
+                self.flush_marker();
             }
             TagEnd::BlockQuote(_) => {
                 self.close();
                 self.quote = self.quote.saturating_sub(1);
+                // An empty quote has no block to start.
+                if self.quote_start > self.quote {
+                    self.quote_start = 0;
+                }
             }
             TagEnd::List(_) => {
                 self.close();
+                self.marker = Marker::None;
                 self.lists.pop();
             }
             TagEnd::FootnoteDefinition => {
                 self.close();
+                self.flush_marker();
                 self.footnote_backlink();
                 self.footnotes.active = false;
             }
@@ -523,12 +542,22 @@ impl Builder {
         self.push_block(kind, spans);
     }
 
+    /// A pending marker no block claimed (empty item or footnote definition, or a nested list
+    /// starting right after the marker) gets an empty paragraph to render on.
+    fn flush_marker(&mut self) {
+        if self.open.is_none() && self.marker != Marker::None {
+            let at = self.doc.spans.len() as u32;
+            self.push_block(BlockKind::Paragraph, at..at);
+        }
+    }
+
     fn push_block(&mut self, kind: BlockKind, spans: Range<u32>) {
         let block = Block {
             kind,
             spans,
             list: self.lists.len().min(u8::MAX as usize) as u8,
             quote: self.quote,
+            quote_start: std::mem::take(&mut self.quote_start),
             marker: std::mem::replace(&mut self.marker, Marker::None),
         };
         if self.footnotes.active {
@@ -659,7 +688,7 @@ impl Builder {
                 rest = after.find("-->").map_or("", |i| &after[i + 3..]);
                 continue;
             }
-            let Some(gt) = rest.find('>') else {
+            let Some(gt) = tag_end(rest) else {
                 self.html_text(rest, block);
                 break;
             };
@@ -744,6 +773,26 @@ impl Builder {
         }
         self.doc
     }
+}
+
+/// Index of the `>` closing the tag at the start of `s`, skipping quoted attribute values.
+fn tag_end(s: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut prev = ' ';
+    for (i, c) in s.char_indices() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                prev = c;
+            }
+            Some(_) => {}
+            None if c == '>' => return Some(i),
+            None if (c == '"' || c == '\'') && prev == '=' => quote = Some(c),
+            None if !c.is_whitespace() => prev = c,
+            None => {}
+        }
+    }
+    None
 }
 
 /// Push and return a 1-based id, or 0 once the u16 id space is exhausted.

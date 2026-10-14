@@ -1,0 +1,7 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"- a\\n-\\n\\nNext para\\n\")"
+---
+P list=1 Bullet | "a"
+P list=1 Bullet |
+P | "Next para"

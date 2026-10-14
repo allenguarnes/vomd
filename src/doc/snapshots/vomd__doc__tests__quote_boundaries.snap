@@ -1,0 +1,10 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"> [!NOTE]\\n> n\\n\\n> plain quote\\n\\n> a\\n>\\n> > inner\\n\\n>\\n\\nafter empty quote\\n\")"
+---
+Alert(Note) quote=1 qstart=1 |
+P quote=1 | "n"
+P quote=1 qstart=1 | "plain quote"
+P quote=1 qstart=1 | "a"
+P quote=2 qstart=2 | "inner"
+P | "after empty quote"

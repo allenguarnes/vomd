@@ -34,6 +34,8 @@ const FOOTNOTE_SIZE: f32 = 0.875;
 const KEEP_SCREENS: f32 = 4.0;
 /// Blocks within this many viewport heights are measured exactly by `ensure`.
 const MEASURE_SCREENS: f32 = 2.0;
+/// Line width for text that must never wrap (list markers).
+const NO_WRAP: f32 = 1.0e6;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
@@ -73,19 +75,21 @@ pub struct BlockBox {
 impl BlockBox {
     /// Append a paragraph layout at (`dx`, `dy`).
     fn append(&mut self, pl: ParaLayout, para_styles: &[TextStyle], dx: f32, dy: f32) {
-        let style_base = self.styles.len() as u16;
+        // Style ids are u16; past that, glyphs saturate onto the last style rather than wrap.
+        debug_assert!(self.styles.len() + para_styles.len() <= u16::MAX as usize + 1);
+        let style_base = self.styles.len().min(u16::MAX as usize) as u16;
         let hit_base = self.hits.len() as u32;
         self.styles.extend_from_slice(para_styles);
         self.glyphs.extend(pl.glyphs.into_iter().map(|g| PGlyph {
             x: g.x + dx,
             y: g.y + dy,
-            style: g.style + style_base,
+            style: g.style.saturating_add(style_base),
             ..g
         }));
         self.hits.extend(pl.hits.into_iter().map(|h| PHit {
             x0: h.x0 + dx,
             x1: h.x1 + dx,
-            style: h.style + style_base,
+            style: h.style.saturating_add(style_base),
             ..h
         }));
         self.lines.extend(pl.lines.into_iter().map(|l| PLine {
@@ -104,6 +108,24 @@ impl BlockBox {
             x: b.x + dx,
             y: b.y + dy,
             ..b
+        }));
+    }
+
+    /// Add a style for decoration text and return its index.
+    fn push_style(&mut self, style: TextStyle) -> u16 {
+        debug_assert!(self.styles.len() <= u16::MAX as usize);
+        self.styles.push(style);
+        (self.styles.len() - 1).min(u16::MAX as usize) as u16
+    }
+
+    /// Append the glyphs of synthetic decoration text (markers, alert titles) at (`dx`, `dy`)
+    /// with an existing style. It gets no lines or hits: it isn't document text.
+    fn append_decor(&mut self, pl: &ParaLayout, style: u16, dx: f32, dy: f32) {
+        self.glyphs.extend(pl.glyphs.iter().map(|g| PGlyph {
+            x: g.x + dx,
+            y: g.y + dy,
+            style,
+            ..*g
         }));
     }
 
@@ -184,6 +206,8 @@ pub struct Layout {
     /// Blocks currently holding content.
     live: Vec<u32>,
     missing: Vec<char>,
+    /// Characters already returned by `take_missing` (sorted).
+    tried: Vec<char>,
     ctx: TextCtx,
     para: Para,
 }
@@ -203,6 +227,7 @@ impl Layout {
             cursor: 0,
             live: Vec::new(),
             missing: Vec::new(),
+            tried: Vec::new(),
             ctx: TextCtx::default(),
             para: Para::default(),
         };
@@ -237,9 +262,18 @@ impl Layout {
         self.cursor >= self.geoms.len() && self.geoms.iter().all(|g| g.measured)
     }
 
-    /// Characters no loaded face covered, accumulated since the last call.
+    /// Characters no loaded face covered, accumulated since the last call. Each character is
+    /// returned once: if a fallback scan found nothing for it, remeasuring doesn't report it
+    /// (or flag its blocks) again, so callers never rescan the system fonts for the same
+    /// character.
     pub fn take_missing(&mut self) -> Vec<char> {
-        std::mem::take(&mut self.missing)
+        let missing = std::mem::take(&mut self.missing);
+        for &c in &missing {
+            if let Err(at) = self.tried.binary_search(&c) {
+                self.tried.insert(at, c);
+            }
+        }
+        missing
     }
 
     /// New width, scale, or font settings: everything is remeasured (old heights remain as
@@ -263,19 +297,27 @@ impl Layout {
         self.recompute_ys();
     }
 
-    /// Fallback faces were added: remeasure blocks that had uncovered characters.
+    /// Fallback faces were added: remeasure blocks that had uncovered characters. A table
+    /// is remeasured whole, since its column widths depend on every row.
     pub fn invalidate_missing(&mut self, doc: &Doc) {
         for i in 0..self.geoms.len() {
-            if self.geoms[i].missing {
-                let g = &mut self.geoms[i];
+            if !self.geoms[i].missing {
+                continue;
+            }
+            let rows = match doc.blocks[i].kind {
+                BlockKind::TableRow { table, .. } => {
+                    self.table_cols[table as usize] = None;
+                    self.table_rows[table as usize].clone()
+                }
+                _ => i as u32..i as u32 + 1,
+            };
+            for r in rows.start as usize..rows.end as usize {
+                let g = &mut self.geoms[r];
                 g.measured = false;
                 g.content = None;
                 g.missing = false;
-                if let BlockKind::TableRow { table, .. } = doc.blocks[i].kind {
-                    self.table_cols[table as usize] = None;
-                }
-                self.cursor = self.cursor.min(i);
             }
+            self.cursor = self.cursor.min(rows.start as usize);
         }
         self.live
             .retain(|&i| self.geoms[i as usize].content.is_some());
@@ -303,10 +345,13 @@ impl Layout {
             .iter()
             .position(|b| matches!(b.marker, Marker::Footnote(_)));
         for (i, b) in doc.blocks.iter().enumerate() {
+            // A quote that starts at or outside the alert's depth is a different quote.
+            if alert.is_some_and(|(_, d)| b.quote < d || (b.quote_start != 0 && b.quote_start <= d))
+            {
+                alert = None;
+            }
             if let BlockKind::AlertTitle(a) = b.kind {
                 alert = Some((a, b.quote));
-            } else if alert.is_some_and(|(_, d)| b.quote < d) {
-                alert = None;
             }
             meta[i].alert = alert;
             if let BlockKind::TableRow { table, header, .. } = b.kind {
@@ -539,11 +584,9 @@ impl Layout {
                 let pl = self
                     .ctx
                     .layout(fonts, &self.para, avail, Align::Start, BODY_LH);
-                let h = pl.height;
-                let styles = std::mem::take(&mut self.para.styles);
-                out.append(pl, &styles, indent, gap);
-                self.para.styles = styles;
-                h
+                let s = out.push_style(style);
+                out.append_decor(&pl, s, indent, gap);
+                pl.height
             }
             BlockKind::TableRow { table, .. } => self.table_row(
                 doc,
@@ -558,12 +601,13 @@ impl Layout {
             ),
         };
         self.quote_bars(doc, i, meta, gap, content_h, &mut out);
-        if !missing.is_empty() {
+        for c in missing {
+            if self.tried.binary_search(&c).is_ok() {
+                continue;
+            }
             self.geoms[i].missing = true;
-            for c in missing {
-                if let Err(at) = self.missing.binary_search(&c) {
-                    self.missing.insert(at, c);
-                }
+            if let Err(at) = self.missing.binary_search(&c) {
+                self.missing.insert(at, c);
             }
         }
         (out, gap + content_h)
@@ -682,22 +726,18 @@ impl Layout {
                 if !checked {
                     return;
                 }
+                let style = TextStyle {
+                    bold: true,
+                    size: 0.8 * em,
+                    role: Role::Bg,
+                    ..body
+                };
                 self.para.clear();
-                self.para.push_synthetic(
-                    "✓",
-                    0,
-                    TextStyle {
-                        bold: true,
-                        size: 0.8 * em,
-                        role: Role::Bg,
-                        ..body
-                    },
-                );
+                self.para.push_synthetic("✓", 0, style);
                 let pl = self.ctx.layout(fonts, &self.para, size, Align::Center, 1.0);
                 let dy = y + size / 2.0 - pl.height / 2.0;
-                let styles = std::mem::take(&mut self.para.styles);
-                out.append(pl, &styles, x, dy);
-                self.para.styles = styles;
+                let s = out.push_style(style);
+                out.append_decor(&pl, s, x, dy);
                 return;
             }
         };
@@ -705,17 +745,17 @@ impl Layout {
             role: Role::Muted,
             ..body
         };
-        let gutter = LIST_INDENT * em - 0.5 * em;
         self.para.clear();
         self.para.push_synthetic(&text, 0, style);
+        // Laid out unwrapped and right-aligned by hand: long numbers extend into the margin
+        // instead of breaking inside the gutter.
         let pl = self
             .ctx
-            .layout(fonts, &self.para, gutter, Align::Right, BODY_LH);
+            .layout(fonts, &self.para, NO_WRAP, Align::Start, BODY_LH);
         missing.extend_from_slice(&pl.missing);
         let dy = baseline - pl.lines.first().map_or(0.0, |l| l.baseline);
-        let styles = std::mem::take(&mut self.para.styles);
-        out.append(pl, &styles, indent - LIST_INDENT * em, dy);
-        self.para.styles = styles;
+        let s = out.push_style(style);
+        out.append_decor(&pl, s, indent - 0.5 * em - pl.width, dy);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -775,29 +815,20 @@ impl Layout {
         self.para.styles = styles;
         // Continuation markers in the left padding for soft-wrapped lines.
         if !conts.is_empty() {
+            let style = TextStyle {
+                role: Role::Muted,
+                ..style
+            };
             self.para.clear();
-            self.para.push_synthetic(
-                "↪",
-                0,
-                TextStyle {
-                    role: Role::Muted,
-                    ..style
-                },
-            );
+            self.para.push_synthetic("↪", 0, style);
             let mark = self
                 .ctx
                 .layout(fonts, &self.para, pad, Align::Center, CODE_LH);
             let mark_baseline = mark.lines.first().map_or(0.0, |l| l.baseline);
-            let styles = std::mem::take(&mut self.para.styles);
+            let s = out.push_style(style);
             for baseline in conts {
-                out.append(
-                    mark.clone(),
-                    &styles,
-                    indent,
-                    gap + pad + baseline - mark_baseline,
-                );
+                out.append_decor(&mark, s, indent, gap + pad + baseline - mark_baseline);
             }
-            self.para.styles = styles;
         }
         h
     }
@@ -932,7 +963,9 @@ impl Layout {
         let block = &doc.blocks[i];
         let prev_quote = if i > 0 { doc.blocks[i - 1].quote } else { 0 };
         for q in 0..block.quote {
-            let top = if prev_quote > q { 0.0 } else { gap };
+            // Joined to the previous block only when it is in the same quote.
+            let joined = prev_quote > q && !(block.quote_start != 0 && block.quote_start <= q + 1);
+            let top = if joined { 0.0 } else { gap };
             let role = match meta.alert {
                 Some((a, depth)) if depth == q + 1 => alert_role(a),
                 _ => Role::QuoteBar,
