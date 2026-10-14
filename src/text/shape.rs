@@ -37,7 +37,7 @@ pub struct Cluster {
     pub glyphs: Range<u32>,
     pub advance: f32,
     pub face: FaceId,
-    pub style: u16,
+    pub style: u32,
     /// Bidi embedding level (odd = RTL).
     pub level: u8,
     pub flags: u8,
@@ -71,7 +71,13 @@ fn attaches_to_previous(c: char) -> bool {
         | '\u{1F3FB}'..='\u{1F3FF}'
         | '\u{E0020}'..='\u{E007F}'
         | '\u{E0100}'..='\u{E01EF}')
-        || matches!(
+        || is_combining_mark(c)
+}
+
+/// Visible combining marks: they stay in their base's face, so that face must cover them too.
+fn is_combining_mark(c: char) -> bool {
+    !is_default_ignorable(c)
+        && matches!(
             c.category(),
             Category::NonspacingMark | Category::SpacingMark | Category::EnclosingMark
         )
@@ -150,10 +156,30 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 _ if c.is_control() || c.is_whitespace() || is_default_ignorable(c) => {
                     last.map_or(primary, |r| r.face)
                 }
-                _ => fonts.select(primary, c).unwrap_or_else(|| {
-                    out.missing.push(c);
-                    primary
-                }),
+                _ => {
+                    // The marks that follow stay on this face, so it must draw all of them.
+                    let marks: Vec<char> = text[at + c.len_utf8()..range.end]
+                        .chars()
+                        .take_while(|&m| attaches_to_previous(m))
+                        .filter(|&m| is_combining_mark(m))
+                        .collect();
+                    let whole = (!marks.is_empty())
+                        .then(|| fonts.select_sequence(primary, c, &marks))
+                        .flatten();
+                    whole.unwrap_or_else(|| {
+                        // No face draws the whole sequence: the base keeps its own face, and
+                        // marks nothing draws are reported so a fallback gets searched.
+                        out.missing.extend(
+                            marks
+                                .iter()
+                                .filter(|&&m| fonts.select(primary, m).is_none()),
+                        );
+                        fonts.select(primary, c).unwrap_or_else(|| {
+                            out.missing.push(c);
+                            primary
+                        })
+                    })
+                }
             };
             let script = match c.script() {
                 Script::Common | Script::Inherited | Script::Unknown => {

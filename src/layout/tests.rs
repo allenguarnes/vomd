@@ -571,9 +571,364 @@ fn paragraph_with_many_distinct_links_lays_out() {
     let fonts = Fonts::new().unwrap();
     let src: String = (0..20_000).map(|i| format!("[a](#{i}) ")).collect();
     let doc = Doc::parse(&src);
+    // The paragraph is split into chunks, each laid out with its own style table.
+    assert!(doc.blocks.len() > 1);
+    let last = doc.blocks.len() - 1;
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let anchor = Anchor {
+        block: last as u32,
+        frac: 0.5,
+    };
+    l.ensure(&doc, &fonts, anchor, 800.0);
+    let c = l.geoms()[last].content.as_ref().unwrap();
+    let links: Vec<u32> = c.styles.iter().map(|s| s.link).collect();
+    assert_eq!(links.iter().max(), Some(&20_000));
+    // One style per link in the chunk, plus the plain style of the spaces between them.
+    let spans = doc.block_spans(&doc.blocks[last]);
+    assert!((spans.len() / 2..=spans.len() / 2 + 2).contains(&c.styles.len()));
+}
+
+/// Right edge of a glyph, from its face's advance.
+fn glyph_right(fonts: &Fonts, c: &BlockBox, g: &PGlyph) -> f32 {
+    let size = c.styles[g.style as usize].size;
+    let metrics = fonts.face(g.face).font().glyph_metrics(&[]).scale(size);
+    g.x + metrics.advance_width(g.id)
+}
+
+fn quote_bar_xs(c: &BlockBox) -> Vec<f32> {
+    c.rects
+        .iter()
+        .filter(|r| r.role == Role::QuoteBar)
+        .map(|r| r.x)
+        .collect()
+}
+
+#[test]
+fn markers_stay_left_of_quote_bars_inside_items() {
+    let fonts = Fonts::new().unwrap();
+    let em = 16.0;
+    for src in ["- > q\n", "10. > q\n", "- [ ]\n  > q\n", "- [x]\n  > q\n"] {
+        let doc = Doc::parse(src);
+        let mut l = Layout::new(&doc, params(900.0, 1.0));
+        l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+        let c = l.geoms()[0].content.as_ref().unwrap();
+        let block = &doc.blocks[0];
+        assert!(block.quote == 1 && block.marker != Marker::None, "{src:?}");
+        let bar = quote_bar_xs(c)[0];
+        // Right edge of the marker: the checkbox rect, or the glyphs left of the bar.
+        let edge = match block.marker {
+            Marker::Task(_) => c
+                .rects
+                .iter()
+                .filter(|r| r.role != Role::QuoteBar)
+                .map(|r| r.x + r.w)
+                .fold(f32::MIN, f32::max),
+            _ => c
+                .glyphs
+                .iter()
+                .filter(|g| g.x < bar)
+                .map(|g| glyph_right(&fonts, c, g))
+                .fold(f32::MIN, f32::max),
+        };
+        assert!(
+            edge > f32::MIN && edge <= bar,
+            "{src:?}: marker ends at {edge}, bar at {bar}"
+        );
+        // And it still hangs in the item's gutter, not the quote's text indent.
+        assert!(edge >= bar - em, "{src:?}: marker at {edge}, bar at {bar}");
+    }
+}
+
+#[test]
+fn footnote_quote_bars_sit_inside_the_footnote_indent() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("x[^1]\n\n[^1]: > note\n");
     let mut l = Layout::new(&doc, params(900.0, 1.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let em = 16.0;
+    let (i, block) = doc
+        .blocks
+        .iter()
+        .enumerate()
+        .find(|(_, b)| b.quote == 1)
+        .unwrap();
+    assert!(matches!(block.marker, Marker::Footnote(1)));
+    let c = l.geoms()[i].content.as_ref().unwrap();
+    // The number hangs in the footnote gutter; the bar starts at the footnote's indent and the
+    // text follows the bar.
+    let bar = quote_bar_xs(c)[0];
+    assert_eq!(bar, LIST_INDENT * em);
+    let number = c.glyphs.iter().filter(|g| g.x < bar).collect::<Vec<_>>();
+    assert!(!number.is_empty());
+    assert!(number.iter().all(|g| glyph_right(&fonts, c, g) <= bar));
+    let text = c
+        .glyphs
+        .iter()
+        .filter(|g| g.x >= bar)
+        .map(|g| g.x)
+        .fold(f32::MAX, f32::min);
+    assert!(text >= bar + (QUOTE_INDENT - 0.01) * em, "text at {text}");
+}
+
+#[test]
+fn deep_quote_nesting_keeps_exact_list_depths() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("> > > > - > note\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let em = 16.0;
     let c = l.geoms()[0].content.as_ref().unwrap();
-    // One style per link, plus the plain style of the spaces between them.
-    assert_eq!(c.styles.len(), 20_001);
+    // Four quotes outside the list, then the list indent, then the fifth quote inside it.
+    let expect: Vec<f32> = (0..4)
+        .map(|q| q as f32 * QUOTE_INDENT * em)
+        .chain([(4.0 * QUOTE_INDENT + LIST_INDENT) * em])
+        .collect();
+    assert_eq!(quote_bar_xs(c), expect);
+}
+
+/// Total text bytes of a block's spans.
+fn block_bytes(doc: &Doc, block: &Block) -> usize {
+    doc.block_spans(block)
+        .iter()
+        .map(|s| (s.end - s.start) as usize)
+        .sum()
+}
+
+const BIG: usize = 2_500_000;
+
+fn huge_code() -> String {
+    format!("```\n{}\n```\n", "x ".repeat(BIG))
+}
+
+fn huge_paragraph() -> String {
+    format!("{}\n", "word ".repeat(BIG / 2))
+}
+
+#[test]
+fn huge_blocks_are_measured_in_bounded_chunks() {
+    let fonts = Fonts::new().unwrap();
+    for (name, src) in [("code", huge_code()), ("paragraph", huge_paragraph())] {
+        let doc = Doc::parse(&src);
+        assert!(
+            doc.blocks.len() >= 300,
+            "{name}: {} blocks",
+            doc.blocks.len()
+        );
+        assert!(
+            doc.blocks
+                .iter()
+                .all(|b| block_bytes(&doc, b) <= doc::MAX_BLOCK_BYTES)
+        );
+        let mut l = Layout::new(&doc, params(900.0, 1.0));
+        // Every idle call with an expired deadline measures exactly one chunk, so one call
+        // shapes at most MAX_BLOCK_BYTES of text however large the block is.
+        for done in 1..=5 {
+            assert!(!l.idle(&doc, &fonts, Instant::now()));
+            assert_eq!(
+                l.geoms().iter().filter(|g| g.measured).count(),
+                done,
+                "{name}"
+            );
+        }
+        assert!(
+            l.geoms()
+                .iter()
+                .filter(|g| g.measured)
+                .all(|g| g.content.is_none())
+        );
+        // Viewing the middle builds only the chunks near it.
+        let mid = l.anchor_at(l.total_height() / 2.0);
+        l.ensure(&doc, &fonts, mid, 1000.0);
+        let live = l.geoms().iter().filter(|g| g.content.is_some()).count();
+        assert!((1..=8).contains(&live), "{name}: {live} chunks built");
+        let at = mid.block as usize;
+        assert!(l.geoms()[at].content.is_some());
+        assert!(l.geoms()[0].content.is_none());
+        check_geometry(&l);
+    }
+}
+
+#[test]
+fn chunk_estimates_match_measured_heights() {
+    let fonts = Fonts::new().unwrap();
+    // 4 chunks of code, plus a paragraph and a heading run, so every estimate path with
+    // `joined` is exercised.
+    let code: String = (0..12_000).map(|i| format!("l{}\n", i % 10)).collect();
+    let words = "alpha beta gamma ".repeat(3000);
+    let doc = Doc::parse(&format!("```\n{code}```\n\n# {words}\n\n{words}\n"));
+    assert!(doc.blocks.iter().filter(|b| b.joined).count() >= 6);
+    let est = Layout::new(&doc, params(900.0, 1.0));
+    let est: Vec<f32> = est.geoms().iter().map(|g| g.h).collect();
+    let l = complete(&doc, &fonts, params(900.0, 1.0));
+    for (i, (e, g)) in est.iter().zip(l.geoms()).enumerate() {
+        match doc.blocks[i].kind {
+            // Code lines are exact, so are the pads on the run's outer edges.
+            BlockKind::Code => assert!(
+                (e - g.h).abs() < 1.0 + g.h * 1e-3,
+                "block {i}: {e} vs {}",
+                g.h
+            ),
+            _ => assert!(
+                *e > 0.0 && g.h > 0.0 && e / g.h < 2.0 && g.h / e < 2.0,
+                "block {i}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn chunked_code_is_one_continuous_background() {
+    let fonts = Fonts::new().unwrap();
+    let code: String = (0..12_000).map(|i| format!("l{}\n", i % 10)).collect();
+    let doc = Doc::parse(&format!("```\n{code}```\n\ntail\n"));
+    let n = doc.blocks.len() - 1;
+    assert!(n >= 3);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    let pad = 16.0;
+    for i in 0..n {
+        let g = &l.geoms()[i];
+        let c = g.content.as_ref().unwrap();
+        let bg = c.rects.iter().find(|r| r.role == Role::CodeBg).unwrap();
+        // No spacing between chunks; padding only above the first and below the last.
+        assert_eq!(bg.y, 0.0);
+        assert_eq!(bg.h, g.h, "chunk {i} background covers it");
+        assert_eq!(bg.radius, 0.0);
+        let top = c.lines.first().unwrap().top;
+        assert_eq!(top, if i == 0 { pad } else { 0.0 }, "chunk {i}");
+        let bottom = g.h - c.lines.last().unwrap().bottom;
+        assert_eq!(bottom, if i == n - 1 { pad } else { 0.0 }, "chunk {i}");
+        if i > 0 {
+            assert_eq!(g.y, l.geoms()[i - 1].y + l.geoms()[i - 1].h);
+        }
+    }
+    // A code block that fits in one block keeps its rounded corners and both pads.
+    let doc = Doc::parse("```\nshort\n```\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let bg = l.geoms()[0].content.as_ref().unwrap().rects[0];
+    assert!(bg.radius > 0.0);
+}
+
+#[test]
+fn chunked_quotes_and_headings_stay_whole() {
+    let fonts = Fonts::new().unwrap();
+    let words = "alpha beta gamma ".repeat(3000);
+    let doc = Doc::parse(&format!("> {words}\n\n# {words}\n\nend\n"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    let quote: Vec<usize> = (0..doc.blocks.len())
+        .filter(|&i| doc.blocks[i].quote > 0)
+        .collect();
+    assert!(quote.len() >= 3);
+    for &i in &quote {
+        let (g, c) = (&l.geoms()[i], l.geoms()[i].content.as_ref().unwrap());
+        // One bar per chunk, spanning it entirely: it joins its neighbors.
+        let bars: Vec<_> = c
+            .rects
+            .iter()
+            .filter(|r| r.role == Role::QuoteBar)
+            .collect();
+        assert_eq!(bars.len(), 1);
+        assert_eq!((bars[0].y, bars[0].h), (0.0, g.h), "chunk {i}");
+    }
+    // The heading's rule is drawn once, under the last chunk.
+    let heading: Vec<usize> = (0..doc.blocks.len())
+        .filter(|&i| matches!(doc.blocks[i].kind, BlockKind::Heading(1)))
+        .collect();
+    assert!(heading.len() >= 3);
+    for &i in &heading {
+        let c = l.geoms()[i].content.as_ref().unwrap();
+        let rules = c
+            .rects
+            .iter()
+            .filter(|r| r.role == Role::BorderMuted)
+            .count();
+        assert_eq!(rules, (i == *heading.last().unwrap()) as usize, "chunk {i}");
+    }
+    // Chunks of a run have no gap between them.
+    for &i in &heading[1..] {
+        let prev = &l.geoms()[i - 1];
+        assert_eq!(l.geoms()[i].y, prev.y + prev.h);
+    }
+}
+
+#[test]
+fn table_rows_with_over_65535_styles_keep_their_links() {
+    let fonts = Fonts::new().unwrap();
+    const N: usize = 20_000;
+    let cell = |from: usize| -> String {
+        (from..from + N)
+            .map(|i| format!("[a **b**](#{i}) "))
+            .collect()
+    };
+    let doc = Doc::parse(&format!(
+        "| h | h |\n|---|---|\n| {} | {} |\n",
+        cell(0),
+        cell(N)
+    ));
+    assert_eq!(doc.links.len(), 2 * N);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(
+        &doc,
+        &fonts,
+        Anchor {
+            block: 1,
+            frac: 0.0,
+        },
+        800.0,
+    );
+    let c = l.geoms()[1].content.as_ref().unwrap();
+    // Two styles per link in each cell: well past what 16 bits can index.
+    assert!(
+        c.styles.len() > u16::MAX as usize + 1,
+        "{} styles",
+        c.styles.len()
+    );
+    // The last link of the second cell is the last link in the document.
+    let all = c.hits.iter().map(|h| c.styles[h.style as usize].link);
+    assert_eq!(all.max(), Some(2 * N as u32));
+    let last = c
+        .hits
+        .iter()
+        .rev()
+        .find(|h| c.styles[h.style as usize].link != 0)
+        .unwrap();
+    assert_eq!(c.styles[last.style as usize].link, 2 * N as u32);
+    assert_eq!(doc.links[2 * N - 1], format!("#{}", 2 * N - 1));
+    // Hits resolve to the link under them at the far end of the row, too.
+    let (x, y) = (
+        l.column().0 + last.x0 + 0.5,
+        l.geoms()[1].y + c.lines.last().unwrap().baseline - 3.0,
+    );
+    if let Some(hit) = l.hit(x, y) {
+        assert_eq!(hit.link, 2 * N as u32);
+    }
+}
+
+#[test]
+fn tables_past_65535_lay_out_all_cells() {
+    let fonts = Fonts::new().unwrap();
+    let mut src: String = (0..65_536).map(|_| "|a|\n|-|\n|b|\n\n").collect();
+    src.push_str("|x|y|\n|-|-|\n|1|2|\n");
+    let doc = Doc::parse(&src);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let last = doc.blocks.len() as u32 - 1;
+    l.ensure(
+        &doc,
+        &fonts,
+        Anchor {
+            block: last,
+            frac: 0.0,
+        },
+        800.0,
+    );
+    let c = l.geoms()[last as usize].content.as_ref().unwrap();
+    // Both cells of the final two-column table are laid out ("1" and "2").
+    let docs: Vec<u32> = c.hits.iter().map(|h| h.doc).collect();
+    let (one, two) = (
+        doc.text.rfind('1').unwrap() as u32,
+        doc.text.rfind('2').unwrap() as u32,
+    );
+    assert!(docs.contains(&one) && docs.contains(&two), "{docs:?}");
 }

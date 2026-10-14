@@ -37,7 +37,14 @@ fn main() {
     let first = t.elapsed();
     let t = Instant::now();
     let mut slices = 0;
-    while !layout.idle(&doc, &fonts, Instant::now() + Duration::from_millis(4)) {
+    let mut worst = Duration::ZERO;
+    loop {
+        let call = Instant::now();
+        let done = layout.idle(&doc, &fonts, call + Duration::from_millis(4));
+        worst = worst.max(call.elapsed());
+        if done {
+            break;
+        }
         slices += 1;
     }
     let idle = t.elapsed();
@@ -47,13 +54,14 @@ fn main() {
     let jump = t.elapsed();
     println!(
         "{path}: {} blocks | parse {:.1} ms | Layout::new {:.1} ms | first viewport {:.1} ms | \
-         idle full {:.0} ms in {slices} slices | jump to middle {:.1} ms | height {:.0} px | \
+         idle full {:.0} ms in {slices} slices (worst {:.1} ms) | jump to middle {:.1} ms | height {:.0} px | \
          RSS now {} KB, peak {} KB",
         doc.blocks.len(),
         parsed.as_secs_f64() * 1e3,
         created.as_secs_f64() * 1e3,
         first.as_secs_f64() * 1e3,
         idle.as_secs_f64() * 1e3,
+        worst.as_secs_f64() * 1e3,
         jump.as_secs_f64() * 1e3,
         layout.total_height(),
         rss_kb("VmRSS:"),

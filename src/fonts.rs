@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use swash::proxy::{CharmapProxy, MetricsProxy};
+use swash::text::Codepoint;
 use swash::{CacheKey, FontRef, Metrics};
 
 /// Index into [`Fonts`]. Stable for the life of the process (faces are only ever added).
@@ -74,6 +75,21 @@ impl Face {
     /// Glyph for `ch`, or 0 (`.notdef`) if the face doesn't cover it.
     pub fn glyph(&self, ch: char) -> u16 {
         self.charmap.materialize(&self.font()).map(ch)
+    }
+
+    /// Whether the face can draw `base` followed by combining `marks`: each mark has a glyph or
+    /// composes into the base (shaping turns `e` + U+0301 into `é`, so the face needs no glyph
+    /// for the mark itself).
+    pub fn covers_sequence(&self, base: char, marks: &[char]) -> bool {
+        let mut cluster = base;
+        for &mark in marks {
+            match char::compose(cluster, mark) {
+                Some(composed) if self.glyph(composed) != 0 => cluster = composed,
+                _ if self.glyph(mark) != 0 => {}
+                _ => return false,
+            }
+        }
+        self.glyph(cluster) != 0
     }
 
     /// Design-unit metrics; scale with `metrics.scale(px)`.
@@ -260,6 +276,13 @@ impl Fonts {
             .find(|&id| self.face(id).glyph(ch) != 0)
     }
 
+    /// First face drawing `base` with all of `marks`: the primary, then fallbacks.
+    pub fn select_sequence(&self, primary: FaceId, base: char, marks: &[char]) -> Option<FaceId> {
+        std::iter::once(primary)
+            .chain(self.fallbacks.iter().copied())
+            .find(|&id| self.face(id).covers_sequence(base, marks))
+    }
+
     pub fn has_source(&self, path: &Path, index: u32) -> bool {
         self.faces.iter().any(|f| {
             f.source
@@ -315,5 +338,17 @@ mod tests {
         assert_eq!(fonts.select(regular, 'A'), Some(regular));
         assert_eq!(fonts.select(regular, '中'), None);
         assert!(fonts.face(regular).metrics().units_per_em > 0);
+    }
+
+    #[test]
+    fn sequences_need_marks_or_a_composition() {
+        let fonts = Fonts::new().unwrap();
+        let face = fonts.face(fonts.primary(false, false, false));
+        // No glyph for U+0301 in the subset, but `é` exists.
+        assert_eq!(face.glyph('\u{0301}'), 0);
+        assert!(face.covers_sequence('e', &['\u{0301}']));
+        assert!(!face.covers_sequence('q', &['\u{0301}']));
+        assert!(!face.covers_sequence('中', &[]));
+        assert!(face.covers_sequence('q', &[]));
     }
 }

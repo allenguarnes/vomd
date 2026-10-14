@@ -4,7 +4,7 @@
 //! list. Nesting (lists, quotes) becomes per-block depth counters and markers instead of a tree,
 //! so layout and paint stay linear.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use pulldown_cmark::{Alignment, BlockQuoteKind, Event, Options, Parser, Tag, TagEnd};
@@ -29,9 +29,9 @@ pub struct Span {
     pub end: u32,
     pub style: u8,
     /// 1-based index into [`Doc::links`]; 0 = not a link.
-    pub link: u16,
+    pub link: u32,
     /// 1-based index into [`Doc::images`]; 0 = not an image.
-    pub image: u16,
+    pub image: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,10 +53,10 @@ pub enum BlockKind {
     AlertTitle(Alert),
     /// One table row. Cells are `Doc::cells[first_cell..first_cell + cells]`.
     TableRow {
-        table: u16,
+        table: u32,
         header: bool,
         first_cell: u32,
-        cells: u16,
+        cells: u32,
     },
 }
 
@@ -67,7 +67,7 @@ pub enum Marker {
     Bullet,
     Ordered(u32),
     Task(bool),
-    Footnote(u16),
+    Footnote(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,15 +82,18 @@ pub struct Block {
     /// Depth of the outermost blockquote that begins at this block (0 = none), so adjacent
     /// quotes stay distinct.
     pub quote_start: u8,
-    /// List depth at which each of the first [`QUOTE_LEVELS`] quote levels opened, so layout
-    /// can interleave quote bars and list indents in their real nesting order. Deeper quotes
-    /// reuse the last entry.
-    pub quote_lists: [u8; QUOTE_LEVELS],
+    /// Range into [`Doc::quote_lists`]: the list depth at which each of the block's quote levels
+    /// opened, so layout can interleave quote bars and list indents in their real nesting order.
+    pub quote_lists: Range<u32>,
     pub marker: Marker,
+    /// Continues the previous block (an oversized block split at [`MAX_BLOCK_BYTES`]): same
+    /// kind and nesting, no marker, and no spacing in between.
+    pub joined: bool,
 }
 
-/// Quote levels whose list depth is recorded per block.
-pub const QUOTE_LEVELS: usize = 4;
+/// Paragraphs, headings and code blocks longer than this many text bytes are split into
+/// consecutive chunk blocks, so no single block needs a huge shaping pass or allocation.
+pub const MAX_BLOCK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -133,6 +136,9 @@ pub struct Doc {
     pub headings: Vec<Heading>,
     /// `#fragment` targets (heading slugs, footnotes) → block index.
     pub anchors: Vec<(String, u32)>,
+    /// Backing store for [`Block::quote_lists`]; consecutive blocks in the same quotes share
+    /// one range.
+    pub quote_lists: Vec<u8>,
 }
 
 impl Doc {
@@ -159,12 +165,17 @@ impl Doc {
         &self.spans[block.spans.start as usize..block.spans.end as usize]
     }
 
+    /// List depth at which each of the block's quote levels opened.
+    pub fn block_quote_lists(&self, block: &Block) -> &[u8] {
+        &self.quote_lists[block.quote_lists.start as usize..block.quote_lists.end as usize]
+    }
+
     /// Spans of each cell in a table row (empty for other blocks).
     pub fn row_cells(&self, block: &Block) -> impl Iterator<Item = &[Span]> {
         let cells = match block.kind {
             BlockKind::TableRow {
                 first_cell, cells, ..
-            } => &self.cells[first_cell as usize..first_cell as usize + cells as usize],
+            } => &self.cells[first_cell as usize..(first_cell + cells) as usize],
             _ => &[],
         };
         cells
@@ -185,13 +196,13 @@ struct Open {
 
 #[derive(Default)]
 struct Footnotes {
-    numbers: HashMap<String, u16>,
+    numbers: HashMap<String, u32>,
     /// Definition blocks, appended after the main flow at the end.
     blocks: Vec<Block>,
     /// One per definition: (number, label, first index into `blocks`).
-    defs: Vec<(u16, String, usize)>,
+    defs: Vec<(u32, String, usize)>,
     /// Labels whose first reference already has a `fnref-` anchor.
-    referenced: std::collections::HashSet<String>,
+    referenced: HashSet<String>,
     active: bool,
     /// Main-flow `quote_start` set aside while a definition is open.
     quote_start: u8,
@@ -205,7 +216,7 @@ struct Builder {
     bold: u16,
     italic: u16,
     strike: u16,
-    links: Vec<u16>,
+    links: Vec<u32>,
     /// Next number for each open list (`None` = bullet list).
     lists: Vec<Option<u64>>,
     quote: u8,
@@ -215,12 +226,17 @@ struct Builder {
     quote_start: u8,
     marker: Marker,
     /// Open image: (image id, alt text collected so far).
-    image: Option<(u16, String)>,
+    image: Option<(u32, String)>,
     html_block: Option<String>,
     metadata: bool,
     row: Option<(bool, u32)>,
     footnotes: Footnotes,
-    slugs: HashMap<String, u32>,
+    /// Every heading slug handed out so far.
+    slugs: HashSet<String>,
+    /// Next `-N` suffix to try for each duplicated slug.
+    slug_suffix: HashMap<String, u32>,
+    /// Range of the last block's entry in `Doc::quote_lists`, for sharing.
+    quote_pool: Range<u32>,
 }
 
 impl Builder {
@@ -246,7 +262,9 @@ impl Builder {
             metadata: false,
             row: None,
             footnotes: Footnotes::default(),
-            slugs: HashMap::new(),
+            slugs: HashSet::new(),
+            slug_suffix: HashMap::new(),
+            quote_pool: 0..0,
         }
     }
 
@@ -378,12 +396,7 @@ impl Builder {
                 self.close();
                 let header = matches!(tag, Tag::TableHead);
                 self.row = Some((header, self.doc.cells.len() as u32));
-                let table = self
-                    .doc
-                    .tables
-                    .len()
-                    .saturating_sub(1)
-                    .min(u16::MAX as usize) as u16;
+                let table = self.doc.tables.len().saturating_sub(1) as u32;
                 self.open(BlockKind::TableRow {
                     table,
                     header,
@@ -396,7 +409,7 @@ impl Builder {
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
             Tag::Link { dest_url, .. } => {
-                let id = push_capped(&mut self.doc.links, dest_url.into_string());
+                let id = push_id(&mut self.doc.links, dest_url.into_string());
                 self.links.push(id);
             }
             Tag::Image { dest_url, .. } => {
@@ -492,7 +505,7 @@ impl Builder {
         s
     }
 
-    fn link(&self) -> u16 {
+    fn link(&self) -> u32 {
         self.links.last().copied().unwrap_or(0)
     }
 
@@ -507,7 +520,7 @@ impl Builder {
 
     /// Append text to the open block, opening an implicit paragraph if needed (tight list
     /// items and inline content after HTML have no explicit paragraph).
-    fn text(&mut self, s: &str, extra_style: u8, image: u16) {
+    fn text(&mut self, s: &str, extra_style: u8, image: u32) {
         if s.is_empty() {
             return;
         }
@@ -551,7 +564,7 @@ impl Builder {
             && let Some((_, first)) = self.row.take()
         {
             *first_cell = first;
-            *cells = (self.doc.cells.len() as u32 - first).min(u16::MAX as u32) as u16;
+            *cells = self.doc.cells.len() as u32 - first;
         }
         let spans = open.span_start..self.doc.spans.len() as u32;
         if kind == BlockKind::Paragraph && spans.is_empty() && self.marker == Marker::None {
@@ -561,11 +574,37 @@ impl Builder {
             && !self.footnotes.active
             && let Some(slug) = self.slug(spans.clone())
         {
+            // Anchors point at the first chunk of a split heading.
             let block = self.doc.blocks.len() as u32;
             self.doc.anchors.push((slug.clone(), block));
             self.doc.headings.push(Heading { level, block, slug });
         }
-        self.push_block(kind, spans);
+        let splittable = matches!(
+            kind,
+            BlockKind::Paragraph | BlockKind::Heading(_) | BlockKind::Code
+        );
+        let block_spans = &self.doc.spans[spans.start as usize..];
+        let bytes = match (block_spans.first(), block_spans.last()) {
+            (Some(first), Some(last)) => last.end as usize - first.start as usize,
+            _ => 0,
+        };
+        if splittable && bytes > MAX_BLOCK_BYTES {
+            self.push_chunks(kind, spans.start as usize);
+        } else {
+            self.push_block(kind, spans);
+        }
+    }
+
+    /// Split the open block's spans (everything from `first` on) into chunk blocks. The marker
+    /// and quote start go to the first chunk; the rest are `joined` to it.
+    fn push_chunks(&mut self, kind: BlockKind, first: usize) {
+        let tail = self.doc.spans.split_off(first);
+        let (spans, chunks) = split_spans(&self.doc.text, &tail, MAX_BLOCK_BYTES);
+        self.doc.spans.extend(spans);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let range = (first as u32 + chunk.start)..(first as u32 + chunk.end);
+            self.push_joined(kind, range, i > 0);
+        }
     }
 
     /// A pending marker no block claimed (empty item or footnote definition, or a nested list
@@ -578,23 +617,43 @@ impl Builder {
     }
 
     fn push_block(&mut self, kind: BlockKind, spans: Range<u32>) {
+        self.push_joined(kind, spans, false);
+    }
+
+    fn push_joined(&mut self, kind: BlockKind, spans: Range<u32>, joined: bool) {
+        let quote_lists = self.quote_lists_range();
         let block = Block {
             kind,
             spans,
             list: self.lists.len().min(u8::MAX as usize) as u8,
             quote: self.quote,
             quote_start: std::mem::take(&mut self.quote_start),
-            quote_lists: std::array::from_fn(|k| {
-                let last = self.quote_lists.len().saturating_sub(1);
-                self.quote_lists.get(k.min(last)).copied().unwrap_or(0)
-            }),
+            quote_lists,
             marker: std::mem::replace(&mut self.marker, Marker::None),
+            joined,
         };
         if self.footnotes.active {
             self.footnotes.blocks.push(block);
         } else {
             self.doc.blocks.push(block);
         }
+    }
+
+    /// The open quotes' list depths as a range of `Doc::quote_lists`, reusing the previous
+    /// block's entry when the quotes are the same.
+    fn quote_lists_range(&mut self) -> Range<u32> {
+        let open = &self.quote_lists[..(self.quote as usize).min(self.quote_lists.len())];
+        let pool = &mut self.doc.quote_lists;
+        if open.is_empty() {
+            return 0..0;
+        }
+        let last = &self.quote_pool;
+        if pool[last.start as usize..last.end as usize] != *open {
+            let start = pool.len() as u32;
+            pool.extend_from_slice(open);
+            self.quote_pool = start..pool.len() as u32;
+        }
+        self.quote_pool.clone()
     }
 
     /// Fenced code text ends with a newline that isn't part of the content.
@@ -613,7 +672,7 @@ impl Builder {
     }
 
     /// GitHub-compatible heading anchor: lowercase, keep alphanumerics, `-` and `_`, spaces
-    /// become `-`, duplicates get `-1`, `-2`, ... suffixes.
+    /// become `-`, duplicates get the first unused `-1`, `-2`, ... suffix.
     fn slug(&mut self, spans: Range<u32>) -> Option<String> {
         let mut slug = String::new();
         for span in &self.doc.spans[spans.start as usize..spans.end as usize] {
@@ -628,18 +687,24 @@ impl Builder {
         if slug.is_empty() {
             return None;
         }
-        let n = self.slugs.entry(slug.clone()).or_insert(0);
-        *n += 1;
-        if *n > 1 {
-            slug = format!("{slug}-{}", *n - 1);
-            self.slugs.entry(slug.clone()).or_insert(1);
+        if !self.slugs.insert(slug.clone()) {
+            // Skip suffixes that earlier headings already took (`foo-1` written out by hand).
+            let next = self.slug_suffix.entry(slug.clone()).or_insert(0);
+            loop {
+                *next += 1;
+                let candidate = format!("{slug}-{next}");
+                if self.slugs.insert(candidate.clone()) {
+                    slug = candidate;
+                    break;
+                }
+            }
         }
         Some(slug)
     }
 
-    fn push_image(&mut self, src: String) -> u16 {
+    fn push_image(&mut self, src: String) -> u32 {
         let remote = src.starts_with("http://") || src.starts_with("https://");
-        push_capped(&mut self.doc.images, ImageRef { src, remote })
+        push_id(&mut self.doc.images, ImageRef { src, remote })
     }
 
     fn end_image(&mut self) {
@@ -654,13 +719,14 @@ impl Builder {
         self.text(&alt, style::IMAGE, id);
     }
 
-    fn footnote_number(&mut self, label: &str) -> u16 {
-        let next = self.footnotes.numbers.len() as u16 + 1;
-        *self
-            .footnotes
-            .numbers
-            .entry(label.to_owned())
-            .or_insert(next)
+    /// Footnotes are numbered in order of first mention, reference or definition.
+    fn footnote_number(&mut self, label: &str) -> u32 {
+        if let Some(&n) = self.footnotes.numbers.get(label) {
+            return n;
+        }
+        let n = self.footnotes.numbers.len() as u32 + 1;
+        self.footnotes.numbers.insert(label.to_owned(), n);
+        n
     }
 
     fn footnote_ref(&mut self, label: &str) {
@@ -669,7 +735,7 @@ impl Builder {
             let block = self.doc.blocks.len() as u32;
             self.doc.anchors.push((format!("fnref-{label}"), block));
         }
-        let link = push_capped(&mut self.doc.links, format!("#fn-{label}"));
+        let link = push_id(&mut self.doc.links, format!("#fn-{label}"));
         self.links.push(link);
         self.text(&n.to_string(), style::FOOTREF, 0);
         self.links.pop();
@@ -687,7 +753,7 @@ impl Builder {
         if block.spans.end as usize != self.doc.spans.len() || block.kind == BlockKind::Code {
             return;
         }
-        let link = push_capped(&mut self.doc.links, target);
+        let link = push_id(&mut self.doc.links, target);
         let start = self.doc.text.len() as u32;
         self.doc.text.push_str(" ↩");
         let end = self.doc.text.len() as u32;
@@ -733,7 +799,7 @@ impl Builder {
             match name.as_str() {
                 "br" => self.text("\n", 0, 0),
                 "img" => {
-                    let src = attr(tag, "src").unwrap_or_default();
+                    let src = attr(tag, "src").map_or_else(String::new, |s| decode_entities(&s));
                     let alt = attr(tag, "alt").map(|a| decode_entities(&a));
                     let id = self.push_image(src);
                     let alt = alt
@@ -825,42 +891,136 @@ fn tag_end(s: &str) -> Option<usize> {
     None
 }
 
-/// Push and return a 1-based id, or 0 once the u16 id space is exhausted.
-fn push_capped<T>(v: &mut Vec<T>, item: T) -> u16 {
-    if v.len() >= u16::MAX as usize {
-        return 0;
-    }
+/// Push and return the item's 1-based id (0 is reserved for "none").
+fn push_id<T>(v: &mut Vec<T>, item: T) -> u32 {
     v.push(item);
-    v.len() as u16
+    v.len() as u32
 }
 
-/// Value of an HTML attribute (quoted or unquoted), case-insensitive name match.
+/// Value of an HTML attribute (quoted or unquoted), case-insensitive name match. Walks the
+/// tag's real attribute boundaries, so text inside another attribute's value never matches.
 fn attr(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(i) = lower[from..].find(name) {
-        let at = from + i;
-        from = at + name.len();
-        let boundary = at == 0 || lower.as_bytes()[at - 1].is_ascii_whitespace();
-        let rest = lower[from..].trim_start();
-        if !boundary || !rest.starts_with('=') {
+    let b = tag.as_bytes();
+    let skip_space = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    // Past the tag name.
+    let mut i = tag
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(tag.len());
+    loop {
+        i = skip_space(i);
+        while i < b.len() && b[i] == b'/' {
+            i = skip_space(i + 1);
+        }
+        if i >= b.len() {
+            return None;
+        }
+        let name_at = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'=' && b[i] != b'/' {
+            i += 1;
+        }
+        let found = tag[name_at..i].eq_ignore_ascii_case(name);
+        i = skip_space(i);
+        if b.get(i) != Some(&b'=') {
+            if found {
+                return None;
+            }
             continue;
         }
-        let value_at = tag.len() - rest.len() + 1;
-        let value = tag[value_at..].trim_start();
-        let (quote, body) = match value.chars().next()? {
-            q @ ('"' | '\'') => (Some(q), &value[1..]),
-            _ => (None, value),
+        i = skip_space(i + 1);
+        let value = match b.get(i) {
+            Some(&q @ (b'"' | b'\'')) => {
+                let body = &tag[i + 1..];
+                let len = body.find(q as char).unwrap_or(body.len());
+                i += len + 2;
+                &body[..len]
+            }
+            _ => {
+                let start = i;
+                while i < b.len() && !b[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                // A `/` right before the closing `>` is self-closing syntax, not part of the URL.
+                let value = &tag[start..i];
+                match i == b.len() {
+                    true => value.strip_suffix('/').unwrap_or(value),
+                    false => value,
+                }
+            }
         };
-        let end = match quote {
-            Some(q) => body.find(q).unwrap_or(body.len()),
-            None => body
-                .find(|c: char| c.is_whitespace() || c == '/')
-                .unwrap_or(body.len()),
-        };
-        return Some(body[..end].to_owned());
+        if found {
+            return Some(value.to_owned());
+        }
     }
-    None
+}
+
+/// Cut a block's `spans` (contiguous text) into chunks of at most `max` text bytes. Returns the
+/// re-cut spans (a span crossing a cut becomes two with the same style, link and image) and
+/// each chunk's range into them. A cut goes just after the last newline in reach (the newline
+/// itself is dropped: the chunk boundary is the line break), else after the last whitespace,
+/// else at the last char boundary.
+fn split_spans(text: &str, spans: &[Span], max: usize) -> (Vec<Span>, Vec<Range<u32>>) {
+    let (Some(first), Some(last)) = (spans.first(), spans.last()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let (mut at, end) = (first.start as usize, last.end as usize);
+    let mut out = Vec::with_capacity(spans.len() + end.saturating_sub(at) / max.max(1) + 1);
+    let mut chunks = Vec::new();
+    let mut next = 0;
+    loop {
+        let (cut, resume) = if end - at > max {
+            split_point(text, at, max)
+        } else {
+            (end, end)
+        };
+        while next < spans.len() && spans[next].end as usize <= at {
+            next += 1;
+        }
+        let from = out.len() as u32;
+        for span in spans[next..]
+            .iter()
+            .take_while(|s| (s.start as usize) < cut)
+        {
+            let (start, end) = (span.start.max(at as u32), span.end.min(cut as u32));
+            if start < end {
+                out.push(Span {
+                    start,
+                    end,
+                    ..*span
+                });
+            }
+        }
+        chunks.push(from..out.len() as u32);
+        if resume >= end {
+            return (out, chunks);
+        }
+        at = resume;
+    }
+}
+
+/// Where to cut the chunk starting at `from` (at most `max` bytes): its end and the next
+/// chunk's start, which differ when a newline is dropped.
+fn split_point(text: &str, from: usize, max: usize) -> (usize, usize) {
+    let mut limit = (from + max).min(text.len());
+    while !text.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    if limit == from {
+        // `max` is smaller than the next char: take it whole.
+        limit = from + text[from..].chars().next().map_or(0, char::len_utf8);
+    }
+    let window = &text[from..limit];
+    if let Some(i) = window.rfind('\n') {
+        return (from + i, from + i + 1);
+    }
+    match window.char_indices().rev().find(|(_, c)| c.is_whitespace()) {
+        Some((i, c)) => (from + i + c.len_utf8(), from + i + c.len_utf8()),
+        None => (limit, limit),
+    }
 }
 
 /// Decode the HTML entities that show up in hand-written READMEs.

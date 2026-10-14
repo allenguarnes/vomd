@@ -9,7 +9,7 @@
 use std::ops::Range;
 use std::time::Instant;
 
-use crate::doc::{self, Alert, Block, BlockKind, Doc, Marker, QUOTE_LEVELS, Span, style};
+use crate::doc::{self, Alert, Block, BlockKind, Doc, Marker, Span, style};
 use crate::fonts::Fonts;
 use crate::text::{
     Align, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, TextCtx, TextStyle, deco,
@@ -75,21 +75,19 @@ pub struct BlockBox {
 impl BlockBox {
     /// Append a paragraph layout at (`dx`, `dy`).
     fn append(&mut self, pl: ParaLayout, para_styles: &[TextStyle], dx: f32, dy: f32) {
-        // Style ids are u16; past that, glyphs saturate onto the last style rather than wrap.
-        debug_assert!(self.styles.len() + para_styles.len() <= u16::MAX as usize + 1);
-        let style_base = self.styles.len().min(u16::MAX as usize) as u16;
+        let style_base = self.styles.len() as u32;
         let hit_base = self.hits.len() as u32;
         self.styles.extend_from_slice(para_styles);
         self.glyphs.extend(pl.glyphs.into_iter().map(|g| PGlyph {
             x: g.x + dx,
             y: g.y + dy,
-            style: g.style.saturating_add(style_base),
+            style: g.style + style_base,
             ..g
         }));
         self.hits.extend(pl.hits.into_iter().map(|h| PHit {
             x0: h.x0 + dx,
             x1: h.x1 + dx,
-            style: h.style.saturating_add(style_base),
+            style: h.style + style_base,
             ..h
         }));
         self.lines.extend(pl.lines.into_iter().map(|l| PLine {
@@ -112,15 +110,14 @@ impl BlockBox {
     }
 
     /// Add a style for decoration text and return its index.
-    fn push_style(&mut self, style: TextStyle) -> u16 {
-        debug_assert!(self.styles.len() <= u16::MAX as usize);
+    fn push_style(&mut self, style: TextStyle) -> u32 {
         self.styles.push(style);
-        (self.styles.len() - 1).min(u16::MAX as usize) as u16
+        self.styles.len() as u32 - 1
     }
 
     /// Append the glyphs of synthetic decoration text (markers, alert titles) at (`dx`, `dy`)
     /// with an existing style. It gets no lines or hits: it isn't document text.
-    fn append_decor(&mut self, pl: &ParaLayout, style: u16, dx: f32, dy: f32) {
+    fn append_decor(&mut self, pl: &ParaLayout, style: u32, dx: f32, dy: f32) {
         self.glyphs.extend(pl.glyphs.iter().map(|g| PGlyph {
             x: g.x + dx,
             y: g.y + dy,
@@ -187,7 +184,7 @@ pub struct Hit {
     /// Byte offset into `Doc::text`.
     pub doc: u32,
     /// 1-based link id; 0 = not a link.
-    pub link: u16,
+    pub link: u32,
 }
 
 pub struct Layout {
@@ -521,8 +518,9 @@ impl Layout {
         let meta = self.meta[i];
         let em = self.em;
         let gap = self.gap_before(doc, i) * em;
-        let indent = self.indent(block, meta);
+        let indent = self.indent(doc, block, meta);
         let avail = (self.col_w - indent).max(em);
+        let last = !joined_next(doc, i);
         let mut out = BlockBox::default();
         let mut missing = Vec::new();
         let body = self.body_style(block, meta);
@@ -542,20 +540,23 @@ impl Layout {
                 let styles = std::mem::take(&mut self.para.styles);
                 out.append(pl, &styles, indent, gap);
                 self.para.styles = styles;
-                if let BlockKind::Heading(1 | 2) = block.kind {
+                if let BlockKind::Heading(1 | 2) = block.kind
+                    && last
+                {
                     h += 0.3 * em;
                     out.rect(indent, gap + h, avail, self.hairline(), Role::BorderMuted);
                     h += self.hairline();
                 }
                 if let Some(baseline) = first_baseline {
-                    self.marker(fonts, block, meta, indent, baseline, &mut out, &mut missing);
+                    let gutter = self.gutter(doc, block, meta);
+                    self.marker(fonts, block, meta, gutter, baseline, &mut out, &mut missing);
                 }
                 h
             }
             BlockKind::Code => self.code(
                 doc,
                 fonts,
-                block,
+                (block, last),
                 indent,
                 avail,
                 gap,
@@ -622,7 +623,7 @@ impl Layout {
 
     /// Spacing above block `i`, in em.
     fn gap_before(&self, doc: &Doc, i: usize) -> f32 {
-        if i == 0 {
+        if i == 0 || doc.blocks[i].joined {
             return 0.0;
         }
         let (prev, cur) = (&doc.blocks[i - 1], &doc.blocks[i]);
@@ -647,11 +648,28 @@ impl Layout {
         }
     }
 
-    fn indent(&self, block: &Block, meta: Meta) -> f32 {
+    /// Extra indent in em for blocks inside the footnote section, applied to everything in the
+    /// block: its number in the gutter, quote bars, and text.
+    fn footnote_x(block: &Block, meta: Meta) -> f32 {
         let footnote = matches!(block.marker, Marker::Footnote(_))
             || (meta.footnote && block.list == 0 && block.kind != BlockKind::Rule);
-        let extra = if footnote { LIST_INDENT } else { 0.0 };
-        (nesting_x(block, block.quote) + extra) * self.em
+        if footnote { LIST_INDENT } else { 0.0 }
+    }
+
+    /// Left edge of the block's content.
+    fn indent(&self, doc: &Doc, block: &Block, meta: Meta) -> f32 {
+        (nesting_x(doc, block, block.quote, block.list) + Self::footnote_x(block, meta)) * self.em
+    }
+
+    /// Where the block's marker hangs from: the content edge of the item's list level, left of
+    /// any quote that opened inside the item.
+    fn gutter(&self, doc: &Doc, block: &Block, meta: Meta) -> f32 {
+        let outer = doc
+            .block_quote_lists(block)
+            .iter()
+            .take_while(|&&opened| opened < block.list)
+            .count();
+        (nesting_x(doc, block, outer as u8, block.list) + Self::footnote_x(block, meta)) * self.em
     }
 
     fn body_style(&self, block: &Block, meta: Meta) -> TextStyle {
@@ -684,7 +702,7 @@ impl Layout {
         s
     }
 
-    /// Bullet, number, checkbox, or footnote number in the gutter left of `indent`, aligned to
+    /// Bullet, number, checkbox, or footnote number in the gutter left of `gutter`, aligned to
     /// the first line's baseline.
     #[allow(clippy::too_many_arguments)]
     fn marker(
@@ -692,7 +710,7 @@ impl Layout {
         fonts: &Fonts,
         block: &Block,
         meta: Meta,
-        indent: f32,
+        gutter: f32,
         baseline: f32,
         out: &mut BlockBox,
         missing: &mut Vec<char>,
@@ -710,7 +728,7 @@ impl Layout {
             Marker::Footnote(n) => format!("{n}."),
             Marker::Task(checked) => {
                 let size = 0.875 * em;
-                let x = indent - 1.375 * em;
+                let x = gutter - 1.375 * em;
                 let y = baseline - 0.8 * em;
                 out.rects.push(PRect {
                     x,
@@ -757,7 +775,7 @@ impl Layout {
         missing.extend_from_slice(&pl.missing);
         let dy = baseline - pl.lines.first().map_or(0.0, |l| l.baseline);
         let s = out.push_style(style);
-        out.append_decor(&pl, s, indent - 0.5 * em - pl.width, dy);
+        out.append_decor(&pl, s, gutter - 0.5 * em - pl.width, dy);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -765,7 +783,7 @@ impl Layout {
         &mut self,
         doc: &Doc,
         fonts: &Fonts,
-        block: &Block,
+        (block, last): (&Block, bool),
         indent: f32,
         avail: f32,
         gap: f32,
@@ -774,6 +792,11 @@ impl Layout {
     ) -> f32 {
         let em = self.em;
         let pad = em;
+        // A chunked block is one continuous background: padding only at the run's outer edges.
+        let (top, bottom) = (
+            if block.joined { 0.0 } else { pad },
+            if last { pad } else { 0.0 },
+        );
         let style = TextStyle {
             bold: false,
             italic: false,
@@ -796,14 +819,18 @@ impl Layout {
             .ctx
             .layout(fonts, &self.para, inner, Align::Start, CODE_LH);
         missing.extend_from_slice(&pl.missing);
-        let h = pl.height + 2.0 * pad;
+        let h = pl.height + top + bottom;
         out.rects.push(PRect {
             x: indent,
             y: gap,
             w: avail,
             h,
             role: Role::CodeBg,
-            radius: 6.0 * self.params.scale,
+            radius: if block.joined || !last {
+                0.0
+            } else {
+                6.0 * self.params.scale
+            },
             kind: RectKind::Fill,
         });
         let conts: Vec<f32> = pl
@@ -813,7 +840,7 @@ impl Layout {
             .map(|l| l.baseline)
             .collect();
         let styles = std::mem::take(&mut self.para.styles);
-        out.append(pl, &styles, indent + pad, gap + pad);
+        out.append(pl, &styles, indent + pad, gap + top);
         self.para.styles = styles;
         // Continuation markers in the left padding for soft-wrapped lines.
         if !conts.is_empty() {
@@ -829,7 +856,7 @@ impl Layout {
             let mark_baseline = mark.lines.first().map_or(0.0, |l| l.baseline);
             let s = out.push_style(style);
             for baseline in conts {
-                out.append_decor(&mark, s, indent, gap + pad + baseline - mark_baseline);
+                out.append_decor(&mark, s, indent, gap + top + baseline - mark_baseline);
             }
         }
         h
@@ -963,6 +990,7 @@ impl Layout {
         out: &mut BlockBox,
     ) {
         let block = &doc.blocks[i];
+        let opened = doc.block_quote_lists(block);
         let prev_quote = if i > 0 { doc.blocks[i - 1].quote } else { 0 };
         for q in 0..block.quote {
             // Joined to the previous block only when it is in the same quote.
@@ -973,7 +1001,13 @@ impl Layout {
                 _ => Role::QuoteBar,
             };
             out.rect(
-                nesting_x(block, q) * self.em,
+                (nesting_x(
+                    doc,
+                    block,
+                    q,
+                    opened.get(q as usize).map_or(0, |&d| d.min(block.list)),
+                ) + Self::footnote_x(block, meta))
+                    * self.em,
                 top,
                 QUOTE_BAR * self.em,
                 gap + content_h - top,
@@ -987,7 +1021,7 @@ impl Layout {
         let block = &doc.blocks[i];
         let em = self.em;
         let gap = self.gap_before(doc, i) * em;
-        let avail = (self.col_w - self.indent(block, self.meta[i])).max(em);
+        let avail = (self.col_w - self.indent(doc, block, self.meta[i])).max(em);
         let chars: usize = doc
             .block_spans(block)
             .iter()
@@ -1007,7 +1041,9 @@ impl Layout {
                     .map(|s| doc.span_text(s).matches('\n').count())
                     .sum::<usize>()
                     + 1;
-                (text_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em + 2.0 * em
+                let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
+                (text_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em
+                    + pads as f32 * em
             }
             BlockKind::Rule => 0.25 * em,
             BlockKind::TableRow { .. } => BODY_LH * em + 2.0 * CELL_PAD_Y * em,
@@ -1015,22 +1051,30 @@ impl Layout {
     }
 }
 
-/// Offset in em along the block's nesting, walked in its real order (a quote inside a list item
-/// is indented by the list; a list inside a quote, by the quote). `level == block.quote` gives
-/// the content's indent; a smaller `level` gives the x of that quote level's bar.
-fn nesting_x(block: &Block, level: u8) -> f32 {
-    let (mut x, mut lists) = (0.0, 0);
-    for q in 0..level {
-        let opened = block.quote_lists[(q as usize).min(QUOTE_LEVELS - 1)].clamp(lists, block.list);
-        x += (opened - lists) as f32 * LIST_INDENT + QUOTE_INDENT;
-        lists = opened;
+/// The next block continues this one (see [`Block::joined`]).
+fn joined_next(doc: &Doc, i: usize) -> bool {
+    doc.blocks.get(i + 1).is_some_and(|b| b.joined)
+}
+
+/// Offset in em along the block's nesting after its first `quotes` quote levels and `lists`
+/// list levels, walked in their real order (a quote inside a list item is indented by the list;
+/// a list inside a quote, by the quote). `quotes == block.quote` and `lists == block.list` give
+/// the content's indent; a quote level's bar sits at `quotes` = that level and `lists` = the
+/// list depth where it opened.
+fn nesting_x(doc: &Doc, block: &Block, quotes: u8, lists: u8) -> f32 {
+    let opened = doc.block_quote_lists(block);
+    let (mut x, mut depth) = (0.0, 0);
+    for q in 0..quotes as usize {
+        let at = opened
+            .get(q)
+            .copied()
+            .unwrap_or(depth)
+            .min(lists)
+            .max(depth);
+        x += (at - depth) as f32 * LIST_INDENT + QUOTE_INDENT;
+        depth = at;
     }
-    let until = if level < block.quote {
-        block.quote_lists[(level as usize).min(QUOTE_LEVELS - 1)].clamp(lists, block.list)
-    } else {
-        block.list
-    };
-    x + (until - lists) as f32 * LIST_INDENT
+    x + lists.saturating_sub(depth) as f32 * LIST_INDENT
 }
 
 fn alert_role(a: Alert) -> Role {

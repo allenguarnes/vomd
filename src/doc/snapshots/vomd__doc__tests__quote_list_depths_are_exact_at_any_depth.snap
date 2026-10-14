@@ -1,0 +1,5 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"> > > > - > note\\n\")"
+---
+P list=1 quote=5 qstart=1 qlists=[0, 0, 0, 0, 1] Bullet | "note"

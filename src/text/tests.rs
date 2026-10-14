@@ -305,7 +305,7 @@ fn deterministic() {
 fn many_distinct_styles_are_deduplicated() {
     let mut p = Para::default();
     for round in 0..2 {
-        for link in 0..20_000u16 {
+        for link in 0..20_000u32 {
             p.push_text(
                 "a",
                 0,
@@ -334,4 +334,89 @@ fn many_distinct_styles_are_deduplicated() {
     p.push_text("b", 0, style(99.0));
     assert_eq!(p.styles.len(), 20_001);
     assert_eq!(p.items.last().unwrap().style, 20_000);
+}
+
+#[test]
+fn style_indices_are_not_capped_at_16_bits() {
+    const N: u32 = 70_000;
+    let mut p = Para::default();
+    for link in 0..N {
+        p.push_text(
+            "a ",
+            link * 2,
+            TextStyle {
+                link: link + 1,
+                ..style(16.0)
+            },
+        );
+    }
+    assert_eq!(p.styles.len(), N as usize);
+    assert_eq!(p.items.last().unwrap().style, N - 1);
+    let fonts = Fonts::new().unwrap();
+    let shaped = TextCtx::default().shape(&fonts, &p);
+    assert_eq!(shaped.clusters.last().unwrap().style, N - 1);
+    let l = TextCtx::default().layout(&fonts, &p, 100_000.0, Align::Start, 1.5);
+    // Every glyph and hit still resolves to its own style, not one wrapped past 65,535.
+    let last = l.hits.last().unwrap();
+    assert_eq!(p.styles[last.style as usize].link, N);
+    assert_eq!(l.glyphs.last().unwrap().style, N - 1);
+    for h in l.hits.iter().step_by(997) {
+        assert_eq!(p.styles[h.style as usize].link, h.doc / 2 + 1);
+    }
+}
+
+/// `text` shaped with `fonts`; every cluster's face and glyph ids.
+fn shape_with(fonts: &Fonts, text: &str) -> Shaped {
+    TextCtx::default().shape(fonts, &para(text))
+}
+
+#[test]
+fn uncovered_combining_marks_are_reported_missing() {
+    let fonts = Fonts::new().unwrap();
+    // The embedded subset has no U+0301 glyph, and `q` + acute doesn't compose.
+    let shaped = shape_with(&fonts, "q\u{0301}");
+    assert_eq!(shaped.missing, vec!['\u{0301}']);
+    assert!(shaped.glyphs.iter().any(|g| g.id == 0));
+    // `e` + acute composes into `é`, which the face has: no fallback needed.
+    let shaped = shape_with(&fonts, "e\u{0301}");
+    assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
+    assert!(shaped.glyphs.iter().all(|g| g.id != 0));
+    assert_eq!(shaped.clusters[0].face, fonts.primary(false, false, false));
+    // Several marks on one base: only the ones nothing draws are reported.
+    let shaped = shape_with(&fonts, "e\u{0301}\u{0323}q\u{0308}");
+    assert!(shaped.missing.contains(&'\u{0308}'));
+    assert!(!shaped.missing.contains(&'q'));
+}
+
+#[test]
+fn combining_marks_use_a_fallback_with_their_base() {
+    let base = Fonts::new().unwrap();
+    let found = fallback::find_fallbacks(&['\u{0301}'], &|p, i| base.has_source(p, i));
+    let mut fonts = Fonts::new().unwrap();
+    let ids: Vec<_> = found
+        .iter()
+        .filter_map(|f| fonts.add_fallback(&f.path, f.index))
+        .collect();
+    // Needs an installed face that has the base letter as well as the mark.
+    let Some(&face) = ids.iter().find(|&&id| fonts.face(id).glyph('q') != 0) else {
+        return;
+    };
+    let shaped = shape_with(&fonts, "q\u{0301}x");
+    assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
+    assert!(
+        shaped.glyphs.iter().all(|g| g.id != 0),
+        "{:?}",
+        shaped.glyphs
+    );
+    // The base moved to the fallback together with its mark; the next letter stays on Inter.
+    let cluster = &shaped.clusters[0];
+    assert_eq!((cluster.start, cluster.end), (0, 3));
+    assert_eq!(cluster.face, face);
+    assert_eq!(
+        shaped.clusters.last().unwrap().face,
+        fonts.primary(false, false, false)
+    );
+    // A sequence the primary face composes by itself stays put.
+    let shaped = shape_with(&fonts, "e\u{0301}");
+    assert_eq!(shaped.clusters[0].face, fonts.primary(false, false, false));
 }

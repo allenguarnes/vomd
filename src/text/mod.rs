@@ -42,7 +42,7 @@ pub struct TextStyle {
     /// Baseline shift in physical pixels, positive = up (superscript).
     pub shift: f32,
     /// 1-based link id from the Doc; 0 = none.
-    pub link: u16,
+    pub link: u32,
 }
 
 /// Atomic inline object (image, checkbox, future math) placed in a line like a glyph.
@@ -62,7 +62,7 @@ pub struct ParaItem {
     pub doc: u32,
     /// Synthesized text (e.g. expanded tabs): every byte maps to `doc`.
     pub fixed_doc: bool,
-    pub style: u16,
+    pub style: u32,
     pub inline_box: Option<InlineBox>,
 }
 
@@ -74,12 +74,12 @@ pub struct Para {
     pub styles: Vec<TextStyle>,
     /// Style → index in `styles` for the first `indexed` styles; built lazily once the table
     /// outgrows a linear scan.
-    lookup: HashMap<StyleKey, u16>,
+    lookup: HashMap<StyleKey, u32>,
     indexed: usize,
 }
 
 /// Hashable identity of a [`TextStyle`] (floats by bit pattern).
-type StyleKey = (u8, u32, Role, u8, u32, u16);
+type StyleKey = (u8, u32, Role, u8, u32, u32);
 
 fn style_key(s: &TextStyle) -> StyleKey {
     let flags = s.bold as u8 | (s.italic as u8) << 1 | (s.mono as u8) << 2;
@@ -113,16 +113,16 @@ impl Para {
         self.items.is_empty()
     }
 
-    fn style_index(&mut self, style: TextStyle) -> u16 {
+    fn style_index(&mut self, style: TextStyle) -> u32 {
         // Consecutive items mostly repeat the previous style.
         if let Some(last) = self.styles.last()
             && *last == style
         {
-            return (self.styles.len() - 1) as u16;
+            return (self.styles.len() - 1) as u32;
         }
         if self.styles.len() <= LINEAR_STYLES {
             if let Some(i) = self.styles.iter().position(|s| *s == style) {
-                return i as u16;
+                return i as u32;
             }
         } else {
             // `styles` is also pushed to directly, so catch the index up first.
@@ -131,7 +131,7 @@ impl Para {
                 self.indexed = 0;
             }
             for (i, s) in self.styles.iter().enumerate().skip(self.indexed) {
-                self.lookup.entry(style_key(s)).or_insert(i as u16);
+                self.lookup.entry(style_key(s)).or_insert(i as u32);
             }
             self.indexed = self.styles.len();
             if let Some(&i) = self.lookup.get(&style_key(&style)) {
@@ -139,7 +139,7 @@ impl Para {
             }
         }
         self.styles.push(style);
-        (self.styles.len() - 1) as u16
+        (self.styles.len() - 1) as u32
     }
 
     fn push(&mut self, s: &str, doc: u32, fixed_doc: bool, style: TextStyle, b: Option<InlineBox>) {
@@ -201,7 +201,7 @@ pub struct PGlyph {
     pub id: u16,
     pub face: FaceId,
     /// Index into the owner's style table.
-    pub style: u16,
+    pub style: u32,
     /// [`crate::fonts::synth`] bits.
     pub synth: u8,
 }
@@ -230,7 +230,7 @@ pub struct PHit {
     pub x0: f32,
     pub x1: f32,
     pub doc: u32,
-    pub style: u16,
+    pub style: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
