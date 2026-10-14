@@ -82,8 +82,15 @@ pub struct Block {
     /// Depth of the outermost blockquote that begins at this block (0 = none), so adjacent
     /// quotes stay distinct.
     pub quote_start: u8,
+    /// List depth at which each of the first [`QUOTE_LEVELS`] quote levels opened, so layout
+    /// can interleave quote bars and list indents in their real nesting order. Deeper quotes
+    /// reuse the last entry.
+    pub quote_lists: [u8; QUOTE_LEVELS],
     pub marker: Marker,
 }
+
+/// Quote levels whose list depth is recorded per block.
+pub const QUOTE_LEVELS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -186,6 +193,8 @@ struct Footnotes {
     /// Labels whose first reference already has a `fnref-` anchor.
     referenced: std::collections::HashSet<String>,
     active: bool,
+    /// Main-flow `quote_start` set aside while a definition is open.
+    quote_start: u8,
 }
 
 struct Builder {
@@ -200,6 +209,8 @@ struct Builder {
     /// Next number for each open list (`None` = bullet list).
     lists: Vec<Option<u64>>,
     quote: u8,
+    /// List depth at each open quote's start.
+    quote_lists: Vec<u8>,
     /// Outermost quote depth started since the last block was pushed (0 = none).
     quote_start: u8,
     marker: Marker,
@@ -227,6 +238,7 @@ impl Builder {
             links: Vec::new(),
             lists: Vec::new(),
             quote: 0,
+            quote_lists: Vec::new(),
             quote_start: 0,
             marker: Marker::None,
             image: None,
@@ -280,6 +292,7 @@ impl Builder {
             Event::HardBreak => self.text("\n", 0, 0),
             Event::Rule => {
                 self.close();
+                self.flush_marker();
                 self.push_block(BlockKind::Rule, 0..0);
             }
             Event::TaskListMarker(checked) => self.marker = Marker::Task(checked),
@@ -290,14 +303,23 @@ impl Builder {
         match tag {
             Tag::Paragraph => self.open(BlockKind::Paragraph),
             Tag::Heading { level, .. } => self.open(BlockKind::Heading(level as u8)),
-            Tag::CodeBlock(_) => self.open(BlockKind::Code),
+            Tag::CodeBlock(_) => {
+                self.close();
+                self.flush_marker();
+                self.open(BlockKind::Code);
+            }
             Tag::HtmlBlock => {
                 self.close();
                 self.html_block = Some(String::new());
             }
             Tag::BlockQuote(kind) => {
                 self.close();
+                if kind.is_some() {
+                    self.flush_marker();
+                }
                 self.quote = self.quote.saturating_add(1);
+                self.quote_lists
+                    .push(self.lists.len().min(u8::MAX as usize) as u8);
                 if self.quote_start == 0 {
                     self.quote_start = self.quote;
                 }
@@ -333,12 +355,14 @@ impl Builder {
                 self.close();
                 let n = self.footnote_number(&label);
                 self.footnotes.active = true;
+                self.footnotes.quote_start = std::mem::take(&mut self.quote_start);
                 let at = self.footnotes.blocks.len();
                 self.footnotes.defs.push((n, label.into_string(), at));
                 self.marker = Marker::Footnote(n);
             }
             Tag::Table(aligns) => {
                 self.close();
+                self.flush_marker();
                 let aligns = aligns
                     .into_iter()
                     .map(|a| match a {
@@ -399,6 +423,7 @@ impl Builder {
             TagEnd::BlockQuote(_) => {
                 self.close();
                 self.quote = self.quote.saturating_sub(1);
+                self.quote_lists.pop();
                 // An empty quote has no block to start.
                 if self.quote_start > self.quote {
                     self.quote_start = 0;
@@ -414,6 +439,7 @@ impl Builder {
                 self.flush_marker();
                 self.footnote_backlink();
                 self.footnotes.active = false;
+                self.quote_start = self.footnotes.quote_start;
             }
             TagEnd::TableHead | TagEnd::TableRow => self.close(),
             TagEnd::TableCell => {
@@ -558,6 +584,10 @@ impl Builder {
             list: self.lists.len().min(u8::MAX as usize) as u8,
             quote: self.quote,
             quote_start: std::mem::take(&mut self.quote_start),
+            quote_lists: std::array::from_fn(|k| {
+                let last = self.quote_lists.len().saturating_sub(1);
+                self.quote_lists.get(k.min(last)).copied().unwrap_or(0)
+            }),
             marker: std::mem::replace(&mut self.marker, Marker::None),
         };
         if self.footnotes.active {

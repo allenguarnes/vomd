@@ -1,0 +1,8 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"- | x | y |\\n  |---|---|\\n  | 1 | 2 |\\n- next\\n\")"
+---
+P list=1 Bullet |
+Row(t0,head) list=1 | [ "x" ] [ "y" ]
+Row(t0) list=1 | [ "1" ] [ "2" ]
+P list=1 Bullet | "next"

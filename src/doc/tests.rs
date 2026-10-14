@@ -1,7 +1,7 @@
 use super::*;
 
 /// Human-readable IR dump for snapshots, one block per line:
-/// `<kind> [list=N] [quote=N] [qstart=N] [marker] | [style]"text" ...`
+/// `<kind> [list=N] [quote=N] [qstart=N] [qlists=[..]] [marker] | [style]"text" ...`
 fn dump(doc: &Doc) -> String {
     let mut out = String::new();
     for block in &doc.blocks {
@@ -24,6 +24,12 @@ fn dump(doc: &Doc) -> String {
         }
         if block.quote_start > 0 {
             out.push_str(&format!(" qstart={}", block.quote_start));
+        }
+        if block.quote_lists != [0; QUOTE_LEVELS] {
+            out.push_str(&format!(
+                " qlists={:?}",
+                &block.quote_lists[..block.quote.min(4) as usize]
+            ));
         }
         if block.marker != Marker::None {
             out.push_str(&format!(" {:?}", block.marker));
@@ -306,4 +312,21 @@ fn html_tag_with_gt_in_attribute() {
     insta::assert_snapshot!(parse(
         "Text <img alt=\"a>b\" src='x>y.png'> after <span title=\"1 > 0\">span</span>.\n"
     ));
+}
+
+#[test]
+fn markers_survive_non_paragraph_item_starts() {
+    insta::assert_snapshot!(parse("1. ```\n   code\n   ```\n2. next\n"));
+    insta::assert_snapshot!(parse("- | x | y |\n  |---|---|\n  | 1 | 2 |\n- next\n"));
+    insta::assert_snapshot!(parse("- > [!NOTE]\n  > n\n- next\n\n- * * *\n"));
+}
+
+#[test]
+fn footnote_definition_keeps_quote_start() {
+    insta::assert_snapshot!(parse("> a\n\n> [^x]: d\n>\n> b\n\ny[^x]\n"));
+}
+
+#[test]
+fn quote_list_nesting_order_is_recorded() {
+    insta::assert_snapshot!(parse("- item\n\n  > quoted\n\n> - item\n>   > deep\n"));
 }

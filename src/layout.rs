@@ -9,7 +9,7 @@
 use std::ops::Range;
 use std::time::Instant;
 
-use crate::doc::{self, Alert, Block, BlockKind, Doc, Marker, Span, style};
+use crate::doc::{self, Alert, Block, BlockKind, Doc, Marker, QUOTE_LEVELS, Span, style};
 use crate::fonts::Fonts;
 use crate::text::{
     Align, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, TextCtx, TextStyle, deco,
@@ -263,9 +263,9 @@ impl Layout {
     }
 
     /// Characters no loaded face covered, accumulated since the last call. Each character is
-    /// returned once: if a fallback scan found nothing for it, remeasuring doesn't report it
-    /// (or flag its blocks) again, so callers never rescan the system fonts for the same
-    /// character.
+    /// returned once, so callers never rescan the system fonts for the same character. Blocks
+    /// containing it are still flagged whenever they are measured, including while the scan
+    /// runs, so `invalidate_missing` covers every block that was laid out without a face.
     pub fn take_missing(&mut self) -> Vec<char> {
         let missing = std::mem::take(&mut self.missing);
         for &c in &missing {
@@ -297,7 +297,8 @@ impl Layout {
         self.recompute_ys();
     }
 
-    /// Fallback faces were added: remeasure blocks that had uncovered characters. A table
+    /// Fallback faces were added: remeasure blocks that had uncovered characters (even ones
+    /// already reported). A table
     /// is remeasured whole, since its column widths depend on every row.
     pub fn invalidate_missing(&mut self, doc: &Doc) {
         for i in 0..self.geoms.len() {
@@ -602,10 +603,11 @@ impl Layout {
         };
         self.quote_bars(doc, i, meta, gap, content_h, &mut out);
         for c in missing {
+            // Always flag the block: a fallback scan may still be running for `c`.
+            self.geoms[i].missing = true;
             if self.tried.binary_search(&c).is_ok() {
                 continue;
             }
-            self.geoms[i].missing = true;
             if let Err(at) = self.missing.binary_search(&c) {
                 self.missing.insert(at, c);
             }
@@ -648,8 +650,8 @@ impl Layout {
     fn indent(&self, block: &Block, meta: Meta) -> f32 {
         let footnote = matches!(block.marker, Marker::Footnote(_))
             || (meta.footnote && block.list == 0 && block.kind != BlockKind::Rule);
-        let lists = block.list as f32 + if footnote { 1.0 } else { 0.0 };
-        (block.quote as f32 * QUOTE_INDENT + lists * LIST_INDENT) * self.em
+        let extra = if footnote { LIST_INDENT } else { 0.0 };
+        (nesting_x(block, block.quote) + extra) * self.em
     }
 
     fn body_style(&self, block: &Block, meta: Meta) -> TextStyle {
@@ -971,7 +973,7 @@ impl Layout {
                 _ => Role::QuoteBar,
             };
             out.rect(
-                q as f32 * QUOTE_INDENT * self.em,
+                nesting_x(block, q) * self.em,
                 top,
                 QUOTE_BAR * self.em,
                 gap + content_h - top,
@@ -1011,6 +1013,24 @@ impl Layout {
             BlockKind::TableRow { .. } => BODY_LH * em + 2.0 * CELL_PAD_Y * em,
         }
     }
+}
+
+/// Offset in em along the block's nesting, walked in its real order (a quote inside a list item
+/// is indented by the list; a list inside a quote, by the quote). `level == block.quote` gives
+/// the content's indent; a smaller `level` gives the x of that quote level's bar.
+fn nesting_x(block: &Block, level: u8) -> f32 {
+    let (mut x, mut lists) = (0.0, 0);
+    for q in 0..level {
+        let opened = block.quote_lists[(q as usize).min(QUOTE_LEVELS - 1)].clamp(lists, block.list);
+        x += (opened - lists) as f32 * LIST_INDENT + QUOTE_INDENT;
+        lists = opened;
+    }
+    let until = if level < block.quote {
+        block.quote_lists[(level as usize).min(QUOTE_LEVELS - 1)].clamp(lists, block.list)
+    } else {
+        block.list
+    };
+    x + (until - lists) as f32 * LIST_INDENT
 }
 
 fn alert_role(a: Alert) -> Role {

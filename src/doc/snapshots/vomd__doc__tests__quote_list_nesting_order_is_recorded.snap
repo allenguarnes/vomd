@@ -1,0 +1,8 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"- item\\n\\n  > quoted\\n\\n> - item\\n>   > deep\\n\")"
+---
+P list=1 Bullet | "item"
+P list=1 quote=1 qstart=1 qlists=[1] | "quoted"
+P list=1 quote=1 qstart=1 Bullet | "item"
+P list=1 quote=2 qstart=2 qlists=[0, 1] | "deep"

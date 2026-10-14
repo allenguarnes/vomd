@@ -10,6 +10,7 @@ pub mod fallback;
 mod lines;
 mod shape;
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use swash::shape::ShapeContext;
@@ -71,7 +72,29 @@ pub struct Para {
     pub text: String,
     pub items: Vec<ParaItem>,
     pub styles: Vec<TextStyle>,
+    /// Style → index in `styles` for the first `indexed` styles; built lazily once the table
+    /// outgrows a linear scan.
+    lookup: HashMap<StyleKey, u16>,
+    indexed: usize,
 }
+
+/// Hashable identity of a [`TextStyle`] (floats by bit pattern).
+type StyleKey = (u8, u32, Role, u8, u32, u16);
+
+fn style_key(s: &TextStyle) -> StyleKey {
+    let flags = s.bold as u8 | (s.italic as u8) << 1 | (s.mono as u8) << 2;
+    (
+        flags,
+        s.size.to_bits(),
+        s.role,
+        s.deco,
+        s.shift.to_bits(),
+        s.link,
+    )
+}
+
+/// Style tables up to this size are searched linearly.
+const LINEAR_STYLES: usize = 16;
 
 /// Object replacement character standing in for inline boxes in `Para::text`, so line
 /// breaking sees them.
@@ -82,6 +105,8 @@ impl Para {
         self.text.clear();
         self.items.clear();
         self.styles.clear();
+        self.lookup.clear();
+        self.indexed = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -89,8 +114,29 @@ impl Para {
     }
 
     fn style_index(&mut self, style: TextStyle) -> u16 {
-        if let Some(i) = self.styles.iter().position(|s| *s == style) {
-            return i as u16;
+        // Consecutive items mostly repeat the previous style.
+        if let Some(last) = self.styles.last()
+            && *last == style
+        {
+            return (self.styles.len() - 1) as u16;
+        }
+        if self.styles.len() <= LINEAR_STYLES {
+            if let Some(i) = self.styles.iter().position(|s| *s == style) {
+                return i as u16;
+            }
+        } else {
+            // `styles` is also pushed to directly, so catch the index up first.
+            if self.indexed > self.styles.len() {
+                self.lookup.clear();
+                self.indexed = 0;
+            }
+            for (i, s) in self.styles.iter().enumerate().skip(self.indexed) {
+                self.lookup.entry(style_key(s)).or_insert(i as u16);
+            }
+            self.indexed = self.styles.len();
+            if let Some(&i) = self.lookup.get(&style_key(&style)) {
+                return i;
+            }
         }
         self.styles.push(style);
         (self.styles.len() - 1) as u16

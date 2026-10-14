@@ -300,3 +300,38 @@ fn deterministic() {
     let text = "Mixed text with **stuff**, 中文, שלום and emoji 🎉 wrapping around. ".repeat(5);
     assert_eq!(lay(&text, 333.0), lay(&text, 333.0));
 }
+
+#[test]
+fn many_distinct_styles_are_deduplicated() {
+    let mut p = Para::default();
+    for round in 0..2 {
+        for link in 0..20_000u16 {
+            p.push_text(
+                "a",
+                0,
+                TextStyle {
+                    link,
+                    ..style(16.0)
+                },
+            );
+            let expect = if round == 0 {
+                link as usize + 1
+            } else {
+                20_000
+            };
+            assert_eq!(p.styles.len(), expect);
+        }
+    }
+    assert_eq!(p.items.len(), 40_000);
+    assert!(
+        p.items[20_000..]
+            .iter()
+            .enumerate()
+            .all(|(i, it)| it.style as usize == i)
+    );
+    // Styles pushed directly are picked up by the index too.
+    p.styles.push(style(99.0));
+    p.push_text("b", 0, style(99.0));
+    assert_eq!(p.styles.len(), 20_001);
+    assert_eq!(p.items.last().unwrap().style, 20_000);
+}

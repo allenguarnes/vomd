@@ -1,0 +1,10 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"- > [!NOTE]\\n  > n\\n- next\\n\\n- * * *\\n\")"
+---
+P list=1 Bullet |
+Alert(Note) list=1 quote=1 qstart=1 qlists=[1] |
+P list=1 quote=1 qlists=[1] | "n"
+P list=1 Bullet | "next"
+P list=1 Bullet |
+Rule list=1 |

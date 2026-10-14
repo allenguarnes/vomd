@@ -510,8 +510,70 @@ fn uncoverable_characters_are_reported_once() {
     assert!(l.geoms().iter().any(|g| g.missing));
     // A fallback scan finds nothing; remeasuring must not ask for it again.
     l.invalidate_missing(&doc);
-    assert!(l.geoms().iter().all(|g| !g.missing));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     assert!(l.take_missing().is_empty());
-    assert!(l.geoms().iter().all(|g| !g.missing));
+}
+
+#[test]
+fn blocks_measured_during_the_fallback_scan_are_invalidated() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&"a \u{E000} b\n\n".repeat(60));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 100.0);
+    assert_eq!(l.take_missing(), vec!['\u{E000}']);
+    let early = l.geoms().iter().filter(|g| g.measured).count();
+    // The scan is still running: the window grows and more blocks are measured.
+    l.ensure(&doc, &fonts, Anchor::TOP, 1000.0);
+    assert!(l.geoms().iter().filter(|g| g.measured).count() > early);
+    assert!(l.take_missing().is_empty());
+    // The scan finishes: every block laid out without the character is remeasured.
+    l.invalidate_missing(&doc);
+    assert!(l.geoms().iter().all(|g| !g.measured && g.content.is_none()));
+}
+
+#[test]
+fn quote_bars_follow_nesting_order() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("- item\n\n  > quoted\n\n> - item\n>   > deep\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let em = 16.0;
+    let bars = |i: usize| -> Vec<f32> {
+        let c = l.geoms()[i].content.as_ref().unwrap();
+        c.rects
+            .iter()
+            .filter(|r| r.role == Role::QuoteBar)
+            .map(|r| r.x)
+            .collect()
+    };
+    let text_x = |i: usize| {
+        let c = l.geoms()[i].content.as_ref().unwrap();
+        c.glyphs.iter().map(|g| g.x).fold(f32::MAX, f32::min)
+    };
+    // A quote inside a list item: the bar sits inside the list indent, text after the bar.
+    assert_eq!(bars(1), vec![LIST_INDENT * em]);
+    assert!(text_x(1) >= (LIST_INDENT + QUOTE_INDENT) * em - 0.5);
+    // A list inside a quote: the bar is outside, at the margin.
+    assert_eq!(bars(2), vec![0.0]);
+    let (col_x, _) = l.column();
+    let c = l.geoms()[2].content.as_ref().unwrap();
+    let y = l.geoms()[2].y + c.lines[0].baseline - 4.0;
+    let hit = l
+        .hit(col_x + (QUOTE_INDENT + LIST_INDENT) * em + 2.0, y)
+        .unwrap();
+    assert_eq!(hit.doc as usize, doc.text.rfind("item").unwrap());
+    // A quote inside that list: outer bar at the margin, inner one inside the list indent.
+    assert_eq!(bars(3), vec![0.0, (QUOTE_INDENT + LIST_INDENT) * em]);
+}
+
+#[test]
+fn paragraph_with_many_distinct_links_lays_out() {
+    let fonts = Fonts::new().unwrap();
+    let src: String = (0..20_000).map(|i| format!("[a](#{i}) ")).collect();
+    let doc = Doc::parse(&src);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let c = l.geoms()[0].content.as_ref().unwrap();
+    // One style per link, plus the plain style of the spaces between them.
+    assert_eq!(c.styles.len(), 20_001);
 }
