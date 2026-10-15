@@ -26,8 +26,6 @@ use vomd::view::{self, Outcome, Stamp, View, Wake};
 const WINDOW_SIZE: (f64, f64) = (900.0, 1000.0);
 /// Idle layout runs in slices this long between events.
 const IDLE_SLICE: Duration = Duration::from_millis(4);
-/// Ctrl + trackpad scroll zooms one step per this many pixels.
-const ZOOM_PIXELS: f64 = 50.0;
 const EMPTY_MESSAGE: &str = "Drop a Markdown file here";
 
 enum UserEvent {
@@ -80,8 +78,6 @@ struct App {
     stamp: Option<Stamp>,
     mods: ModifiersState,
     cursor: PhysicalPosition<f64>,
-    /// Ctrl + trackpad scroll not yet turned into zoom steps.
-    zoom_pixels: f64,
     shown: bool,
     exit_code: i32,
 }
@@ -312,7 +308,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::DroppedFile(path) => self.open(Input::File(path)),
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.mods = m.state();
+                if !(self.mods.control_key() || self.mods.super_key()) {
+                    view.zoom_wheel_end();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(action) = view::key_action(&event.logical_key, self.mods) {
                     let outcome = view.apply(action, now);
@@ -326,22 +327,13 @@ impl ApplicationHandler<UserEvent> for App {
                         view.wheel_lines(-f64::from(y), now)
                     }
                     (MouseScrollDelta::PixelDelta(p), false) => view.scroll_by(-p.y, now),
-                    (delta, true) => {
-                        self.zoom_pixels += match delta {
-                            MouseScrollDelta::LineDelta(_, y) => f64::from(y) * ZOOM_PIXELS,
+                    (delta, true) => view.zoom_wheel(
+                        match delta {
+                            MouseScrollDelta::LineDelta(_, y) => f64::from(y) * view::ZOOM_PIXELS,
                             MouseScrollDelta::PixelDelta(p) => p.y,
-                        };
-                        while self.zoom_pixels.abs() >= ZOOM_PIXELS {
-                            let up = self.zoom_pixels > 0.0;
-                            self.zoom_pixels -= ZOOM_PIXELS.copysign(self.zoom_pixels);
-                            let action = if up {
-                                view::Action::ZoomIn
-                            } else {
-                                view::Action::ZoomOut
-                            };
-                            view.apply(action, now);
-                        }
-                    }
+                        },
+                        now,
+                    ),
                 }
                 self.redraw();
             }
@@ -433,7 +425,6 @@ fn main() {
         stamp: None,
         mods: ModifiersState::empty(),
         cursor: PhysicalPosition::new(0.0, 0.0),
-        zoom_pixels: 0.0,
         shown: false,
         exit_code: 0,
     };

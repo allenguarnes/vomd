@@ -674,4 +674,241 @@ mod with_fonts {
         v.replace(Doc::parse("tiny"), None);
         assert_eq!(v.anchor().block, 0);
     }
+
+    /// A changelog of versions `top` down to 1, each with the same two headings.
+    fn changelog(top: u32) -> String {
+        let mut s = String::from("# Changelog\n\n");
+        for n in (1..=top).rev() {
+            s += &format!(
+                "## {n}.0.0\n\n### Added\n\nAdded thing {n}.1\n\nAdded thing {n}.2\n\n\
+                 ### Fixed\n\nFixed thing {n}.1\n\n"
+            );
+        }
+        s
+    }
+
+    fn block_text(v: &View, block: u32) -> String {
+        let doc = v.doc();
+        let spans = doc.block_spans(&doc.blocks[block as usize]);
+        spans.iter().map(|s| doc.span_text(s)).collect()
+    }
+
+    /// Scroll to the block with exactly `text`, `dy` pixels into it.
+    fn read_at(v: &mut View, text: &str, dy: f64) -> Anchor {
+        let block = (0..v.doc().blocks.len() as u32)
+            .find(|&b| block_text(v, b) == text)
+            .unwrap();
+        v.set_scroll(v.layout().top(block as usize) + dy);
+        assert_eq!(v.anchor().block, block);
+        v.anchor()
+    }
+
+    /// Repeated headings get numbered slugs, so a heading added above shifts every number below
+    /// it: the position follows the headings' texts instead.
+    #[test]
+    fn reload_with_a_repeated_heading_added_above() {
+        let src = changelog(8);
+        let mut v = view(&src, 600, 100);
+        settle(&mut v);
+        for text in ["Added thing 5.1", "Added thing 5.2", "Fixed thing 5.1"] {
+            let before = read_at(&mut v, text, 3.0);
+            v.replace(Doc::parse(&changelog(9)), None);
+            assert_eq!(block_text(&v, v.anchor().block), text);
+            assert_eq!(v.anchor().frac, before.frac);
+            assert!(v.anchor().block > before.block);
+            // The same text again: the same anchor, and still through the next reload.
+            v.replace(Doc::parse(&changelog(9)), None);
+            assert_eq!(block_text(&v, v.anchor().block), text);
+            v.replace(Doc::parse(&src), None);
+            assert_eq!(v.anchor(), before, "back to the original");
+        }
+    }
+
+    /// Headings with the same path (same text, same parents): by ordinal while there are as
+    /// many as before, else the one nearest the old block.
+    #[test]
+    fn reload_among_identical_headings() {
+        let sec = |n: u32| format!("### Example\n\nbody {n}\n\nmore {n}\n\n");
+        let end = format!("# End\n\n{}", paras(30));
+        let src = format!("# A\n\n{}{}{}{end}", sec(1), sec(2), sec(3));
+        let mut v = view(&src, 600, 100);
+        settle(&mut v);
+        let before = read_at(&mut v, "more 2", 2.0);
+        v.replace(Doc::parse(&src), None);
+        assert_eq!(v.anchor(), before, "identical");
+        // A paragraph added to the first: same count, so the second still.
+        let edited = src.replace("body 1", "body 1\n\nextra");
+        v.replace(Doc::parse(&edited), None);
+        assert_eq!(block_text(&v, v.anchor().block), "more 2");
+        // One more at the end: different count, so the nearest to where it was.
+        let four = format!("# A\n\n{}{}{}{}{end}", sec(1), sec(2), sec(3), sec(4));
+        v.replace(Doc::parse(&four), None);
+        assert_eq!(block_text(&v, v.anchor().block), "more 2");
+        read_at(&mut v, "more 4", 0.0);
+        v.replace(Doc::parse(&src), None);
+        assert_eq!(
+            block_text(&v, v.anchor().block),
+            "more 3",
+            "the fourth is gone"
+        );
+    }
+
+    /// The path gone from the new text: the slug if it is still there, else the block.
+    #[test]
+    fn reload_falls_back_from_the_path_to_the_slug_to_the_block() {
+        let src = changelog(8);
+        let mut v = view(&src, 600, 100);
+        settle(&mut v);
+        let intro = |s: &str| s.replace("# Changelog\n\n", "# Changelog\n\nIntro.\n\n");
+        // A parent renamed (and a paragraph added above): the slug still finds the heading.
+        let before = read_at(&mut v, "Added thing 5.1", 3.0);
+        let edited = intro(&src.replace("## 5.0.0", "## 5.0.0 (yanked)"));
+        v.replace(Doc::parse(&edited), None);
+        assert_eq!(block_text(&v, v.anchor().block), "Added thing 5.1");
+        assert_eq!(v.anchor().block, before.block + 1, "an extra block above");
+        // The last "Added" renamed: no path, and its slug (added-7) is gone too, so the block.
+        v.replace(Doc::parse(&src), None);
+        let before = read_at(&mut v, "Added thing 1.2", 5.0);
+        let edited = intro(&src.replace("## 1.0.0\n\n### Added", "## 1.0.0\n\n### Additions"));
+        v.replace(Doc::parse(&edited), None);
+        assert_eq!(v.anchor(), before, "the same block index, and fraction");
+    }
+
+    /// A reload that fails (the file briefly missing) doesn't lose the position.
+    #[test]
+    fn reload_keeps_the_position_through_errors() {
+        let body = mixed(40);
+        let src = format!("# Intro\n\nshort\n\n## Target\n\n{body}");
+        let mut v = view(&src, 600, 400);
+        settle(&mut v);
+        let target = v.doc().headings[1].block;
+        v.set_scroll(v.layout().top((target + 20) as usize) + 5.0);
+        let before = v.anchor();
+        let gone = || (Doc::default(), Some("Cannot open x".to_string()));
+        let (doc, msg) = gone();
+        v.replace(doc, msg);
+        assert_eq!(v.anchor(), Anchor::TOP);
+        v.replace(Doc::parse(&src), None);
+        assert_eq!(v.message(), None);
+        assert_eq!(v.anchor(), before, "error, then the same file");
+        // Twice in a row, and the file back with an edit above: it follows the heading.
+        for _ in 0..2 {
+            let (doc, msg) = gone();
+            v.replace(doc, msg);
+            assert_eq!(v.anchor(), Anchor::TOP);
+        }
+        let edited = format!("# Intro\n\nshort\n\nmore\n\n## Target\n\n{body}");
+        v.replace(Doc::parse(&edited), None);
+        assert_eq!(
+            v.anchor(),
+            Anchor {
+                block: before.block + 1,
+                frac: before.frac
+            }
+        );
+        // Without headings: the block.
+        let plain = paras(100);
+        v.open(Doc::parse(&plain), None);
+        v.set_scroll(v.layout().top(60));
+        let (doc, msg) = gone();
+        v.replace(doc, msg);
+        v.replace(Doc::parse(&plain), None);
+        assert_eq!(v.anchor().block, 60);
+    }
+
+    /// A different document starts at the top whatever was kept, and a successful reload
+    /// forgets it.
+    #[test]
+    fn open_after_an_error_starts_at_the_top() {
+        let src = format!("# One\n\n{}", mixed(30));
+        let mut v = view(&src, 600, 400);
+        settle(&mut v);
+        v.set_scroll(v.layout().top(20));
+        v.replace(Doc::default(), Some("Cannot open x".into()));
+        v.open(Doc::parse(&src), None);
+        assert_eq!(v.anchor(), Anchor::TOP);
+        // The kept position doesn't come back after a document was opened in between.
+        v.replace(Doc::default(), Some("Cannot open x".into()));
+        v.open(Doc::default(), Some("Cannot open y".into()));
+        v.replace(Doc::parse(&src), None);
+        assert_eq!(v.anchor(), Anchor::TOP);
+        // And a reload that worked leaves nothing behind for the next error to restore.
+        v.set_scroll(v.layout().top(10));
+        let at = v.anchor();
+        v.replace(Doc::parse(&src), None);
+        v.replace(Doc::default(), Some("gone".into()));
+        v.open(Doc::parse(&src), None);
+        v.set_scroll(v.layout().top(5));
+        v.replace(Doc::parse(&src), None);
+        assert_ne!(v.anchor(), at);
+        assert_eq!(v.anchor().block, 5);
+    }
+
+    /// What is left of a zoom step when Ctrl is released doesn't carry into the next gesture.
+    #[test]
+    fn zoom_wheel_leftovers_are_dropped_with_the_modifier() {
+        let now = Instant::now();
+        let mut v = view(&paras(10), 600, 400);
+        v.zoom_wheel(ZOOM_PIXELS * 0.6, now);
+        assert_eq!(v.zoom(), 100);
+        v.zoom_wheel(ZOOM_PIXELS * 0.6, now);
+        assert_eq!(v.zoom(), 110, "one step from 1.2, with 0.2 left over");
+        v.zoom_wheel_end();
+        v.zoom_wheel(ZOOM_PIXELS * 0.9, now);
+        assert_eq!(v.zoom(), 110, "the 0.2 is gone");
+        v.zoom_wheel(-ZOOM_PIXELS * 2.5, now);
+        assert_eq!(v.zoom(), 100, "a step down from -1.6, with -0.6 left over");
+        v.zoom_wheel(-ZOOM_PIXELS * 0.5, now);
+        assert_eq!(v.zoom(), 90);
+    }
+
+    /// A scrollbar on screen follows the total height as idle layout measures; a hidden one
+    /// costs no repaint.
+    #[test]
+    fn tick_repaints_a_visible_thumb_that_measuring_moved() {
+        let t0 = Instant::now();
+        let slice = || Some(Instant::now() + Duration::from_micros(300));
+        let mut v = view(&mixed(1200), 600, 400);
+        // Deep in the document, where the thumb's position follows the total.
+        v.set_scroll(v.layout().top(600));
+        v.apply(Action::Lines(1), t0);
+        let mut moved = 0;
+        while !v.layout().complete() {
+            let before = v.thumb_at(v.scroll());
+            let tick = v.tick(t0, slice());
+            let after = v.thumb_at(v.scroll());
+            assert_eq!(tick.redraw, before != after);
+            moved += usize::from(before != after);
+        }
+        assert!(moved > 0, "the estimates were off, so the thumb moved");
+        // Hidden: measuring repaints nothing.
+        let mut v = view(&mixed(1200), 600, 400);
+        // Deep in the document, where the thumb's position follows the total.
+        v.set_scroll(v.layout().top(600));
+        v.apply(Action::Lines(1), t0);
+        let due = v.deadline().unwrap();
+        assert!(v.tick(due, slice()).redraw, "hides");
+        let mut moved = 0;
+        while !v.layout().complete() {
+            let before = v.thumb_at(v.scroll());
+            assert!(!v.tick(due, slice()).redraw);
+            moved += usize::from(before != v.thumb_at(v.scroll()));
+        }
+        assert!(moved > 0, "it did move, unseen");
+        // Dragging keeps it showing.
+        let mut v = view(&mixed(1200), 600, 400);
+        // Deep in the document, where the thumb's position follows the total.
+        v.set_scroll(v.layout().top(600));
+        let t = v.thumb_at(v.scroll()).unwrap();
+        assert!(v.press(f64::from(t.x0), f64::from(t.y0 + 1), t0));
+        let due = t0 + Duration::from_secs(60);
+        let mut moved = 0;
+        while !v.layout().complete() {
+            let before = v.thumb_at(v.scroll());
+            let tick = v.tick(due, slice());
+            assert_eq!(tick.redraw, before != v.thumb_at(v.scroll()));
+            moved += usize::from(tick.redraw);
+        }
+        assert!(moved > 0);
+    }
 }

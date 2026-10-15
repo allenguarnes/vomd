@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::cli::Input;
-use crate::doc::Doc;
+use crate::doc::{Doc, Heading};
 use crate::fonts::Fonts;
 use crate::layout::{Anchor, BlockBox, Layout, Params};
 use crate::render::{self, Clip, Frame, ScrollbarFade, Viewport};
@@ -28,6 +28,8 @@ pub const ZOOM_MAX: u16 = 300;
 pub const ZOOM_STEP: u16 = 10;
 /// Space above and below the document, in em (GitHub pads its pages about this much).
 const PAGE_PAD: f32 = 2.0;
+/// Ctrl + trackpad scroll zooms one step per this many pixels.
+pub const ZOOM_PIXELS: f64 = 50.0;
 /// Lines scrolled per wheel notch.
 const WHEEL_LINES: f64 = 3.0;
 /// Passes [`View::bottom`] makes: measuring the last screen changes the total height.
@@ -226,6 +228,12 @@ pub struct View {
     /// Characters already handed to a fallback scan, over all documents shown (the
     /// system fonts are scanned once per character, not once per reload).
     tried: HashSet<char>,
+    /// Ctrl + trackpad scroll not yet turned into zoom steps.
+    zoom_pixels: f64,
+    /// While a message replaces a reloaded document: the reading position of the last good
+    /// one, for the next successful reload (a file that is briefly missing, as editors and
+    /// branch switches make it, doesn't cost the position).
+    kept: Option<(Option<Place>, Anchor)>,
 }
 
 impl View {
@@ -257,6 +265,8 @@ impl View {
             fade: ScrollbarFade::default(),
             drag: None,
             tried: HashSet::new(),
+            zoom_pixels: 0.0,
+            kept: None,
         }
     }
 
@@ -399,6 +409,22 @@ impl View {
     /// Wheel notches (line deltas, positive = down).
     pub fn wheel_lines(&mut self, lines: f64, now: Instant) {
         self.scroll_by(lines * WHEEL_LINES * self.line(), now);
+    }
+
+    /// Ctrl + trackpad scroll by `pixels` (positive = zoom in): a zoom step for every
+    /// [`ZOOM_PIXELS`] gathered, the rest kept for the next event of the gesture.
+    pub fn zoom_wheel(&mut self, pixels: f64, now: Instant) {
+        self.zoom_pixels += pixels;
+        while self.zoom_pixels.abs() >= ZOOM_PIXELS {
+            let up = self.zoom_pixels > 0.0;
+            self.zoom_pixels -= ZOOM_PIXELS.copysign(self.zoom_pixels);
+            self.apply(if up { Action::ZoomIn } else { Action::ZoomOut }, now);
+        }
+    }
+
+    /// The zoom modifier was released: what is left of a step doesn't carry into a later gesture.
+    pub fn zoom_wheel_end(&mut self) {
+        self.zoom_pixels = 0.0;
     }
 
     /// Jump to the end: measuring the last screen changes the total, so settle in a few passes.
@@ -607,10 +633,14 @@ impl View {
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its
     /// time is up (whatever woke the loop, and however busy measuring keeps it), then measure
-    /// until `measure_until` (`None`: not yet), and say when to run again.
+    /// until `measure_until` (`None`: not yet), and say when to run again. A scrollbar on
+    /// screen is repainted when measuring moves its thumb.
     pub fn tick(&mut self, now: Instant, measure_until: Option<Instant>) -> Tick {
-        let redraw = self.expire(now);
+        let mut redraw = self.expire(now);
+        let showing = self.message.is_none() && (self.drag.is_some() || self.fade.visible(now));
+        let thumb = showing.then(|| self.thumb_at(self.scroll()));
         let measured = measure_until.is_none_or(|t| self.idle(t));
+        redraw |= thumb.is_some_and(|before| before != self.thumb_at(self.scroll()));
         // No timers when there's nothing to do.
         let wake = match (measured, self.deadline()) {
             (false, _) => Wake::Poll,
@@ -659,24 +689,33 @@ impl View {
         self.layout = Layout::new(&self.doc, params(self.width, self.hidpi, self.zoom));
         self.anchor = Anchor::TOP;
         self.drag = None;
+        self.kept = None;
     }
 
     /// Show a new version of the document (reload) or a message in its place. The position
-    /// follows the nearest heading at or above it, so edits above it don't move the text being
-    /// read; without one (or if the heading is gone) it keeps the block index.
+    /// follows the nearest heading at or above it (found by its path of heading texts, then
+    /// its slug), so edits above it don't move the text being read; without one
+    /// (or if the heading is gone) it keeps the block index. A message keeps the position of
+    /// the document it replaced for the next one.
     pub fn replace(&mut self, doc: Doc, message: Option<String>) {
-        let place = self.place();
-        let old = self.anchor;
+        let (place, old) = self
+            .kept
+            .take()
+            .unwrap_or_else(|| (self.place(), self.anchor));
         self.doc = doc;
         self.message = message;
         self.layout = Layout::new(&self.doc, params(self.width, self.hidpi, self.zoom));
         self.anchor = Anchor::TOP;
+        if self.message.is_some() {
+            self.kept = Some((place, old));
+            return;
+        }
         let n = self.doc.blocks.len();
         if n == 0 {
             return;
         }
         let found = place.and_then(|p| {
-            let h = self.doc.headings.iter().find(|h| h.slug == p.slug)?;
+            let h = self.locate(&p)?;
             // The same block offset below the heading, not the same pixels: the blocks in
             // between are only estimates until measured, so a pixel offset lands elsewhere
             // even when nothing changed. A section that got shorter clamps to its last block.
@@ -700,25 +739,78 @@ impl View {
             return None;
         }
         let at = self.anchor.block;
-        let h = self
+        let (i, h) = self
             .doc
             .headings
             .iter()
-            .filter(|h| h.block <= at)
-            .max_by_key(|h| h.block)?;
+            .enumerate()
+            .filter(|(_, h)| h.block <= at)
+            .max_by_key(|(_, h)| h.block)?;
+        let paths = heading_paths(&self.doc);
+        let ordinal = paths[..i].iter().filter(|p| **p == paths[i]).count();
+        let of = ordinal + paths[i..].iter().filter(|p| **p == paths[i]).count();
         Some(Place {
+            path: paths[i].clone(),
             slug: h.slug.clone(),
+            ordinal,
+            of,
+            block: h.block,
             offset: at - h.block,
             frac: self.anchor.frac,
         })
     }
+
+    /// The heading of the new document that `p` was at or below: the one with the same path;
+    /// among several with it, the same ordinal if there are as many as before, else the
+    /// nearest to the old block. Failing that, the same slug.
+    fn locate(&self, p: &Place) -> Option<&Heading> {
+        let paths = heading_paths(&self.doc);
+        let same: Vec<&Heading> = self
+            .doc
+            .headings
+            .iter()
+            .zip(&paths)
+            .filter(|(_, path)| **path == p.path)
+            .map(|(h, _)| h)
+            .collect();
+        let by_path = if same.len() == p.of {
+            same.get(p.ordinal).copied()
+        } else {
+            same.into_iter().min_by_key(|h| h.block.abs_diff(p.block))
+        };
+        by_path.or_else(|| self.doc.headings.iter().find(|h| h.slug == p.slug))
+    }
 }
 
-/// The reading position as a heading (by slug), blocks below it, and a fraction of that block.
+/// The reading position as a heading, blocks below it, and a fraction of that block.
 struct Place {
+    /// The texts of the heading and of its ancestors, outermost first.
+    path: Vec<String>,
     slug: String,
+    /// Which of the `of` headings with this path it is.
+    ordinal: usize,
+    of: usize,
+    /// The heading's block in the document it was taken from.
+    block: u32,
     offset: u32,
     frac: f32,
+}
+
+/// For each heading, the texts of it and of its ancestors (the nearest preceding heading of
+/// each lower level), outermost first. A heading split into chunks is its first chunk's text.
+fn heading_paths(doc: &Doc) -> Vec<Vec<String>> {
+    let mut stack: Vec<(u8, String)> = Vec::new();
+    doc.headings
+        .iter()
+        .map(|h| {
+            while stack.last().is_some_and(|(level, _)| *level >= h.level) {
+                stack.pop();
+            }
+            let spans = doc.block_spans(&doc.blocks[h.block as usize]);
+            stack.push((h.level, spans.iter().map(|s| doc.span_text(s)).collect()));
+            stack.iter().map(|(_, text)| text.clone()).collect()
+        })
+        .collect()
 }
 
 /// The block after the section that starts at heading block `from`: the next heading's, or the
