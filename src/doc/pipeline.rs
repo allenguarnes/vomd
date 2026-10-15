@@ -67,8 +67,10 @@ impl Config {
 struct Gate {
     /// The next segment to hand out.
     next: usize,
-    /// Segments that have had their turn.
+    /// Segments that have had their turn (a turn that broke counts).
     done: usize,
+    /// Whether some turn broke: the run failed, even if every segment has had its turn.
+    broke: bool,
     stop: bool,
     /// The most segments in flight.
     peak: usize,
@@ -168,7 +170,8 @@ impl<S> Turn<'_, S> {
         let flow = f(&mut relock(&shared.state));
         let mut gate = relock(&shared.gate);
         gate.done += 1;
-        gate.stop |= flow.is_break();
+        gate.broke |= flow.is_break();
+        gate.stop |= gate.broke;
         drop(gate);
         shared.wake.notify_all();
     }
@@ -189,6 +192,7 @@ pub(super) fn ordered<S: Send>(
         gate: Mutex::new(Gate {
             next: 0,
             done: 0,
+            broke: false,
             stop: false,
             peak: 0,
             panic: None,
@@ -210,7 +214,8 @@ pub(super) fn ordered<S: Send>(
     }
     #[cfg(test)]
     config.peak.fetch_max(gate.peak, Ordering::Relaxed);
-    let completed = gate.done == total;
+    // A break in the last segment still counts as its turn, so `done == total` isn't enough.
+    let completed = gate.done == total && !gate.broke;
     drop(gate);
     let state = shared
         .state
@@ -333,6 +338,34 @@ mod tests {
                 taken
             });
             assert_eq!(taken, [0, 1, 2, 3], "{workers} × {window}");
+        }
+    }
+
+    #[test]
+    fn a_break_in_any_turn_fails_the_run_even_the_last() {
+        const TOTAL: usize = 12;
+        for workers in [0, 1, 3] {
+            for window in [1, 2, 5] {
+                for bad in [0, 6, TOTAL - 1] {
+                    let (taken, done) = within(move || {
+                        let config = Config::new(workers, window);
+                        ordered(TOTAL, &config, Vec::new(), |n, turn| {
+                            pause((n as u64 * 31 % 7) * 100);
+                            turn.take(|taken| {
+                                taken.push(n);
+                                if n == bad {
+                                    ControlFlow::Break(())
+                                } else {
+                                    ControlFlow::Continue(())
+                                }
+                            });
+                        })
+                    });
+                    let name = format!("{workers} × {window}, break at {bad}");
+                    assert!(!done, "{name}");
+                    assert_eq!(taken, (0..=bad).collect::<Vec<_>>(), "{name}");
+                }
+            }
         }
     }
 

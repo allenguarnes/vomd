@@ -3035,3 +3035,28 @@ fn a_late_fallback_with_threads_ahead_gives_the_single_parser_result() {
     assert!(Doc::parse_segments(&src, SEGMENT_BYTES).is_none());
     assert!(Doc::parse(&src) == Doc::parse_whole(&src));
 }
+
+#[test]
+fn a_fallback_in_the_last_segment_gives_the_single_parser_result() {
+    let url = format!("/{}", "u".repeat(1000));
+    // The references that spend too much come last: the segment that finds out is the final one,
+    // so every segment has had its turn when the builder gives up.
+    let uses = "[x] ".repeat(300);
+    let src = format!("[x]: {url}\n\n{}{uses}\n", filler(4000));
+    assert!(segment_count(&src, 400) > 300);
+    let whole = Doc::parse_whole(&src);
+    assert!(whole.links.len() >= 100, "one parser resolves them");
+    for config in pipelines() {
+        let (workers, window) = (config.workers, config.window);
+        assert!(
+            Doc::parse_segments_with(&src, 400, &config).is_none(),
+            "{workers} workers, window {window}"
+        );
+    }
+    // The same through `Doc::parse` for a document big enough to be segmented by itself.
+    let src = format!("[x]: {url}\n\n{}{uses}\n", filler(25_000));
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    assert!(Doc::parse_segments(&src, SEGMENT_BYTES).is_none());
+    assert!(Doc::parse(&src) == Doc::parse_whole(&src));
+    assert_eq!(Doc::parse(&src).links.len(), 300);
+}
