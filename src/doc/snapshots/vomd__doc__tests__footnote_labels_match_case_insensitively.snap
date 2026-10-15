@@ -1,0 +1,11 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"Ref[^A]\\n\\n[^a]: note\\n\")"
+---
+P | "Ref" [LF1]"1"
+Rule |
+P Footnote(1) | "note" [L2]" ↩"
+link 1: #fn-A
+link 2: #fnref-A
+anchor #fnref-A -> 0
+anchor #fn-A -> 2

@@ -8,8 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use pulldown_cmark::{
-    Alignment, BlockQuoteKind, BrokenLink, CowStr, Event, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, BrokenLink, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
 };
+use unicase::UniCase;
 
 mod segment;
 
@@ -123,6 +124,8 @@ const SEGMENT_THRESHOLD: usize = 1 << 20;
 /// Target segment size: pulldown-cmark builds a tree for a whole segment before emitting events,
 /// so this bounds its peak memory.
 const SEGMENT_BYTES: usize = 128 * 1024;
+/// What pulldown-cmark lets a parser spend on copying link definitions into links, at least.
+const MIN_EXPANSION: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -202,67 +205,56 @@ impl Doc {
     /// Parse in segments of about `budget` bytes, all feeding one builder, or `None` when the
     /// text can't be split safely (see [`segment`]). Each segment's parser is dropped before the
     /// next one starts, so the parser's tree is never larger than a segment.
+    ///
+    /// Link reference definitions and footnote definitions may lie in another segment than their
+    /// use, so a first pass parses every segment that could hold one (see
+    /// [`segment::Plan::definitions`]) and the second pass gives each segment's parser what it
+    /// found: the link definitions through the broken-link callback, the footnote definitions as
+    /// stubs in front of the segment's text.
     fn parse_segments(src: &str, budget: usize) -> Option<Doc> {
         let plan = segment::plan(src, budget)?;
         let opts = options();
-        // Link reference definitions anywhere in the text, for segments that use them
-        // (CommonMark allows a definition after its use). Pulldown-cmark collects them
-        // while building the tree.
-        let defs = Parser::new_ext(&plan.definitions, opts);
-        let defs = defs.reference_definitions().clone();
-        let has_defs = defs.iter().next().is_some();
+        let defs = plan.definitions(src, opts)?;
         let mut b = Builder::new(src.len());
+        let mut spent = 0usize;
         for (n, seg) in plan.segments.iter().enumerate() {
-            let stubs = plan.footnote_stubs(src, seg);
-            let body = &src[seg.range.clone()];
-            let text = if seg.head.is_none() && stubs.is_empty() {
-                std::borrow::Cow::Borrowed(body)
-            } else {
-                // A table continuation starts with the table's header and delimiter rows, so
-                // pulldown-cmark still sees a table. Footnote definitions that live in other
-                // segments are declared first (after front matter, which must stay first), so
-                // references to them parse as footnote references; the builder drops those
-                // declarations.
-                let head = seg.head.clone().map_or("", |h| &src[h]);
-                let (front, body) = body.split_at(if n == 0 { plan.front_matter_end } else { 0 });
-                let mut text = String::with_capacity(head.len() + body.len() + 16 * stubs.len());
-                text.push_str(front);
-                for label in &stubs {
-                    text.push_str(&format!("[^{label}]: x\n"));
-                }
-                if !stubs.is_empty() {
-                    // A reference definition ends the last stub (indented text after it would
-                    // continue it), and defines nothing anyone refers to.
-                    text.push_str("\n[\u{1}]: x\n\n");
-                }
-                text.push_str(head);
-                text.push_str(body);
-                std::borrow::Cow::Owned(text)
-            };
+            let stubs = defs.footnote_stubs(&src[seg.range.clone()]);
+            let text = plan.text(src, n, &stubs);
             b.begin_segment(stubs.len(), seg.head.is_some());
-            let defs = &defs;
+            let links = &defs.links;
             let resolve = move |link: BrokenLink<'_>| {
-                let def = defs.get(&link.reference)?;
-                let title = def.title.as_deref().unwrap_or("");
-                Some((
-                    CowStr::from(def.dest.to_string()),
-                    CowStr::from(title.to_owned()),
-                ))
+                let (dest, title) = links.get(&UniCase::new(link.reference.into_string()))?;
+                Some((CowStr::from(dest.clone()), CowStr::from(title.clone())))
             };
             // Without definitions there is nothing to look up (and no callback to make).
-            let resolve = has_defs.then_some(resolve);
+            let resolve = (!links.is_empty()).then_some(resolve);
             let parser = Parser::new_with_broken_link_callback(&text, opts, resolve);
-            // A segment's own definition of a label shadows the first one in the text, which
-            // lies in an earlier segment, when the two differ. One parser would use the first.
-            let clash = parser.reference_definitions().iter().any(|(label, local)| {
-                defs.get(label)
-                    .is_some_and(|d| d.dest != local.dest || d.title != local.title)
-            });
-            if clash {
+            let mut open = 0i64;
+            let mut expanded = 0usize;
+            for event in parser {
+                match &event {
+                    Event::Start(tag) => {
+                        open += 1;
+                        expanded += expansion(tag);
+                    }
+                    Event::End(_) => open -= 1,
+                    _ => {}
+                }
+                b.event(event);
+            }
+            // pulldown-cmark ends its events early on some malformed input (a link definition
+            // in a list item followed by a line of whitespace, say), losing the rest of the
+            // text. Whatever one parser makes of that, segments can't repeat it. (Nor if a stub
+            // didn't come out as a definition.)
+            if open != 0 || b.footnotes.stubs != 0 {
                 return None;
             }
-            for event in parser {
-                b.event(event);
+            // A parser stops resolving references once their destinations and titles add up to
+            // its text's length (at least 100 KB). A segment's parser has less to spend than the
+            // one for the whole text, so spending that much makes them differ.
+            spent += expanded;
+            if expanded >= text.len().max(MIN_EXPANSION) || spent >= src.len().max(MIN_EXPANSION) {
+                return None;
             }
         }
         Some(b.finish())
@@ -310,15 +302,22 @@ struct Open {
 
 #[derive(Default)]
 struct Footnotes {
-    numbers: HashMap<String, u32>,
-    /// Labels by number (index = number - 1).
+    /// Number of each label that a reference mentioned, keyed the way pulldown-cmark matches
+    /// labels (Unicode case folding), so `[^A]` and `[^a]` are one note.
+    numbers: HashMap<UniCase<String>, u32>,
+    /// Labels by number (index = number - 1), as first spelled: by the first reference, or by
+    /// the definition for a note nothing refers to (numbered last, see `finish`).
     labels: Vec<String>,
     /// Definition blocks, appended after the main flow at the end.
     blocks: Vec<Block>,
-    /// One per definition: (number, label, first index into `blocks`).
-    defs: Vec<(u32, String, usize)>,
-    /// Labels whose first reference already has a `fnref-` anchor.
-    referenced: HashSet<String>,
+    /// The definitions kept, in document order: the first definition of a label wins.
+    defs: Vec<FootnoteDef>,
+    defined: HashSet<UniCase<String>>,
+    /// Definitions open inside the open one (in a quote or list item of it), whose events are
+    /// left alone: their text stays in the outer note.
+    nested: usize,
+    /// Those definitions' labels, with the anchor that points at their text.
+    nested_defs: Vec<(usize, String)>,
     /// `fnref-` anchors of the open block, as (index into `Doc::anchors`, text offset of the
     /// reference): they get the block holding the reference once the block is split.
     pending: Vec<(usize, u32)>,
@@ -332,10 +331,26 @@ struct Footnotes {
     /// `finish`, after every heading, so a heading's slug is never taken from it.
     ref_anchors: Vec<(usize, u32)>,
     ref_links: Vec<(usize, u32)>,
-    back_links: Vec<(usize, u32)>,
     /// Footnote definitions the segment declares in front of its text to stand for definitions
     /// in other segments: their events are dropped (see `Doc::parse_segments`).
     stubs: usize,
+}
+
+/// A footnote definition, whose blocks are `Footnotes::blocks[first..]` up to the next one.
+struct FootnoteDef {
+    label: String,
+    first: usize,
+    /// The "↩" back-link at its end, which `finish` keeps only if something refers to the note.
+    back: Option<BackLink>,
+}
+
+struct BackLink {
+    /// The link span; its link id is allocated in `finish`.
+    span: usize,
+    /// The block holding it.
+    block: usize,
+    /// The block is a paragraph of its own, else the span ends a paragraph or heading of the note.
+    own: bool,
 }
 
 /// Open image: its id, the alt text collected so far, and how many images are open inside it
@@ -372,8 +387,9 @@ struct Builder {
     continue_table: bool,
     /// Skipping the repeated header rows of a continued table.
     skip_head: bool,
-    /// Skipping a footnote definition that only declares a label.
-    skip_def: bool,
+    /// Skipping a footnote definition (a stub, or a repeat of a label): how many definitions
+    /// are open inside it, itself included.
+    skip_def: usize,
     footnotes: Footnotes,
     /// Every heading slug handed out so far.
     slugs: HashSet<String>,
@@ -407,7 +423,7 @@ impl Builder {
             row: None,
             continue_table: false,
             skip_head: false,
-            skip_def: false,
+            skip_def: 0,
             footnotes: Footnotes::default(),
             slugs: HashSet::new(),
             slug_suffix: HashMap::new(),
@@ -428,8 +444,12 @@ impl Builder {
             self.skip_head = !matches!(event, Event::End(TagEnd::TableHead));
             return;
         }
-        if self.skip_def {
-            self.skip_def = !matches!(event, Event::End(TagEnd::FootnoteDefinition));
+        if self.skip_def > 0 {
+            match event {
+                Event::Start(Tag::FootnoteDefinition(_)) => self.skip_def += 1,
+                Event::End(TagEnd::FootnoteDefinition) => self.skip_def -= 1,
+                _ => {}
+            }
             return;
         }
         if self.metadata {
@@ -535,18 +555,44 @@ impl Builder {
                 };
             }
             Tag::FootnoteDefinition(label) => {
+                // A stub stands for a definition elsewhere; of several definitions of a label the
+                // first counts (as on GitHub), the others are dropped.
                 if self.footnotes.stubs > 0 {
                     self.footnotes.stubs -= 1;
-                    self.skip_def = true;
+                    self.skip_def = 1;
+                    return;
+                }
+                if !self
+                    .footnotes
+                    .defined
+                    .insert(UniCase::new(label.to_string()))
+                {
+                    self.skip_def = 1;
+                    return;
+                }
+                if self.footnotes.active {
+                    // A note inside another one stays part of it: there is one section entry
+                    // per outermost note. The label names the spot, so references to it work.
+                    self.footnotes.nested += 1;
+                    let anchor = self.doc.anchors.len();
+                    self.doc.anchors.push((String::new(), 0));
+                    let offset = self.doc.text.len() as u32;
+                    self.footnotes.pending.push((anchor, offset));
+                    self.footnotes
+                        .nested_defs
+                        .push((anchor, label.into_string()));
                     return;
                 }
                 self.close();
-                let n = self.footnote_number(&label);
                 self.footnotes.active = true;
                 self.footnotes.quote_start = std::mem::take(&mut self.quote_start);
-                let at = self.footnotes.blocks.len();
-                self.footnotes.defs.push((n, label.into_string(), at));
-                self.marker = Marker::Footnote(n);
+                self.footnotes.defs.push(FootnoteDef {
+                    label: label.into_string(),
+                    first: self.footnotes.blocks.len(),
+                    back: None,
+                });
+                // The number is only known once every reference has been seen (`finish`).
+                self.marker = Marker::Footnote(0);
             }
             Tag::Table(_) if std::mem::take(&mut self.continue_table) => self.skip_head = true,
             Tag::Table(aligns) => {
@@ -622,6 +668,7 @@ impl Builder {
                 self.marker = Marker::None;
                 self.lists.pop();
             }
+            TagEnd::FootnoteDefinition if self.footnotes.nested > 0 => self.footnotes.nested -= 1,
             TagEnd::FootnoteDefinition => {
                 self.close();
                 self.flush_marker();
@@ -1014,23 +1061,24 @@ impl Builder {
         self.text(&alt, style::IMAGE, id);
     }
 
-    /// Footnotes are numbered in order of first mention, reference or definition.
-    fn footnote_number(&mut self, label: &str) -> u32 {
-        if let Some(&n) = self.footnotes.numbers.get(label) {
-            return n;
+    /// Footnotes are numbered in order of first reference, whether it is in the text or inside
+    /// another note. Returns the number and whether this is the first reference.
+    fn footnote_number(&mut self, label: &str) -> (u32, bool) {
+        let key = UniCase::new(label.to_owned());
+        if let Some(&n) = self.footnotes.numbers.get(&key) {
+            return (n, false);
         }
-        let n = self.footnotes.numbers.len() as u32 + 1;
-        self.footnotes.numbers.insert(label.to_owned(), n);
+        let n = self.footnotes.labels.len() as u32 + 1;
+        self.footnotes.numbers.insert(key, n);
         self.footnotes.labels.push(label.to_owned());
-        n
+        (n, true)
     }
 
     /// The first reference to a label (in the main text or inside a definition) gets a
     /// `fnref-` anchor, which the definition's back-link points at. Link and anchor ids are
     /// filled in by `finish`.
     fn footnote_ref(&mut self, label: &str) {
-        let n = self.footnote_number(label);
-        let first = self.footnotes.referenced.insert(label.to_owned());
+        let (n, first) = self.footnote_number(label);
         let offset = self.doc.text.len() as u32;
         let link = push_id(&mut self.doc.links, String::new());
         self.footnotes.ref_links.push((link as usize - 1, n));
@@ -1048,24 +1096,23 @@ impl Builder {
 
     /// End a footnote definition with a "↩" link back to the reference: appended to the
     /// definition's last block when that is a paragraph (or heading), else a paragraph of its
-    /// own (a table row, code block or rule has no paragraph text to hold it).
+    /// own (a table row, code block or rule has no paragraph text to hold it). Whether anything
+    /// refers to the note isn't known yet, so `finish` takes the link out again if not.
     fn footnote_backlink(&mut self) {
-        let Some(&(n, _, first)) = self.footnotes.defs.last() else {
+        let Some(first) = self.footnotes.defs.last().map(|d| d.first) else {
             return;
         };
-        let link = push_id(&mut self.doc.links, String::new());
-        self.footnotes.back_links.push((link as usize - 1, n));
         let spans_end = self.doc.spans.len();
         let last = self.footnotes.blocks[first..].last_mut();
-        let text = match last {
+        let (text, own) = match last {
             Some(block)
                 if matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading(_))
                     && block.spans.end as usize == spans_end =>
             {
                 block.spans.end += 1;
-                " ↩"
+                (" ↩", false)
             }
-            _ => "↩",
+            _ => ("↩", true),
         };
         let start = self.doc.text.len() as u32;
         self.doc.text.push_str(text);
@@ -1074,12 +1121,20 @@ impl Builder {
             start,
             end,
             style: style::LINK,
-            link,
+            link: 0,
             image: 0,
         });
-        if text == "↩" {
+        if own {
             let at = spans_end as u32;
             self.push_block(BlockKind::Paragraph, at..at + 1);
+        }
+        let block = self.footnotes.blocks.len() - 1;
+        if let Some(def) = self.footnotes.defs.last_mut() {
+            def.back = Some(BackLink {
+                span: spans_end,
+                block,
+                own,
+            });
         }
     }
 
@@ -1162,17 +1217,40 @@ impl Builder {
 
     fn finish(mut self) -> Doc {
         self.close();
-        let fn_blocks = std::mem::take(&mut self.footnotes.blocks);
+        let mut fn_blocks = std::mem::take(&mut self.footnotes.blocks);
         if !fn_blocks.is_empty() {
             self.push_block(BlockKind::Rule, 0..0);
         }
-        // Anchor ids for every footnote, in number order, now that all headings have theirs.
+        // Notes nothing refers to are numbered after the referenced ones.
+        let referenced = self.footnotes.labels.len();
+        let defs = std::mem::take(&mut self.footnotes.defs);
+        let nested = std::mem::take(&mut self.footnotes.nested_defs);
+        let defined = defs
+            .iter()
+            .map(|d| &d.label)
+            .chain(nested.iter().map(|(_, label)| label));
+        for label in defined {
+            let key = UniCase::new(label.clone());
+            if !self.footnotes.numbers.contains_key(&key) {
+                let n = self.footnotes.labels.len() as u32 + 1;
+                self.footnotes.numbers.insert(key, n);
+                self.footnotes.labels.push(label.clone());
+            }
+        }
+        // Anchor ids for every footnote, in number order, now that all headings have theirs. Only
+        // a referenced note has a return anchor.
         let labels = std::mem::take(&mut self.footnotes.labels);
         let ids: Vec<(String, String)> = labels
             .iter()
-            .map(|label| {
+            .enumerate()
+            .map(|(i, label)| {
                 let note = self.unique_id(format!("fn-{label}"));
-                (note, self.unique_id(format!("fnref-{label}")))
+                let back = if i < referenced {
+                    self.unique_id(format!("fnref-{label}"))
+                } else {
+                    String::new()
+                };
+                (note, back)
             })
             .collect();
         for (anchor, n) in std::mem::take(&mut self.footnotes.ref_anchors) {
@@ -1183,31 +1261,52 @@ impl Builder {
         for (link, n) in std::mem::take(&mut self.footnotes.ref_links) {
             self.doc.links[link] = format!("#{}", ids[n as usize - 1].0);
         }
-        for (link, n) in std::mem::take(&mut self.footnotes.back_links) {
-            self.doc.links[link] = format!("#{}", ids[n as usize - 1].1);
+        for (anchor, label) in nested {
+            let n = self.footnotes.numbers[&UniCase::new(label)];
+            self.doc.anchors[anchor]
+                .0
+                .clone_from(&ids[n as usize - 1].0);
         }
         if !fn_blocks.is_empty() {
             // List definitions in reference-number order, as GitHub does.
-            let defs = std::mem::take(&mut self.footnotes.defs);
             let ends: Vec<usize> = defs
                 .iter()
                 .skip(1)
-                .map(|d| d.2)
+                .map(|d| d.first)
                 .chain([fn_blocks.len()])
                 .collect();
-            let mut groups: Vec<_> = defs.into_iter().zip(ends).collect();
-            groups.sort_by_key(|((n, ..), _)| *n);
+            let mut groups: Vec<(u32, &FootnoteDef, usize)> = defs
+                .iter()
+                .zip(ends)
+                .map(|(def, end)| {
+                    let n = self.footnotes.numbers[&UniCase::new(def.label.clone())];
+                    (n, def, end)
+                })
+                .collect();
+            groups.sort_by_key(|&(n, ..)| n);
             // Where each definition block ended up, for anchors that point into them.
             let mut moved = vec![0u32; fn_blocks.len()];
-            for ((n, _, start), end) in groups {
+            for (n, def, mut end) in groups {
+                let id = n as usize - 1;
+                if let Some(back) = &def.back {
+                    if id < referenced {
+                        let link = push_id(&mut self.doc.links, format!("#{}", ids[id].1));
+                        self.doc.spans[back.span].link = link;
+                    } else if back.own {
+                        end -= 1;
+                    } else {
+                        fn_blocks[back.block].spans.end -= 1;
+                    }
+                }
+                fn_blocks[def.first].marker = Marker::Footnote(n);
                 let block = self.doc.blocks.len() as u32;
-                self.doc
-                    .anchors
-                    .push((ids[n as usize - 1].0.clone(), block));
-                for (k, slot) in moved[start..end].iter_mut().enumerate() {
+                self.doc.anchors.push((ids[id].0.clone(), block));
+                for (k, slot) in moved[def.first..end].iter_mut().enumerate() {
                     *slot = block + k as u32;
                 }
-                self.doc.blocks.extend_from_slice(&fn_blocks[start..end]);
+                self.doc
+                    .blocks
+                    .extend_from_slice(&fn_blocks[def.first..end]);
             }
             for anchor in std::mem::take(&mut self.footnotes.local) {
                 let at = self.doc.anchors[anchor].1 as usize;
@@ -1215,6 +1314,37 @@ impl Builder {
             }
         }
         self.doc
+    }
+}
+
+/// Bytes a link or image copies from a reference definition, which count against pulldown-cmark's
+/// limit on that.
+fn expansion(tag: &Tag) -> usize {
+    match tag {
+        Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            ..
+        }
+        | Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            ..
+        } if matches!(
+            link_type,
+            LinkType::Reference
+                | LinkType::Collapsed
+                | LinkType::Shortcut
+                | LinkType::ReferenceUnknown
+                | LinkType::CollapsedUnknown
+                | LinkType::ShortcutUnknown
+        ) =>
+        {
+            dest_url.len() + title.len()
+        }
+        _ => 0,
     }
 }
 

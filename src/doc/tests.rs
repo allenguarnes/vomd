@@ -769,14 +769,14 @@ fn many_footnotes_are_numbered_and_ordered() {
         })
         .collect();
     assert_eq!(nums, (1..=N as u32).collect::<Vec<_>>());
-    // The references show their definition's number.
+    // References are numbered in order of mention, and notes nothing refers to come after them.
     let refs: Vec<&str> = doc
         .spans
         .iter()
         .filter(|s| s.style & style::FOOTREF != 0)
         .map(|s| doc.span_text(s))
         .collect();
-    assert_eq!(refs, ["1", "8"]);
+    assert_eq!(refs, ["1", "2"]);
 }
 
 #[test]
@@ -1117,10 +1117,7 @@ fn segmented_parse_never_cuts_inside_blocks_that_span_blank_lines() {
             assert_same(&format!("block {i}: {block}"), &src, budget);
         }
         let n = segment_count(&src, 90);
-        assert!(
-            n >= 3 || block.starts_with("  ```") || block.contains("- item"),
-            "block {i}: {n} segments"
-        );
+        assert!(n >= 3, "block {i}: {n} segments");
     }
     // All of them in one document, one after the other.
     let src: String = blocks.iter().map(|b| format!("{b}\n\n{filler}")).collect();
@@ -1207,7 +1204,11 @@ const FUZZ_LINES: &[&str] = &[
     "|---|:-:|",
     "| 1 | 2 |",
     "|",
+    "|\t",
+    "| \u{b}",
+    "||",
     "| x |",
+    "| a | b | c |",
     "a | b",
     "--|--",
     "[foo]: /url",
@@ -1238,6 +1239,33 @@ const FUZZ_LINES: &[&str] = &[
     "--- x",
     "----",
     "+++",
+    // Definitions in containers, over several lines, with labels of every shape.
+    "[x]: /x \"multi",
+    "line title\"",
+    "[a b]: /u",
+    "[A  B]: /v 'tit'",
+    "[a",
+    "b]: /ml",
+    "> > [x]: /nested",
+    "-\t[x]: /tabbed",
+    "- [a b]: /listed",
+    "[^q r]: spaced note",
+    "-\t[^q r]: tabbed note",
+    "[^\u{e9}]: note \u{e9}",
+    "[^a\\]b]: odd label",
+    "Use [x], [a b], [A  B], [^q r], [^Q   R], [^\u{c9}] and [^a\\]b].",
+    "| [^q r] | [x] |",
+    // Blank lines of every kind, fences and metadata in odd places.
+    "\u{c}",
+    "\u{b}",
+    "\t\t",
+    "---\u{c}",
+    "---\u{b}",
+    "  ```js",
+    "   ~~~",
+    "     ```",
+    "   1. item",
+    "  - [ ] task",
 ];
 
 fn fuzz_doc(rng: &mut Rng) -> String {
@@ -1286,6 +1314,41 @@ const FUZZ_BLOCKS: &[&str] = &[
     "Text with `code` and <b>inline</b> html &amp; entities.",
     "1) paren list\n2) second",
     "* star\n\n* loose",
+    // Fences in list items (closed or not) and other places the scan can't be sure about.
+    "- item\n\n  ```\n  code\n  ```",
+    "- item\n\n  ```\n  code\n\npara after an unclosed item fence",
+    "- item\n\n  ```\n  code\n\nfree text\n\n  ```\n  top-level code\n\n  more\n  ```",
+    "1. a\n   - b\n\n     ```\n     x\n     ```\n\n   c",
+    "1. one\n\n   ~~~\n   tilde\n\n   ~~~~\n\n2. two",
+    "<div>\n```\nhtml content\n```\n</div>",
+    "<div>\n  ```\n</div>",
+    // Metadata with form feed and vertical tab lines.
+    "---\n\u{c}\n<pre>\n---\n\n# Heading\n**bold**\n</pre>",
+    "---\u{c}\ntitle: x\n\nk: v\n---",
+    "---\u{b}\nnot: metadata\n\n---",
+    "text\n---\nmore: text\n\n---",
+    // Definitions: in containers, over several lines, odd labels.
+    "> [x]: /q\n> \"title\"",
+    "- [x]: /l\n\n  - [y]: /m",
+    "[a\nb]: /ml \"t\n2\"",
+    "[x]:\n/dest\n\"title\"",
+    "-\t[x]: /tab",
+    "Use [x], [y], [a b], [A  B] and ![i][x].",
+    "[A B]: /case\n[long label with several words in it]: /long",
+    // Footnotes with labels of every shape, in containers, tables and at several cases.
+    "Use[^q r], [^Q   R], [^\u{c9}], [^a\\]b] and [^long label here].",
+    "[^q r]: spaced\n\n    para",
+    "[^\u{e9}]: accented\n[^a\\]b]: odd\n[^LONG  label here]: long",
+    "-\t[^q r]: tab",
+    "> [^q r]: quoted\n>\n> more",
+    "| h |\n|---|\n| [^q r] |",
+    "| a | b |\n|---|---|\n| 1 | [^Q R] |\n\t\n| 2 | 3 |",
+    "[^a]: outer\n\n    > [^b]: inner\n    >\n    > more",
+    "[^a]: x\n    - [^b]: y\n    - [^c]: z",
+    "[^q r]: first\n\n[^Q  R]: second duplicate",
+    // Whitespace the scan has to see as pulldown-cmark does.
+    "| a |\n|---|\n| 1 |\n\u{c}\n| 2 |\n| 3 |",
+    "| a |\n|---|\n| 1 |\n\u{b}\n| 2 |\n| 3 |",
 ];
 
 /// A document of blocks, usually separated by a blank line (sometimes by none), maybe with front
@@ -1300,6 +1363,34 @@ fn block_doc(rng: &mut Rng) -> String {
         src.push_str(if rng.below(10) == 0 { "\n" } else { "\n\n" });
     }
     src
+}
+
+/// A document of blocks with a few lines inserted, dropped or doubled at random places, which
+/// leaves constructs half open and cuts in the middle of them.
+fn mutated_doc(rng: &mut Rng) -> String {
+    let src = block_doc(rng);
+    let mut lines: Vec<&str> = src.split_inclusive('\n').collect();
+    for _ in 0..rng.below(6) {
+        let at = rng.below(lines.len() + 1);
+        match rng.below(3) {
+            0 => lines.insert(at, FUZZ_LINES[rng.below(FUZZ_LINES.len())]),
+            1 if at < lines.len() => {
+                lines.remove(at);
+            }
+            _ if at < lines.len() => lines.insert(at, lines[at]),
+            _ => {}
+        }
+    }
+    lines
+        .iter()
+        .map(|l| {
+            if l.ends_with('\n') {
+                l.to_string()
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect()
 }
 
 /// `VOMD_FUZZ=<n>` runs `n` random documents of each kind instead of the default.
@@ -1326,6 +1417,12 @@ fn segmented_parse_matches_on_random_documents() {
         let src = fuzz_doc(&mut rng);
         for budget in [1, 40] {
             assert_same(&format!("line doc {i}\n{src}"), &src, budget);
+        }
+    }
+    for i in 0..fuzz_runs() {
+        let src = mutated_doc(&mut rng);
+        for budget in [1, 150] {
+            assert_same(&format!("mutated doc {i}\n{src}"), &src, budget);
         }
     }
 }
@@ -1545,4 +1642,465 @@ fn exhausted_cells_cost_nothing_in_later_fragments() {
     // Short cells sit in the first fragment only.
     assert_eq!(cell_texts(&doc, &doc.blocks[1])[1], "x");
     assert_eq!(cell_texts(&doc, &doc.blocks[2])[1], "");
+}
+
+/// Some paragraphs, to put distance between two parts of a document.
+fn filler(paragraphs: usize) -> String {
+    "Some filler text to make the document longer.\n\n".repeat(paragraphs)
+}
+
+fn footnote_refs(doc: &Doc) -> usize {
+    doc.spans
+        .iter()
+        .filter(|s| s.style & style::FOOTREF != 0)
+        .count()
+}
+
+#[test]
+fn definitions_anywhere_resolve_across_segments() {
+    let filler = filler(30);
+    let long = "long label ".repeat(90);
+    let cases = [
+        ("[x]".to_owned(), "> [x]: /x\n".to_owned()),
+        ("[x]".to_owned(), "[x]: /x \"a\nb\"\n".to_owned()),
+        ("[x]".to_owned(), "- [x]: /x\n".to_owned()),
+        ("[x]".to_owned(), "- - [x]: /x\n".to_owned()),
+        ("[x]".to_owned(), "> > [x]: /x\n".to_owned()),
+        ("[x]".to_owned(), "1. > [x]: /x\n".to_owned()),
+        ("[x]".to_owned(), "-\t[x]: /x\n".to_owned()),
+        ("[x]".to_owned(), ">\t[x]: /x\n".to_owned()),
+        ("[x]".to_owned(), "[x]:\n/x\n".to_owned()),
+        ("[x]".to_owned(), "  [x]: </x> 'T'\n".to_owned()),
+        ("[a b]".to_owned(), "[a\nb]: /x\n".to_owned()),
+        ("[a  b]".to_owned(), "[A B]: /x\n".to_owned()),
+        ("[a, b.]".to_owned(), "[A, B.]: /x\n".to_owned()),
+        ("[\u{e9}]".to_owned(), "[\u{c9}]: /x\n".to_owned()),
+        (
+            format!("[{}]", long.trim_end()),
+            format!("[{}]: /x\n", long.to_uppercase().trim_end()),
+        ),
+        ("![x]".to_owned(), "[x]: /x\n".to_owned()),
+    ];
+    for (i, (usage, def)) in cases.iter().enumerate() {
+        for src in [
+            format!("{usage}\n\n{filler}{def}"),
+            format!("{def}\n{filler}{usage}\n"),
+        ] {
+            let name = format!("definition {i}: {def:?}");
+            assert!(assert_same(&name, &src, 400) > 3, "{name}");
+            let doc = Doc::parse_segments(&src, 400).unwrap();
+            let whole = Doc::parse_whole(&src);
+            let found = whole.links.len() + whole.images.len();
+            assert_eq!(found, 1, "{name}: the single parser resolves the use");
+            assert_eq!(doc.links.len() + doc.images.len(), 1, "{name}");
+        }
+    }
+    // A big document, past the threshold for segmenting by itself (the definition in a quote).
+    let src = format!(
+        "[x]\n\n{}> [x]: /x\n",
+        "filler paragraph\n\n".repeat(65_000)
+    );
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    assert_eq!(Doc::parse(&src).links, ["/x"]);
+}
+
+#[test]
+fn conflicting_definitions_in_two_segments_fall_back_to_one_parser() {
+    let filler = filler(30);
+    // The first definition of a label counts; a later segment's own would shadow it.
+    let src = format!("[x]\n\n{filler}[x]: /first\n\n{filler}[X]: /second\n");
+    assert!(segment::plan(&src, 400).is_some());
+    assert!(Doc::parse_segments(&src, 400).is_none());
+    let doc = Doc::parse_whole(&src);
+    assert_eq!(doc.links, ["/first"]);
+    // The same definition twice is no conflict.
+    let src = format!("[x]\n\n{filler}[x]: /same\n\n{filler}[X]: /same\n");
+    assert!(assert_same("same definition twice", &src, 400) > 5);
+}
+
+#[test]
+fn footnote_labels_of_every_shape_resolve_across_segments() {
+    let filler = filler(30);
+    let long = "long label ".repeat(15);
+    let cases = [
+        ("Ref[^a b]".to_owned(), "[^a b]: note\n".to_owned()),
+        ("Ref[^A]".to_owned(), "[^a]: note\n".to_owned()),
+        ("Ref[^a  b]".to_owned(), "[^A B]: note\n".to_owned()),
+        (
+            format!("Ref[^{}]", long.trim_end()),
+            format!("[^{}]: note\n", long.to_uppercase().trim_end()),
+        ),
+        ("Ref[^a]".to_owned(), "-\t[^a]: note\n".to_owned()),
+        ("Ref[^a]".to_owned(), "> [^a]: note\n".to_owned()),
+        ("Ref[^a]".to_owned(), "1. [^a]: note\n".to_owned()),
+        ("Ref[^a:b]".to_owned(), "[^a:b]: note\n".to_owned()),
+        ("Ref[^a\\]b]".to_owned(), "[^a\\]b]: note\n".to_owned()),
+        ("Ref[^\u{e9}]".to_owned(), "[^\u{c9}]: note\n".to_owned()),
+        ("Ref[^a\tb]".to_owned(), "[^a b]: note\n".to_owned()),
+        // In a table cell `\|` stands for `|`.
+        (
+            "| h |\n|---|\n| x[^a\\|b] |\n".to_owned(),
+            "[^a|b]: note\n".to_owned(),
+        ),
+    ];
+    for (i, (usage, def)) in cases.iter().enumerate() {
+        for src in [
+            format!("{usage}\n{filler}{def}"),
+            format!("{def}\n{filler}{usage}\n"),
+        ] {
+            let name = format!("footnote {i}: {usage:?} {def:?}");
+            assert!(assert_same(&name, &src, 400) > 3, "{name}");
+            let whole = Doc::parse_whole(&src);
+            assert_eq!(footnote_refs(&whole), 1, "{name}: a real reference");
+            let parts = Doc::parse_segments(&src, 400).unwrap();
+            assert_eq!(footnote_refs(&parts), 1, "{name}");
+        }
+    }
+}
+
+#[test]
+fn footnote_reference_scan_is_linear() {
+    // Inputs where a scan that looks for the closing bracket of every `[^` from scratch would take
+    // quadratic time: the work is counted, not timed.
+    let units = ["[^", "[^a ", "[^a\\[^", "[^\\[^\\[^", "[^a b\n", "[^a][^b"];
+    for unit in units {
+        let text = unit.repeat(1_000_000 / unit.len());
+        let scanned = segment::footnote_references(&text, |_| ());
+        assert!(
+            scanned <= text.len() + 8,
+            "{unit:?}: {scanned} bytes looked at in {}",
+            text.len()
+        );
+    }
+    // One label that runs on for the whole text, with escaped brackets that look like new labels.
+    let text = format!("[^{}", "\\[^".repeat(300_000));
+    let scanned = segment::footnote_references(&text, |_| panic!("not a label"));
+    assert!(scanned <= text.len() + 8, "{scanned} of {}", text.len());
+    // A label is found where there is one, normalized as pulldown-cmark does.
+    let mut found = Vec::new();
+    segment::footnote_references("a [^ Ab \t c ] b [^x\\|y] [^] [^z", |l| found.push(l));
+    assert_eq!(found, ["Ab c", "x\\|y", "x|y"]);
+    // And through the whole parse, a big text of unmatched `[^` goes the segmented way.
+    let src = format!(
+        "{}Note[^n].\n\n[^n]: A note.\n",
+        "text [^ and [^a more [^\n\n".repeat(50_000)
+    );
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    assert!(segment_count(&src, SEGMENT_BYTES) > 5);
+    let doc = Doc::parse(&src);
+    check_invariants(&doc);
+    assert_eq!(footnote_refs(&doc), 1);
+}
+
+#[test]
+fn a_list_fence_does_not_stop_segmentation() {
+    let table = big_table(3000);
+    let prefixes = [
+        "- item\n\n  ```\n  code\n  ```\n\n",
+        "1. item\n\n   ~~~\n   code\n\n   more\n   ~~~\n\n",
+        "- a\n  - b\n\n    ```\n    c\n    ```\n\n",
+        "> quote\n\n- item\n\n  ```rust\n  fn main() {}\n  ```\n\n",
+        "- item\n\n  ```\n  code\n  ```\n\n- again\n\n  ```\n  more\n  ```\n\ntext\n\n",
+    ];
+    for prefix in prefixes {
+        let src = format!("{prefix}{table}\nafter\n");
+        let n = assert_same(prefix, &src, 4096);
+        assert!(n > 5, "{prefix:?}: {n} segments");
+        // The rest of the text is cut as before: no segment grows beyond a budget's worth.
+        let plan = segment::plan(&src, 4096).unwrap();
+        let widest = plan.segments.iter().map(|s| s.range.len()).max().unwrap();
+        assert!(widest < 2 * 4096, "{prefix:?}: a segment of {widest} bytes");
+        // And in the middle of a text.
+        let filler = filler(100);
+        let src = format!("{filler}{prefix}{filler}{table}");
+        assert!(assert_same(prefix, &src, 2000) > 8, "{prefix:?}");
+    }
+    // A fence in a list item that is never closed ends with the item: the text goes on.
+    let src = format!("- item\n\n  ```\n  code\n\nfree text\n\n{table}");
+    assert_same("unclosed item fence", &src, 4096);
+    // A closing line that really opens a fence, after the item ended.
+    let src = format!(
+        "- item\n\n  ```\n  code\n\nfree text\n\n  ```\n  real top-level code\n\n  more\n  ```\n\n{table}"
+    );
+    // (Both readings of the first fence line stay possible, so there are no cuts to count.)
+    assert_same("fence after the item", &src, 4096);
+}
+
+#[test]
+fn footnote_labels_match_case_insensitively() {
+    insta::assert_snapshot!(parse("Ref[^A]\n\n[^a]: note\n"));
+    for src in [
+        "Ref[^A]\n\n[^a]: note\n",
+        "Ref[^a] and [^A]\n\n[^A]: note\n",
+        "[^a]: note\n\nRef[^A]\n",
+        "x[^\u{c9}]\n\n[^\u{e9}]: n\n",
+        "x[^a  b]\n\n[^A B]: n\n",
+        "x[^STRASSE]\n\n[^strasse]: n\n",
+    ] {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        check_anchors(&doc);
+        let notes = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.marker, Marker::Footnote(_)))
+            .count();
+        assert_eq!(notes, 1, "{src:?}");
+        assert!(
+            doc.spans
+                .iter()
+                .filter(|s| s.style & style::FOOTREF != 0)
+                .all(|s| doc.span_text(s) == "1"),
+            "{src:?}"
+        );
+        // Every anchor a link names exists, and the note is numbered 1.
+        assert!(
+            doc.blocks.iter().any(|b| b.marker == Marker::Footnote(1)),
+            "{src:?}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_footnote_definitions_keep_the_first() {
+    let doc = Doc::parse("a[^a]\n\n[^a]: first\n\n[^a]: second\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    assert!(!doc.text.contains("second"));
+    let notes = doc
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.marker, Marker::Footnote(_)))
+        .count();
+    assert_eq!(notes, 1);
+    // Case-insensitively, and from another segment.
+    let doc = Doc::parse("a[^a]\n\n[^A]: first\n\n[^a]: second\n\nb[^A]\n");
+    check_anchors(&doc);
+    assert!(doc.text.contains("first") && !doc.text.contains("second"));
+    let filler = filler(30);
+    let src = format!("a[^a]\n\n[^a]: first\n\n{filler}[^A]: second\n\n{filler}z[^a]\n");
+    assert!(assert_same("duplicate definitions", &src, 400) > 5);
+    let doc = Doc::parse_segments(&src, 400).unwrap();
+    check_invariants(&doc);
+    check_anchors(&doc);
+    assert!(doc.text.contains("first") && !doc.text.contains("second"));
+}
+
+/// The text of the block's spans, back-link arrows included.
+fn block_text(doc: &Doc, block: &Block) -> String {
+    doc.block_spans(block)
+        .iter()
+        .map(|s| doc.span_text(s))
+        .collect()
+}
+
+#[test]
+fn unreferenced_footnotes_have_no_back_link() {
+    let doc = Doc::parse("[^a]: unused\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    assert!(
+        doc.blocks
+            .iter()
+            .all(|b| !block_text(&doc, b).contains('↩'))
+    );
+    assert!(doc.links.iter().all(|l| !l.starts_with("#fnref")));
+    assert!(doc.anchors.iter().any(|(id, _)| id == "fn-a"));
+    assert!(doc.anchors.iter().all(|(id, _)| id != "fnref-a"));
+    // Referenced notes keep theirs; unreferenced ones follow them, numbered after.
+    let doc = Doc::parse("x[^b]\n\n[^a]: unused\n\n[^b]: used\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    let notes: Vec<_> = doc
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.marker, Marker::Footnote(_)))
+        .map(|b| (b.marker, block_text(&doc, b)))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            (Marker::Footnote(1), "used ↩".to_owned()),
+            (Marker::Footnote(2), "unused".to_owned()),
+        ]
+    );
+    // An unreferenced note that ends in a table, code or a rule has no paragraph of its own for
+    // the arrow either.
+    for end in [
+        "    | h |\n    |---|\n    | c |\n",
+        "    ```\n    code\n    ```\n",
+        "    ***\n",
+    ] {
+        let doc = Doc::parse(&format!("[^t]:\n{end}"));
+        check_invariants(&doc);
+        check_anchors(&doc);
+        assert!(
+            doc.blocks
+                .iter()
+                .all(|b| !block_text(&doc, b).contains('↩')),
+            "{end:?}"
+        );
+        let with = Doc::parse(&format!("a[^t]\n\n[^t]:\n{end}"));
+        assert_eq!(with.blocks.len(), doc.blocks.len() + 2, "{end:?}");
+    }
+    // A reference only inside an unreferenced note's text counts as a reference.
+    let doc = Doc::parse("[^a]: see[^b]\n\n[^b]: other\n");
+    check_anchors(&doc);
+}
+
+#[test]
+fn footnotes_are_numbered_by_reference_not_by_definition() {
+    let doc = Doc::parse("[^b]: B\n\n[^a]: A\n\nref[^a] then[^b]\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    let refs: Vec<_> = doc
+        .spans
+        .iter()
+        .filter(|s| s.style & style::FOOTREF != 0)
+        .map(|s| doc.span_text(s))
+        .collect();
+    assert_eq!(refs, ["1", "2"]);
+    let notes: Vec<_> = doc
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.marker, Marker::Footnote(_)))
+        .map(|b| (b.marker, block_text(&doc, b)))
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            (Marker::Footnote(1), "A ↩".to_owned()),
+            (Marker::Footnote(2), "B ↩".to_owned()),
+        ]
+    );
+    // Also across segments, with the definitions in front.
+    let filler = filler(30);
+    let src = format!("[^b]: B\n\n[^a]: A\n\n{filler}ref[^a] then[^b]\n");
+    assert!(assert_same("numbering", &src, 400) > 3);
+}
+
+#[test]
+fn form_feed_and_vertical_tab_lines_are_not_cut_inside_html_blocks() {
+    // A form feed line is blank to the metadata scan: `---` is no metadata opener here, and the
+    // `<pre>` block that follows holds a heading and bold text as plain content.
+    let region = "---\n\u{c}\n<pre>\n---\n\n# Heading\n**bold**\n</pre>\n\n";
+    for blank in ["\u{c}", "\u{b}", "\t", " \u{c} ", "\u{c}\u{c}"] {
+        let region = region.replace('\u{c}', blank);
+        let filler = filler(6);
+        let src = format!("{filler}{region}{filler}Text.\n");
+        for budget in [1, 100, 700] {
+            assert_same(&format!("{blank:?} @ {budget}"), &src, budget);
+        }
+    }
+    // As a 1 MB text, with the region where the first segment is full.
+    let filler = "filler paragraph\n\n".repeat(7283);
+    let src = format!("{filler}{region}{}", "filler paragraph\n\n".repeat(58_000));
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    assert_same("1 MB", &src, SEGMENT_BYTES);
+    let doc = Doc::parse(&src);
+    assert!(doc == Doc::parse_whole(&src));
+}
+
+#[test]
+fn lines_of_whitespace_are_read_like_pulldown_cmark_reads_them() {
+    let table = big_table(100);
+    let rows = "| a | b | c |\n".repeat(100);
+    for blank in [
+        "\t",
+        "\u{b}",
+        "\u{c}",
+        "  ",
+        "      ",
+        "\t\t",
+        " \t ",
+        "\u{b}\u{c}",
+    ] {
+        // A blank line ends a table: the rows after it are text.
+        let src = format!("{table}{blank}\n{rows}");
+        for budget in [1, 300] {
+            assert_same(&format!("table, {blank:?} @ {budget}"), &src, budget);
+        }
+        // Lines of whitespace after link reference definitions, where pulldown-cmark can lose the
+        // rest of the text.
+        for def in [
+            "[a b]: /l\n",
+            "- [a b]: /l\n",
+            "> [a]: /l\n",
+            "- [x]: /y\n  [z]:\n",
+        ] {
+            let src = format!(
+                "{def}{blank}\n  - nested\n\n{}[a b]\n\n{}",
+                filler(5),
+                filler(5)
+            );
+            for budget in [1, 100] {
+                assert_same(&format!("{def:?} {blank:?} @ {budget}"), &src, budget);
+            }
+        }
+    }
+}
+
+#[test]
+fn reference_links_that_would_hit_the_expansion_limit_fall_back_to_one_parser() {
+    // pulldown-cmark stops copying definitions into links once that has cost as many bytes as its
+    // text is long (at least 100 KB). A segment's parser has less to spend than the one for the
+    // whole text, so a segment that spends its share parses on one parser.
+    let url = format!("/{}", "u".repeat(1000));
+    // 300 uses (300 KB) in a segment of a 690 KB text.
+    let uses = "[x] ".repeat(300);
+    let src = format!("[x]: {url}\n\n{uses}\n\n{}", filler(15_000));
+    assert!(Doc::parse_segments(&src, 400).is_none());
+    assert_eq!(
+        Doc::parse_whole(&src).links.len(),
+        300,
+        "one parser resolves them all"
+    );
+    assert_same("one segment spends too much", &src, 400);
+    // Many segments that spend little each but a lot together: the whole text is only 120 KB.
+    let mut src = format!("[x]: {url}\n\n");
+    for _ in 0..150 {
+        src.push_str(&format!("[x] {}\n\n", "t".repeat(450)));
+    }
+    assert!(Doc::parse_segments(&src, 400).is_none());
+    assert_same("segments together spend too much", &src, 400);
+    // Modest use is no problem, and the text is cut.
+    let src = format!("[x]: {url}\n\n{}", "[x] and a paragraph.\n\n".repeat(50));
+    assert!(assert_same("modest use", &src, 400) > 3);
+}
+
+#[test]
+fn footnotes_inside_footnotes_stay_part_of_the_outer_note() {
+    for src in [
+        "[^a]: x\n\n    > [^b]: y\n\nr[^a][^b]\n",
+        "[^a]: x\n    - [^b]: y\n\nr[^a][^b]\n",
+        "[^a]: x\n    - [^b]: y\n\nr[^a]\n",
+        "[^a]: x\n    - [^b]: y\n",
+        "r[^b]\n\n[^a]: x\n    - [^b]: y\n",
+        "r[^a]\n\n[^a]: x\n    - [^A]: y\n    - [^c]: z\n",
+    ] {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        check_anchors(&doc);
+        // One section entry and one arrow for the outer note, and the inner label names its text.
+        let notes = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.marker, Marker::Footnote(_)))
+            .count();
+        assert_eq!(notes, 1, "{src:?}");
+        let arrows: usize = doc
+            .blocks
+            .iter()
+            .map(|b| block_text(&doc, b).matches('↩').count())
+            .sum();
+        assert!(arrows <= 1, "{src:?}");
+        let at = |id: &str| doc.anchors.iter().find(|(a, _)| a == id).map(|(_, b)| *b);
+        let inner = at("fn-b")
+            .or(at("fn-c"))
+            .expect("an anchor for the inner note");
+        assert!(
+            block_text(&doc, &doc.blocks[inner as usize]).contains(['y', 'z']),
+            "{src:?}"
+        );
+    }
 }

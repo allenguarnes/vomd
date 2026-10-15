@@ -5,13 +5,13 @@ expression: "parse(\"First[^b] and second[^a] and again[^b].\\n\\n[^a]: Note A.\
 P | "First" [LF1]"1" " and second" [LF2]"2" " and again" [LF3]"1" "."
 H1 | "After"
 Rule |
-P Footnote(1) | "Note B with " [I]"style" "." [L5]" ↩"
-P Footnote(2) | "Note A." [L4]" ↩"
+P Footnote(1) | "Note B with " [I]"style" "." [L4]" ↩"
+P Footnote(2) | "Note A." [L5]" ↩"
 link 1: #fn-b
 link 2: #fn-a
 link 3: #fn-b
-link 4: #fnref-a
-link 5: #fnref-b
+link 4: #fnref-b
+link 5: #fnref-a
 anchor #fnref-b -> 0
 anchor #fnref-a -> 0
 anchor #after -> 1

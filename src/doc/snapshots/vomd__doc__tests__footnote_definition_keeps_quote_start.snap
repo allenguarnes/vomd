@@ -4,10 +4,10 @@ expression: "parse(\"> a\\n\\n> [^x]: d\\n>\\n> b\\n\\ny[^x]\\n\")"
 ---
 P quote=1 qstart=1 | "a"
 P quote=1 qstart=1 | "b"
-P | "y" [LF2]"1"
+P | "y" [LF1]"1"
 Rule |
-P quote=1 Footnote(1) | "d" [L1]" ↩"
-link 1: #fnref-x
-link 2: #fn-x
+P quote=1 Footnote(1) | "d" [L2]" ↩"
+link 1: #fn-x
+link 2: #fnref-x
 anchor #fnref-x -> 2
 anchor #fn-x -> 4

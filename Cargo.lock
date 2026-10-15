@@ -1576,6 +1576,7 @@ dependencies = [
  "pulldown-cmark",
  "softbuffer",
  "swash",
+ "unicase",
  "unicode-bidi",
  "unicode-linebreak",
  "winit",

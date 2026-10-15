@@ -12,27 +12,48 @@
 //! not fall inside a block that spans blank lines: fenced code, an HTML block that only ends at
 //! its closing tag (CommonMark types 1–5), or a YAML metadata block (pulldown-cmark accepts
 //! those anywhere). Those are tracked line by line with the same rules as pulldown-cmark
-//! (case-sensitive end tags included). Lines that open one of them where it might be inert (a
-//! fence inside a list item or after an HTML block, a `---` after a text line) can't be told
-//! apart from a real opener, so scanning stops there and the rest of the text is one segment.
-//! Everything is conservative: when in doubt, no cut.
+//! (case-sensitive end tags included, and its whitespace: tab, VT and FF blank a line too).
+//!
+//! **Ambiguity.** Some lines open one of those blocks only in some contexts: a fence inside a
+//! list item or an HTML block, a `---` after a text line. The scan can't always tell, so it
+//! follows every reading at once (a handful of states) and cuts only where all of them agree
+//! that nothing is open. A fence in a list item, for example, is either a real fence or part of
+//! the item (which ends at the next column-0 line); once its closing line is seen both readings
+//! agree again and cutting resumes. Only a pile-up of readings (more than [`MAX_STATES`]) makes
+//! the scan stop for good.
 //!
 //! **Tables.** A table has no blank lines, so a giant one has no safe cut. Instead a segment may
 //! end between two rows of a table whose rows all start with `|` in column 0; the next segment
 //! starts with the table's header and delimiter rows again ([`Segment::head`]), which the builder
 //! drops (see `Builder::continue_table`). The header is checked once with pulldown-cmark itself.
+//! A table whose short rows would make pulldown-cmark end it partway (it only fills in so many
+//! empty cells) is not cut: segments would count afresh and go on.
 //!
 //! **Definitions.** Link reference definitions and footnote definitions may come after their
-//! use, in another segment. The scan collects both for the whole text; `Doc::parse_segments`
-//! gives every segment's parser the link definitions (broken-link callback) and a stub footnote
-//! definition for each label it references. A definition can look like text, or text like a
-//! definition (inside an HTML block, after a paragraph line); where the scan can't tell it
-//! gives up on segmenting at all, as it does for text with lone CR line endings.
+//! use, in another segment. They are not guessed from the text: [`Plan::definitions`] parses
+//! each segment that could hold one (it has `]:` in it) and takes the definitions from the
+//! parser itself, so containers, multi-line labels and titles and every other quirk of the
+//! grammar are covered. `Doc::parse_segments` then gives every segment's parser the link
+//! definitions (broken-link callback) and a stub footnote definition for each defined label the
+//! segment refers to. A label that two segments define differently makes the planner give up
+//! (the first definition must win, and a segment's own would shadow it), as does text with lone
+//! CR line endings.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use pulldown_cmark::{Event, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag};
+use unicase::UniCase;
+
+/// Most readings of the text the scan follows at once. More than that (a stack of lines that are
+/// each ambiguous in a new way) and it stops cutting.
+const MAX_STATES: usize = 16;
+
+/// How many cells of short rows pulldown-cmark fills in for one table before it ends the table
+/// there (its `MAX_AUTOCOMPLETED_CELLS`).
+const MAX_AUTOCOMPLETED_CELLS: usize = 1 << 18;
 
 /// A part of the text to parse on its own.
 pub(super) struct Segment {
@@ -43,73 +64,293 @@ pub(super) struct Segment {
 
 pub(super) struct Plan {
     pub segments: Vec<Segment>,
-    /// The lines that might be link reference definitions, one group per candidate, as a text
-    /// to parse by itself.
-    pub definitions: String,
-    /// Footnote definition labels (lowercased).
-    footnotes: HashSet<String>,
     /// Where leading YAML front matter ends (0 if none).
-    pub front_matter_end: usize,
+    front_matter_end: usize,
+}
+
+/// The definitions of the whole text, from every segment, as pulldown-cmark reads them.
+#[derive(Default)]
+pub(super) struct Definitions {
+    /// Link reference definitions by label (matched like pulldown-cmark does, case-folded):
+    /// destination and title of the first one in the text.
+    pub links: HashMap<UniCase<String>, (String, String)>,
+    /// Footnote labels, as the first definition spells them.
+    footnotes: HashMap<UniCase<String>, String>,
 }
 
 impl Plan {
-    /// The labels (as spelled in the segment) that the segment references and that some segment
-    /// defines. The segment declares them with stub definitions in front of its text, so that
-    /// pulldown-cmark sees footnote references, not text, where the definition is in another
-    /// segment; the builder drops the stubs' events (they come first). A segment that defines a
-    /// label itself gets a stub too, which is harmless.
-    pub fn footnote_stubs(&self, src: &str, seg: &Segment) -> Vec<String> {
+    /// The text to parse for segment `n`: the segment itself, preceded by the header of the table
+    /// it continues, and by the footnote `stubs` (labels defined in other segments, which this
+    /// one's parser needs to see footnote references where they are, not text). The stubs go
+    /// after front matter, which must stay first; the builder drops their events, which come
+    /// first. A reference definition ends the last stub (indented text after it would continue
+    /// it) and defines nothing anyone refers to.
+    pub fn text<'a>(&self, src: &'a str, n: usize, stubs: &[String]) -> Cow<'a, str> {
+        let seg = &self.segments[n];
+        let body = &src[seg.range.clone()];
+        if seg.head.is_none() && stubs.is_empty() {
+            return Cow::Borrowed(body);
+        }
+        let head = seg.head.clone().map_or("", |h| &src[h]);
+        let (front, body) = body.split_at(if n == 0 { self.front_matter_end } else { 0 });
+        let mut text = String::with_capacity(head.len() + body.len() + 16 * stubs.len());
+        text.push_str(front);
+        for label in stubs {
+            text.push_str("[^");
+            text.push_str(label);
+            text.push_str("]: x\n");
+        }
+        if !stubs.is_empty() {
+            text.push_str("\n[\u{1}]: x\n\n");
+        }
+        text.push_str(head);
+        text.push_str(body);
+        Cow::Owned(text)
+    }
+
+    /// Every link reference definition and footnote definition in the text, in document order
+    /// (the first of a label counts), collected by parsing each segment that has `]:` in it
+    /// (every definition has) on its own. `None` when a label is defined in several segments
+    /// with different destinations or titles: one parser would use the first, but a segment's
+    /// own definition shadows what is declared to its parser from outside.
+    pub fn definitions(&self, src: &str, opts: Options) -> Option<Definitions> {
+        let mut defs = Definitions::default();
+        for (n, seg) in self.segments.iter().enumerate() {
+            let body = &src[seg.range.clone()];
+            let (links, notes) = may_define(body);
+            if !links {
+                continue;
+            }
+            let text = self.text(src, n, &[]);
+            // Building the parser finds the link definitions; the footnote definitions only show
+            // in the events.
+            let mut parser = Parser::new_ext(&text, opts);
+            if notes {
+                let mut open = 0i64;
+                for event in parser.by_ref() {
+                    match event {
+                        Event::Start(Tag::FootnoteDefinition(label)) => {
+                            open += 1;
+                            let label = label.into_string();
+                            defs.footnotes
+                                .entry(UniCase::new(label.clone()))
+                                .or_insert(label);
+                        }
+                        Event::Start(_) => open += 1,
+                        Event::End(_) => open -= 1,
+                        _ => {}
+                    }
+                }
+                // The events ended early (see `Doc::parse_segments`): the definitions seen are
+                // not all there are.
+                if open != 0 {
+                    return None;
+                }
+            }
+            for (label, def) in parser.reference_definitions().iter() {
+                let value = (
+                    def.dest.to_string(),
+                    def.title.as_deref().unwrap_or("").to_owned(),
+                );
+                match defs.links.entry(UniCase::new(label.to_owned())) {
+                    Entry::Occupied(first) if *first.get() != value => return None,
+                    Entry::Occupied(_) => {}
+                    Entry::Vacant(slot) => {
+                        slot.insert(value);
+                    }
+                }
+            }
+        }
+        Some(defs)
+    }
+}
+
+impl Definitions {
+    /// The defined footnote labels (as their definitions spell them) that `text`, a segment,
+    /// may refer to: the stubs to declare in front of it. A segment that defines a label itself
+    /// gets a stub for it too, which is harmless.
+    pub fn footnote_stubs(&self, text: &str) -> Vec<String> {
         let mut stubs: Vec<String> = Vec::new();
         if self.footnotes.is_empty() {
             return stubs;
         }
         let mut seen = HashSet::new();
-        let mut rest = &src[seg.range.clone()];
-        while let Some(i) = rest.find("[^") {
-            rest = &rest[i + 2..];
-            let Some(label) = label_at(rest) else {
-                continue;
-            };
-            let key = label.to_lowercase();
-            if self.footnotes.contains(&key) && seen.insert(key) {
-                stubs.push(label.to_owned());
+        footnote_references(text, |label| {
+            if let Some(spelled) = self.footnotes.get(&UniCase::new(label))
+                && seen.insert(spelled.as_str())
+            {
+                stubs.push(spelled.clone());
             }
-        }
+        });
         stubs
     }
 }
 
-/// The footnote label at the start of `s` (up to `]`): letters, digits, `-`, `_` and `.` only,
-/// which `Plan::footnote_stubs` can safely write back into a definition.
-fn label_at(s: &str) -> Option<&str> {
-    let end = s.find(']')?;
-    let label = &s[..end];
-    let ok = !label.is_empty()
-        && label.len() <= 100
-        && label
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    ok.then_some(label)
+/// Calls `found` with the label of every `[^label]` in `text` that might be a footnote
+/// reference, as pulldown-cmark would normalize it: the part between the brackets, with runs of
+/// whitespace collapsed to one space and trimmed. In a table cell `\|` stands for `|`, so a label
+/// with one is reported both ways. This only picks which definitions a segment needs declared;
+/// extra candidates are harmless. Returns the bytes looked at (more than `text.len()` only if
+/// the scan were not linear, which tests check).
+pub(super) fn footnote_references(text: &str, mut found: impl FnMut(String)) -> usize {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    let mut scanned = 0;
+    while let Some(i) = text[at..].find("[^") {
+        let start = at + i + 2;
+        // The label ends at the first unescaped `]`. A `[` or a line break ends the search: the
+        // text is no label, and a `[` may start the next one, so this never looks at a byte twice.
+        let mut j = start;
+        let closed = loop {
+            match bytes.get(j) {
+                None | Some(b'[' | b'\n' | b'\r') => break false,
+                Some(b']') => break true,
+                Some(b'\\') if bytes.get(j + 1).is_some_and(u8::is_ascii_punctuation) => j += 2,
+                _ => j += 1,
+            }
+        };
+        scanned += j.min(bytes.len()) - at;
+        at = if closed { j + 1 } else { j.min(bytes.len()) };
+        if closed && j > start {
+            let raw = &text[start..j];
+            found(normalize_label(raw));
+            if raw.contains("\\|") {
+                found(normalize_label(&raw.replace("\\|", "|")));
+            }
+        }
+    }
+    scanned
+}
+
+/// pulldown-cmark's label normalization: runs of whitespace become one space, both ends are
+/// trimmed.
+fn normalize_label(raw: &str) -> String {
+    let mut label = String::with_capacity(raw.len());
+    for word in raw.split([' ', '\t', '\u{b}', '\u{c}']) {
+        if !word.is_empty() {
+            if !label.is_empty() {
+                label.push(' ');
+            }
+            label.push_str(word);
+        }
+    }
+    label
 }
 
 /// Where a table started, for cuts between its rows.
+#[derive(Clone, PartialEq, Eq)]
 struct TableScan {
     /// Header and delimiter lines.
     head: Range<usize>,
     /// Start of the first body line.
     body: usize,
-    /// Whether pulldown-cmark really reads `head` as a table header (checked once, lazily).
-    valid: Option<bool>,
+    /// The table's rows don't leave so many cells empty that pulldown-cmark gives up on it
+    /// partway (see [`MAX_AUTOCOMPLETED_CELLS`]), which segments would do at other rows.
+    cuttable: bool,
+}
+
+/// A fenced code block the scan believes may be open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Fence {
+    /// Fence character and length.
+    c: u8,
+    n: usize,
+    /// For a fence that might be inside a list item or quote: the indentation of its opening
+    /// line. Such a fence ends with the item, at a line that is indented less.
+    container: Option<usize>,
+}
+
+/// One reading of the text so far: what is open, if the ambiguous lines were taken this way.
+#[derive(Clone, PartialEq, Eq)]
+struct State {
+    fence: Option<Fence>,
+    /// HTML blocks (types 1–5) that may be open, as the text that ends each. A line that looks
+    /// like an opener might be content of a block that is open or of a list item, so every
+    /// opener counts until its end text shows up (always an over-estimate).
+    html: Vec<&'static str>,
+    /// Inside a metadata block.
+    meta: bool,
+    /// That block began at the start of the text (front matter).
+    front: bool,
+    /// A list, quote or footnote definition may be open.
+    containers: bool,
+    /// A line of the current run of non-blank lines began with `<` (maybe an HTML block).
+    html_run: bool,
+    /// A line of the current run has `]:` in it: it may hold a link reference definition.
+    def_run: bool,
+    /// The previous line ended a fenced or metadata block, so this one starts a run.
+    fresh: bool,
+    table: Option<TableScan>,
+}
+
+impl State {
+    /// A line inside a fence or metadata block ended the current run of plain lines.
+    fn leave_run(&mut self) {
+        self.html_run = false;
+        self.def_run = false;
+        self.fresh = true;
+        self.table = None;
+    }
+}
+
+/// What the line being read means for cutting, over all readings.
+struct Verdict {
+    /// No reading has anything open before the line.
+    plain: bool,
+    /// Every reading is in the same table, which pulldown-cmark can start from its header.
+    table: Option<Range<usize>>,
+    table_ok: bool,
+}
+
+impl Verdict {
+    fn block(&mut self) {
+        self.plain = false;
+        self.table_ok = false;
+    }
+
+    fn table(&mut self, head: Option<Range<usize>>) {
+        match (head, &self.table) {
+            (Some(head), None) if self.table_ok => self.table = Some(head),
+            (Some(head), Some(first)) if *first == head => {}
+            _ => self.table_ok = false,
+        }
+    }
+}
+
+/// The line being read.
+struct Line<'l> {
+    pos: usize,
+    bytes: &'l [u8],
+    blank: bool,
+    was_blank: bool,
+    indent: usize,
+    /// Whitespace that only some scanners of pulldown-cmark take for blank (see `is_blank_ws`):
+    /// whether it separates blocks depends on what comes before it.
+    odd_blank: bool,
+    /// Indented at most 3 spaces: may start a block at the top level.
+    top: bool,
+    /// The line without its indentation, if `top`.
+    rest: &'l [u8],
+    /// A column-0 `---`, which may open a metadata block.
+    meta_open: bool,
+    /// A table row: starts with `|` in column 0 and has a cell (a lone `|` ends a table).
+    row: bool,
+    /// A segment may start here: after a blank line, in column 0, with a line that can't
+    /// continue a construct before it.
+    l_start: bool,
+    /// The segment is big enough to cut.
+    want_cut: bool,
 }
 
 /// Plan the segments of `src`, each about `budget` bytes. `None` when there is nothing to cut.
 pub(super) fn plan(src: &str, budget: usize) -> Option<Plan> {
     // A lone CR is a line ending for pulldown-cmark, but not for this scanner.
     let bytes = src.as_bytes();
-    if bytes
-        .iter()
-        .enumerate()
-        .any(|(i, &b)| b == b'\r' && bytes.get(i + 1) != Some(&b'\n'))
+    if bytes.contains(&b'\r')
+        && bytes
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b == b'\r' && bytes.get(i + 1) != Some(&b'\n'))
     {
         return None;
     }
@@ -124,51 +365,20 @@ struct Scan<'a> {
     segments: Vec<Segment>,
     start: usize,
     head: Option<Range<usize>>,
-    definitions: String,
-    footnotes: HashSet<String>,
     front_matter_end: usize,
-    /// Start of the open metadata block.
-    meta_start: usize,
     // Line state.
     /// Start of the line after the current one.
     next: usize,
     prev_blank: bool,
-    /// Open fenced code block: fence character and length.
-    fence: Option<(u8, usize)>,
-    /// HTML blocks (types 1–5) that may be open, as the text that ends each. A line that looks
-    /// like an opener might be content of a block that is open or of a list item, so every
-    /// opener counts until its end text shows up (always an over-estimate).
-    html: Vec<&'static str>,
-    /// Inside a metadata block.
-    meta: bool,
+    /// Every reading of the text so far (never empty until the scan stops).
+    states: Vec<State>,
+    scratch: Vec<State>,
     /// A search for the closing line of a metadata block failed: there are none further on.
     no_meta_close: bool,
-    /// Something we can't follow: no more cuts.
+    /// Too many readings to follow: no more cuts.
     stopped: bool,
-    /// A list, quote or footnote definition may be open.
-    containers: bool,
-    /// A line of the current run of non-blank lines began with `<` (maybe an HTML block).
-    html_run: bool,
-    /// The previous line ended a fenced or metadata block, so this one starts a run.
-    fresh: bool,
-    /// The previous line ended an HTML block.
-    html_ended: bool,
-    table: Option<TableScan>,
-    // Link reference definition candidates.
-    prev_def: bool,
-    def_extra: u8,
-    /// The definition's destination is on the next line.
-    def_open: bool,
-    /// The definition's label isn't closed yet.
-    label_open: bool,
-    /// The previous line ended its block (a heading, a rule).
-    prev_heading: bool,
-    /// The previous line was ordinary paragraph text.
-    prev_text: bool,
-    /// The previous line was indented code.
-    indented_code: bool,
-    /// A definition appeared where we can't tell if it counts (see `definition_line`).
-    unsure_definitions: bool,
+    /// Whether the header at this start offset is a table for pulldown-cmark (checked lazily).
+    valid_head: Option<(usize, bool)>,
 }
 
 impl<'a> Scan<'a> {
@@ -179,37 +389,31 @@ impl<'a> Scan<'a> {
             segments: Vec::new(),
             start: 0,
             head: None,
-            definitions: String::new(),
-            footnotes: HashSet::new(),
             front_matter_end: 0,
-            meta_start: 0,
             next: 0,
             prev_blank: true,
-            fence: None,
-            html: Vec::new(),
-            meta: false,
+            states: vec![State {
+                fence: None,
+                html: Vec::new(),
+                meta: false,
+                front: false,
+                containers: false,
+                html_run: false,
+                def_run: false,
+                fresh: false,
+                table: None,
+            }],
+            scratch: Vec::new(),
             no_meta_close: false,
             stopped: false,
-            containers: false,
-            html_run: false,
-            fresh: false,
-            html_ended: false,
-            table: None,
-            prev_def: false,
-            def_extra: 0,
-            def_open: false,
-            label_open: false,
-            prev_heading: false,
-            prev_text: false,
-            indented_code: false,
-            unsure_definitions: false,
+            valid_head: None,
         }
     }
 
     fn run(&mut self) {
         let src = self.src;
         let mut pos = 0;
-        while pos < src.len() {
+        while pos < src.len() && !self.stopped {
             let end = src[pos..].find('\n').map_or(src.len(), |i| pos + i);
             let next = (end + 1).min(src.len());
             let line = src[pos..end].strip_suffix('\r').unwrap_or(&src[pos..end]);
@@ -219,146 +423,201 @@ impl<'a> Scan<'a> {
         }
     }
 
-    fn line(&mut self, pos: usize, line: &[u8]) {
-        if self.stopped {
-            // Nothing the scan tracks can be trusted any more, so every line that looks like a
-            // definition is a guess (see `definition_line`).
-            let indent = leading_spaces(line);
-            let rest = &line[indent.min(line.len())..];
-            self.unsure_definitions |= footnote_label(line).is_some()
-                || (indent <= 3
-                    && rest.first() == Some(&b'[')
-                    && rest.get(1) != Some(&b'^')
-                    && contains(rest, b"]:"));
+    fn line(&mut self, pos: usize, bytes: &[u8]) {
+        let blank = is_blank(bytes);
+        let was_blank = std::mem::replace(&mut self.prev_blank, blank);
+        let indent = leading_spaces(bytes);
+        let top = indent <= 3 && bytes.get(indent) != Some(&b'\t');
+        let line = Line {
+            pos,
+            bytes,
+            blank,
+            was_blank,
+            indent,
+            odd_blank: !blank && is_blank_ws(bytes),
+            top,
+            rest: if top { &bytes[indent..] } else { &bytes[..0] },
+            meta_open: !blank && indent == 0 && is_meta_open(bytes),
+            row: bytes.first() == Some(&b'|') && !is_blank_ws(&bytes[1..]),
+            l_start: !blank && was_blank && indent == 0 && cut_may_start(bytes),
+            want_cut: pos - self.start >= self.budget,
+        };
+        let mut verdict = Verdict {
+            plain: true,
+            table: None,
+            table_ok: true,
+        };
+        let mut states = std::mem::take(&mut self.states);
+        let mut next = std::mem::take(&mut self.scratch);
+        next.clear();
+        for state in states.drain(..) {
+            self.step(state, &line, &mut next, &mut verdict);
+        }
+        // Readings that came out the same are one.
+        let mut i = 1;
+        while i < next.len() {
+            if next[..i].contains(&next[i]) {
+                next.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        if next.len() > MAX_STATES {
+            self.stopped = true;
+        }
+        self.states = next;
+        self.scratch = states;
+        if blank || self.stopped || !line.want_cut {
             return;
         }
-        // Only spaces make a line blank here: pulldown-cmark mishandles a tab-only line after a
-        // link reference definition (it leaves a soft break), so nothing is cut after one.
-        let blank = line.iter().all(|&b| b == b' ');
-        let was_blank = std::mem::replace(&mut self.prev_blank, blank);
-        if self.meta {
-            self.meta = !is_meta_close(line);
-            if !self.meta && self.meta_start == 0 {
+        if line.l_start && verdict.plain {
+            self.cut(pos, None);
+        } else if let Some(head) = verdict.table.filter(|_| verdict.table_ok) {
+            self.cut(pos, Some(head));
+        }
+    }
+
+    /// Read `line` in one reading of the text, pushing the readings it leads to (several when
+    /// the line is ambiguous) to `out` and what it says about cutting to `verdict`.
+    fn step(&mut self, mut st: State, line: &Line, out: &mut Vec<State>, verdict: &mut Verdict) {
+        if st.meta {
+            st.meta = !is_meta_close(line.bytes);
+            if !st.meta && st.front {
                 self.front_matter_end = self.next;
             }
-            return self.leave_run();
+            verdict.block();
+            st.leave_run();
+            return out.push(st);
         }
-        if let Some((c, n)) = self.fence {
-            let indent = leading_spaces(line);
-            if indent <= 3 && fence_close(&line[indent..], c, n) {
-                self.fence = None;
+        if let Some(fence) = st.fence {
+            match fence.container {
+                None => {
+                    if line.indent <= 3 && fence_close(&line.bytes[line.indent..], fence.c, fence.n)
+                    {
+                        st.fence = None;
+                    }
+                    verdict.block();
+                    st.leave_run();
+                    return out.push(st);
+                }
+                Some(open) => {
+                    // The fence ends with its container, at a line indented less than the
+                    // container's content. That is certain for a line indented under 2 (or more
+                    // than 3 less than the fence), and certainly not for one indented as much as
+                    // the fence; in between, both readings go on.
+                    let width = indent_width(line.bytes);
+                    let alive = line.blank || (width >= 2 && width + 3 >= open);
+                    let certain = line.blank || width >= open;
+                    if alive {
+                        let mut kept = st.clone();
+                        if !line.blank && fence_close(trim_indent(line.bytes), fence.c, fence.n) {
+                            kept.fence = None;
+                        }
+                        verdict.block();
+                        kept.leave_run();
+                        out.push(kept);
+                        if certain {
+                            return;
+                        }
+                    }
+                    st.fence = None;
+                }
             }
-            return self.leave_run();
         }
-        // A cut is decided on the state at the start of the line: a line that ends an HTML block
-        // belongs to it.
-        let in_html = !self.html.is_empty();
-        let cuttable = !in_html && !self.stopped;
-        self.html.retain(|end| !contains(line, end.as_bytes()));
-        if blank {
-            self.table = None;
-            self.prev_def = false;
-            self.def_extra = 0;
-            self.fresh = false;
-            return;
+        if line.odd_blank {
+            // Such a line is blank at the start of a block, in an HTML block of type 6 or 7 and
+            // before a metadata block's content, but text within a paragraph: no telling which,
+            // so no more cuts.
+            self.stopped = true;
         }
-        let indent = leading_spaces(line);
-        let top = indent <= 3 && line.get(indent) != Some(&b'\t');
-        let rest = if top { &line[indent..] } else { &line[..0] };
+        let in_html = !st.html.is_empty();
+        st.html.retain(|end| !contains(line.bytes, end.as_bytes()));
+        if line.blank {
+            // Pulldown-cmark mishandles a line of only whitespace right after a link reference
+            // definition: it is part of the paragraph (a break), and in a list item it can cut
+            // the rest of the text off. Nothing can be said about what follows, so no more cuts.
+            if st.def_run && !line.bytes.is_empty() {
+                self.stopped = true;
+            }
+            st.def_run = false;
+            st.table = None;
+            st.fresh = false;
+            return out.push(st);
+        }
+        st.def_run |= has_ref_end(line.bytes);
+        if in_html {
+            verdict.block();
+        }
         // The first line of a run of plain lines: after a blank line, or a block that ended.
-        let first = was_blank || std::mem::take(&mut self.fresh);
+        let first = line.was_blank || std::mem::take(&mut st.fresh);
         if first {
-            self.html_run = false;
+            st.html_run = false;
         }
-        // The line after the end of an HTML block starts a block, unless the block wasn't one.
-        let after_html = std::mem::replace(&mut self.html_ended, in_html && self.html.is_empty());
         // An HTML block of type 6 or 7 can start wherever a block does (after a heading, a rule,
         // ...), and runs until the next blank line.
-        let html_start = top && rest.first() == Some(&b'<');
-        self.html_run |= html_start;
+        st.html_run |= line.top && line.rest.first() == Some(&b'<');
 
         // A YAML metadata block starts with `---` in column 0 (pulldown-cmark accepts it at any
         // block start) and may contain anything, blank lines included. After a blank line, outside
         // HTML blocks, that is certainly a block start; anywhere else the line may be a setext
-        // underline or HTML content, and we can't tell.
-        if indent == 0 && is_meta_open(line) && self.meta_closes() {
-            if was_blank && self.html.is_empty() {
-                self.meta = true;
-                self.meta_start = pos;
-            } else {
-                self.stopped = true;
-            }
-            return self.leave_run();
-        }
-
-        let l_start = was_blank && indent == 0 && cut_may_start(line);
-        if cuttable && self.size(pos) >= self.budget {
-            if l_start {
-                self.cut(pos, None);
-            } else if indent == 0 && rest.first() == Some(&b'|') {
-                self.table_cut(pos);
+        // underline or HTML content, and either reading goes on.
+        if line.meta_open && self.meta_closes() {
+            let mut meta = st.clone();
+            meta.meta = true;
+            meta.front = line.pos == 0;
+            verdict.block();
+            meta.leave_run();
+            out.push(meta);
+            if line.was_blank && st.html.is_empty() {
+                return;
             }
         }
-        if top && starts_container(rest) {
-            self.containers = true;
-        } else if l_start {
-            self.containers = false;
+
+        if line.want_cut && line.row {
+            let head = (!in_html).then(|| self.table_head(&st, line.pos)).flatten();
+            verdict.table(head);
+        }
+        if line.top && starts_container(line.rest) {
+            st.containers = true;
+        } else if line.l_start {
+            st.containers = false;
         }
 
-        self.table_line(pos, line, was_blank);
-        // Inside an HTML block a definition is just content, but whether we are inside one is a
-        // guess: type 6 and 7 blocks (and lazy continuation lines) look alike.
-        let unsure =
-            !self.prev_def && (in_html || (self.html_run && !first) || (after_html && !first));
-        self.definition_line(line, top, rest, first, unsure);
-        self.prev_text = top && is_plain_text(rest);
-        // Also indented code: an indented line that starts a block or continues code, with no
-        // list item possibly open (there it would be a continuation line).
-        let code = !top && (first || self.indented_code || self.prev_heading) && !self.containers;
-        self.prev_heading = if top {
-            is_block_end(rest, indent, self.containers)
-        } else {
-            code
-        };
-        self.indented_code = code;
-
-        if !top {
-            return;
+        self.table_line(&mut st, line);
+        if !line.top {
+            return out.push(st);
         }
-        if let Some((c, n)) = fence_open(rest) {
-            // Whether this line really opens a fence depends on its context: inside a list item,
-            // an HTML block or a metadata block it is just content, and a list item's fence
-            // ends with the item, so the closing line may as well open the next fence.
-            let certain =
-                (indent == 0 || !self.containers) && !self.html_run && self.html.is_empty();
-            if certain {
-                self.fence = Some((c, n));
-            } else {
-                self.stopped = true;
+        if let Some((c, n)) = fence_open(line.rest) {
+            // Whether this line really opens a fence depends on its context. Inside a list item
+            // it opens one that ends with the item; inside an HTML block it is just content;
+            // otherwise it is a fence of the top level. Each reading that is possible goes on.
+            let in_item = line.indent > 0 && st.containers;
+            let in_html = st.html_run || !st.html.is_empty();
+            if in_item {
+                let mut item = st.clone();
+                item.fence = Some(Fence {
+                    c,
+                    n,
+                    container: Some(line.indent),
+                });
+                out.push(item);
             }
-        } else if rest.first() == Some(&b'<')
-            && let Some(end) = html_end_tag(&rest[1..])
-            && !contains(rest, end.as_bytes())
-            && !self.html.contains(&end)
+            if in_html {
+                out.push(st.clone());
+            }
+            st.fence = Some(Fence {
+                c,
+                n,
+                container: None,
+            });
+        } else if line.rest.first() == Some(&b'<')
+            && let Some(end) = html_end_tag(&line.rest[1..])
+            && !contains(line.rest, end.as_bytes())
+            && !st.html.contains(&end)
         {
-            self.html.push(end);
+            st.html.push(end);
         }
-    }
-
-    /// A line inside a fence or block ended the current run of plain lines.
-    fn leave_run(&mut self) {
-        self.html_run = false;
-        self.prev_text = false;
-        self.indented_code = false;
-        self.fresh = true;
-        self.prev_heading = false;
-        self.table = None;
-        self.prev_def = false;
-        self.def_extra = 0;
-    }
-
-    fn size(&self, pos: usize) -> usize {
-        pos - self.start
+        out.push(st);
     }
 
     fn cut(&mut self, at: usize, head: Option<Range<usize>>) {
@@ -370,23 +629,22 @@ impl<'a> Scan<'a> {
         self.start = at;
     }
 
-    /// Cut before the table row at `pos`, if it is in a table that pulldown-cmark reads from
-    /// its header, after at least one body row.
-    fn table_cut(&mut self, pos: usize) {
-        let src = self.src;
-        let Some(table) = self.table.as_mut() else {
-            return;
+    /// The header to repeat for a cut before the table row at `pos`, if `st` is in a table that
+    /// pulldown-cmark reads from its header, after at least one body row.
+    fn table_head(&mut self, st: &State, pos: usize) -> Option<Range<usize>> {
+        let table = st.table.as_ref()?;
+        if pos <= table.body || !table.cuttable {
+            return None;
+        }
+        let valid = match self.valid_head {
+            Some((start, valid)) if start == table.head.start => valid,
+            _ => {
+                let valid = valid_head(self.src, &table.head);
+                self.valid_head = Some((table.head.start, valid));
+                valid
+            }
         };
-        if pos <= table.body {
-            return;
-        }
-        if *table
-            .valid
-            .get_or_insert_with(|| valid_head(src, &table.head))
-        {
-            let head = table.head.clone();
-            self.cut(pos, Some(head));
-        }
+        valid.then(|| table.head.clone())
     }
 
     /// Whether the metadata block opened by the `---` line just read is closed somewhere:
@@ -403,7 +661,7 @@ impl<'a> Scan<'a> {
             let end = src[pos..].find('\n').map_or(src.len(), |i| pos + i);
             let line = src[pos..end].strip_suffix('\r').unwrap_or(&src[pos..end]);
             let close = is_meta_close(line.as_bytes());
-            if first && (close || line.bytes().all(|b| matches!(b, b' ' | b'\t'))) {
+            if first && (close || is_blank_ws(line.as_bytes())) {
                 return false;
             }
             first = false;
@@ -418,17 +676,14 @@ impl<'a> Scan<'a> {
 
     /// Track a table whose rows all start with `|` in column 0 (so it is not inside a list
     /// item): the header must follow a blank line and be followed by a delimiter row.
-    fn table_line(&mut self, pos: usize, line: &[u8], was_blank: bool) {
-        let row = line.first() == Some(&b'|');
-        if let Some(table) = self.table.as_mut() {
-            if pos < table.body {
-                // The delimiter row.
-            } else if !row {
-                self.table = None;
+    fn table_line(&mut self, st: &mut State, line: &Line) {
+        if let Some(table) = st.table.as_ref() {
+            if line.pos >= table.body && !line.row {
+                st.table = None;
             }
             return;
         }
-        if !(was_blank && row && self.html.is_empty()) {
+        if !(line.was_blank && line.row && st.html.is_empty()) {
             return;
         }
         let (src, next) = (self.src, self.next);
@@ -436,83 +691,16 @@ impl<'a> Scan<'a> {
         let delim = src[next..end].strip_suffix('\r').unwrap_or(&src[next..end]);
         if is_delimiter_row(delim.as_bytes()) {
             let body = (end + 1).min(src.len());
-            self.table = Some(TableScan {
-                head: pos..body,
+            st.table = Some(TableScan {
+                head: line.pos..body,
                 body,
-                valid: None,
+                cuttable: sparse_rows_fit(src, delim.as_bytes(), body),
             });
         }
     }
 
-    /// Collect lines that may be link reference definitions (`[label]: destination "title"`, the
-    /// destination and title possibly on the next lines) and footnote definitions.
-    fn definition_line(
-        &mut self,
-        line: &[u8],
-        top: bool,
-        rest: &[u8],
-        was_blank: bool,
-        unsure: bool,
-    ) {
-        // Nearly every line has no bracket and can't be (part of) a definition.
-        if !self.prev_def && !line.contains(&b'[') {
-            return;
-        }
-        let ref_shaped = top && rest.first() == Some(&b'[') && rest.get(1) != Some(&b'^');
-        if unsure {
-            // A definition here may or may not be one. Segments before it could depend on
-            // it, so the text can't be cut at all.
-            self.unsure_definitions |=
-                footnote_label(line).is_some() || (ref_shaped && contains(rest, b"]:"));
-            self.prev_def = false;
-            return;
-        }
-        // A footnote definition can interrupt a paragraph. A link reference definition counts
-        // when it surely starts a block: after a blank line, a heading or another definition;
-        // anywhere else it may just continue a paragraph.
-        if let Some((label, _)) = footnote_label(line) {
-            self.footnotes.insert(label.to_lowercase());
-        }
-        let starts = was_blank || self.prev_def || self.prev_heading;
-        // The label may run over several lines, so a line that opens one without closing it
-        // counts too.
-        let shaped = ref_shaped && (contains(rest, b"]:") || !rest.contains(&b']'));
-        let candidate = shaped && starts;
-        // Right after paragraph text it continues the paragraph; right after anything else that
-        // doesn't end a block, it may or may not be a definition.
-        self.unsure_definitions |=
-            shaped && !starts && !self.prev_text && !self.prev_def && contains(rest, b"]:");
-        let text = std::str::from_utf8(line).unwrap_or("");
-        let appended = if candidate {
-            if !self.prev_def {
-                self.definitions.push('\n');
-            }
-            self.def_extra = 2;
-            self.label_open = !rest.contains(&b']');
-            true
-        } else if self.prev_def
-            && self.def_extra > 0
-            && (self.def_open
-                || self.label_open
-                || matches!(line.trim_ascii_start().first(), Some(b'"' | b'\'' | b'(')))
-        {
-            self.def_extra -= 1;
-            self.label_open &= !line.contains(&b']');
-            true
-        } else {
-            false
-        };
-        self.prev_def = appended;
-        if appended {
-            self.definitions.push_str(text);
-            self.definitions.push('\n');
-            // Without a destination yet, the next line is it.
-            self.def_open = !self.label_open && line.trim_ascii_end().ends_with(b":");
-        }
-    }
-
     fn finish(mut self) -> Option<Plan> {
-        if self.segments.is_empty() || self.unsure_definitions {
+        if self.segments.is_empty() {
             return None;
         }
         self.segments.push(Segment {
@@ -521,11 +709,55 @@ impl<'a> Scan<'a> {
         });
         Some(Plan {
             segments: self.segments,
-            definitions: self.definitions,
-            footnotes: self.footnotes,
             front_matter_end: self.front_matter_end,
         })
     }
+}
+
+/// Whether the rows of the table whose body starts at `from` (rows start with `|`; a lone one
+/// ends the table) fill no more than [`MAX_AUTOCOMPLETED_CELLS`] cells in all, going by how many
+/// cells each row has at least and the delimiter row `delim` has at most. A row with fewer cells
+/// than the header gets the others as empty cells, and once pulldown-cmark has made that many it
+/// ends the table, where a segment of the table (which starts counting afresh) would not.
+fn sparse_rows_fit(src: &str, delim: &[u8], from: usize) -> bool {
+    let cols = cells_at_least(delim, true);
+    let mut missing = 0;
+    for line in src[from..].split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line).as_bytes();
+        if line.first() != Some(&b'|') || is_blank_ws(&line[1..]) {
+            break;
+        }
+        missing += cols.saturating_sub(cells_at_least(line, false));
+        if missing > MAX_AUTOCOMPLETED_CELLS {
+            return false;
+        }
+    }
+    true
+}
+
+/// The cells of a table row that starts with `|`: one per unescaped `|` (not counting one at the
+/// end), at least one. With a backtick in the line that is all that is claimed, unless `exact`
+/// (the delimiter row, which has no backticks or escapes).
+fn cells_at_least(row: &[u8], exact: bool) -> usize {
+    if !exact && row.contains(&b'`') {
+        return 1;
+    }
+    // A pipe after a backslash may be escaped; counting it out only lowers the count.
+    let escapes = row.contains(&b'\\');
+    let pipes = if escapes {
+        (0..row.len())
+            .filter(|&i| row[i] == b'|' && (i == 0 || row[i - 1] != b'\\'))
+            .count()
+    } else {
+        row.iter().filter(|&&b| b == b'|').count()
+    };
+    let end = row
+        .iter()
+        .rposition(|&b| !matches!(b, b' ' | b'\t' | 0x0b | 0x0c))
+        .map_or(0, |i| i + 1);
+    let trailing =
+        end > 0 && row[end - 1] == b'|' && !(escapes && end > 1 && row[end - 2] == b'\\');
+    (pipes - usize::from(trailing)).max(1)
 }
 
 /// Whether pulldown-cmark reads `head` (a header and delimiter row) as a table.
@@ -538,11 +770,105 @@ fn leading_spaces(line: &[u8]) -> usize {
     line.iter().take_while(|&&b| b == b' ').count()
 }
 
+/// Whether the line (its end removed) is blank to every scanner of pulldown-cmark: only spaces
+/// and tabs.
+fn is_blank(line: &[u8]) -> bool {
+    line.iter().all(|&b| matches!(b, b' ' | b'\t'))
+}
+
+/// Whether the line is whitespace by `scan_blank_line`, which also takes a vertical tab and a
+/// form feed for blank. Only some scanners do: a paragraph goes on over a line of them.
+fn is_blank_ws(line: &[u8]) -> bool {
+    line.iter()
+        .all(|&b| matches!(b, b' ' | b'\t' | 0x0b | 0x0c))
+}
+
+/// Width of the leading spaces and tabs, in columns (a tab goes to the next multiple of 4).
+fn indent_width(line: &[u8]) -> usize {
+    let mut width = 0;
+    for &b in line {
+        match b {
+            b' ' => width += 1,
+            b'\t' => width += 4 - width % 4,
+            _ => break,
+        }
+    }
+    width
+}
+
+/// The line without its leading spaces and tabs.
+fn trim_indent(line: &[u8]) -> &[u8] {
+    let n = line
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    &line[n..]
+}
+
+/// What a text may define, going by its shape: a link reference definition, a footnote
+/// definition. Every definition is `[label]:` with the `[` first on its line (after the markers
+/// of lists and quotes), so only that is looked for: a `]:` and the unescaped `[` before it,
+/// with no blank line in between. That finds every definition (and some text that is none),
+/// which is all `Plan::definitions` needs to know to skip a segment.
+fn may_define(text: &str) -> (bool, bool) {
+    let bytes = text.as_bytes();
+    let (mut links, mut notes) = (false, false);
+    // The scan for a label's `[` goes back no further than the previous `]:`, so the whole text
+    // is read about twice.
+    let mut floor = 0;
+    let mut at = 0;
+    while let Some(i) = text[at..].find("]:") {
+        let end = at + i;
+        at = end + 2;
+        let mut k = end;
+        // Whether the line being read backwards is blank so far; the one with the `]:` is not.
+        let mut blank = false;
+        let open = loop {
+            if k <= floor {
+                break None;
+            }
+            k -= 1;
+            match bytes[k] {
+                b'[' => {
+                    let escapes = bytes[..k].iter().rev().take_while(|&&b| b == b'\\').count();
+                    if escapes % 2 == 0 {
+                        break Some(k);
+                    }
+                    blank = false;
+                }
+                b'\n' if blank => break None,
+                b'\n' => blank = true,
+                b' ' | b'\t' | b'\r' => {}
+                _ => blank = false,
+            }
+        };
+        floor = end + 2;
+        let Some(open) = open else { continue };
+        let mut before = bytes[..open].iter().rev().take_while(|&&b| b != b'\n');
+        if before.all(|&b| {
+            matches!(b, b' ' | b'\t' | b'>' | b'*' | b'+' | b'-' | b'.' | b')')
+                || b.is_ascii_digit()
+        }) {
+            links = true;
+            notes |= bytes.get(open + 1) == Some(&b'^') && !bytes[open..end].contains(&b'\n');
+            if notes {
+                break;
+            }
+        }
+    }
+    (links, notes)
+}
+
+/// Whether the line has `]:` in it (the fast check for `]` first).
+fn has_ref_end(line: &[u8]) -> bool {
+    line.contains(&b']') && contains(line, b"]:")
+}
+
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Whitespace as pulldown-cmark's scanners see it (a superset of what we treat as blank).
+/// Whitespace as pulldown-cmark's HTML scanners see it.
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
@@ -598,45 +924,10 @@ fn fence_close(rest: &[u8], c: u8, len: usize) -> bool {
     n >= len && rest[n..].iter().all(|&b| b == b' ')
 }
 
-/// Whether the line (after list and quote markers) is ordinary paragraph text.
-fn is_plain_text(mut rest: &[u8]) -> bool {
-    loop {
-        let marker = match rest.first() {
-            Some(b'>') => 1,
-            Some(b'-' | b'*' | b'+') if rest.get(1).is_none_or(|&b| b == b' ' || b == b'\t') => 1,
-            Some(b'0'..=b'9') if is_ordered_marker(rest, true) => {
-                rest.iter().take_while(|b| b.is_ascii_digit()).count() + 1
-            }
-            _ => break,
-        };
-        rest = &rest[marker..];
-        rest = &rest[rest.iter().take_while(|&&b| b == b' ').count()..];
-    }
-    rest.first()
-        .is_some_and(|b| !b"#>-*+=_|<[`~\\ \t".contains(b))
-}
-
-/// A line that ends its block by itself: an ATX heading or a thematic break (at column 0 these
-/// also end any list item or quote, and a `---` setext underline ends its paragraph the same
-/// way). A `===` underline isn't one: without a paragraph above it is text.
-fn is_block_end(rest: &[u8], indent: usize, containers: bool) -> bool {
-    let certain = indent == 0 || !containers;
-    match rest.first() {
-        Some(b'#') => {
-            let hashes = rest.iter().take_while(|&&b| b == b'#').count();
-            certain && hashes <= 6 && rest.get(hashes).is_none_or(|&b| b == b' ' || b == b'\t')
-        }
-        Some(&c @ (b'-' | b'*' | b'_')) => {
-            let marks = rest.iter().filter(|&&b| b != b' ' && b != b'\t').count();
-            certain && marks >= 3 && rest.iter().all(|&b| b == c || b == b' ' || b == b'\t')
-        }
-        _ => false,
-    }
-}
-
-/// `---` and nothing else but whitespace.
+/// `---` and nothing else but whitespace (as `u8::is_ascii_whitespace` has it: pulldown-cmark
+/// accepts a form feed there, not a vertical tab).
 fn is_meta_open(line: &[u8]) -> bool {
-    line.starts_with(b"---") && line[3..].iter().all(|&b| is_ws(b))
+    line.starts_with(b"---") && line[3..].iter().all(u8::is_ascii_whitespace)
 }
 
 /// `---` or `...` in column 0, then only spaces.
@@ -674,42 +965,4 @@ fn html_end_tag(after: &[u8]) -> Option<&'static str> {
         }
     }
     (after.len() > 1 && after[0] == b'!' && after[1].is_ascii_alphabetic()).then_some(">")
-}
-
-/// The label of a footnote definition line (`[^label]:`), possibly inside quotes or list items
-/// (then the flag is set).
-fn footnote_label(line: &[u8]) -> Option<(&str, bool)> {
-    let mut rest = line;
-    let mut nested = false;
-    for _ in 0..6 {
-        let indent = leading_spaces(rest).min(3);
-        rest = &rest[indent..];
-        match rest.first()? {
-            b'>' => {
-                rest = &rest[1..];
-                nested = true;
-            }
-            b'-' | b'*' | b'+' if rest.get(1) == Some(&b' ') => {
-                rest = &rest[2..];
-                nested = true;
-            }
-            b'0'..=b'9' => {
-                let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-                if matches!(rest.get(digits), Some(b'.' | b')'))
-                    && rest.get(digits + 1) == Some(&b' ')
-                {
-                    rest = &rest[digits + 2..];
-                    nested = true;
-                } else {
-                    return None;
-                }
-            }
-            _ => break,
-        }
-    }
-    let rest = std::str::from_utf8(rest.strip_prefix(b"[^")?).ok()?;
-    let label = label_at(rest)?;
-    rest[label.len()..]
-        .starts_with("]:")
-        .then_some((label, nested))
 }

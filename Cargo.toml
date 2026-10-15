@@ -12,6 +12,7 @@ members = ["xtask"]
 
 [dependencies]
 pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }
+unicase = "2" # pulldown-cmark's label matching, already in the tree
 winit = { version = "0.30", default-features = false, features = [
     "rwh_06", "x11", "wayland", "wayland-dlopen",
 ] }
