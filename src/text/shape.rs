@@ -98,10 +98,10 @@ fn is_default_ignorable(c: char) -> bool {
 
 /// The combining marks after a base, and where they end.
 struct Marks {
-    /// Directly after the base (or after joiners and variation selectors): they may compose
-    /// with it.
+    /// Directly after the base: they may compose with it.
     composable: Vec<char>,
-    /// After another ignorable character (CGJ, ZWSP, ...): never composed.
+    /// After an ignorable character (ZWJ, variation selector, CGJ, ZWSP, ...): canonical
+    /// composition doesn't reach across it, so the mark needs a glyph of its own.
     loose: Vec<char>,
     /// End of everything that stays with the base.
     end: usize,
@@ -141,9 +141,9 @@ fn marks_after(text: &str, from: usize, end: usize) -> Marks {
             };
             list.push(c);
         } else if is_default_ignorable(c) {
-            // Joiners and variation selectors are transparent; anything else (CGJ, ZWSP, ...)
-            // stands between the base and the marks after it.
-            blocked |= !attaches_to_previous(c);
+            // Joiners and variation selectors stay with the base's face, but still stand
+            // between it and the marks after them.
+            blocked = true;
         } else if !attaches_to_previous(c) {
             break;
         }
@@ -325,11 +325,21 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
             let start = base + c.source.start;
             let end = base + c.source.end;
             let src = &text[start as usize..end as usize];
-            // Invisible formatting characters render nothing, even when the face lacks them.
+            // Invisible formatting characters render nothing, even when the face lacks them:
+            // a cluster that is all of them drops every `.notdef`, one that carries them next
+            // to a base (`e` + variation selector + mark) drops one per such character.
             let invisible = src.chars().all(is_default_ignorable);
+            let mut unseen = src
+                .chars()
+                .filter(|&ch| is_default_ignorable(ch) && fonts.face(run.face).glyph(ch) == 0)
+                .count();
             let g0 = glyphs.len() as u32;
             let mut advance = 0.0;
-            for g in c.glyphs.iter().filter(|g| !(invisible && g.id == 0)) {
+            for g in c.glyphs.iter().filter(|g| {
+                let drop = g.id == 0 && (invisible || unseen > 0);
+                unseen -= (drop && unseen > 0) as usize;
+                !drop
+            }) {
                 glyphs.push(Glyph {
                     id: g.id,
                     x: g.x,

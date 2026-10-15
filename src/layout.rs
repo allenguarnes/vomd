@@ -202,6 +202,8 @@ pub struct Layout {
     /// Block range of each table.
     table_rows: Vec<Range<u32>>,
     table_cols: Vec<Option<Vec<f32>>>,
+    /// Some character in a table's sampled rows had no face when its columns were measured.
+    table_missing: Vec<bool>,
     total: f32,
     /// Next block for idle measurement.
     cursor: usize,
@@ -225,6 +227,7 @@ impl Layout {
             meta: Vec::new(),
             table_rows: vec![0..0; doc.tables.len()],
             table_cols: vec![None; doc.tables.len()],
+            table_missing: vec![false; doc.tables.len()],
             total: 0.0,
             cursor: 0,
             live: Vec::new(),
@@ -295,14 +298,23 @@ impl Layout {
         }
         self.live.clear();
         self.table_cols.iter_mut().for_each(|c| *c = None);
+        self.table_missing.iter_mut().for_each(|m| *m = false);
         self.cursor = 0;
         self.recompute_ys();
     }
 
     /// Fallback faces were added: remeasure blocks that had uncovered characters (even ones
     /// already reported). A table whose sampled rows were affected is remeasured whole, since
-    /// its column widths depend on them.
+    /// its column widths depend on them: either a sampled row was laid out with a missing
+    /// character, or the columns were measured with one (the sampled rows may not have been
+    /// laid out at all).
     pub fn invalidate_missing(&mut self, doc: &Doc) {
+        for table in 0..self.table_missing.len() {
+            if std::mem::take(&mut self.table_missing[table]) {
+                self.table_cols[table] = None;
+                self.reset_rows(self.table_rows[table].clone());
+            }
+        }
         for i in 0..self.geoms.len() {
             if !self.geoms[i].missing {
                 continue;
@@ -316,16 +328,32 @@ impl Layout {
                 }
                 _ => i as u32..i as u32 + 1,
             };
-            for r in rows.start as usize..rows.end as usize {
-                let g = &mut self.geoms[r];
-                g.measured = false;
-                g.content = None;
-                g.missing = false;
-            }
-            self.cursor = self.cursor.min(rows.start as usize);
+            self.reset_rows(rows);
         }
         self.live
             .retain(|&i| self.geoms[i as usize].content.is_some());
+    }
+
+    /// Mark the blocks measured again.
+    fn reset_rows(&mut self, rows: Range<u32>) {
+        for g in &mut self.geoms[rows.start as usize..rows.end as usize] {
+            g.measured = false;
+            g.content = None;
+            g.missing = false;
+        }
+        self.cursor = self.cursor.min(rows.start as usize);
+    }
+
+    /// Queue characters no face covered for `take_missing`, unless already reported.
+    fn report_missing(&mut self, chars: &[char]) {
+        for &c in chars {
+            if self.tried.binary_search(&c).is_ok() {
+                continue;
+            }
+            if let Err(at) = self.missing.binary_search(&c) {
+                self.missing.insert(at, c);
+            }
+        }
     }
 
     fn set_geometry(&mut self) {
@@ -616,16 +644,9 @@ impl Layout {
             ),
         };
         self.quote_bars(doc, i, meta, gap, content_h, &mut out);
-        for c in missing {
-            // Always flag the block: a fallback scan may still be running for `c`.
-            self.geoms[i].missing = true;
-            if self.tried.binary_search(&c).is_ok() {
-                continue;
-            }
-            if let Err(at) = self.missing.binary_search(&c) {
-                self.missing.insert(at, c);
-            }
-        }
+        // Always flag the block: a fallback scan may still be running for these characters.
+        self.geoms[i].missing |= !missing.is_empty();
+        self.report_missing(&missing);
         (out, gap + content_h)
     }
 
@@ -904,7 +925,9 @@ impl Layout {
         let aligns = &doc.tables[table].aligns;
         let mut cells = Vec::with_capacity(cols.len());
         let mut row_h: f32 = 0.0;
-        for (c, spans) in doc.row_cells(block).take(cols.len()).enumerate() {
+        // A fragment of a split row only stores the cells that still have text.
+        let stored = doc.row_cells(block).take_while(|&(c, _)| c < cols.len());
+        for (c, spans) in stored {
             fill_para(&mut self.para, doc, spans, body);
             let align = match aligns.get(c) {
                 Some(doc::Align::Center) => Align::Center,
@@ -920,7 +943,7 @@ impl Layout {
             );
             missing.extend_from_slice(&pl.missing);
             row_h = row_h.max(pl.height);
-            cells.push((pl, std::mem::take(&mut self.para.styles)));
+            cells.push((c, pl, std::mem::take(&mut self.para.styles)));
         }
         if cells.is_empty() {
             self.para.clear();
@@ -944,9 +967,9 @@ impl Layout {
         }
         let mut x = indent;
         out.rect(x, gap, line, h, Role::Border);
-        let mut cells = cells.into_iter();
-        for w in &cols {
-            if let Some((pl, styles)) = cells.next() {
+        let mut cells = cells.into_iter().peekable();
+        for (c, w) in cols.iter().enumerate() {
+            if let Some((_, pl, styles)) = cells.next_if(|(col, ..)| *col == c) {
                 out.append(pl, &styles, x + px, gap + top);
             }
             x += w;
@@ -956,16 +979,18 @@ impl Layout {
     }
 
     /// The blocks of a table whose cells size its columns: its first rows, up to
-    /// [`TABLE_SAMPLE_ROWS`] blocks or [`TABLE_SAMPLE_BYTES`] of text (always at least the
-    /// header).
+    /// [`TABLE_SAMPLE_ROWS`] blocks or [`TABLE_SAMPLE_BYTES`] of text, counted per block (a
+    /// fragment of a split row that would pass the budget isn't sampled). Always at least the
+    /// header's first block.
     fn table_sample(&self, doc: &Doc, table: usize) -> Range<u32> {
         let rows = self.table_rows[table].clone();
         let (mut end, mut bytes) = (rows.start, 0);
-        while end < rows.end
-            && ((end - rows.start) as usize) < TABLE_SAMPLE_ROWS
-            && bytes < TABLE_SAMPLE_BYTES
-        {
-            bytes += text_bytes(doc, &doc.blocks[end as usize]);
+        while end < rows.end && ((end - rows.start) as usize) < TABLE_SAMPLE_ROWS {
+            let next = text_bytes(doc, &doc.blocks[end as usize]);
+            if end > rows.start && bytes + next > TABLE_SAMPLE_BYTES {
+                break;
+            }
+            bytes += next;
             end += 1;
         }
         rows.start..end
@@ -987,6 +1012,7 @@ impl Layout {
         let (mut min, mut max) = (vec![0.0f32; n], vec![0.0f32; n]);
         let sample = self.table_sample(doc, table);
         let truncated = sample.end < self.table_rows[table].end;
+        let mut missing = Vec::new();
         for r in sample {
             let block = &doc.blocks[r as usize];
             let header = matches!(block.kind, BlockKind::TableRow { header: true, .. });
@@ -994,12 +1020,21 @@ impl Layout {
                 bold: header,
                 ..self.body_style(block, self.meta[r as usize])
             };
-            for (c, spans) in doc.row_cells(block).take(n).enumerate() {
+            for (c, spans) in doc.row_cells(block).take_while(|&(c, _)| c < n) {
                 fill_para(&mut self.para, doc, spans, body);
-                let (lo, hi) = self.ctx.measure(fonts, &self.para);
+                let (lo, hi, absent) = self.ctx.measure_missing(fonts, &self.para);
                 min[c] = min[c].max(lo);
                 max[c] = max[c].max(hi);
+                missing.extend(absent);
             }
+        }
+        // The sampled rows may never be laid out themselves, so their missing characters are
+        // recorded with the table: loading a fallback must remeasure its columns.
+        if !missing.is_empty() {
+            self.table_missing[table] = true;
+            missing.sort_unstable();
+            missing.dedup();
+            self.report_missing(&missing);
         }
         let avail = (self.col_w - indent - n as f32 * 2.0 * px).max(0.0);
         let (sum_min, sum_max): (f32, f32) = (min.iter().sum(), max.iter().sum());

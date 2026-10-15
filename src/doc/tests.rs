@@ -43,7 +43,13 @@ fn dump(doc: &Doc) -> String {
             }
         };
         if let BlockKind::TableRow { .. } = block.kind {
-            for cell in doc.row_cells(block) {
+            let mut next = 0;
+            for (col, cell) in doc.row_cells(block) {
+                // Fragments of a split row skip the columns that ran out of text.
+                if col != next {
+                    out.push_str(&format!(" c{col}"));
+                }
+                next = col + 1;
                 out.push_str(" [");
                 spans_of(cell, &mut out);
                 out.push_str(" ]");
@@ -117,8 +123,11 @@ fn check_invariants(doc: &Doc) {
         } = block.kind
         {
             assert!((first_cell + cells) as usize <= doc.cells.len());
+            let mut col = 0;
             for cell in doc.cells[first_cell as usize..][..cells as usize].iter() {
-                assert!(cell.start >= block.spans.start && cell.end <= block.spans.end);
+                assert!(cell.spans.start >= block.spans.start && cell.spans.end <= block.spans.end);
+                assert!(cell.col >= col, "columns ascend");
+                col = cell.col + 1;
             }
         }
     }
@@ -145,6 +154,22 @@ fn inline_styles() {
         "Plain *italic* **bold** ***both*** ~~strike~~ `code` and [a **bold** link](https://x.y).\n\
          Soft\nbreak and hard  \nbreak."
     ));
+}
+
+#[test]
+fn inline_nesting_depth_is_not_capped() {
+    // 65536 nested levels used to overflow a u16 counter (a debug panic, or a wrap to zero that
+    // dropped the style).
+    let strong = format!("{}x{}", "**".repeat(65_536), "**".repeat(65_536));
+    // Alternating `*` and `_` emphasis nests 70000 deep.
+    let italic = format!("{}x {}", "*a _a ".repeat(35_000), "a_ a* ".repeat(35_000));
+    for (src, flag) in [(strong, style::BOLD), (italic, style::ITALIC)] {
+        let doc = Doc::parse(&src);
+        check_invariants(&doc);
+        let x = doc.spans.iter().find(|s| doc.span_text(s).contains('x'));
+        let x = x.unwrap_or_else(|| panic!("{:.100}", dump(&doc)));
+        assert!(x.style & flag != 0, "style {:#b}", x.style);
+    }
 }
 
 #[test]
@@ -249,6 +274,20 @@ fn entities() {
         Some("yes")
     );
     assert_eq!(attr("img alt", "alt"), None);
+}
+
+#[test]
+fn entity_scan_is_linear() {
+    // Every `&` used to scan the whole remainder for a `;`: quadratic on a run of them.
+    let amps = "&".repeat(400_000);
+    let t = std::time::Instant::now();
+    assert_eq!(decode_entities(&amps), amps);
+    let doc = Doc::parse(&format!("<div>{amps}</div>\n"));
+    check_invariants(&doc);
+    assert_eq!(doc.text, amps);
+    // A `;` just past the 10-byte reach is not an entity.
+    assert_eq!(decode_entities("&aaaaaaaaaa;&lt;"), "&aaaaaaaaaa;<");
+    assert!(t.elapsed().as_secs_f64() < 1.0, "{:?}", t.elapsed());
 }
 
 /// Every example in the CommonMark spec parses without panicking and satisfies invariants.
@@ -542,11 +581,16 @@ fn chunked_headings_and_footnotes_anchor_at_the_first_chunk() {
     );
 }
 
-/// Text of each cell of a table row block.
+/// Text of each column of a table row block (columns a fragment doesn't store are empty).
 fn cell_texts(doc: &Doc, block: &Block) -> Vec<String> {
-    doc.row_cells(block)
-        .map(|spans| spans.iter().map(|s| doc.span_text(s)).collect())
-        .collect()
+    let BlockKind::TableRow { table, .. } = block.kind else {
+        panic!("not a table row");
+    };
+    let mut out = vec![String::new(); doc.tables[table as usize].aligns.len()];
+    for (col, spans) in doc.row_cells(block) {
+        out[col] = spans.iter().map(|s| doc.span_text(s)).collect();
+    }
+    out
 }
 
 /// Bytes of text in a block's spans.
@@ -582,7 +626,12 @@ fn oversized_table_rows_split_into_fragments() {
         else {
             panic!("fragment {k} is a table row");
         };
-        assert_eq!((table, header, count), (0, false, 2), "fragment {k}");
+        // The first fragment stores both cells; later ones only the cell with text left.
+        assert_eq!(
+            (table, header, count),
+            (0, false, if k == 0 { 2 } else { 1 }),
+            "fragment {k}"
+        );
         assert!(block_bytes(&doc, b) <= MAX_BLOCK_BYTES, "fragment {k}");
         let texts = cell_texts(&doc, b);
         // The short cell is in the first fragment; later fragments hold an empty cell.
@@ -628,7 +677,7 @@ fn table_row_fragments_cut_on_char_boundaries_and_keep_headers() {
             .collect();
         assert_eq!(text, wide);
     }
-    // Fragments keep every cell range valid, even exhausted (empty) ones.
+    // Every fragment reads as a full row: columns that ran out are empty.
     for b in &doc.blocks {
         assert_eq!(cell_texts(&doc, b).len(), 2);
     }
@@ -825,4 +874,675 @@ fn quote_list_depths_are_exact_at_any_depth() {
     let b = doc.blocks.last().unwrap();
     assert_eq!((b.list, b.quote), (5, 5));
     assert_eq!(doc.block_quote_lists(b), [1, 2, 3, 4, 5]);
+}
+
+/// How many segments `src` is cut into at `budget`.
+fn segment_count(src: &str, budget: usize) -> usize {
+    segment::plan(src, budget).map_or(1, |p| p.segments.len())
+}
+
+/// Segmented parsing at `budget` bytes gives exactly the document one parser gives. Returns the
+/// number of segments, so callers can check that the text really was cut.
+fn assert_same(name: &str, src: &str, budget: usize) -> usize {
+    let whole = Doc::parse_whole(src);
+    let Some(parts) = Doc::parse_segments(src, budget) else {
+        return 1;
+    };
+    check_invariants(&parts);
+    if whole != parts {
+        std::fs::write("/tmp/vomd_fail.md", src).ok();
+        let (a, b) = (dump(&whole), dump(&parts));
+        let at = a.lines().zip(b.lines()).position(|(x, y)| x != y);
+        let (la, lb): (Vec<_>, Vec<_>) = (a.lines().collect(), b.lines().collect());
+        let at = at.unwrap_or(la.len().min(lb.len()));
+        panic!(
+            "{name} @ {budget}: segmented parse differs at dump line {at}\n  whole:     {:.300}\n  segmented: {:.300}\n  ({} vs {} lines)",
+            la.get(at).unwrap_or(&"<end>"),
+            lb.get(at).unwrap_or(&"<end>"),
+            la.len(),
+            lb.len()
+        );
+    }
+    segment_count(src, budget)
+}
+
+#[test]
+fn segmented_parse_matches_fixtures() {
+    for name in ["tiny", "readme", "spec", "cjk", "rtl", "emoji", "tables"] {
+        let path = format!("{}/fixtures/{name}.md", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path).unwrap();
+        for budget in [1, 200, 1024, 4096] {
+            let n = assert_same(name, &src, budget);
+            // The larger fixtures really are cut (the one-line ones can't be).
+            if src.len() > 20_000 && budget <= 1024 {
+                assert!(n >= 5, "{name} @ {budget}: {n} segments");
+            }
+        }
+    }
+}
+
+#[test]
+fn segmented_parse_handles_crlf_and_lone_cr_line_endings() {
+    for name in ["readme", "tables", "spec"] {
+        let path = format!("{}/fixtures/{name}.md", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace('\n', "\r\n");
+        for budget in [1, 300, 2048] {
+            let n = assert_same(&format!("{name} (CRLF)"), &src, budget);
+            assert!(
+                name == "tables" || n > 3,
+                "{name} (CRLF) @ {budget}: {n} segments"
+            );
+        }
+    }
+    let table = big_table(500).replace('\n', "\r\n");
+    assert!(assert_same("CRLF table", &table, 500) > 3);
+    // A lone CR ends a line for pulldown-cmark but not for the planner: no cuts at all.
+    let src = "one\rtwo\r\rthree\n\nfour\n";
+    assert!(segment::plan(src, 1).is_none());
+    assert_same("lone CR", src, 1);
+}
+
+#[test]
+fn large_documents_parse_in_segments_with_the_same_result() {
+    // Over `SEGMENT_THRESHOLD`, `Doc::parse` takes the segmented path by itself.
+    let seed = include_str!("../../fixtures/readme.md").to_owned()
+        + include_str!("../../fixtures/tables.md")
+        + &big_table(200)
+        + "\nNote[^n].\n\n[^n]: A note.\n";
+    let src: String = (0..40)
+        .map(|i| format!("\n# Section {i}\n\n{seed}"))
+        .collect();
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    let n = segment_count(&src, SEGMENT_BYTES);
+    assert!(n > src.len() / SEGMENT_BYTES / 2, "{n} segments");
+    let doc = Doc::parse(&src);
+    check_invariants(&doc);
+    assert!(doc == Doc::parse_whole(&src));
+    // A giant table is one table, however many segments carry it.
+    let table = big_table(40_000);
+    assert!(table.len() > SEGMENT_THRESHOLD);
+    let doc = Doc::parse(&table);
+    assert_eq!(doc.tables.len(), 1);
+    assert_eq!(doc.blocks.len(), 40_001);
+    assert!(doc == Doc::parse_whole(&table));
+}
+
+/// Every example of the CommonMark spec, in one document and in groups, each example followed
+/// by a paragraph. The examples leave fences, HTML blocks and lists open, so they interact; the
+/// planner gives up on some of them (then the parse is whole and trivially equal).
+#[test]
+fn segmented_parse_matches_the_spec_examples_concatenated() {
+    let spec = include_str!("../../fixtures/spec.md");
+    let fence = "````````````````````````````````";
+    let (mut examples, mut rest) = (Vec::new(), spec);
+    while let Some(i) = rest.find(&format!("{fence} example")) {
+        rest = &rest[i + fence.len() + 8..];
+        let end = rest.find(&format!("\n{fence}")).unwrap();
+        let md = rest[..end]
+            .split("\n.\n")
+            .next()
+            .unwrap()
+            .replace('→', "\t");
+        examples.push(md);
+        rest = &rest[end..];
+    }
+    let join = |group: &[String], sep: &str| -> String {
+        group.iter().map(|e| format!("{e}{sep}")).collect()
+    };
+    let mut cuts = 0;
+    for (sep, tag) in [
+        ("\nA paragraph between examples.\n\n", "spaced"),
+        ("\n", "tight"),
+    ] {
+        for budget in [1, 300] {
+            assert_same(tag, &join(&examples, sep), budget);
+            for (g, group) in examples.chunks(3).enumerate() {
+                let src = join(group, sep);
+                cuts += assert_same(&format!("{tag} group {g}"), &src, budget) - 1;
+            }
+        }
+    }
+    assert!(cuts > 100, "only {cuts} cuts");
+}
+
+/// A header, alignments, and rows with markup, so a cut between rows repeats a real header.
+fn big_table(rows: usize) -> String {
+    let mut src = String::from("| Name | Qty | Notes |\n|:-----|----:|:-----:|\n");
+    for i in 0..rows {
+        src.push_str(&format!("| item {i} | {i} | **b**{i} `c` [l](#{i}) |\n"));
+    }
+    src
+}
+
+#[test]
+fn segmented_parse_cuts_giant_tables_between_rows() {
+    let src = format!("# Title\n\n{}\nafter\n\n{}", big_table(3000), big_table(40));
+    for budget in [1, 700, 4096] {
+        let n = assert_same("tables", &src, budget);
+        assert!(n > 5, "{n} segments at {budget}");
+    }
+    let plan = segment::plan(&src, 4096).unwrap();
+    // Cuts inside the first table repeat its header, which the builder drops.
+    assert!(plan.segments.iter().filter(|s| s.head.is_some()).count() > 3);
+    let doc = Doc::parse_segments(&src, 4096).unwrap();
+    assert_eq!(doc.tables.len(), 2);
+    assert_eq!(
+        doc.tables[0].aligns,
+        [Align::Left, Align::Right, Align::Center]
+    );
+    let heads = doc
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.kind, BlockKind::TableRow { header: true, .. }))
+        .count();
+    assert_eq!(heads, 2);
+    // The title, the first table (header and rows), a paragraph, the second table.
+    assert_eq!(doc.blocks.len(), 1 + (1 + 3000) + 1 + (1 + 40));
+}
+
+#[test]
+fn segmented_parse_resolves_definitions_from_other_segments() {
+    let filler = "Some filler text to make the document longer.\n\n".repeat(30);
+    // Reference definitions at the end, used at the start (with titles, labels in another case,
+    // and a destination on the next line), plus a definition shadowed by a later duplicate.
+    let src = format!(
+        "[Foo], [bar][b], ![img][pic] and [foo].\n\n{filler}Again [FOO] and [missing].\n\n\
+         [foo]: /first \"Title\"\n[b]:\n  /second\n[pic]: i.png\n\n[foo]: /ignored\n"
+    );
+    assert!(assert_same("definitions", &src, 400) > 3);
+    let doc = Doc::parse_segments(&src, 400).unwrap();
+    assert_eq!(&doc.links[..3], ["/first", "/second", "/first"]);
+    assert_eq!(doc.images[0].src, "i.png");
+    // Definitions before their use, and after a heading.
+    let src = format!("# Links\n[x]: /x\n\n{filler}Use [x].\n");
+    assert!(assert_same("definitions after heading", &src, 400) > 3);
+    assert_eq!(Doc::parse_segments(&src, 400).unwrap().links, ["/x"]);
+}
+
+#[test]
+fn segmented_parse_resolves_footnotes_from_other_segments() {
+    let filler = "Some filler text to make the document longer.\n\n".repeat(30);
+    let src = format!(
+        "Early[^a] and [^B].\n\n{filler}Middle[^a], [^c] and [^missing].\n\n{filler}\
+         [^a]: First note.\n\n    Second paragraph.\n\n[^b]: Second note with ref[^c].\n\n\
+         [^c]: Third.\n\nLast[^a].\n"
+    );
+    assert!(assert_same("footnotes at the end", &src, 400) > 5);
+    let doc = Doc::parse_segments(&src, 400).unwrap();
+    let refs = doc
+        .spans
+        .iter()
+        .filter(|s| s.style & style::FOOTREF != 0)
+        .count();
+    assert_eq!(refs, 6);
+    // Definitions before their references work too, and so do ones inside a quote.
+    let src = format!("[^a]: Note.\n\n> [^q]: Quoted.\n\n{filler}Late[^a] and[^q].\n");
+    assert!(assert_same("footnotes at the start", &src, 400) > 3);
+    // Front matter stays first.
+    let src = format!("---\ntitle: x\n\nk: v\n---\nRef[^a].\n\n{filler}[^a]: Note.\n");
+    assert!(assert_same("front matter and footnotes", &src, 400) > 3);
+}
+
+#[test]
+fn segmented_parse_never_cuts_inside_blocks_that_span_blank_lines() {
+    let filler = "Some filler text to make the document longer.\n\n".repeat(20);
+    let blocks = [
+        // Fenced code with blank lines, column-0 text and headings inside.
+        "```\ncode\n\ntext at column 0\n\n# heading-like\n\n[x]: /not-a-definition\n```",
+        "~~~\ncode\n\n~~~~\n\nstill code\n~~~~~",
+        "  ```\n  indented fence\n\nstays\n  ```",
+        // HTML blocks that only end at their closing tag.
+        "<!--\ncomment\n\ntext in a comment\n\n-->",
+        "<pre>\npre\n\ntext\n</pre>",
+        "<script>\nvar a;\n\ntext\n</script>",
+        "<style>\na {}\n\ntext\n</style>",
+        "<![CDATA[\ndata\n\ntext\n]]>",
+        "<?php\necho 1;\n\ntext\n?>",
+        "<!DOCTYPE html\n\ntext\n>",
+        // A metadata block in the middle of the text.
+        "---\ntitle: x\n\ntext\n---",
+        // Lists and quotes with blank lines between their parts.
+        "- a\n\n- b\n\n  nested para\n\n- c",
+        "1. one\n\n2. two\n\n   - nested\n\n     more\n\n3. three",
+        "> quote\n>\n> more\n\n> another",
+        "- item\n\n  > quote in item\n  >\n  > more\n\n  ```\n  code\n\n  more\n  ```\n\n- next",
+        "> - a\n>\n>   b\n>\n> - c",
+        "    indented\n\n    code\n\ntext",
+    ];
+    for (i, block) in blocks.iter().enumerate() {
+        let src = format!("{filler}{block}\n\n{filler}Text at column 0.\n\n# After\n\n{filler}");
+        for budget in [1, 90, 700] {
+            assert_same(&format!("block {i}: {block}"), &src, budget);
+        }
+        let n = segment_count(&src, 90);
+        assert!(
+            n >= 3 || block.starts_with("  ```") || block.contains("- item"),
+            "block {i}: {n} segments"
+        );
+    }
+    // All of them in one document, one after the other.
+    let src: String = blocks.iter().map(|b| format!("{b}\n\n{filler}")).collect();
+    for budget in [1, 90, 700] {
+        assert_same("all blocks", &src, budget);
+    }
+}
+
+/// Deterministic pseudo-random numbers (xorshift), so failures reproduce.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Lines that exercise every construct the segment scanner has to follow.
+const FUZZ_LINES: &[&str] = &[
+    "",
+    "",
+    "",
+    "text",
+    "more text",
+    "Text with [foo] and [bar][baz] and [^a] and [^b].",
+    "# Heading",
+    "## Heading two",
+    "Setext",
+    "===",
+    "---",
+    "...",
+    "* * *",
+    "- item",
+    "- [ ] task",
+    "  - nested",
+    "    - deeper",
+    "1. one",
+    "2) two",
+    "10. ten",
+    "+ plus",
+    "> quote",
+    "> > nested",
+    ">",
+    "> [!NOTE]",
+    "    indented code",
+    "\tcode",
+    "```",
+    "```rust",
+    "~~~",
+    "~~~~",
+    "````",
+    "  ```",
+    "   ```",
+    "    ```",
+    "`` ` ``",
+    "<!--",
+    "-->",
+    "<!-- one line -->",
+    "<div>",
+    "</div>",
+    "<pre>",
+    "</pre>",
+    "<PRE>",
+    "</PRE>",
+    "<script>",
+    "</script>",
+    "<style>",
+    "</style>",
+    "<?php",
+    "?>",
+    "<!DOCTYPE html>",
+    "<![CDATA[",
+    "]]>",
+    "<br>",
+    "<img src=\"a.png\">",
+    "| a | b |",
+    "|---|:-:|",
+    "| 1 | 2 |",
+    "|",
+    "| x |",
+    "a | b",
+    "--|--",
+    "[foo]: /url",
+    "[foo]: /url \"title\"",
+    "[bar]:",
+    "/bar",
+    "\"title\"",
+    "[Baz]: <b z>",
+    "[^a]: note a",
+    "[^b]: note b",
+    "    more note",
+    "[^a]:",
+    "  > [^b]: quoted note",
+    "- [^a]: listed",
+    "\u{a0}",
+    "  ",
+    "\t",
+    "text  ",
+    "&amp; &lt;",
+    "\\",
+    "\\*",
+    "1.",
+    "-",
+    "*",
+    "\u{4e2d}\u{6587}",
+    "  - ",
+    "---  ",
+    "--- x",
+    "----",
+    "+++",
+];
+
+fn fuzz_doc(rng: &mut Rng) -> String {
+    let mut src = String::new();
+    for _ in 0..rng.below(120) + 20 {
+        src.push_str(FUZZ_LINES[rng.below(FUZZ_LINES.len())]);
+        src.push('\n');
+    }
+    src
+}
+
+/// Multi-line constructs, several with blank lines or column-0 text inside.
+const FUZZ_BLOCKS: &[&str] = &[
+    "A paragraph with [foo], [bar][baz] and a note[^a] and another[^b].\nSecond line.",
+    "# Heading one",
+    "## Heading *two*",
+    "Setext heading\n==============",
+    "- a\n- b\n\n- c",
+    "1. one\n2. two\n\n   para in item\n3. three",
+    "- item\n\n  ```\n  code\n\n  more\n  ```\n- next",
+    "- list\n  - nested\n\n    deeper para\n\n- again",
+    "> quote\n>\n> more\n\n> second quote",
+    "> [!NOTE]\n> alert text\n>\n> - item",
+    "```\ncode\n\nstill code\n\n# not a heading\n\ntext\n```",
+    "~~~rust\nfn main() {}\n\n~~~",
+    "````\n```\nnested\n```\n\n````",
+    " ```\nindented fence\n\nstays code\n ```",
+    "<!--\ncomment\n\nwith a blank line\n-->",
+    "<!-- one line -->",
+    "<pre>\npre text\n\nafter blank\n</pre>",
+    "<script>\nvar x = 1;\n\nvar y = 2;\n</script>",
+    "<div>\nhtml *block*\n</div>",
+    "<details>\n<summary>More</summary>\n\nInner *markdown*\n\n</details>",
+    "<p align=\"center\">\n  <img src=\"a.png\" alt=\"A\">\n</p>",
+    "| a | b |\n|---|:-:|\n| 1 | 2 |\n| 3 | 4 |",
+    "| a |\n|---|\n| only |",
+    "[foo]: /url \"title\"\n[bar]: <b z>",
+    "[baz]: /baz",
+    "[^a]: note a\n\n    second paragraph of the note",
+    "[^b]: note *b*",
+    "    indented code\n\n    more code",
+    "***",
+    "---",
+    "---\ntitle: x\n\nkey: y\n---",
+    "A line\nwith a hard break  \nand more",
+    "Text with `code` and <b>inline</b> html &amp; entities.",
+    "1) paren list\n2) second",
+    "* star\n\n* loose",
+];
+
+/// A document of blocks, usually separated by a blank line (sometimes by none), maybe with front
+/// matter first.
+fn block_doc(rng: &mut Rng) -> String {
+    let mut src = String::new();
+    if rng.below(4) == 0 {
+        src.push_str("---\ntitle: Doc\n\ntags: [a]\n---\n\n");
+    }
+    for _ in 0..rng.below(60) + 10 {
+        src.push_str(FUZZ_BLOCKS[rng.below(FUZZ_BLOCKS.len())]);
+        src.push_str(if rng.below(10) == 0 { "\n" } else { "\n\n" });
+    }
+    src
+}
+
+/// `VOMD_FUZZ=<n>` runs `n` random documents of each kind instead of the default.
+fn fuzz_runs() -> usize {
+    std::env::var("VOMD_FUZZ")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(600)
+}
+
+#[test]
+fn segmented_parse_matches_on_random_documents() {
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ fuzz_runs() as u64);
+    let mut cuts = 0;
+    for i in 0..fuzz_runs() {
+        let src = block_doc(&mut rng);
+        for budget in [1, 150] {
+            cuts += assert_same(&format!("block doc {i}\n{src}"), &src, budget) - 1;
+        }
+    }
+    assert!(cuts > fuzz_runs() * 2, "only {cuts} cuts were exercised");
+    // Random lines are mostly unsplittable, but a cut must never change the result.
+    for i in 0..fuzz_runs() {
+        let src = fuzz_doc(&mut rng);
+        for budget in [1, 40] {
+            assert_same(&format!("line doc {i}\n{src}"), &src, budget);
+        }
+    }
+}
+
+#[test]
+fn nested_images_keep_the_whole_outer_alt_text() {
+    let doc = Doc::parse("![outer ![inner](inner.png) end](outer.png)");
+    check_invariants(&doc);
+    // Only the outer image is an image; the inner one contributes its alt text.
+    assert_eq!(doc.images.len(), 1);
+    assert_eq!(doc.images[0].src, "outer.png");
+    let texts: Vec<_> = doc.spans.iter().map(|s| doc.span_text(s)).collect();
+    assert_eq!(texts, ["outer inner end"]);
+    assert_eq!(doc.spans[0].style & style::IMAGE, style::IMAGE);
+    // Deeper nesting, and text after the image stays outside it.
+    let doc = Doc::parse("![a ![b ![c](c.png) d](b.png) e](a.png) after");
+    check_invariants(&doc);
+    let texts: Vec<_> = doc.spans.iter().map(|s| doc.span_text(s)).collect();
+    assert_eq!(texts, ["a b c d e", " after"]);
+    assert_eq!(doc.images.len(), 1);
+}
+
+/// Every `#fragment` link points at an anchor, and anchor ids are unique.
+fn check_anchors(doc: &Doc) {
+    let mut seen = HashSet::new();
+    for (id, _) in &doc.anchors {
+        assert!(seen.insert(id.as_str()), "duplicate anchor {id:?}");
+    }
+    for link in doc.links.iter().filter(|l| l.starts_with('#')) {
+        assert!(seen.contains(&link[1..]), "dangling link {link:?}");
+    }
+}
+
+#[test]
+fn footnote_anchors_never_collide_with_heading_slugs() {
+    let doc = Doc::parse("# fnref-n\n\nref[^n]\n\n[^n]: def\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    // The heading keeps its slug; the footnote's back-link anchor takes the next free id, and
+    // the link back to it follows.
+    assert_eq!(doc.headings[0].slug, "fnref-n");
+    let anchor = |id: &str| doc.anchors.iter().find(|(s, _)| s == id).map(|(_, b)| *b);
+    assert_eq!(anchor("fnref-n"), Some(0));
+    assert_eq!(anchor("fnref-n-1"), Some(1));
+    assert!(doc.links.iter().any(|l| l == "#fnref-n-1"));
+    assert!(doc.links.iter().any(|l| l == "#fn-n"));
+    // The same for the definition's own anchor, and when the footnote comes first.
+    let doc = Doc::parse("# fn-n\n\nref[^n]\n\n[^n]: def\n");
+    check_anchors(&doc);
+    assert_eq!(doc.headings[0].slug, "fn-n");
+    assert!(doc.anchors.iter().any(|(s, _)| s == "fn-n-1"));
+    assert!(doc.links.iter().any(|l| l == "#fn-n-1"));
+    let doc = Doc::parse("ref[^n]\n\n[^n]: def\n\n# fnref-n\n\n# fn-n\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    let slugs: Vec<_> = doc.headings.iter().map(|h| h.slug.as_str()).collect();
+    assert_eq!(slugs, ["fnref-n", "fn-n"]);
+    // Several colliding labels and headings still give unique ids.
+    let doc = Doc::parse(
+        "# fnref-a\n# fnref-a-1\n# fn-b\n\nx[^a][^b]\n\n[^a]: A\n[^b]: B\n\n# fnref-b\n# fn-a\n",
+    );
+    check_invariants(&doc);
+    check_anchors(&doc);
+}
+
+#[test]
+fn references_inside_footnote_definitions_have_return_anchors() {
+    let doc = Doc::parse("a[^a]\n\n[^a]: ref[^b]\n\n[^b]: def\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    let anchor = |id: &str| doc.anchors.iter().find(|(s, _)| s == id).map(|(_, b)| *b);
+    // The reference to `b` is in note a's block, in the footnote section.
+    let at = anchor("fnref-b").expect("an anchor for the reference inside note a") as usize;
+    assert_eq!(anchor("fn-a").map(|b| b as usize), Some(at));
+    assert!(doc.blocks[at].marker == Marker::Footnote(1));
+    assert!(
+        doc.block_spans(&doc.blocks[at])
+            .iter()
+            .any(|s| s.style & style::FOOTREF != 0)
+    );
+    // The first reference wins: one in the text before beats one in a definition.
+    let doc = Doc::parse("x[^b] a[^a]\n\n[^a]: ref[^b]\n\n[^b]: def\n");
+    check_anchors(&doc);
+    let b = doc.anchors.iter().find(|(s, _)| s == "fnref-b").unwrap().1;
+    assert_eq!(b, 0);
+    // And in the other order, the definition's reference wins.
+    let doc = Doc::parse("a[^a]\n\n[^a]: ref[^b]\n\n[^b]: def\n\nlate[^b]\n");
+    check_anchors(&doc);
+    let b = doc.anchors.iter().find(|(s, _)| s == "fnref-b").unwrap().1 as usize;
+    assert!(doc.blocks[b].marker == Marker::Footnote(1));
+    // Many notes in a chain, listed in reference order, keep their anchors on the right blocks.
+    let doc = Doc::parse("r[^c]\n\n[^a]: end\n[^b]: to a[^a]\n[^c]: to b[^b] and **bold**[^a]\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    for label in ["a", "b"] {
+        let at = doc
+            .anchors
+            .iter()
+            .find(|(s, _)| s == &format!("fnref-{label}"))
+            .unwrap()
+            .1 as usize;
+        assert!(
+            doc.block_spans(&doc.blocks[at])
+                .iter()
+                .any(|s| s.style & style::FOOTREF != 0),
+            "fnref-{label}"
+        );
+    }
+}
+
+#[test]
+fn footnotes_ending_in_a_table_or_code_get_their_own_backlink_paragraph() {
+    for end in [
+        "    | h |\n    |---|\n    | c |\n",
+        "    ```\n    code\n    ```\n",
+        "    ***\n",
+    ] {
+        let src = format!("a[^t]\n\n[^t]:\n{end}");
+        let doc = Doc::parse(&src);
+        check_invariants(&doc);
+        check_anchors(&doc);
+        let last = doc.blocks.last().unwrap();
+        assert_eq!(last.kind, BlockKind::Paragraph, "{src:?}");
+        let spans = doc.block_spans(last);
+        assert_eq!(spans.len(), 1, "{src:?}");
+        assert_eq!(doc.span_text(&spans[0]), "↩");
+        assert_eq!(doc.links[spans[0].link as usize - 1], "#fnref-t");
+        // The definition's last block was left alone: no span was glued onto it.
+        let before = &doc.blocks[doc.blocks.len() - 2];
+        assert!(
+            doc.block_spans(before)
+                .iter()
+                .all(|s| doc.span_text(s) != " ↩")
+        );
+    }
+    // Paragraphs still take the back-link in their own text.
+    let doc = Doc::parse("a[^t]\n\n[^t]: text\n");
+    let last = doc.blocks.last().unwrap();
+    assert!(
+        doc.block_spans(last)
+            .last()
+            .is_some_and(|s| doc.span_text(s) == " ↩")
+    );
+}
+
+#[test]
+fn wide_rows_are_split_within_an_aggregate_byte_budget() {
+    // 512 columns of 1 KB each: every cell used to get at least 256 bytes of every fragment, so a
+    // fragment held 128 KB.
+    const COLS: usize = 512;
+    let word = "word ".repeat(200);
+    let head: String = (0..COLS).map(|c| format!("| h{c} ")).collect::<String>() + "|\n";
+    let delim = "|---".repeat(COLS) + "|\n";
+    let row: String = (0..COLS).map(|_| format!("| {word} ")).collect::<String>() + "|\n";
+    let doc = Doc::parse(&format!("{head}{delim}{row}"));
+    check_invariants(&doc);
+    let widest = doc
+        .blocks
+        .iter()
+        .map(|b| block_bytes(&doc, b))
+        .max()
+        .unwrap();
+    assert!(widest <= MAX_BLOCK_BYTES, "a fragment holds {widest} bytes");
+    // The row still holds all of its text, piece by piece.
+    assert!(doc.blocks.len() > 30, "{} blocks", doc.blocks.len());
+    let total: usize = doc.blocks.iter().map(|b| block_bytes(&doc, b)).sum();
+    let header: usize = (0..COLS).map(|c| format!("h{c}").len()).sum();
+    assert_eq!(total, header + COLS * word.trim_end().len());
+    let first = &doc.blocks[1];
+    assert_eq!(cell_texts(&doc, first).len(), COLS);
+    // With more columns than the budget has bytes, the floor keeps every cell moving.
+    let doc = Doc::parse(&format!(
+        "{}{}| {} |\n",
+        "|a".repeat(2000) + "|\n",
+        "|-".repeat(2000) + "|\n",
+        "x ".repeat(100)
+            .repeat(2000)
+            .replace("x x ", "|")
+            .trim_end_matches('|')
+    ));
+    check_invariants(&doc);
+}
+
+#[test]
+fn exhausted_cells_cost_nothing_in_later_fragments() {
+    // One long cell and 511 one-character ones: later fragments used to store 511 empty cells
+    // each, about 10 million ranges for a 5 MB table.
+    const COLS: usize = 512;
+    let long = "word ".repeat(120_000);
+    let head: String = (0..COLS).map(|c| format!("| h{c} ")).collect::<String>() + "|\n";
+    let delim = "|---".repeat(COLS) + "|\n";
+    let row = format!("| {long} {}|\n", "| x ".repeat(COLS - 1));
+    let doc = Doc::parse(&format!("{head}{delim}{row}"));
+    check_invariants(&doc);
+    let fragments = doc.blocks.len();
+    assert!(fragments > 30, "{fragments} blocks");
+    // The header, plus the row's first fragment with every cell, plus one cell per later
+    // fragment.
+    assert!(
+        doc.cells.len() <= COLS + COLS + fragments,
+        "{} cells for {fragments} blocks",
+        doc.cells.len()
+    );
+    // Block 0 is the header, block 1 the row's first fragment.
+    let later = &doc.blocks[2];
+    assert!(later.joined);
+    let stored: Vec<_> = doc.row_cells(later).map(|(col, _)| col).collect();
+    assert_eq!(stored, [0]);
+    // They still read as full rows.
+    assert_eq!(cell_texts(&doc, later).len(), COLS);
+    // The long cell is complete.
+    let text: String = doc.blocks[1..]
+        .iter()
+        .map(|b| cell_texts(&doc, b)[0].clone())
+        .collect();
+    assert_eq!(text, long.trim_end());
+    // Short cells sit in the first fragment only.
+    assert_eq!(cell_texts(&doc, &doc.blocks[1])[1], "x");
+    assert_eq!(cell_texts(&doc, &doc.blocks[2])[1], "");
 }

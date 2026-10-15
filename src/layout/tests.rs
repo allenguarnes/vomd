@@ -1085,7 +1085,7 @@ fn row_fragments_share_stripes_borders_and_parity() {
 #[test]
 fn row_fragment_estimates_match_measured_heights() {
     let fonts = Fonts::new().unwrap();
-    let words = "alpha beta gamma ".repeat(3000);
+    let words = "alpha beta gamma ".repeat(4500);
     let doc = Doc::parse(&format!(
         "| a | b |\n|---|---|\n| 1 | 2 |\n| x | {words} |\n| 3 | 4 |\n"
     ));
@@ -1229,4 +1229,171 @@ fn rows_past_the_sample_get_slack_instead_of_wrapping() {
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     let total: f32 = l.table_cols[0].as_ref().unwrap().iter().sum();
     assert!(total < col_w * 0.5, "{total}");
+}
+
+#[test]
+fn missing_characters_in_sampled_rows_remeasure_the_columns() {
+    let fonts_embedded = Fonts::new().unwrap();
+    // Rows 200 and 600 are wide in a language the embedded fonts lack. Row 200 is only measured
+    // for the column widths (it is in the sample but far from the viewport); row 600 is laid out.
+    let wide = "Ж".repeat(100);
+    let doc = Doc::parse(
+        &long_table(1000, 200, &wide).replace("| k600 | v |", &format!("| k600 | {wide} |")),
+    );
+    let row = 1 + 600;
+    let at = Anchor {
+        block: row,
+        frac: 0.0,
+    };
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts_embedded, at, 800.0);
+    let missing = l.take_missing();
+    assert!(missing.contains(&'Ж'));
+    assert!(
+        l.table_missing[0],
+        "the columns were measured without a face"
+    );
+    assert!(l.table_cols[0].is_some());
+    let stale = l.table_cols[0].clone().unwrap();
+
+    // Without the fix only the laid-out row 600 was invalidated, and the columns stayed.
+    l.invalidate_missing(&doc);
+    assert!(l.table_cols[0].is_none() && !l.table_missing[0]);
+    let rows = l.table_rows[0].clone();
+    for r in rows.clone() {
+        let g = &l.geoms[r as usize];
+        assert!(!g.measured && g.content.is_none() && !g.missing, "row {r}");
+    }
+    assert_eq!(l.cursor, rows.start as usize);
+
+    // With a fallback face (when the machine has one) the columns and rows come out as they do
+    // for a fresh layout.
+    let found = fallback::find_fallbacks(&missing, &|p, i| fonts_embedded.has_source(p, i));
+    if found.is_empty() {
+        return;
+    }
+    let mut fonts = Fonts::new().unwrap();
+    for f in &found {
+        fonts.add_fallback(&f.path, f.index);
+    }
+    l.ensure(&doc, &fonts, at, 800.0);
+    if !l.take_missing().is_empty() {
+        return; // The fallback doesn't cover it either.
+    }
+    let mut fresh = Layout::new(&doc, params(900.0, 1.0));
+    fresh.ensure(&doc, &fonts, at, 800.0);
+    assert_eq!(l.table_cols[0], fresh.table_cols[0]);
+    assert_ne!(l.table_cols[0].as_ref(), Some(&stale));
+    let (a, b) = (&l.geoms()[row as usize], &fresh.geoms()[row as usize]);
+    assert!((a.h - b.h).abs() < 1e-3, "{} vs {}", a.h, b.h);
+}
+
+#[test]
+fn sparse_row_fragments_draw_every_column_and_keep_cells_in_theirs() {
+    let fonts = Fonts::new().unwrap();
+    // Six columns; only the third has more text than fits a fragment.
+    let long = "alpha beta gamma ".repeat(4000);
+    let src = format!(
+        "| a | b | c | d | e | f |\n|---|---|---|---|---|---|\n| 1 | 2 | {long} | 4 | 5 | 6 |\n"
+    );
+    let doc = Doc::parse(&src);
+    let later: Vec<usize> = (0..doc.blocks.len())
+        .filter(|&i| {
+            doc.blocks[i].joined
+                && doc
+                    .row_cells(&doc.blocks[i])
+                    .map(|(c, _)| c)
+                    .collect::<Vec<_>>()
+                    == [2]
+        })
+        .collect();
+    assert!(later.len() >= 2, "{} sparse fragments", later.len());
+    let mut l = complete(&doc, &fonts, params(900.0, 1.0));
+    let cols = l.table_cols[0].clone().unwrap();
+    assert_eq!(cols.len(), 6);
+    let px = CELL_PAD_X * 16.0;
+    let (left, right) = (cols[0] + cols[1], cols[0] + cols[1] + cols[2]);
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    for i in later {
+        let c = l.geoms()[i].content.as_ref().unwrap();
+        // All seven vertical rules, even though six cells have nothing in this fragment.
+        assert_eq!(rules(c).len(), 7, "fragment {i}");
+        assert!(!c.glyphs.is_empty());
+        for g in &c.glyphs {
+            assert!(
+                g.x >= left + px - 1.0 && g.x <= right,
+                "glyph at {} outside column 2 ({left}..{right})",
+                g.x
+            );
+        }
+    }
+}
+
+#[test]
+fn wide_tables_sample_a_bounded_number_of_bytes() {
+    let fonts = Fonts::new().unwrap();
+    // 128 columns of 8 KB each: row fragments of about 16 KB, so a sample that always took one
+    // more block than the budget allowed would overshoot by a whole fragment.
+    const COLS: usize = 128;
+    let words = "alpha ".repeat(1400);
+    let head: String = (0..COLS).map(|c| format!("| h{c} ")).collect::<String>() + "|\n";
+    let delim = "|---".repeat(COLS) + "|\n";
+    let row: String = (0..COLS).map(|_| format!("| {words} ")).collect::<String>() + "|\n";
+    let doc = Doc::parse(&format!("{head}{delim}{row}"));
+    assert!(doc.blocks.len() > 20);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let sample = l.table_sample(&doc, 0);
+    let bytes: usize = sample
+        .clone()
+        .map(|r| text_bytes(&doc, &doc.blocks[r as usize]))
+        .sum();
+    // The header is always in; after it, whole fragments up to the budget.
+    assert!(
+        sample.len() >= 2 && sample.len() < doc.blocks.len(),
+        "{sample:?}"
+    );
+    assert!(bytes <= TABLE_SAMPLE_BYTES, "{bytes} bytes sampled");
+    let next = text_bytes(&doc, &doc.blocks[sample.end as usize]);
+    assert!(
+        bytes + next > TABLE_SAMPLE_BYTES,
+        "the next fragment would still fit"
+    );
+    // The first frame stays bounded: a few fragments are measured, not the whole row.
+    l.ensure(&doc, &fonts, Anchor::TOP, 1000.0);
+    let built = l.geoms().iter().filter(|g| g.content.is_some()).count();
+    assert!(
+        built < doc.blocks.len(),
+        "{built} of {} blocks built",
+        doc.blocks.len()
+    );
+}
+
+#[test]
+fn footnote_ending_in_a_table_has_a_visible_backlink() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("a[^t]\n\n[^t]:\n    | h |\n    |---|\n    | c |\n");
+    let mut l = complete(&doc, &fonts, params(900.0, 1.0));
+    let back = doc.links.iter().position(|t| t == "#fnref-t").unwrap() as u32 + 1;
+    let last = l.geoms().len() - 1;
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    let shows = |i: usize| {
+        let c = l.geoms()[i].content.as_ref().unwrap();
+        c.hits
+            .iter()
+            .any(|h| c.styles[h.style as usize].link == back)
+    };
+    assert!(
+        shows(last),
+        "the back-link paragraph has a hit for the link"
+    );
+    assert!(
+        (0..last).all(|i| !shows(i)),
+        "no other block carries the back-link"
+    );
+    assert!(l.geoms()[last].content.as_ref().unwrap().glyphs.len() == 1);
+    assert!(matches!(doc.blocks[last].kind, BlockKind::Paragraph));
+    assert!(matches!(
+        doc.blocks[last - 1].kind,
+        BlockKind::TableRow { .. }
+    ));
 }

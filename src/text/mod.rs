@@ -300,8 +300,15 @@ impl TextCtx {
 
     /// (minimum, natural) width: the widest unbreakable segment, and the unwrapped width.
     pub fn measure(&mut self, fonts: &Fonts, para: &Para) -> (f32, f32) {
+        let (min, max, _) = self.measure_missing(fonts, para);
+        (min, max)
+    }
+
+    /// [`measure`](Self::measure), plus the characters no loaded face covers.
+    pub fn measure_missing(&mut self, fonts: &Fonts, para: &Para) -> (f32, f32, Vec<char>) {
         let shaped = self.shape(fonts, para);
-        lines::measure(para, &shaped)
+        let (min, max) = lines::measure(para, &shaped);
+        (min, max, shaped.missing)
     }
 }
 

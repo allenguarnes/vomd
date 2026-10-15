@@ -442,9 +442,15 @@ fn marks_after_cgj_and_whitespace_are_checked_for_coverage() {
     // not: `e` + acute composes into `é`.
     let shaped = shape_with(&fonts, "e\u{0301}x\u{034F}");
     assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
-    // Joiners and variation selectors don't block composition.
-    let shaped = shape_with(&fonts, "e\u{200D}\u{0301}");
-    assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
+    // Neither do joiners and variation selectors compose across: the mark needs its own glyph.
+    for text in [
+        "e\u{200D}\u{0301}",
+        "e\u{FE0F}\u{0301}",
+        "e\u{200C}\u{0301}",
+    ] {
+        let shaped = shape_with(&fonts, text);
+        assert_eq!(shaped.missing, vec!['\u{0301}'], "{text:?}");
+    }
 }
 
 #[test]
@@ -476,5 +482,38 @@ fn marks_after_cgj_and_whitespace_use_a_fallback() {
         );
         // The base moved with its mark.
         assert_eq!(shaped.clusters[0].face, face, "{text:?}");
+    }
+}
+
+#[test]
+fn marks_after_joiners_and_selectors_use_a_fallback() {
+    let base = Fonts::new().unwrap();
+    let found = fallback::find_fallbacks(&['\u{0301}'], &|p, i| base.has_source(p, i));
+    let mut fonts = Fonts::new().unwrap();
+    let ids: Vec<_> = found
+        .iter()
+        .filter_map(|f| fonts.add_fallback(&f.path, f.index))
+        .collect();
+    // Needs an installed face with both the base letter and the mark.
+    let Some(&face) = ids
+        .iter()
+        .find(|&&id| fonts.face(id).glyph('e') != 0 && fonts.face(id).glyph('\u{0301}') != 0)
+    else {
+        return;
+    };
+    for text in ["e\u{200D}\u{0301}", "e\u{FE0F}\u{0301}"] {
+        let shaped = shape_with(&fonts, text);
+        assert!(shaped.missing.is_empty(), "{text:?}: {:?}", shaped.missing);
+        assert!(
+            shaped.glyphs.iter().all(|g| g.id != 0),
+            "{text:?}: {:?}",
+            shaped.glyphs
+        );
+        // Inter composes nothing here, so the whole sequence moved to the fallback.
+        assert!(
+            shaped.clusters.iter().all(|c| c.face == face),
+            "{text:?}: {:?}",
+            shaped.clusters
+        );
     }
 }

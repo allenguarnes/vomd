@@ -7,7 +7,22 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use pulldown_cmark::{Alignment, BlockQuoteKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, BrokenLink, CowStr, Event, Options, Parser, Tag, TagEnd,
+};
+
+mod segment;
+
+fn options() -> Options {
+    let mut opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+    opts.remove(Options::ENABLE_SMART_PUNCTUATION);
+    opts
+}
 
 /// Inline style bits carried by each [`Span`].
 pub mod style {
@@ -51,7 +66,9 @@ pub enum BlockKind {
     Rule,
     /// First line of a GitHub alert blockquote (`> [!NOTE]`); has no spans.
     AlertTitle(Alert),
-    /// One table row. Cells are `Doc::cells[first_cell..first_cell + cells]`.
+    /// One table row (or fragment of one). The stored cells are
+    /// `Doc::cells[first_cell..first_cell + cells]`: every cell of a whole row, only the cells
+    /// that still have text in a later fragment.
     TableRow {
         table: u32,
         header: bool,
@@ -88,7 +105,7 @@ pub struct Block {
     pub marker: Marker,
     /// Continues the previous block (an oversized block split at [`MAX_BLOCK_BYTES`]): same
     /// kind and nesting, no marker, and no spacing in between. For a table row, fragment `k`
-    /// holds piece `k` of every cell (a cell that ran out is empty).
+    /// holds piece `k` of every cell that has one (the first fragment keeps all cells).
     pub joined: bool,
 }
 
@@ -96,9 +113,16 @@ pub struct Block {
 /// consecutive chunk blocks, so no single block needs a huge shaping pass or allocation.
 pub const MAX_BLOCK_BYTES: usize = 16 * 1024;
 
-/// Smallest per-cell share of [`MAX_BLOCK_BYTES`] when a table row is split, so rows with very
-/// many columns don't shatter into thousands of fragments.
-const MIN_CELL_BYTES: usize = 256;
+/// Smallest share of a split table row's fragment per cell that still has text. The fragment's
+/// [`MAX_BLOCK_BYTES`] is divided among those cells; this floor only guarantees every cell makes
+/// progress, so a fragment holds about `max(MAX_BLOCK_BYTES, MIN_CELL_BYTES × active cells)`.
+const MIN_CELL_BYTES: usize = 32;
+
+/// Documents over this many bytes are parsed in segments; smaller ones in one go.
+const SEGMENT_THRESHOLD: usize = 1 << 20;
+/// Target segment size: pulldown-cmark builds a tree for a whole segment before emitting events,
+/// so this bounds its peak memory.
+const SEGMENT_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
@@ -106,6 +130,15 @@ pub enum Align {
     Left,
     Center,
     Right,
+}
+
+/// One stored cell of a table row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cell {
+    /// Column index; a row fragment stores only its populated cells, so columns can be skipped.
+    pub col: u32,
+    /// Range into [`Doc::spans`].
+    pub spans: Range<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,13 +160,13 @@ pub struct ImageRef {
     pub remote: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Doc {
     pub text: String,
     pub spans: Vec<Span>,
     pub blocks: Vec<Block>,
-    /// Span ranges, one per table cell.
-    pub cells: Vec<Range<u32>>,
+    /// Table cells, in row order.
+    pub cells: Vec<Cell>,
     pub tables: Vec<Table>,
     /// Link targets, as written in the source.
     pub links: Vec<String>,
@@ -147,19 +180,92 @@ pub struct Doc {
 }
 
 impl Doc {
+    /// Parse a document. Large ones go through [`Doc::parse_segments`]; the result is the same.
     pub fn parse(src: &str) -> Doc {
-        let mut opts = Options::ENABLE_TABLES
-            | Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_FOOTNOTES
-            | Options::ENABLE_GFM
-            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-        opts.remove(Options::ENABLE_SMART_PUNCTUATION);
+        if src.len() > SEGMENT_THRESHOLD
+            && let Some(doc) = Doc::parse_segments(src, SEGMENT_BYTES)
+        {
+            return doc;
+        }
+        Doc::parse_whole(src)
+    }
+
+    /// One parser for the whole text.
+    fn parse_whole(src: &str) -> Doc {
         let mut b = Builder::new(src.len());
-        for event in Parser::new_ext(src, opts) {
+        for event in Parser::new_ext(src, options()) {
             b.event(event);
         }
         b.finish()
+    }
+
+    /// Parse in segments of about `budget` bytes, all feeding one builder, or `None` when the
+    /// text can't be split safely (see [`segment`]). Each segment's parser is dropped before the
+    /// next one starts, so the parser's tree is never larger than a segment.
+    fn parse_segments(src: &str, budget: usize) -> Option<Doc> {
+        let plan = segment::plan(src, budget)?;
+        let opts = options();
+        // Link reference definitions anywhere in the text, for segments that use them
+        // (CommonMark allows a definition after its use). Pulldown-cmark collects them
+        // while building the tree.
+        let defs = Parser::new_ext(&plan.definitions, opts);
+        let defs = defs.reference_definitions().clone();
+        let has_defs = defs.iter().next().is_some();
+        let mut b = Builder::new(src.len());
+        for (n, seg) in plan.segments.iter().enumerate() {
+            let stubs = plan.footnote_stubs(src, seg);
+            let body = &src[seg.range.clone()];
+            let text = if seg.head.is_none() && stubs.is_empty() {
+                std::borrow::Cow::Borrowed(body)
+            } else {
+                // A table continuation starts with the table's header and delimiter rows, so
+                // pulldown-cmark still sees a table. Footnote definitions that live in other
+                // segments are declared first (after front matter, which must stay first), so
+                // references to them parse as footnote references; the builder drops those
+                // declarations.
+                let head = seg.head.clone().map_or("", |h| &src[h]);
+                let (front, body) = body.split_at(if n == 0 { plan.front_matter_end } else { 0 });
+                let mut text = String::with_capacity(head.len() + body.len() + 16 * stubs.len());
+                text.push_str(front);
+                for label in &stubs {
+                    text.push_str(&format!("[^{label}]: x\n"));
+                }
+                if !stubs.is_empty() {
+                    // A reference definition ends the last stub (indented text after it would
+                    // continue it), and defines nothing anyone refers to.
+                    text.push_str("\n[\u{1}]: x\n\n");
+                }
+                text.push_str(head);
+                text.push_str(body);
+                std::borrow::Cow::Owned(text)
+            };
+            b.begin_segment(stubs.len(), seg.head.is_some());
+            let defs = &defs;
+            let resolve = move |link: BrokenLink<'_>| {
+                let def = defs.get(&link.reference)?;
+                let title = def.title.as_deref().unwrap_or("");
+                Some((
+                    CowStr::from(def.dest.to_string()),
+                    CowStr::from(title.to_owned()),
+                ))
+            };
+            // Without definitions there is nothing to look up (and no callback to make).
+            let resolve = has_defs.then_some(resolve);
+            let parser = Parser::new_with_broken_link_callback(&text, opts, resolve);
+            // A segment's own definition of a label shadows the first one in the text, which
+            // lies in an earlier segment, when the two differ. One parser would use the first.
+            let clash = parser.reference_definitions().iter().any(|(label, local)| {
+                defs.get(label)
+                    .is_some_and(|d| d.dest != local.dest || d.title != local.title)
+            });
+            if clash {
+                return None;
+            }
+            for event in parser {
+                b.event(event);
+            }
+        }
+        Some(b.finish())
     }
 
     pub fn span_text(&self, span: &Span) -> &str {
@@ -175,17 +281,20 @@ impl Doc {
         &self.quote_lists[block.quote_lists.start as usize..block.quote_lists.end as usize]
     }
 
-    /// Spans of each cell in a table row (empty for other blocks).
-    pub fn row_cells(&self, block: &Block) -> impl Iterator<Item = &[Span]> {
+    /// The stored cells of a table row as (column, spans), in column order (nothing for other
+    /// blocks). A whole row has every column; a later fragment of a split row only the columns
+    /// that still have text, so callers treat missing columns as empty.
+    pub fn row_cells(&self, block: &Block) -> impl Iterator<Item = (usize, &[Span])> {
         let cells = match block.kind {
             BlockKind::TableRow {
                 first_cell, cells, ..
             } => &self.cells[first_cell as usize..(first_cell + cells) as usize],
             _ => &[],
         };
-        cells
-            .iter()
-            .map(|r| &self.spans[r.start as usize..r.end as usize])
+        cells.iter().map(|c| {
+            let spans = &self.spans[c.spans.start as usize..c.spans.end as usize];
+            (c.col as usize, spans)
+        })
     }
 
     pub fn remote_image_count(&self) -> usize {
@@ -202,6 +311,8 @@ struct Open {
 #[derive(Default)]
 struct Footnotes {
     numbers: HashMap<String, u32>,
+    /// Labels by number (index = number - 1).
+    labels: Vec<String>,
     /// Definition blocks, appended after the main flow at the end.
     blocks: Vec<Block>,
     /// One per definition: (number, label, first index into `blocks`).
@@ -214,6 +325,25 @@ struct Footnotes {
     active: bool,
     /// Main-flow `quote_start` set aside while a definition is open.
     quote_start: u8,
+    /// Anchors that point into `blocks` (references inside definitions) until `finish` moves
+    /// the definitions into the document.
+    local: Vec<usize>,
+    /// Anchor and link targets that name a footnote by number. Their ids are allocated in
+    /// `finish`, after every heading, so a heading's slug is never taken from it.
+    ref_anchors: Vec<(usize, u32)>,
+    ref_links: Vec<(usize, u32)>,
+    back_links: Vec<(usize, u32)>,
+    /// Footnote definitions the segment declares in front of its text to stand for definitions
+    /// in other segments: their events are dropped (see `Doc::parse_segments`).
+    stubs: usize,
+}
+
+/// Open image: its id, the alt text collected so far, and how many images are open inside it
+/// (their text is part of the outer alt text).
+struct ImageAlt {
+    id: u32,
+    alt: String,
+    depth: usize,
 }
 
 struct Builder {
@@ -221,9 +351,9 @@ struct Builder {
     open: Option<Open>,
     /// Spans at or after this index may be merged with the next text; protects cell boundaries.
     merge_floor: usize,
-    bold: u16,
-    italic: u16,
-    strike: u16,
+    bold: usize,
+    italic: usize,
+    strike: usize,
     links: Vec<u32>,
     /// Next number for each open list (`None` = bullet list).
     lists: Vec<Option<u64>>,
@@ -233,11 +363,17 @@ struct Builder {
     /// Outermost quote depth started since the last block was pushed (0 = none).
     quote_start: u8,
     marker: Marker,
-    /// Open image: (image id, alt text collected so far).
-    image: Option<(u32, String)>,
+    image: Option<ImageAlt>,
     html_block: Option<String>,
     metadata: bool,
     row: Option<(bool, u32)>,
+    /// The next table continues the previous segment's (its header is a repeat, see
+    /// `Doc::parse_segments`).
+    continue_table: bool,
+    /// Skipping the repeated header rows of a continued table.
+    skip_head: bool,
+    /// Skipping a footnote definition that only declares a label.
+    skip_def: bool,
     footnotes: Footnotes,
     /// Every heading slug handed out so far.
     slugs: HashSet<String>,
@@ -269,6 +405,9 @@ impl Builder {
             html_block: None,
             metadata: false,
             row: None,
+            continue_table: false,
+            skip_head: false,
+            skip_def: false,
             footnotes: Footnotes::default(),
             slugs: HashSet::new(),
             slug_suffix: HashMap::new(),
@@ -276,7 +415,23 @@ impl Builder {
         }
     }
 
+    /// Start a segment of a segmented parse. It begins with `stubs` footnote definitions that
+    /// only declare labels; `continued` means it starts with a repeat of the previous segment's
+    /// last table header.
+    fn begin_segment(&mut self, stubs: usize, continued: bool) {
+        self.footnotes.stubs = stubs;
+        self.continue_table = continued;
+    }
+
     fn event(&mut self, event: Event) {
+        if self.skip_head {
+            self.skip_head = !matches!(event, Event::End(TagEnd::TableHead));
+            return;
+        }
+        if self.skip_def {
+            self.skip_def = !matches!(event, Event::End(TagEnd::FootnoteDefinition));
+            return;
+        }
         if self.metadata {
             if let Event::End(TagEnd::MetadataBlock(_)) = event {
                 self.metadata = false;
@@ -294,10 +449,12 @@ impl Builder {
             }
             return;
         }
-        if let Some((_, alt)) = &mut self.image {
+        if let Some(image) = &mut self.image {
             match event {
-                Event::Text(s) | Event::Code(s) => alt.push_str(&s),
-                Event::SoftBreak | Event::HardBreak => alt.push(' '),
+                Event::Text(s) | Event::Code(s) => image.alt.push_str(&s),
+                Event::SoftBreak | Event::HardBreak => image.alt.push(' '),
+                Event::Start(Tag::Image { .. }) => image.depth += 1,
+                Event::End(TagEnd::Image) if image.depth > 0 => image.depth -= 1,
                 Event::End(TagEnd::Image) => self.end_image(),
                 _ => {}
             }
@@ -378,6 +535,11 @@ impl Builder {
                 };
             }
             Tag::FootnoteDefinition(label) => {
+                if self.footnotes.stubs > 0 {
+                    self.footnotes.stubs -= 1;
+                    self.skip_def = true;
+                    return;
+                }
                 self.close();
                 let n = self.footnote_number(&label);
                 self.footnotes.active = true;
@@ -386,6 +548,7 @@ impl Builder {
                 self.footnotes.defs.push((n, label.into_string(), at));
                 self.marker = Marker::Footnote(n);
             }
+            Tag::Table(_) if std::mem::take(&mut self.continue_table) => self.skip_head = true,
             Tag::Table(aligns) => {
                 self.close();
                 self.flush_marker();
@@ -422,7 +585,11 @@ impl Builder {
             }
             Tag::Image { dest_url, .. } => {
                 let id = self.push_image(dest_url.into_string());
-                self.image = Some((id, String::new()));
+                self.image = Some(ImageAlt {
+                    id,
+                    alt: String::new(),
+                    depth: 0,
+                });
             }
             Tag::MetadataBlock(_) => self.metadata = true,
             // Not enabled (GitHub doesn't support them); content flows as plain text.
@@ -465,7 +632,11 @@ impl Builder {
             TagEnd::TableHead | TagEnd::TableRow => self.close(),
             TagEnd::TableCell => {
                 let start = self.merge_floor as u32;
-                self.doc.cells.push(start..self.doc.spans.len() as u32);
+                let first = self.row.map_or(0, |(_, first)| first as usize);
+                self.doc.cells.push(Cell {
+                    col: (self.doc.cells.len() - first) as u32,
+                    spans: start..self.doc.spans.len() as u32,
+                });
                 self.merge_floor = self.doc.spans.len();
             }
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
@@ -587,7 +758,7 @@ impl Builder {
             self.doc.anchors.push((slug.clone(), block));
             self.doc.headings.push(Heading { level, block, slug });
         }
-        let first_block = self.doc.blocks.len();
+        let first_block = self.block_count();
         let block_spans = &self.doc.spans[spans.start as usize..];
         let bytes = match (block_spans.first(), block_spans.last()) {
             (Some(first), Some(last)) => last.end as usize - first.start as usize,
@@ -620,75 +791,112 @@ impl Builder {
     }
 
     /// Split an oversized table row (spans from `first_span`, cells from `first_cell`) into
-    /// fragment blocks: each cell is cut into pieces of at most its share of
-    /// [`MAX_BLOCK_BYTES`], and fragment `k` takes piece `k` of every cell, so the fragments
-    /// stay rectangular rows. The first fragment keeps the quote start; the rest are `joined`.
+    /// fragment blocks, so the fragments stay rectangular rows: fragment `k` takes piece `k` of
+    /// every cell that has one. A fragment holds about [`MAX_BLOCK_BYTES`] of text in all, shared
+    /// equally by the cells that still have text (at least [`MIN_CELL_BYTES`] each, so every
+    /// cell progresses). The first fragment keeps every cell; later ones only store the cells
+    /// that still have text, so exhausted cells cost nothing. The first fragment keeps the quote
+    /// start; the rest are `joined`.
     fn push_row_fragments(&mut self, kind: BlockKind, first_span: usize, first_cell: usize) {
         let BlockKind::TableRow { table, header, .. } = kind else {
             return;
         };
         let cells = self.doc.cells.split_off(first_cell);
         let tail = self.doc.spans.split_off(first_span);
-        let budget = (MAX_BLOCK_BYTES / cells.len().max(1)).max(MIN_CELL_BYTES);
-        let pieces: Vec<_> = cells
+        // Per cell: its spans, and where its remaining text starts and ends.
+        let mut rest: Vec<CellRest> = cells
             .iter()
             .map(|c| {
-                let spans = &tail[c.start as usize - first_span..c.end as usize - first_span];
-                split_spans(&self.doc.text, spans, budget)
+                let spans = &tail[c.spans.start as usize - first_span..][..c.spans.len()];
+                let (at, end) = match (spans.first(), spans.last()) {
+                    (Some(first), Some(last)) => (first.start as usize, last.end as usize),
+                    _ => (0, 0),
+                };
+                CellRest {
+                    col: c.col,
+                    spans,
+                    next: 0,
+                    at,
+                    end,
+                }
             })
             .collect();
-        let count = pieces.iter().map(|(_, chunks)| chunks.len()).max();
-        for k in 0..count.unwrap_or(1) {
+        let mut k = 0;
+        loop {
+            let active = rest.iter().filter(|r| r.at < r.end).count();
+            let budget = (MAX_BLOCK_BYTES / active.max(1)).max(MIN_CELL_BYTES);
             let (span_from, cell_from) = (self.doc.spans.len(), self.doc.cells.len());
-            for (spans, chunks) in &pieces {
+            for r in rest.iter_mut().filter(|r| k == 0 || r.at < r.end) {
                 let from = self.doc.spans.len() as u32;
-                if let Some(chunk) = chunks.get(k) {
-                    self.doc
-                        .spans
-                        .extend_from_slice(&spans[chunk.start as usize..chunk.end as usize]);
-                }
-                self.doc.cells.push(from..self.doc.spans.len() as u32);
+                take_chunk(&self.doc.text, r, budget, &mut self.doc.spans);
+                let spans = from..self.doc.spans.len() as u32;
+                self.doc.cells.push(Cell { col: r.col, spans });
             }
             let kind = BlockKind::TableRow {
                 table,
                 header,
                 first_cell: cell_from as u32,
-                cells: pieces.len() as u32,
+                cells: (self.doc.cells.len() - cell_from) as u32,
             };
             let spans = span_from as u32..self.doc.spans.len() as u32;
             self.push_joined(kind, spans, k > 0);
+            k += 1;
+            if rest.iter().all(|r| r.at >= r.end) {
+                break;
+            }
+        }
+    }
+
+    /// Number of blocks in the list the open block will be pushed to.
+    fn block_count(&self) -> usize {
+        if self.footnotes.active {
+            self.footnotes.blocks.len()
+        } else {
+            self.doc.blocks.len()
         }
     }
 
     /// Point the `fnref-` anchors of the block just closed at the block (of the `first..` run it
-    /// was split into) that holds the reference.
+    /// was split into) that holds the reference. Inside a footnote definition the block index is
+    /// into the definitions' blocks for now (see `finish`).
     fn resolve_refs(&mut self, first: usize) {
         let pending = std::mem::take(&mut self.footnotes.pending);
-        let blocks = &self.doc.blocks[first.min(self.doc.blocks.len())..];
+        let active = self.footnotes.active;
+        let all = if active {
+            &self.footnotes.blocks
+        } else {
+            &self.doc.blocks
+        };
+        let blocks = &all[first.min(all.len())..];
         if pending.is_empty() || blocks.is_empty() {
             return;
         }
+        let mut targets = Vec::with_capacity(pending.len());
         if blocks.len() == 1 {
-            for (anchor, _) in pending {
-                self.doc.anchors[anchor].1 = first as u32;
+            targets.extend(pending.iter().map(|&(anchor, _)| (anchor, first)));
+        } else {
+            // Spans of a run's blocks, ordered by text position (a row's fragments interleave).
+            let mut starts: Vec<(u32, u32)> = blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(k, b)| {
+                    self.doc.spans[b.spans.start as usize..b.spans.end as usize]
+                        .iter()
+                        .map(move |s| (s.start, k as u32))
+                })
+                .collect();
+            starts.sort_unstable();
+            for &(anchor, offset) in &pending {
+                let at = starts.partition_point(|&(start, _)| start <= offset);
+                let k = at.checked_sub(1).map_or(0, |at| starts[at].1);
+                targets.push((anchor, first + k as usize));
             }
-            return;
         }
-        // Spans of a run's blocks, ordered by text position (a row's fragments interleave).
-        let mut starts: Vec<(u32, u32)> = blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(k, b)| {
-                self.doc.spans[b.spans.start as usize..b.spans.end as usize]
-                    .iter()
-                    .map(move |s| (s.start, k as u32))
-            })
-            .collect();
-        starts.sort_unstable();
-        for (anchor, offset) in pending {
-            let at = starts.partition_point(|&(start, _)| start <= offset);
-            let k = at.checked_sub(1).map_or(0, |at| starts[at].1);
-            self.doc.anchors[anchor].1 = first as u32 + k;
+        for (anchor, block) in targets {
+            self.doc.anchors[anchor].1 = block as u32;
+            if active {
+                self.footnotes.local.push(anchor);
+            }
         }
     }
 
@@ -757,7 +965,7 @@ impl Builder {
     }
 
     /// GitHub-compatible heading anchor: lowercase, keep alphanumerics, `-` and `_`, spaces
-    /// become `-`, duplicates get the first unused `-1`, `-2`, ... suffix.
+    /// become `-`, duplicates get the first unused suffix (see `unique_id`).
     fn slug(&mut self, spans: Range<u32>) -> Option<String> {
         let mut slug = String::new();
         for span in &self.doc.spans[spans.start as usize..spans.end as usize] {
@@ -769,22 +977,24 @@ impl Builder {
                 }
             }
         }
-        if slug.is_empty() {
-            return None;
+        (!slug.is_empty()).then(|| self.unique_id(slug))
+    }
+
+    /// Claim `id` as an anchor id: itself if nobody has it, else the first unused `-1`, `-2`,
+    /// ... suffix. Headings and footnotes share this registry, so no two anchors collide.
+    fn unique_id(&mut self, id: String) -> String {
+        if self.slugs.insert(id.clone()) {
+            return id;
         }
-        if !self.slugs.insert(slug.clone()) {
-            // Skip suffixes that earlier headings already took (`foo-1` written out by hand).
-            let next = self.slug_suffix.entry(slug.clone()).or_insert(0);
-            loop {
-                *next += 1;
-                let candidate = format!("{slug}-{next}");
-                if self.slugs.insert(candidate.clone()) {
-                    slug = candidate;
-                    break;
-                }
+        // Skip suffixes that earlier ids already took (`foo-1` written out by hand).
+        let next = self.slug_suffix.entry(id.clone()).or_insert(0);
+        loop {
+            *next += 1;
+            let candidate = format!("{id}-{next}");
+            if self.slugs.insert(candidate.clone()) {
+                return candidate;
             }
         }
-        Some(slug)
     }
 
     fn push_image(&mut self, src: String) -> u32 {
@@ -793,7 +1003,7 @@ impl Builder {
     }
 
     fn end_image(&mut self) {
-        let Some((id, alt)) = self.image.take() else {
+        let Some(ImageAlt { id, alt, .. }) = self.image.take() else {
             return;
         };
         let alt = if alt.trim().is_empty() {
@@ -811,41 +1021,54 @@ impl Builder {
         }
         let n = self.footnotes.numbers.len() as u32 + 1;
         self.footnotes.numbers.insert(label.to_owned(), n);
+        self.footnotes.labels.push(label.to_owned());
         n
     }
 
+    /// The first reference to a label (in the main text or inside a definition) gets a
+    /// `fnref-` anchor, which the definition's back-link points at. Link and anchor ids are
+    /// filled in by `finish`.
     fn footnote_ref(&mut self, label: &str) {
         let n = self.footnote_number(label);
-        let first = !self.footnotes.active && self.footnotes.referenced.insert(label.to_owned());
+        let first = self.footnotes.referenced.insert(label.to_owned());
         let offset = self.doc.text.len() as u32;
-        let link = push_id(&mut self.doc.links, format!("#fn-{label}"));
+        let link = push_id(&mut self.doc.links, String::new());
+        self.footnotes.ref_links.push((link as usize - 1, n));
         self.links.push(link);
         self.text(&n.to_string(), style::FOOTREF, 0);
         self.links.pop();
         if first {
             // The block isn't known until the open one is split, see `resolve_refs`.
-            self.footnotes
-                .pending
-                .push((self.doc.anchors.len(), offset));
-            self.doc.anchors.push((format!("fnref-{label}"), 0));
+            let anchor = self.doc.anchors.len();
+            self.footnotes.pending.push((anchor, offset));
+            self.footnotes.ref_anchors.push((anchor, n));
+            self.doc.anchors.push((String::new(), 0));
         }
     }
 
-    /// Append a "↩" link back to the reference at the end of the definition's last block.
+    /// End a footnote definition with a "↩" link back to the reference: appended to the
+    /// definition's last block when that is a paragraph (or heading), else a paragraph of its
+    /// own (a table row, code block or rule has no paragraph text to hold it).
     fn footnote_backlink(&mut self) {
-        let Some((_, label, _)) = self.footnotes.defs.last() else {
+        let Some(&(n, _, first)) = self.footnotes.defs.last() else {
             return;
         };
-        let target = format!("#fnref-{label}");
-        let Some(block) = self.footnotes.blocks.last() else {
-            return;
+        let link = push_id(&mut self.doc.links, String::new());
+        self.footnotes.back_links.push((link as usize - 1, n));
+        let spans_end = self.doc.spans.len();
+        let last = self.footnotes.blocks[first..].last_mut();
+        let text = match last {
+            Some(block)
+                if matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading(_))
+                    && block.spans.end as usize == spans_end =>
+            {
+                block.spans.end += 1;
+                " ↩"
+            }
+            _ => "↩",
         };
-        if block.spans.end as usize != self.doc.spans.len() || block.kind == BlockKind::Code {
-            return;
-        }
-        let link = push_id(&mut self.doc.links, target);
         let start = self.doc.text.len() as u32;
-        self.doc.text.push_str(" ↩");
+        self.doc.text.push_str(text);
         let end = self.doc.text.len() as u32;
         self.doc.spans.push(Span {
             start,
@@ -854,8 +1077,9 @@ impl Builder {
             link,
             image: 0,
         });
-        if let Some(block) = self.footnotes.blocks.last_mut() {
-            block.spans.end += 1;
+        if text == "↩" {
+            let at = spans_end as u32;
+            self.push_block(BlockKind::Paragraph, at..at + 1);
         }
     }
 
@@ -941,6 +1165,28 @@ impl Builder {
         let fn_blocks = std::mem::take(&mut self.footnotes.blocks);
         if !fn_blocks.is_empty() {
             self.push_block(BlockKind::Rule, 0..0);
+        }
+        // Anchor ids for every footnote, in number order, now that all headings have theirs.
+        let labels = std::mem::take(&mut self.footnotes.labels);
+        let ids: Vec<(String, String)> = labels
+            .iter()
+            .map(|label| {
+                let note = self.unique_id(format!("fn-{label}"));
+                (note, self.unique_id(format!("fnref-{label}")))
+            })
+            .collect();
+        for (anchor, n) in std::mem::take(&mut self.footnotes.ref_anchors) {
+            self.doc.anchors[anchor]
+                .0
+                .clone_from(&ids[n as usize - 1].1);
+        }
+        for (link, n) in std::mem::take(&mut self.footnotes.ref_links) {
+            self.doc.links[link] = format!("#{}", ids[n as usize - 1].0);
+        }
+        for (link, n) in std::mem::take(&mut self.footnotes.back_links) {
+            self.doc.links[link] = format!("#{}", ids[n as usize - 1].1);
+        }
+        if !fn_blocks.is_empty() {
             // List definitions in reference-number order, as GitHub does.
             let defs = std::mem::take(&mut self.footnotes.defs);
             let ends: Vec<usize> = defs
@@ -951,10 +1197,21 @@ impl Builder {
                 .collect();
             let mut groups: Vec<_> = defs.into_iter().zip(ends).collect();
             groups.sort_by_key(|((n, ..), _)| *n);
-            for ((_, label, start), end) in groups {
+            // Where each definition block ended up, for anchors that point into them.
+            let mut moved = vec![0u32; fn_blocks.len()];
+            for ((n, _, start), end) in groups {
                 let block = self.doc.blocks.len() as u32;
-                self.doc.anchors.push((format!("fn-{label}"), block));
+                self.doc
+                    .anchors
+                    .push((ids[n as usize - 1].0.clone(), block));
+                for (k, slot) in moved[start..end].iter_mut().enumerate() {
+                    *slot = block + k as u32;
+                }
                 self.doc.blocks.extend_from_slice(&fn_blocks[start..end]);
+            }
+            for anchor in std::mem::take(&mut self.footnotes.local) {
+                let at = self.doc.anchors[anchor].1 as usize;
+                self.doc.anchors[anchor].1 = moved[at];
             }
         }
         self.doc
@@ -1048,47 +1305,71 @@ fn attr(tag: &str, name: &str) -> Option<String> {
     }
 }
 
+/// A table cell whose text is being cut into pieces: `spans` are its spans, `at..end` the text
+/// not placed yet, `next` the first span that may still overlap it.
+struct CellRest<'a> {
+    col: u32,
+    spans: &'a [Span],
+    next: usize,
+    at: usize,
+    end: usize,
+}
+
+/// Take the next piece of at most `max` text bytes off `cell` (see [`split_point`] for where it
+/// ends) and append its spans to `out`: a span crossing the cut becomes two with the same style,
+/// link and image.
+fn take_chunk(text: &str, cell: &mut CellRest, max: usize, out: &mut Vec<Span>) {
+    let at = cell.at;
+    let cut = if cell.end - at > max {
+        split_point(text, at, max)
+    } else {
+        cell.end
+    };
+    let spans = cell.spans;
+    while cell.next < spans.len() && spans[cell.next].end as usize <= at {
+        cell.next += 1;
+    }
+    for span in spans[cell.next..]
+        .iter()
+        .take_while(|s| (s.start as usize) < cut)
+    {
+        let (start, end) = (span.start.max(at as u32), span.end.min(cut as u32));
+        if start < end {
+            out.push(Span {
+                start,
+                end,
+                ..*span
+            });
+        }
+    }
+    cell.at = cut;
+}
+
 /// Cut a block's `spans` (contiguous text) into chunks of at most `max` text bytes. Returns the
-/// re-cut spans (a span crossing a cut becomes two with the same style, link and image) and
-/// each chunk's range into them. A cut goes just after the last newline in reach (the newline
-/// stays at the end of its chunk, so the line count is unchanged), else after the last
-/// whitespace, else at the last char boundary.
+/// re-cut spans and each chunk's range into them. A cut goes just after the last newline in
+/// reach (the newline stays at the end of its chunk, so the line count is unchanged), else
+/// after the last whitespace, else at the last char boundary.
 fn split_spans(text: &str, spans: &[Span], max: usize) -> (Vec<Span>, Vec<Range<u32>>) {
     let (Some(first), Some(last)) = (spans.first(), spans.last()) else {
         return (Vec::new(), Vec::new());
     };
-    let (mut at, end) = (first.start as usize, last.end as usize);
+    let (at, end) = (first.start as usize, last.end as usize);
     let mut out = Vec::with_capacity(spans.len() + end.saturating_sub(at) / max.max(1) + 1);
     let mut chunks = Vec::new();
-    let mut next = 0;
+    let mut cell = CellRest {
+        col: 0,
+        spans,
+        next: 0,
+        at,
+        end,
+    };
     loop {
-        let cut = if end - at > max {
-            split_point(text, at, max)
-        } else {
-            end
-        };
-        while next < spans.len() && spans[next].end as usize <= at {
-            next += 1;
-        }
         let from = out.len() as u32;
-        for span in spans[next..]
-            .iter()
-            .take_while(|s| (s.start as usize) < cut)
-        {
-            let (start, end) = (span.start.max(at as u32), span.end.min(cut as u32));
-            if start < end {
-                out.push(Span {
-                    start,
-                    end,
-                    ..*span
-                });
-            }
-        }
+        take_chunk(text, &mut cell, max, &mut out);
         chunks.push(from..out.len() as u32);
-        if cut >= end {
+        if cell.at >= end {
             return (out, chunks);
         }
-        at = cut;
     }
 }
 
@@ -1131,7 +1412,10 @@ fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let semi = rest.find(';').filter(|&j| j <= 10);
+        // The longest entity handled is 10 bytes: look no further than that for the `;`.
+        let semi = rest.as_bytes()[..rest.len().min(11)]
+            .iter()
+            .position(|&b| b == b';');
         let decoded = semi.and_then(|j| {
             let ent = &rest[1..j];
             let c = match ent {
