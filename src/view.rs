@@ -267,10 +267,18 @@ fn read_input_limited(
             // Stamp first: a write landing between the two makes the next focus reload again
             // rather than miss the change.
             let before = stamp(path);
-            // A document reached from another one is opened without waiting for a writer (a
-            // FIFO would otherwise hang the window) and judged by the file actually opened,
-            // so a path swapped for a FIFO or device after any earlier look is still refused.
-            // The command-line argument opens plainly: a pipe there waits for its writer.
+            // A document reached from another one must be a regular file. `metadata` follows
+            // symlinks and opens nothing, so every target refuses a FIFO or device here without
+            // blocking on it or touching it. The open is still non-blocking and the opened file
+            // is judged again, so a path swapped for a FIFO after that look is refused too on
+            // targets where `platform::open_nonblocking` has the flag (elsewhere that rare race
+            // can still block the open). The command-line argument opens plainly: a pipe there
+            // waits for its writer.
+            if origin == Origin::Navigation
+                && !std::fs::metadata(path).map_or(true, |m| m.is_file())
+            {
+                return Err(format!("Cannot open {shown}: not a regular file"));
+            }
             let opened = match origin {
                 Origin::Navigation => platform::open_nonblocking(path),
                 Origin::Argument => std::fs::File::open(path),

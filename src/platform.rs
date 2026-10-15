@@ -59,11 +59,13 @@ pub fn open(target: &std::ffi::OsStr) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Open `path` for reading without ever waiting for a writer: a FIFO opens at once instead of
-/// blocking until something writes to it (Linux: `O_NONBLOCK`; reading a regular file is
-/// unaffected). The caller inspects the opened file (`File::metadata`) and decides what to do
-/// with a pipe or device; this is what makes that check immune to the path changing after it
-/// was looked at.
+/// Open `path` for reading without ever waiting for a writer: where the platform's `O_NONBLOCK`
+/// is known (Linux on the architectures below, macOS, iOS and the BSDs) a FIFO opens at once
+/// instead of blocking until something writes to it, and reading a regular file is unaffected.
+/// Elsewhere this is a plain blocking open, so a caller that must not block on a FIFO has to
+/// refuse it beforehand (`view::read_input` looks at `metadata(path)` first). The caller also
+/// inspects the opened file (`File::metadata`), which is what makes the check immune to the
+/// path changing after it was looked at, on the targets with the flag.
 pub fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -85,8 +87,20 @@ pub fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File
         // O_NONBLOCK is 0o4000 on these architectures (not on mips, sparc, alpha, parisc).
         options.custom_flags(0o4000);
     }
-    // TODO(P14): other targets open plainly, so a FIFO swapped in after the caller's own check
-    // can still block there (O_NONBLOCK differs per OS and architecture).
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK is 0x0004 on Apple and every BSD.
+        options.custom_flags(0x0004);
+    }
+    // TODO(P14): other targets (Windows, other Linux architectures) open plainly.
     options.open(path)
 }
 

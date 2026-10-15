@@ -199,6 +199,18 @@ fn navigation_refuses_what_is_not_a_regular_file() {
                 .unwrap_err();
             assert!(err.contains("not a regular file"), "{err}");
         }
+        // The refusal comes from the look at the path, before any open: a FIFO nobody may open
+        // is still "not a regular file" rather than "permission denied" (as root the open
+        // succeeds and the opened file is refused with the same message).
+        let shut = dir.join("shut.md");
+        let made = std::process::Command::new("mkfifo")
+            .args(["-m", "200"])
+            .arg(&shut)
+            .status();
+        if made.is_ok_and(|s| s.success()) {
+            let err = read(&shut).unwrap_err();
+            assert!(err.contains("not a regular file"), "{err}");
+        }
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
