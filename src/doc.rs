@@ -5,13 +5,14 @@
 //! so layout and paint stay linear.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, BrokenLink, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
 };
 use unicase::UniCase;
 
+mod pipeline;
 mod segment;
 
 fn options() -> Options {
@@ -162,8 +163,10 @@ const MIN_CELL_BYTES: usize = 32;
 /// Documents over this many bytes are parsed in segments; smaller ones in one go.
 const SEGMENT_THRESHOLD: usize = 1 << 20;
 /// Target segment size: pulldown-cmark builds a tree for a whole segment before emitting events,
-/// so this bounds its peak memory.
-const SEGMENT_BYTES: usize = 128 * 1024;
+/// so this bounds its peak memory, and that of the events of the few segments in flight at once
+/// (see [`pipeline`]): a table row of short cells makes dozens of 80-byte events from dozens of
+/// source bytes.
+const SEGMENT_BYTES: usize = 16 * 1024;
 /// What pulldown-cmark lets a parser spend on copying link definitions into links, at least.
 const MIN_EXPANSION: usize = 100_000;
 
@@ -246,71 +249,68 @@ impl Doc {
     }
 
     /// Parse in segments of about `budget` bytes, all feeding one builder, or `None` when the
-    /// text can't be split safely (see [`segment`]). Each segment's parser is dropped before the
-    /// next one starts, so the parser's tree is never larger than a segment.
+    /// text can't be split safely (see [`segment`]). A parser's tree is never larger than a
+    /// segment, and a few threads parse segments ahead while the builder takes their events in
+    /// order (see [`pipeline`]).
+    fn parse_segments(src: &str, budget: usize) -> Option<Doc> {
+        Doc::parse_segments_with(src, budget, &pipeline::Config::detect())
+    }
+
+    /// [`Doc::parse_segments`] on the given pipeline (no workers: all on this thread).
     ///
     /// Link reference definitions and footnote definitions may lie in another segment than their
     /// use, so a first pass parses every segment that could hold one (see
     /// [`segment::Plan::definitions`]) and the second pass gives each segment's parser what it
     /// found: the link definitions through the broken-link callback, the footnote definitions as
     /// stubs in front of the segment's text.
-    fn parse_segments(src: &str, budget: usize) -> Option<Doc> {
+    fn parse_segments_with(src: &str, budget: usize, pipeline: &pipeline::Config) -> Option<Doc> {
         let src = &src[front_matter_len(src)..];
         let plan = segment::plan(src, budget)?;
         let opts = options();
         let defs = plan.definitions(src, opts)?;
-        let mut b = Builder::new(src.len());
-        let mut spent = 0usize;
-        for (n, seg) in plan.segments.iter().enumerate() {
-            let stubs = defs.footnote_stubs(&src[seg.range.clone()]);
+        let mut feed = SegmentFeed {
+            plan: &plan,
+            b: Builder::new(src.len()),
+            src_len: src.len(),
+            spent: 0,
+        };
+        let total = plan.segments.len();
+        let stubs_and_text = |n: usize| {
+            let stubs = defs.footnote_stubs(&src[plan.segments[n].range.clone()]);
             let text = plan.text(src, n, &stubs);
-            b.begin_segment(stubs.len(), seg.head.is_some(), seg.list);
-            let links = &defs.links;
-            let resolve = move |link: BrokenLink<'_>| {
-                let (dest, title) = links.get(&UniCase::new(link.reference.into_string()))?;
-                Some((CowStr::from(dest.clone()), CowStr::from(title.clone())))
-            };
-            // Without definitions there is nothing to look up (and no callback to make).
-            let resolve = (!links.is_empty()).then_some(resolve);
-            let mut events = Parser::new_with_broken_link_callback(&text, opts, resolve).peekable();
-            // The list this segment ends in goes on in the next one: the end of the list is held
-            // back, the next segment's start of its list is dropped (see `Builder::hold_list`).
-            let held = plan.segments.get(n + 1).is_some_and(|next| next.list);
-            let mut open = 0i64;
-            let mut expanded = 0usize;
-            while let Some(event) = events.next() {
-                match &event {
-                    Event::Start(tag) => {
-                        open += 1;
-                        expanded += expansion(tag);
-                    }
-                    Event::End(_) => open -= 1,
-                    _ => {}
-                }
-                if held && events.peek().is_none() {
-                    if !b.hold_list(&event) {
-                        return None;
-                    }
-                    break;
-                }
-                b.event(event);
-            }
-            // pulldown-cmark ends its events early on some malformed input (a link definition
-            // in a list item followed by a line of whitespace, say), losing the rest of the
-            // text. Whatever one parser makes of that, segments can't repeat it. (Nor if a stub
-            // didn't come out as a definition.)
-            if open != 0 || b.footnotes.stubs != 0 || b.broken {
-                return None;
-            }
-            // A parser stops resolving references once their destinations and titles add up to
-            // its text's length (at least 100 KB). A segment's parser has less to spend than the
-            // one for the whole text, so spending that much makes them differ.
-            spent += expanded;
-            if expanded >= text.len().max(MIN_EXPANSION) || spent >= src.len().max(MIN_EXPANSION) {
-                return None;
-            }
+            (stubs.len(), text)
+        };
+        let done = if pipeline.workers == 0 {
+            // Each segment's parser is dropped before the next one starts.
+            (0..total).all(|n| {
+                let (stubs, text) = stubs_and_text(n);
+                let events = segment_events(&text, &defs.links, opts);
+                feed.segment(n, stubs, text.len(), events).is_some()
+            })
+        } else {
+            let (fed, done) = pipeline::ordered(total, pipeline, feed, |n, turn| {
+                let (stubs, text) = stubs_and_text(n);
+                let events: Vec<Event<'_>> = segment_events(&text, &defs.links, opts).collect();
+                let text_len = text.len();
+                // The events are gone (consumed) by the end of the turn.
+                turn.take(
+                    move |feed| match feed.segment(n, stubs, text_len, events.into_iter()) {
+                        Some(()) => ControlFlow::Continue(()),
+                        None => ControlFlow::Break(()),
+                    },
+                );
+            });
+            feed = fed;
+            done
+        };
+        #[cfg(test)]
+        if feed.b.misfit {
+            LIST_MISFITS.with(|n| n.set(n.get() + 1));
         }
-        Some(b.finish())
+        if !done {
+            return None;
+        }
+        Some(feed.b.finish())
     }
 
     pub fn span_text(&self, span: &Span) -> &str {
@@ -448,6 +448,9 @@ struct Builder {
     /// The segments didn't fit together as the planner said (a list that wasn't one, say): the
     /// parse can't go on in segments.
     broken: bool,
+    /// `broken` because of a list that didn't fit (for tests, which count those).
+    #[cfg(test)]
+    misfit: bool,
     /// Skipping a footnote definition (a stub, or a repeat of a label): its depth (see
     /// `fn_depth`), 0 when not skipping. Definitions of new labels inside it are not skipped.
     skip_def: usize,
@@ -490,6 +493,8 @@ impl Builder {
             skip_head: false,
             continue_list: false,
             broken: false,
+            #[cfg(test)]
+            misfit: false,
             skip_def: 0,
             fn_depth: 0,
             suspended: Vec::new(),
@@ -534,8 +539,8 @@ impl Builder {
     /// The segments don't fit together the way the planner said they would.
     fn misfit(&mut self) {
         #[cfg(test)]
-        if !self.broken {
-            LIST_MISFITS.with(|n| n.set(n.get() + 1));
+        {
+            self.misfit |= !self.broken;
         }
         self.broken = true;
     }
@@ -1482,6 +1487,86 @@ impl Builder {
             self.doc.headings.append(&mut noted);
         }
         self.doc
+    }
+}
+
+/// The events of one segment's text, with the document's link definitions (by label) behind the
+/// parser's broken-link callback.
+fn segment_events<'a>(
+    text: &'a str,
+    links: &'a HashMap<UniCase<String>, (String, String)>,
+    opts: Options,
+) -> impl Iterator<Item = Event<'a>> + 'a {
+    let resolve = move |link: BrokenLink<'a>| {
+        let (dest, title) = links.get(&UniCase::new(link.reference.into_string()))?;
+        Some((CowStr::from(dest.clone()), CowStr::from(title.clone())))
+    };
+    // Without definitions there is nothing to look up (and no callback to make).
+    let resolve = (!links.is_empty()).then_some(resolve);
+    Parser::new_with_broken_link_callback(text, opts, resolve)
+}
+
+/// The second pass of [`Doc::parse_segments`]: segments' events, in order, into the builder.
+struct SegmentFeed<'p> {
+    plan: &'p segment::Plan,
+    b: Builder,
+    src_len: usize,
+    /// Bytes copied from definitions into links so far, in all segments.
+    spent: usize,
+}
+
+impl SegmentFeed<'_> {
+    /// Feed segment `n`: its text was `text_len` bytes, with `stubs` footnote stubs in front.
+    /// `None` when the parse can't go on in segments (see below).
+    fn segment<'t>(
+        &mut self,
+        n: usize,
+        stubs: usize,
+        text_len: usize,
+        events: impl Iterator<Item = Event<'t>>,
+    ) -> Option<()> {
+        let (plan, b) = (self.plan, &mut self.b);
+        let seg = &plan.segments[n];
+        b.begin_segment(stubs, seg.head.is_some(), seg.list);
+        let mut events = events.peekable();
+        // The list this segment ends in goes on in the next one: the end of the list is held
+        // back, the next segment's start of its list is dropped (see `Builder::hold_list`).
+        let held = plan.segments.get(n + 1).is_some_and(|next| next.list);
+        let mut open = 0i64;
+        let mut expanded = 0usize;
+        while let Some(event) = events.next() {
+            match &event {
+                Event::Start(tag) => {
+                    open += 1;
+                    expanded += expansion(tag);
+                }
+                Event::End(_) => open -= 1,
+                _ => {}
+            }
+            if held && events.peek().is_none() {
+                if !b.hold_list(&event) {
+                    return None;
+                }
+                break;
+            }
+            b.event(event);
+        }
+        // pulldown-cmark ends its events early on some malformed input (a link definition
+        // in a list item followed by a line of whitespace, say), losing the rest of the
+        // text. Whatever one parser makes of that, segments can't repeat it. (Nor if a stub
+        // didn't come out as a definition.)
+        if open != 0 || b.footnotes.stubs != 0 || b.broken {
+            return None;
+        }
+        // A parser stops resolving references once their destinations and titles add up to
+        // its text's length (at least 100 KB). A segment's parser has less to spend than the
+        // one for the whole text, so spending that much makes them differ.
+        self.spent += expanded;
+        if expanded >= text_len.max(MIN_EXPANSION) || self.spent >= self.src_len.max(MIN_EXPANSION)
+        {
+            return None;
+        }
+        Some(())
     }
 }
 

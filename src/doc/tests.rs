@@ -2881,23 +2881,157 @@ fn a_giant_list_is_cut_between_its_items() {
 fn segments_that_do_not_fit_a_list_are_refused() {
     // The planner said the next segment goes on with the list: if it doesn't start with one (or
     // the list that ends isn't a top-level one), the builder says so instead of guessing.
-    LIST_MISFITS.with(|n| n.set(0));
     let mut b = Builder::new(0);
     b.begin_segment(0, false, true);
     for event in Parser::new_ext("text\n", options()) {
         b.event(event);
     }
-    assert!(b.broken);
+    assert!(b.broken && b.misfit);
     let mut b = Builder::new(0);
     b.begin_segment(0, false, true);
     for event in Parser::new_ext("1. a\n", options()) {
         b.event(event);
     }
-    assert!(b.broken, "an ordered list can't continue nothing");
+    assert!(
+        b.broken && b.misfit,
+        "an ordered list can't continue nothing"
+    );
     let mut b = Builder::new(0);
     let mut events = Parser::new_ext("> - a\n", options()).collect::<Vec<_>>();
     let end = events.pop().unwrap();
     assert!(matches!(end, Event::End(TagEnd::BlockQuote(_))));
     assert!(!b.hold_list(&end));
-    assert_eq!(LIST_MISFITS.with(|n| n.replace(0)), 3);
+    assert!(b.broken && b.misfit);
+}
+
+/// Pipelines to parse with: all on one thread, and threads of every number against windows
+/// tighter and wider than they are.
+fn pipelines() -> Vec<pipeline::Config> {
+    [(0, 1), (1, 1), (1, 3), (2, 1), (3, 2), (3, 5), (7, 8)]
+        .into_iter()
+        .map(|(workers, window)| pipeline::Config::new(workers, window))
+        .collect()
+}
+
+/// Segmented parsing at `budget` on every pipeline gives the document one parser gives. Returns
+/// how many segments the text is cut into.
+fn assert_same_in_parallel(name: &str, src: &str, budget: usize) -> usize {
+    let whole = Doc::parse_whole(src);
+    for (i, config) in pipelines().iter().enumerate() {
+        let Some(parts) = Doc::parse_segments_with(src, budget, config) else {
+            continue;
+        };
+        assert!(
+            whole == parts,
+            "{name} @ {budget}: the pipeline ({} workers, window {}) differs",
+            config.workers,
+            config.window
+        );
+        assert!(config.peak() <= config.window, "{name}: window overrun {i}");
+    }
+    segment_count(src, budget)
+}
+
+#[test]
+fn parallel_parse_matches_the_single_parser() {
+    for name in ["tiny", "readme", "spec", "cjk", "rtl", "emoji", "tables"] {
+        let path = format!("{}/fixtures/{name}.md", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path).unwrap();
+        for budget in [1, 200, 1024] {
+            let n = assert_same_in_parallel(name, &src, budget);
+            if src.len() > 20_000 && budget <= 1024 {
+                assert!(n >= 5, "{name} @ {budget}: {n} segments");
+            }
+        }
+    }
+    // The shapes that make a giant document: a generated file index, a table, prose with
+    // definitions and footnotes far from their uses, and the same with CRLF line ends.
+    let index: String = (0..3000)
+        .map(|i| format!("- [module_{i:06}.rs](src/module_{i:06}.rs)\n"))
+        .collect();
+    let numbered: String = (0..1500)
+        .map(|i| format!("{}. item [x]\n", i + 1))
+        .collect();
+    let numbered = numbered + "\n[x]: /x\n";
+    let notes = format!(
+        "Ref[^a] and [y].\n\n{}[^a]: A note.\n\n[y]: /y \"Y\"\n\n{}",
+        filler(40),
+        filler(40)
+    );
+    let mixed = include_str!("../../fixtures/readme.md").to_owned()
+        + &big_table(300)
+        + &index[..2000]
+        + "\n\n"
+        + include_str!("../../fixtures/tables.md");
+    for (name, src) in [
+        ("file index", index),
+        ("numbered list", numbered),
+        ("table", big_table(1500)),
+        ("notes", notes),
+        ("mixed", mixed),
+    ] {
+        for text in [src.clone(), src.replace('\n', "\r\n")] {
+            for budget in [100, 400, 3000] {
+                let n = assert_same_in_parallel(name, &text, budget);
+                assert!(
+                    n > 3 || text.len() / budget < 4,
+                    "{name} @ {budget}: {n} segments"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_parse_keeps_few_segments_in_flight() {
+    let table = big_table(4000);
+    let index: String = (0..6000)
+        .map(|i| format!("- [module_{i:06}.rs](src/module_{i:06}.rs)\n"))
+        .collect();
+    for src in [&table, &index] {
+        for (workers, window) in [(3, 1), (3, 2), (3, 4), (2, 5)] {
+            let config = pipeline::Config::new(workers, window);
+            let doc = Doc::parse_segments_with(src, 800, &config).unwrap();
+            assert!(doc == Doc::parse_whole(src));
+            assert!(segment_count(src, 800) > 50);
+            assert!(
+                config.peak() <= window,
+                "{} segments in flight, window {window}",
+                config.peak()
+            );
+            // The threads do get ahead of the builder when there is room.
+            assert!(config.peak() >= window.min(2), "{workers} × {window}");
+        }
+    }
+}
+
+#[test]
+fn a_late_fallback_with_threads_ahead_gives_the_single_parser_result() {
+    let url = format!("/{}", "u".repeat(1000));
+    // The segments that spend too much on references come last, after hundreds that don't:
+    // the threads are well ahead of the builder when it finds out. (One segment spends its own
+    // share, or many spend it together.)
+    let uses = "[x] ".repeat(300);
+    let single = format!("[x]: {url}\n\n{}{uses}\n\n{}", filler(4000), filler(100));
+    let mut many = format!("[x]: {url}\n\n{}", filler(3000));
+    for _ in 0..400 {
+        many.push_str(&format!("[x] {}\n\n", "t".repeat(450)));
+    }
+    for (name, src) in [("one segment", single), ("together", many)] {
+        assert!(segment_count(&src, 400) > 300, "{name}");
+        let whole = Doc::parse_whole(&src);
+        assert!(whole.links.len() >= 100, "{name}: one parser resolves them");
+        for config in pipelines() {
+            let (workers, window) = (config.workers, config.window);
+            assert!(
+                Doc::parse_segments_with(&src, 400, &config).is_none(),
+                "{name}: {workers} workers, window {window}"
+            );
+        }
+    }
+    // The same through `Doc::parse` for a document big enough to be segmented by itself.
+    let src = format!("[x]: {url}\n\n{}{uses}\n\n{}", filler(25_000), filler(100));
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    assert!(Doc::parse_segments(&src, SEGMENT_BYTES).is_none());
+    assert!(Doc::parse(&src) == Doc::parse_whole(&src));
 }

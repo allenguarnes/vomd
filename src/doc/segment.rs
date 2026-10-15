@@ -2,9 +2,10 @@
 //!
 //! pulldown-cmark builds a tree for its whole input before it emits the first event, so parsing
 //! a multi-megabyte document in one go costs time and memory far beyond the Doc IR it produces.
-//! A large document is cut into segments of roughly [`super::SEGMENT_BYTES`] that are parsed one
-//! after the other into the same builder. The result is identical to one parser over the whole
-//! text, because a cut is only made where that provably holds (or not made at all).
+//! A large document is cut into segments of roughly [`super::SEGMENT_BYTES`] that are parsed (on a
+//! few threads, see [`super::pipeline`]) into the same builder, in order. The result is identical
+//! to one parser over the whole text, because a cut is only made where that provably holds (or
+//! not made at all).
 //!
 //! **Safe cuts.** A cut goes before a line that follows a blank line, starts in column 0 and
 //! can't continue a construct before it: nothing but a list marker, `>`, a footnote definition
