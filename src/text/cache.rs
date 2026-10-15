@@ -54,7 +54,8 @@ pub struct GlyphImage {
     pub top: i32,
     pub width: u32,
     pub height: u32,
-    /// RGBA (premultiplied as produced by swash) instead of an 8-bit alpha mask.
+    /// Premultiplied RGBA instead of an 8-bit alpha mask. COLR output is premultiplied by
+    /// swash; bitmap color glyphs (CBDT/sbix) are premultiplied by the cache.
     pub color: bool,
     pub data: Vec<u8>,
 }
@@ -149,6 +150,11 @@ impl GlyphCache {
             Source::ColorBitmap(StrikeWith::BestFit),
             Source::Outline,
         ];
+        // TODO(P14): COLR layers that use palette index 0xFFFF ("current text color") come out
+        // swash's default gray, since no foreground is set here. Linux's Noto Color Emoji is
+        // CBDT, so only COLRv0 fonts (Segoe UI Emoji, Twemoji Mozilla) are affected. The fix:
+        // key color glyphs by the text color (not mask glyphs, so their key stays small) and
+        // pass it to `Render::default_color`.
         let mut render = Render::new(&sources);
         render
             .format(Format::Alpha)
@@ -274,5 +280,45 @@ mod tests {
         };
         let h = img.height;
         assert!(centroid(0..h / 4) > centroid(h * 3 / 4..h) + 1.0);
+    }
+}
+
+/// A CBDT/sbix-style bitmap (straight alpha) takes the cache's conversion and then the
+/// painter's premultiplied blit; the result must match plain straight-alpha compositing.
+#[cfg(test)]
+mod color_bitmap_tests {
+    use super::*;
+    use crate::render::Frame;
+
+    #[test]
+    fn straight_alpha_bitmap_composites_like_source_over() {
+        const BG: u32 = 0x00_20_80_e0;
+        let straight: [[u8; 4]; 4] = [
+            [255, 0, 0, 255],
+            [255, 0, 0, 128],
+            [10, 200, 90, 51],
+            [200, 200, 200, 0],
+        ];
+        let mut data: Vec<u8> = straight.concat();
+        premultiply(&mut data);
+        let mut px = [BG; 4];
+        Frame::new(&mut px, 4, 1, 4).blit_rgba(0, 0, 4, 1, &data);
+        for (i, s) in straight.iter().enumerate() {
+            let a = u32::from(s[3]);
+            let bg = [(BG >> 16) & 255, (BG >> 8) & 255, BG & 255];
+            let want: Vec<u32> = (0..3)
+                .map(|c| (u32::from(s[c]) * a + bg[c] * (255 - a) + 127) / 255)
+                .collect();
+            let got = [(px[i] >> 16) & 255, (px[i] >> 8) & 255, px[i] & 255];
+            for c in 0..3 {
+                assert!(
+                    got[c].abs_diff(want[c]) <= 1,
+                    "pixel {i} channel {c}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+        // Opaque stays exact, fully transparent leaves the background alone.
+        assert_eq!(px[0], 0x00_ff_00_00);
+        assert_eq!(px[3], BG);
     }
 }

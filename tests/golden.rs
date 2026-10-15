@@ -29,6 +29,9 @@ struct Case {
     width: f32,
     scale: f32,
     theme: &'static Theme,
+    /// `Some(h)`: a window `h` logical pixels tall scrolled to the middle of the document, with
+    /// the scrollbar painted. `None`: the whole document from the top, no scrollbar.
+    view: Option<f32>,
 }
 
 const CASES: &[Case] = &[
@@ -38,6 +41,7 @@ const CASES: &[Case] = &[
         width: 760.0,
         scale: 1.0,
         theme: &LIGHT,
+        view: None,
     },
     Case {
         name: "golden-dark",
@@ -45,6 +49,7 @@ const CASES: &[Case] = &[
         width: 760.0,
         scale: 1.0,
         theme: &DARK,
+        view: None,
     },
     Case {
         name: "golden-light-2x",
@@ -52,6 +57,7 @@ const CASES: &[Case] = &[
         width: 760.0,
         scale: 2.0,
         theme: &LIGHT,
+        view: None,
     },
     Case {
         name: "golden-narrow",
@@ -59,6 +65,15 @@ const CASES: &[Case] = &[
         width: 360.0,
         scale: 1.0,
         theme: &LIGHT,
+        view: None,
+    },
+    Case {
+        name: "golden-scrolled-1.5x",
+        fixture: "golden.md",
+        width: 760.0,
+        scale: 1.5,
+        theme: &LIGHT,
+        view: Some(600.0),
     },
     Case {
         name: "tables-dark",
@@ -66,6 +81,7 @@ const CASES: &[Case] = &[
         width: 900.0,
         scale: 1.0,
         theme: &DARK,
+        view: None,
     },
     Case {
         name: "tiny",
@@ -73,6 +89,7 @@ const CASES: &[Case] = &[
         width: 640.0,
         scale: 1.0,
         theme: &LIGHT,
+        view: None,
     },
 ];
 
@@ -80,7 +97,7 @@ fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The whole document (up to [`MAX_H`]) painted at the case's size: `(width, height, pixels)`.
+/// The case painted: `(width, height, pixels)`. A whole-document case is cut off at [`MAX_H`].
 fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
     let src = std::fs::read_to_string(root().join("fixtures").join(case.fixture)).unwrap();
     let doc = Doc::parse(&src);
@@ -94,8 +111,23 @@ fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
         },
     );
     while !layout.idle(&doc, fonts, Instant::now() + Duration::from_secs(1)) {}
-    let h = (layout.total_height().ceil() as usize).clamp(1, MAX_H);
-    layout.ensure(&doc, fonts, Anchor::TOP, h as f32);
+    let total = layout.total_height();
+    let h = match case.view {
+        Some(view) => (view * case.scale).round() as usize,
+        None => (total.ceil() as usize).clamp(1, MAX_H),
+    };
+    // The block at the middle of the scroll range goes at the top of the window; everything is
+    // measured, so its y is the scroll offset.
+    let scroll = match case.view {
+        Some(_) => {
+            let anchor = layout.anchor_at((total - h as f32) / 2.0);
+            layout.ensure(&doc, fonts, anchor, h as f32)
+        }
+        None => {
+            layout.ensure(&doc, fonts, Anchor::TOP, h as f32);
+            0.0
+        }
+    };
     let w = width as usize;
     let mut px = vec![0; w * h];
     let vp = Viewport {
@@ -105,7 +137,7 @@ fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
             x1: w as i32,
             y1: h as i32,
         },
-        scroll: 0.0,
+        scroll: f64::from(scroll),
     };
     let mut frame = Frame::new(&mut px, w, h, w);
     render::paint(
@@ -116,6 +148,10 @@ fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
         &mut GlyphCache::default(),
         case.theme,
     );
+    if case.view.is_some() {
+        assert!(total > h as f32, "{}: the window must scroll", case.name);
+        render::paint_scrollbar(&mut frame, vp, total, case.scale, case.theme);
+    }
     (w, h, px)
 }
 

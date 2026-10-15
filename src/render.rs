@@ -494,6 +494,7 @@ pub fn thumb(vp: Viewport, total: f32, scale: f32) -> Option<Thumb> {
     }
     let len = (track * view / total)
         .max(THUMB_MIN as f64 * scale)
+        .max(1.0)
         .min(track);
     let max_scroll = total - view;
     // NaN (a NaN scroll, or infinity over infinity) counts as the top.
@@ -503,12 +504,15 @@ pub fn thumb(vp: Viewport, total: f32, scale: f32) -> Option<Thumb> {
     // f64 throughout, narrowed last: an area near the i32 limits (or a huge `scale`) puts the
     // thumb past them. Saturating keeps whatever part is on screen exactly where it belongs.
     let x1 = f64::from(vp.area.x1) - margin;
-    let y0 = f64::from(vp.area.y0) + (margin + pos).round();
+    // Both ends are rounded from their own position (not top + rounded length): with .5
+    // fractions the two roundings would add up to a pixel past the margin. `len >= 1` keeps
+    // the thumb at least a pixel tall.
+    let top = f64::from(vp.area.y0);
     Some(Thumb {
         x0: (x1 - w) as i32,
-        y0: y0 as i32,
+        y0: (top + (margin + pos).round()) as i32,
         x1: x1 as i32,
-        y1: (y0 + len.round().max(1.0)) as i32,
+        y1: (top + (margin + pos + len).round()) as i32,
     })
 }
 
@@ -524,8 +528,8 @@ pub fn paint_scrollbar(frame: &mut Frame, vp: Viewport, total: f32, scale: f32, 
     frame.set_clip(prev);
 }
 
-/// Scrollbar visibility: shown on scroll, hidden [`SCROLLBAR_LINGER`] after the last one. A
-/// single deadline, so an idle window wakes once to hide it and then sleeps.
+/// Scrollbar visibility: shown on scroll, hidden [`SCROLLBAR_LINGER`] after the last one (at
+/// once, no animation). A single deadline, so an idle window wakes once to hide it and then sleeps.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScrollbarFade {
     until: Option<Instant>,

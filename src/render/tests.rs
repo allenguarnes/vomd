@@ -322,6 +322,44 @@ fn thumb_geometry() {
     assert_eq!(end.y1, 496);
 }
 
+/// Rounding the top and the length separately put the thumb a pixel past the margin when both
+/// fractions were .5: a 100 px area, a 256 px document (length 37.5, position 58.5).
+#[test]
+fn thumb_with_half_pixel_fractions_stays_inside_margin() {
+    let bottom = thumb(vp(100, 156.0), 256.0, 1.0).unwrap();
+    assert_eq!(bottom.y1, 98, "ends at the margin, not one pixel past it");
+    assert!(bottom.y0 >= 2 && bottom.y1 - bottom.y0 >= 37);
+    let top = thumb(vp(100, 0.0), 256.0, 1.0).unwrap();
+    assert_eq!(top.y0, 2);
+}
+
+/// For many window heights, document lengths, scales and scroll positions the thumb stays
+/// between the margins, never collapses, and ends exactly at the bottom margin when scrolled to
+/// the end.
+#[test]
+fn thumb_stays_inside_margins() {
+    for scale in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
+        let margin = (THUMB_MARGIN * scale).round() as i32;
+        for h in (40..800).step_by(7) {
+            for k in [1.01, 1.5, 2.56, 3.0, 7.7, 20.0, 1000.0] {
+                let total = (h as f32 * k).ceil();
+                let max_scroll = f64::from(total) - f64::from(h);
+                for f in [0.0, 0.1, 0.25, 0.333, 0.5, 0.75, 0.999, 1.0, 2.0] {
+                    let t = thumb(vp(h, max_scroll * f), total, scale).unwrap();
+                    let ctx = format!("h {h} total {total} scale {scale} at {f}: {t:?}");
+                    assert!(t.y0 >= margin, "{ctx}");
+                    assert!(t.y1 <= h - margin, "{ctx}");
+                    assert!(t.y1 > t.y0, "{ctx}");
+                }
+                let end = thumb(vp(h, max_scroll), total, scale).unwrap();
+                assert_eq!(end.y1, h - margin, "h {h} total {total} scale {scale}");
+                let start = thumb(vp(h, 0.0), total, scale).unwrap();
+                assert_eq!(start.y0, margin, "h {h} total {total} scale {scale}");
+            }
+        }
+    }
+}
+
 #[test]
 fn scrollbar_paints_inside_area() {
     let mut b = Buf::new(400, 100, 400);

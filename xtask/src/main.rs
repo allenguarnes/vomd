@@ -183,7 +183,6 @@ fn bench(only: Option<&str>) -> bool {
     ok
 }
 
-/// Generate large fixtures that aren't committed.
 /// Regenerate the render goldens in `tests/golden/`. Review the images before
 /// committing them.
 fn bless() -> bool {
@@ -204,6 +203,7 @@ fn bless() -> bool {
         .success()
 }
 
+/// Generate large fixtures that aren't committed.
 fn fixtures() -> bool {
     let dir = root().join("fixtures");
     let mut seed = fs::read_to_string(dir.join("readme.md")).expect("fixtures/readme.md");
