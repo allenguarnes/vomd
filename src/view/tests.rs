@@ -1067,4 +1067,73 @@ mod with_fonts {
         assert!(v.set_family(false, None));
         assert_eq!(v.anchor().block, block);
     }
+
+    fn jb_family() -> [Option<(PathBuf, u32)>; 4] {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+        [
+            Some((dir.join("JetBrainsMono-Regular.ttf"), 0)),
+            Some((dir.join("JetBrainsMono-Bold.ttf"), 0)),
+            None,
+            None,
+        ]
+    }
+
+    /// Box drawing: JetBrains Mono has it, the default Inter doesn't.
+    const BOX: char = '\u{2500}';
+
+    fn covered(v: &View, ch: char) -> bool {
+        v.fonts
+            .select(v.fonts.primary(false, false, false), ch)
+            .is_some()
+    }
+
+    /// Characters a family covered, and no other face did, stay covered when the family is
+    /// left, and are never reported as missing for a scan that couldn't find them.
+    #[test]
+    fn switching_away_from_a_family_keeps_its_characters() {
+        let mut v = view("Lines ─── and more", 600, 300);
+        let missing = v.take_missing();
+        assert!(missing.contains(&BOX), "{missing:?}");
+        // The scan found nothing (no such font installed); the family has it.
+        assert!(v.set_family(false, Some(&jb_family())));
+        settle(&mut v);
+        assert!(covered(&v, BOX));
+        assert!(v.set_family(false, None));
+        settle(&mut v);
+        assert!(covered(&v, BOX), "still covered through the old family");
+        assert!(v.take_missing().is_empty(), "nothing for a scan to do");
+        // A character the family covered before it was ever missing, the same.
+        let mut v = view("Plain", 600, 300);
+        assert!(v.set_family(false, Some(&jb_family())));
+        v.replace(Doc::parse("Lines ─── and more"), None);
+        settle(&mut v);
+        assert!(v.take_missing().is_empty());
+        assert!(v.set_family(false, None));
+        settle(&mut v);
+        assert!(covered(&v, BOX));
+        assert!(v.take_missing().is_empty());
+    }
+
+    /// A face loaded for a family in use is not a fallback, so a scan may find it for the text
+    /// in the other kind of slot.
+    #[test]
+    fn a_scan_can_pick_a_loaded_family_face() {
+        use crate::text::fallback::find_in;
+        let mut v = view("Lines ─── and more\n\n`code ───`", 600, 300);
+        // Code in JetBrains Mono; body text stays in Inter, and lacks the box drawing.
+        assert!(v.set_family(true, Some(&jb_family())));
+        settle(&mut v);
+        assert!(!covered(&v, BOX));
+        assert_eq!(v.take_missing(), vec![BOX]);
+        let sources = v.font_sources();
+        let files = [jb_family()[0].clone().unwrap().0];
+        let skip = |p: &std::path::Path, i: u32| sources.iter().any(|(sp, si)| sp == p && *si == i);
+        let found = find_in(&files, &[BOX], &skip);
+        assert_eq!(found.len(), 1, "the loaded face is still a candidate");
+        assert!(v.add_fallbacks(&found));
+        settle(&mut v);
+        assert!(covered(&v, BOX));
+        assert_eq!(v.font_sources().len(), 1);
+        assert!(!v.add_fallbacks(&found), "once");
+    }
 }

@@ -307,18 +307,24 @@ impl Fonts {
         })
     }
 
-    /// Files and collection indexes of the faces loaded from disk, for a fallback scan running
-    /// on another thread to skip.
+    /// Files and collection indexes of the fallback faces, for a fallback scan running on another
+    /// thread to skip. Faces that are only loaded (a family in use, or one used before) are not
+    /// listed: the scan may still find them, and [`Fonts::add_fallback`] makes them fallbacks.
     pub fn sources(&self) -> Vec<(PathBuf, u32)> {
-        self.faces.iter().filter_map(|f| f.source.clone()).collect()
+        self.fallbacks
+            .iter()
+            .filter_map(|&id| self.face(id).source.clone())
+            .collect()
     }
 
-    /// Memory-map a font file and add one of its faces as a fallback.
+    /// Add one face of a font file as a fallback, memory-mapping the file unless the face is
+    /// loaded already (then it is promoted). `None` if it is a fallback already, or can't be
+    /// loaded.
     pub fn add_fallback(&mut self, path: &Path, index: u32) -> Option<FaceId> {
-        if self.has_source(path, index) {
+        let id = self.face_for(path, index)?;
+        if self.fallbacks.contains(&id) {
             return None;
         }
-        let id = self.load(path, index)?;
         self.fallbacks.push(id);
         Some(id)
     }
@@ -328,7 +334,26 @@ impl Fonts {
     /// `font_mono`); `None` goes back to the defaults. `faces` are regular, bold,
     /// italic and bold italic; missing styles use the nearest face, synthesized. Returns false
     /// (and keeps the defaults) if the regular face can't be loaded.
+    ///
+    /// The faces of the family left behind become fallbacks: they drew the document a moment
+    /// ago, so what they cover stays covered, with no scan (which would also have to find
+    /// files outside the font directories).
     pub fn set_family(&mut self, mono: bool, faces: Option<&[Option<(PathBuf, u32)>; 4]>) -> bool {
+        let range = if mono { 4..6 } else { 0..4 };
+        let old: Vec<FaceId> = self.slots[range.clone()].to_vec();
+        let ok = self.replace_family(mono, faces);
+        for id in old {
+            if !self.defaults.contains(&id)
+                && !self.slots[range.clone()].contains(&id)
+                && !self.fallbacks.contains(&id)
+            {
+                self.fallbacks.push(id);
+            }
+        }
+        ok
+    }
+
+    fn replace_family(&mut self, mono: bool, faces: Option<&[Option<(PathBuf, u32)>; 4]>) -> bool {
         let range = if mono { 4..6 } else { 0..4 };
         let Some(faces) = faces else {
             self.slots[range.clone()].copy_from_slice(&self.defaults[range]);
@@ -463,6 +488,66 @@ mod tests {
         let gone = [Some(("/nonexistent/x.ttf".into(), 0)), None, None, None];
         assert!(!fonts.set_family(false, Some(&gone)));
         assert_eq!(fonts.slots, defaults);
+    }
+
+    const BOX: char = '\u{2500}';
+
+    #[test]
+    fn a_loaded_face_is_promoted_to_a_fallback() {
+        let mut fonts = Fonts::new().unwrap();
+        let regular = fonts.slot(Slot::Regular);
+        let (path, index) = asset("JetBrainsMono-Regular.ttf").unwrap();
+        // Loaded for a family, and in use there: a scan can still pick it as a fallback.
+        let jb = [asset("JetBrainsMono-Regular.ttf"), None, None, None];
+        assert!(fonts.set_family(false, Some(&jb)));
+        assert!(fonts.has_source(&path, index));
+        assert!(fonts.sources().is_empty(), "loaded, but not a fallback");
+        let n = fonts.faces.len();
+        let id = fonts.add_fallback(&path, index).expect("promoted");
+        assert_eq!(fonts.faces.len(), n, "no second copy");
+        assert_eq!(id, fonts.slot(Slot::Regular));
+        assert_eq!(fonts.sources(), vec![(path.clone(), index)]);
+        assert_eq!(fonts.add_fallback(&path, index), None, "once");
+        // It covers what the defaults lack, for the slots left in the defaults.
+        assert!(fonts.set_family(false, None));
+        assert_eq!(fonts.slot(Slot::Regular), regular);
+        assert_eq!(fonts.select(regular, BOX), Some(id));
+    }
+
+    #[test]
+    fn the_family_left_behind_stays_covered() {
+        let mut fonts = Fonts::new().unwrap();
+        let regular = fonts.slot(Slot::Regular);
+        assert_eq!(fonts.select(regular, BOX), None);
+        let jb = [
+            asset("JetBrainsMono-Regular.ttf"),
+            asset("JetBrainsMono-Bold.ttf"),
+            None,
+            None,
+        ];
+        assert!(fonts.set_family(false, Some(&jb)));
+        assert!(fonts.sources().is_empty(), "in use, not a fallback yet");
+        // Changing to another family or to the defaults: what it covered still is.
+        let inter = [asset("Inter-Regular.ttf"), None, None, None];
+        assert!(fonts.set_family(false, Some(&inter)));
+        assert_eq!(fonts.sources().len(), 2, "regular and bold");
+        let primary = fonts.slot(Slot::Regular);
+        assert!(fonts.select(primary, BOX).is_some());
+        assert!(fonts.set_family(false, None));
+        assert!(fonts.select(regular, BOX).is_some());
+        // Neither the defaults nor a family still in use are fallbacks, and nothing twice.
+        assert!(fonts.set_family(false, Some(&jb)));
+        assert!(fonts.set_family(false, Some(&jb)));
+        assert!(fonts.set_family(false, None));
+        assert_eq!(fonts.sources().len(), 3, "JetBrains Mono two, Inter one");
+        let mut ids = fonts.fallbacks.clone();
+        ids.dedup();
+        assert_eq!(ids.len(), fonts.fallbacks.len());
+        // A family that fails to load leaves the previous one covering too.
+        assert!(fonts.set_family(true, Some(&jb)));
+        let gone = [Some(("/nonexistent/x.ttf".into(), 0)), None, None, None];
+        assert!(!fonts.set_family(true, Some(&gone)));
+        assert_eq!(fonts.slot(Slot::Mono), fonts.defaults[Slot::Mono as usize]);
     }
 
     #[test]

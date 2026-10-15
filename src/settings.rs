@@ -418,7 +418,15 @@ pub struct Loaded {
 pub fn load(path: &Path) -> Loaded {
     let stamp = stamp(path);
     let (text, faithful) = match std::fs::metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (String::new(), true),
+        // A file in the way of the directory (`NotADirectory`) leaves nothing to destroy either.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            (String::new(), true)
+        }
         Ok(m) if m.len() <= MAX_FILE => match std::fs::read(path).map(String::from_utf8) {
             Ok(Ok(text)) => (text, true),
             Ok(Err(e)) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
@@ -522,9 +530,9 @@ impl Saver {
 /// gives the defaults and never touches the disk.
 ///
 /// Saving never overwrites the file with a stale copy: changes are kept as `(key, value)`
-/// pending writes, and a save first looks at the file again; if it changed since it was read
-/// (another window, a hand edit) its lines are taken as they are and the pending keys go on
-/// top, so for each key the last write wins and nothing else is lost.
+/// pending writes, and a save first reads the file again (whatever its stamp says); if it
+/// changed since it was read (another window, a hand edit) its lines are taken as they are and
+/// the pending keys go on top, so for each key the last write wins and nothing else is lost.
 #[derive(Debug, Default)]
 pub struct Store {
     path: Option<PathBuf>,
@@ -691,8 +699,11 @@ impl Store {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        if stamp(&path) != self.stamp {
-            self.adopt(load(&path));
+        // Always read the file again, not only when its stamp changed: an edit of the same size
+        // within the timestamp's granularity looks like no edit at all.
+        let (before, changed) = (self.prefs(), stamp(&path) != self.stamp);
+        self.adopt(load(&path));
+        if changed || self.prefs() != before {
             self.foreign = true;
         }
         // Made read-only since it was read (the stamp doesn't show a chmod).

@@ -704,6 +704,34 @@ fn a_merged_external_change_is_not_reverted_by_the_next_record() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn an_edit_with_the_same_stamp_is_not_overwritten_by_a_save() {
+    let dir = temp_dir("same-stamp");
+    let path = dir.join("settings.ini");
+    write_file(&path, "# user note A\nzoom = 100\n");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    // Same length, and the old modification time put back (a coarse clock would do the same).
+    write_file(&path, "# user note B\nzoom = 150\n");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+    assert_eq!(stamp(&path), st.stamp, "the stamp can't tell");
+    st.set("toc", "true", t0);
+    st.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# user note B\nzoom = 150\ntoc = true\n"
+    );
+    let p = st.take_merged().expect("the edit was merged");
+    assert_eq!((p.zoom, p.toc), (150, true));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // ---- Files that can't be read faithfully ------------------------------------------------------
 
 /// A store on `bytes` writes nothing: not on a change, nor when the file is replaced (then it
