@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::cli::Input;
 use crate::doc::Doc;
 use crate::layout::Anchor;
+use crate::view::rereadable;
 
 /// Most entries the back stack keeps; the oldest are dropped.
 pub const BACK_LIMIT: usize = 32;
@@ -204,15 +205,16 @@ impl BackStack {
     }
 
     /// Record that the reader is leaving `here` for `next` (another document, or a place in the
-    /// same one). A document that can't be opened again isn't worth coming back to: stdin is
-    /// read once at startup (a second read would block or find it empty), so leaving it for
-    /// another document forgets every stdin entry, and an empty window has nothing to return
-    /// to. Back then ends at the last document that can be reopened.
+    /// same one). A document that can't be opened again isn't worth coming back to
+    /// ([`rereadable`]): stdin, and a pipe named on the command line, are read once (a second
+    /// read would block or find them empty), so leaving one for another document forgets
+    /// every entry of it, and an empty window has nothing to return to. Back then ends at the
+    /// last document that can be reopened.
     pub fn leave(&mut self, here: Entry, next: &Input) {
         match here.input {
             Input::None => {}
-            Input::Stdin if *next != Input::Stdin => {
-                self.entries.retain(|e| e.input != Input::Stdin);
+            _ if *next != here.input && !rereadable(&here.input) => {
+                self.entries.retain(|e| e.input != here.input);
             }
             _ => self.push(here),
         }

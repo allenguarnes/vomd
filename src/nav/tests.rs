@@ -276,3 +276,22 @@ fn leaving_stdin_forgets_it() {
     s.leave(entry(Input::None), &Input::File("a.md".into()));
     assert!(s.is_empty());
 }
+
+/// A pipe or device named on the command line is read once, like stdin.
+#[cfg(unix)]
+#[test]
+fn leaving_a_pipe_forgets_it() {
+    let pipe = Input::File("/dev/null".into());
+    let mut s = BackStack::default();
+    // Jumps inside it come back to it.
+    s.leave(entry(pipe.clone()), &pipe);
+    assert_eq!(s.len(), 1);
+    s.leave(
+        entry(Input::File("a.md".into())),
+        &Input::File("b.md".into()),
+    );
+    // Leaving it for a document forgets its entries and keeps the others.
+    s.leave(entry(pipe), &Input::File("c.md".into()));
+    assert_eq!(s.len(), 1);
+    assert_eq!(s.pop().unwrap().input, Input::File("a.md".into()));
+}

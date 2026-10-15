@@ -22,7 +22,7 @@ use vomd::nav::{self, BackStack, Target};
 use vomd::platform;
 use vomd::settings::{self, FontPaths, Prefs, Store};
 use vomd::text::fallback::{self, Family, Found};
-use vomd::view::{self, Outcome, Stamp, View, Wake};
+use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
 
 /// Idle layout runs in slices this long between events.
 const IDLE_SLICE: Duration = Duration::from_millis(4);
@@ -42,8 +42,8 @@ struct Loaded {
     stamp: Option<Stamp>,
 }
 
-fn load(input: &Input) -> Loaded {
-    match view::read_input(input) {
+fn load(input: &Input, origin: Origin) -> Loaded {
+    match view::read_input(input, origin) {
         Ok((text, stamp)) => Loaded {
             doc: Doc::parse(&text),
             message: (*input == Input::None).then(|| EMPTY_MESSAGE.to_owned()),
@@ -238,10 +238,11 @@ impl App {
 
     /// Re-read the document, keeping the reading position.
     fn reload(&mut self) {
-        if !matches!(self.input, Input::File(_)) {
+        // A pipe named on the command line was read once: keep what it gave.
+        if !view::rereadable(&self.input) {
             return;
         }
-        let loaded = load(&self.input);
+        let loaded = load(&self.input, Origin::Navigation);
         self.stamp = loaded.stamp;
         if let Some(view) = self.view.as_mut() {
             view.replace(loaded.doc, loaded.message);
@@ -251,7 +252,7 @@ impl App {
 
     /// Open a document in place of the current one (the back stack is the caller's business).
     fn open(&mut self, input: Input) {
-        let loaded = load(&input);
+        let loaded = load(&input, Origin::Navigation);
         self.input = input;
         self.stamp = loaded.stamp;
         if let Some(view) = self.view.as_mut() {
@@ -516,6 +517,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Changes made here are in the file before another window (or an editor) is used.
             WindowEvent::Focused(false) => self.save(|s| s.flush()),
             WindowEvent::Focused(true) => {
+                // (`reload` keeps a pipe's document: its stamp says nothing.)
                 if let Input::File(path) = &self.input
                     && view::stamp(path) != self.stamp
                 {
@@ -655,7 +657,7 @@ fn main() {
     // Read and parse in parallel with creating the window.
     let parse = {
         let input = input.clone();
-        std::thread::spawn(move || load(&input))
+        std::thread::spawn(move || load(&input, Origin::Argument))
     };
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(el) => el,

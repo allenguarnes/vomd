@@ -82,7 +82,11 @@ fn titles() {
 
 #[test]
 fn read_errors_and_lossy_utf8() {
-    let err = read_input(&Input::File("/nonexistent/vomd-test.md".into())).unwrap_err();
+    let err = read_input(
+        &Input::File("/nonexistent/vomd-test.md".into()),
+        Origin::Argument,
+    )
+    .unwrap_err();
     assert!(
         err.starts_with("Cannot open /nonexistent/vomd-test.md"),
         "{err}"
@@ -91,12 +95,15 @@ fn read_errors_and_lossy_utf8() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("bad.md");
     std::fs::write(&path, b"ok \xff end").unwrap();
-    let (text, st) = read_input(&Input::File(path.clone())).unwrap();
+    let (text, st) = read_input(&Input::File(path.clone()), Origin::Argument).unwrap();
     assert_eq!(text, "ok \u{fffd} end");
     assert_eq!(st, stamp(&path));
     assert_eq!(st.unwrap().1, 8);
     std::fs::remove_dir_all(&dir).unwrap();
-    assert_eq!(read_input(&Input::None).unwrap(), (String::new(), None));
+    assert_eq!(
+        read_input(&Input::None, Origin::Argument).unwrap(),
+        (String::new(), None)
+    );
 }
 
 #[test]
@@ -158,12 +165,12 @@ fn cursor_follows_the_link_under_the_pointer() {
     );
 }
 
-/// What a click on a link can reach: only regular files, and a bounded amount of them.
+/// What a link, Back or a drop can reach: only regular files, and a bounded amount of them.
 #[test]
-fn read_input_refuses_what_is_not_a_regular_file() {
+fn navigation_refuses_what_is_not_a_regular_file() {
     let dir = std::env::temp_dir().join(format!("vomd-view-read-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let read = |p: &Path| read_input(&Input::File(p.to_owned()));
+    let read = |p: &Path| read_input(&Input::File(p.to_owned()), Origin::Navigation);
     let err = read(&dir).unwrap_err();
     assert!(err.contains("not a regular file"), "{err}");
     #[cfg(unix)]
@@ -184,7 +191,7 @@ fn read_input_refuses_what_is_not_a_regular_file() {
             let (tx, rx) = std::sync::mpsc::channel();
             let path = fifo.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(read_input(&Input::File(path)));
+                let _ = tx.send(read_input(&Input::File(path), Origin::Navigation));
             });
             let err = rx
                 .recv_timeout(std::time::Duration::from_secs(10))
@@ -192,6 +199,68 @@ fn read_input_refuses_what_is_not_a_regular_file() {
                 .unwrap_err();
             assert!(err.contains("not a regular file"), "{err}");
         }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `vomd [FILE]` takes whatever the shell names: `<(cmd)`, `/dev/stdin`, a FIFO.
+#[cfg(unix)]
+#[test]
+fn the_argument_may_be_a_pipe_or_a_device() {
+    let dir = std::env::temp_dir().join(format!("vomd-view-arg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let arg = |p: &Path| read_input(&Input::File(p.to_owned()), Origin::Argument);
+    // A device reads (as empty here), and has no stamp to compare.
+    assert_eq!(arg(Path::new("/dev/null")).unwrap(), (String::new(), None));
+    // The size limit holds for everything, an endless device too.
+    let err = read_input_limited(&Input::File("/dev/zero".into()), Origin::Argument, 1 << 20)
+        .unwrap_err();
+    assert!(err.ends_with("is larger than 1 MB"), "{err}");
+    // A directory can't be read, with a message.
+    assert!(arg(&dir).is_err());
+    // A FIFO is read once its writer has written (the open waits for it).
+    let fifo = dir.join("pipe.md");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    if made.is_ok_and(|s| s.success()) {
+        let path = fifo.clone();
+        let writer = std::thread::spawn(move || std::fs::write(path, "# piped\n"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_input(&Input::File(path), Origin::Argument));
+        });
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reading a FIFO with a writer blocked");
+        assert_eq!(read.unwrap(), ("# piped\n".to_owned(), None));
+        writer.join().unwrap().unwrap();
+        // Not again: reload and Back keep what was read.
+        assert!(!rereadable(&Input::File(fifo)));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn only_regular_files_are_read_again() {
+    let dir = std::env::temp_dir().join(format!("vomd-view-again-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.md");
+    std::fs::write(&file, "# a").unwrap();
+    assert!(rereadable(&Input::File(file.clone())));
+    // A file that is gone is read again to say why.
+    assert!(rereadable(&Input::File(dir.join("gone.md"))));
+    assert!(!rereadable(&Input::File(dir.clone())));
+    assert!(!rereadable(&Input::Stdin));
+    assert!(!rereadable(&Input::None));
+    #[cfg(unix)]
+    {
+        assert!(!rereadable(&Input::File("/dev/null".into())));
+        let link = dir.join("alias.md");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(rereadable(&Input::File(link)));
+        let dev = dir.join("dev.md");
+        std::os::unix::fs::symlink("/dev/null", &dev).unwrap();
+        assert!(!rereadable(&Input::File(dev)));
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -218,8 +287,13 @@ fn reads_stop_at_the_limit() {
     let path = dir.join("big.md");
     std::fs::write(&path, "0123456789").unwrap();
     let input = Input::File(path);
-    assert_eq!(read_input_limited(&input, 10).unwrap().0, "0123456789");
-    let err = read_input_limited(&input, 9).unwrap_err();
+    assert_eq!(
+        read_input_limited(&input, Origin::Navigation, 10)
+            .unwrap()
+            .0,
+        "0123456789"
+    );
+    let err = read_input_limited(&input, Origin::Argument, 9).unwrap_err();
     assert!(err.ends_with("is larger than 0 MB"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
     const { assert!(MAX_BYTES > 10 << 20, "well above the 10 MB notice") };

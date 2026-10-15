@@ -219,8 +219,34 @@ fn read_limited(
     Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
+/// How the reader came to a document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Named by the reader on the command line (any file the OS can read, including
+    /// a pipe such as `<(cmd)` or `/dev/stdin`; it is read once and the open may block until
+    /// the writer is there, as for any other program).
+    Argument,
+    /// Reached from another document (a link, Back, a drop): only regular files, so a link
+    /// can't hang the window on a FIFO or read a device.
+    Navigation,
+}
+
+/// Whether `input` can be read again (reload, Back): not stdin, not the empty window, and not
+/// a pipe or device named on the command line, which a second read would find empty or block
+/// on. A file that can't be inspected (gone) counts: reading it again reports why.
+pub fn rereadable(input: &Input) -> bool {
+    match input {
+        Input::File(path) => std::fs::metadata(path).map_or(true, |m| m.is_file()),
+        Input::Stdin | Input::None => false,
+    }
+}
+
 /// [`read_input`] with a chosen size limit.
-fn read_input_limited(input: &Input, limit: u64) -> Result<(String, Option<Stamp>), String> {
+fn read_input_limited(
+    input: &Input,
+    origin: Origin,
+    limit: u64,
+) -> Result<(String, Option<Stamp>), String> {
     let lossy = |bytes: Vec<u8>| match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
@@ -237,15 +263,18 @@ fn read_input_limited(input: &Input, limit: u64) -> Result<(String, Option<Stamp
         }
         Input::File(path) => {
             let shown = path.display();
-            // Stamp first: a write landing between the two makes the next focus reload again
-            // rather than miss the change.
-            let st = stamp(path);
-            // Before opening: a FIFO blocks the open until something writes to it. Symlinks
-            // are followed, so a link to a device is refused too.
+            // Before opening: a FIFO blocks the open until something writes to it, and a
+            // document reached from another one must not be able to do that. Symlinks are
+            // followed, so a link to a device is refused too. (The file may change between
+            // this and the open; the size limit below holds whatever it becomes.)
             let meta = std::fs::metadata(path).map_err(|e| format!("Cannot open {shown}: {e}"))?;
-            if !meta.is_file() {
+            let regular = meta.is_file();
+            if !regular && origin == Origin::Navigation {
                 return Err(format!("Cannot open {shown}: not a regular file"));
             }
+            // Stamp first: a write landing between the two makes the next focus reload again
+            // rather than miss the change. A pipe or device has no state to compare.
+            let st = if regular { stamp(path) } else { None };
             let file =
                 std::fs::File::open(path).map_err(|e| format!("Cannot open {shown}: {e}"))?;
             let bytes = read_limited(file, meta.len(), limit)
@@ -256,11 +285,12 @@ fn read_input_limited(input: &Input, limit: u64) -> Result<(String, Option<Stamp
     }
 }
 
-/// Read the document text. Invalid UTF-8 is replaced, never fatal. Only regular
-/// files up to [`MAX_BYTES`] are read (so a link can't hang or exhaust memory). Errors come back
-/// as the message to show in the window.
-pub fn read_input(input: &Input) -> Result<(String, Option<Stamp>), String> {
-    read_input_limited(input, MAX_BYTES)
+/// Read the document text. Invalid UTF-8 is replaced, never fatal. At most
+/// [`MAX_BYTES`] are read, and a document reached by [`Origin::Navigation`] must be a regular
+/// file (so a link can't hang or exhaust memory). Errors come back as the message to show in
+/// the window.
+pub fn read_input(input: &Input, origin: Origin) -> Result<(String, Option<Stamp>), String> {
+    read_input_limited(input, origin, MAX_BYTES)
 }
 
 /// The window title for an input: the file name, or `vomd`.
