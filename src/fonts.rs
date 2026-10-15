@@ -34,6 +34,8 @@ pub struct Face {
     metrics: Metrics,
     pub bold: bool,
     pub italic: bool,
+    /// A color (emoji) font: CBDT, sbix or COLR glyphs.
+    pub color: bool,
     /// Source file and collection index for faces loaded from disk.
     pub source: Option<(PathBuf, u32)>,
 }
@@ -48,7 +50,11 @@ impl Face {
         let attrs = font.attributes();
         let charmap = CharmapProxy::from_font(&font);
         let metrics = MetricsProxy::from_font(&font).materialize_metrics(&font, &[]);
+        let color = [b"CBDT", b"sbix", b"COLR"]
+            .iter()
+            .any(|t| font.table(swash::tag_from_bytes(t)).is_some());
         Some(Face {
+            color,
             offset: font.offset,
             key: font.key,
             charmap,

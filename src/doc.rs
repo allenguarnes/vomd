@@ -12,6 +12,7 @@ use pulldown_cmark::{
 };
 use unicase::UniCase;
 
+mod autolink;
 mod pipeline;
 mod segment;
 
@@ -68,15 +69,18 @@ fn front_matter_len(src: &str) -> usize {
 
 /// Inline style bits carried by each [`Span`].
 pub mod style {
-    pub const BOLD: u8 = 1 << 0;
-    pub const ITALIC: u8 = 1 << 1;
-    pub const CODE: u8 = 1 << 2;
-    pub const STRIKE: u8 = 1 << 3;
-    pub const LINK: u8 = 1 << 4;
+    pub const BOLD: u16 = 1 << 0;
+    pub const ITALIC: u16 = 1 << 1;
+    pub const CODE: u16 = 1 << 2;
+    pub const STRIKE: u16 = 1 << 3;
+    pub const LINK: u16 = 1 << 4;
     /// Span text is the image's alt text; `Span::image` identifies the image.
-    pub const IMAGE: u8 = 1 << 5;
+    pub const IMAGE: u16 = 1 << 5;
     /// Footnote reference, rendered as a superscript number.
-    pub const FOOTREF: u8 = 1 << 6;
+    pub const FOOTREF: u16 = 1 << 6;
+    /// `<sup>` / `<sub>` text.
+    pub const SUP: u16 = 1 << 7;
+    pub const SUB: u16 = 1 << 8;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +88,7 @@ pub struct Span {
     /// Byte range into [`Doc::text`].
     pub start: u32,
     pub end: u32,
-    pub style: u8,
+    pub style: u16,
     /// 1-based index into [`Doc::links`]; 0 = not a link.
     pub link: u32,
     /// 1-based index into [`Doc::images`]; 0 = not an image.
@@ -426,6 +430,11 @@ struct Builder {
     italic: usize,
     strike: usize,
     links: Vec<u32>,
+    /// Styles and links opened by inline HTML tags in the open block.
+    html_inline: HtmlInline,
+    /// Plain text waiting for autolink detection: pulldown-cmark splits a run of text into
+    /// several events (at entities, escapes, unmatched delimiters), and a URL can span them.
+    pending: String,
     /// Next number for each open list (`None` = bullet list).
     lists: Vec<Option<u64>>,
     quote: u8,
@@ -468,6 +477,21 @@ struct Builder {
     quote_pool: Range<u32>,
 }
 
+/// Inline HTML state of the open block (see `Builder::inline_tag`).
+#[derive(Debug, Default)]
+struct HtmlInline {
+    bold: u32,
+    italic: u32,
+    code: u32,
+    strike: u32,
+    sup: u32,
+    sub: u32,
+    /// Links on `Builder::links` pushed by `<a href>`.
+    links: usize,
+    /// Inside `<script>` or `<style>` (the tag name): content is dropped.
+    skip: Option<&'static str>,
+}
+
 impl Builder {
     fn new(src_len: usize) -> Self {
         Builder {
@@ -481,6 +505,8 @@ impl Builder {
             italic: 0,
             strike: 0,
             links: Vec::new(),
+            html_inline: HtmlInline::default(),
+            pending: String::new(),
             lists: Vec::new(),
             quote: 0,
             quote_lists: Vec::new(),
@@ -546,6 +572,9 @@ impl Builder {
     }
 
     fn event(&mut self, event: Event) {
+        if !matches!(event, Event::Text(_)) {
+            self.flush_text();
+        }
         if self.skip_head {
             self.skip_head = !matches!(event, Event::End(TagEnd::TableHead));
             return;
@@ -623,10 +652,10 @@ impl Builder {
                     self.fn_depth -= 1;
                 }
             }
-            Event::Text(s) => {
-                let extra = if self.code_block() { style::CODE } else { 0 };
-                self.text(&s, extra, 0);
-            }
+            Event::Text(_) if self.html_inline.skip.is_some() => {}
+            Event::Text(s) if self.code_block() => self.text(&s, style::CODE, 0),
+            Event::Text(s) if self.link() != 0 => self.text(&s, 0, 0),
+            Event::Text(s) => self.pending.push_str(&s),
             Event::Code(s) => self.text(&s, style::CODE, 0),
             Event::InlineMath(s) | Event::DisplayMath(s) => self.text(&s, 0, 0),
             Event::Html(s) | Event::InlineHtml(s) => self.html(&s, false),
@@ -860,16 +889,25 @@ impl Builder {
         )
     }
 
-    fn style(&self) -> u8 {
+    fn style(&self) -> u16 {
+        let h = &self.html_inline;
         let mut s = 0;
-        if self.bold > 0 {
+        if self.bold > 0 || h.bold > 0 {
             s |= style::BOLD;
         }
-        if self.italic > 0 {
+        if self.italic > 0 || h.italic > 0 {
             s |= style::ITALIC;
         }
-        if self.strike > 0 {
+        if self.strike > 0 || h.strike > 0 {
             s |= style::STRIKE;
+        }
+        if h.code > 0 {
+            s |= style::CODE;
+        }
+        if h.sup > 0 {
+            s |= style::SUP;
+        } else if h.sub > 0 {
+            s |= style::SUB;
         }
         if self.link() != 0 {
             s |= style::LINK;
@@ -892,7 +930,28 @@ impl Builder {
 
     /// Append text to the open block, opening an implicit paragraph if needed (tight list
     /// items and inline content after HTML have no explicit paragraph).
-    fn text(&mut self, s: &str, extra_style: u8, image: u32) {
+    /// Emit the pending plain text, with GFM autolinks (`www.`, `http(s)://`, emails) as links.
+    fn flush_text(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.pending);
+        let mut at = 0;
+        for (range, href) in autolink::find(&text) {
+            self.text(&text[at..range.start], 0, 0);
+            let id = push_id(&mut self.doc.links, href);
+            self.links.push(id);
+            self.text(&text[range.clone()], 0, 0);
+            self.links.pop();
+            at = range.end;
+        }
+        self.text(&text[at..], 0, 0);
+        // Keep the buffer's allocation for the next run.
+        self.pending = text;
+        self.pending.clear();
+    }
+
+    fn text(&mut self, s: &str, extra_style: u16, image: u32) {
         if s.is_empty() {
             return;
         }
@@ -925,6 +984,10 @@ impl Builder {
     }
 
     fn close(&mut self) {
+        // Inline HTML can't leave a style or link open past its block.
+        let h = std::mem::take(&mut self.html_inline);
+        self.links
+            .truncate(self.links.len().saturating_sub(h.links));
         let Some(open) = self.open.take() else { return };
         let mut kind = open.kind;
         if kind == BlockKind::Code {
@@ -1328,6 +1391,17 @@ impl Builder {
                 .take_while(|c| c.is_ascii_alphanumeric())
                 .map(|c| c.to_ascii_lowercase())
                 .collect();
+            let closing = tag.starts_with('/');
+            if let Some(skip) = self.html_inline.skip {
+                // Inside <script> or <style>: everything up to its closing tag is dropped.
+                if closing && name == skip {
+                    self.html_inline.skip = None;
+                }
+                continue;
+            }
+            if self.inline_tag(&name, tag, closing) {
+                continue;
+            }
             match name.as_str() {
                 "br" => self.text("\n", 0, 0),
                 "img" => {
@@ -1345,6 +1419,8 @@ impl Builder {
                 {
                     self.close()
                 }
+                // Cells of an HTML table, flattened: keep them apart.
+                "td" | "th" if block && closing => self.text(" ", 0, 0),
                 _ => {}
             }
         }
@@ -1353,7 +1429,52 @@ impl Builder {
         }
     }
 
+    /// Inline HTML that GitHub renders and we can show: `<b>`/`<strong>`,
+    /// `<i>`/`<em>`, `<code>`/`<kbd>`/`<tt>`/`<samp>`, `<del>`/`<s>`/`<strike>`, `<sup>`,
+    /// `<sub>`, `<a href>`, and `<script>`/`<style>`, whose content is dropped. Returns true if
+    /// `name` was one of them. Opening and closing tags count; unbalanced ones end with the block.
+    fn inline_tag(&mut self, name: &str, tag: &str, closing: bool) -> bool {
+        let h = &mut self.html_inline;
+        let counter = match name {
+            "b" | "strong" => &mut h.bold,
+            "i" | "em" => &mut h.italic,
+            "code" | "kbd" | "tt" | "samp" => &mut h.code,
+            "del" | "s" | "strike" => &mut h.strike,
+            "sup" => &mut h.sup,
+            "sub" => &mut h.sub,
+            "script" | "style" => {
+                if !closing && !tag.trim_end().ends_with('/') {
+                    h.skip = Some(if name == "script" { "script" } else { "style" });
+                }
+                return true;
+            }
+            "a" => {
+                if closing {
+                    if h.links > 0 {
+                        h.links -= 1;
+                        self.links.pop();
+                    }
+                } else if let Some(href) = attr(tag, "href") {
+                    h.links += 1;
+                    let id = push_id(&mut self.doc.links, decode_entities(&href));
+                    self.links.push(id);
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        if closing {
+            *counter = counter.saturating_sub(1);
+        } else if !tag.trim_end().ends_with('/') {
+            *counter += 1;
+        }
+        true
+    }
+
     fn html_text(&mut self, s: &str, block: bool) {
+        if self.html_inline.skip.is_some() {
+            return;
+        }
         if !block {
             self.text(&decode_entities(s), 0, 0);
             return;
@@ -1379,6 +1500,7 @@ impl Builder {
     }
 
     fn finish(mut self) -> Doc {
+        self.flush_text();
         self.close();
         let mut fn_blocks = std::mem::take(&mut self.footnotes.blocks);
         if !fn_blocks.is_empty() {

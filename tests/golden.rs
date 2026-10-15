@@ -84,6 +84,14 @@ const CASES: &[Case] = &[
         view: None,
     },
     Case {
+        name: "inline",
+        fixture: "inline.md",
+        width: 700.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+    },
+    Case {
         name: "tiny",
         fixture: "tiny.md",
         width: 640.0,

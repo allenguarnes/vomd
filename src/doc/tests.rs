@@ -86,6 +86,8 @@ fn span_dump(doc: &Doc, span: &Span) -> String {
         (style::LINK, 'L'),
         (style::IMAGE, 'M'),
         (style::FOOTREF, 'F'),
+        (style::SUP, 'U'),
+        (style::SUB, 'D'),
     ] {
         if span.style & bit != 0 {
             tags.push(c);
@@ -224,9 +226,28 @@ fn raw_html() {
     insta::assert_snapshot!(parse(
         "<p align=\"center\">\n  <img src=\"logo.png\" alt=\"Logo &amp; mark\" width=200>\n</p>\n\n\
          <!-- hidden comment -->\n\n\
-         Inline <b>bold?</b> stays text, line<br>break, <img src='https://x.y/a.png'>.\n\n\
+         Inline <b>bold</b> tag, line<br>break, <img src='https://x.y/a.png'>.\n\n\
          <details>\n<summary>More &lt;info&gt;</summary>\n\nMarkdown *inside*.\n\n</details>\n"
     ));
+}
+
+/// Inline HTML that GitHub styles, script/style content dropped, flattened HTML
+/// table cells kept apart, and GFM autolinks.
+#[test]
+fn inline_html_styles_and_autolinks() {
+    let doc = Doc::parse(
+        "<kbd>Ctrl</kbd>+<kbd>C</kbd>, H<sub>2</sub>O, x<sup>2</sup>, <del>gone</del>, \
+         <strong>strong <em>both</em></strong>, <a href=\"https://a.b/&amp;c\">html link</a>, \
+         <a name=\"x\">no href</a>.\n\n\
+         Unclosed <b>bold ends with the block.\n\n\
+         Not bold. Inline <script>alert(1)</script>script and <style>p{}</style>style.\n\n\
+         <script>\nlet x = 1;\n</script>\n\n\
+         <table><tr><td>one</td><td>two</td></tr><tr><td>three</td></tr></table>\n\n\
+         See www.example.com/a, https://x.y/z) and me@mail.example. Not `https://in.code` or \
+         [https://in.link](https://t), nor xhttps://no.pe.\n",
+    );
+    check_invariants(&doc);
+    insta::assert_snapshot!(dump(&doc));
 }
 
 #[test]
@@ -372,7 +393,7 @@ fn quote_list_nesting_order_is_recorded() {
 }
 
 /// Chunks of `text` as (text, style, link) triples, for `split_spans` expectations.
-fn cut(text: &str, spans: &[Span], max: usize) -> Vec<Vec<(String, u8, u32)>> {
+fn cut(text: &str, spans: &[Span], max: usize) -> Vec<Vec<(String, u16, u32)>> {
     let (spans, chunks) = split_spans(text, spans, max);
     chunks
         .into_iter()

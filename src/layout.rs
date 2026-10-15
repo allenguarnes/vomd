@@ -38,6 +38,8 @@ const LIST_INDENT: f32 = 2.0;
 const CELL_PAD_X: f32 = 0.8125;
 const CELL_PAD_Y: f32 = 0.375;
 const FOOTNOTE_SIZE: f32 = 0.875;
+/// Width and height of an alert icon, in em.
+const ALERT_ICON: f32 = 1.0;
 /// Shaped content is kept within this many viewport heights of the viewport.
 const KEEP_SCREENS: f32 = 4.0;
 /// Blocks within this many viewport heights are measured exactly by `ensure`.
@@ -773,13 +775,24 @@ impl Layout {
                     role: alert_role(alert),
                     ..body
                 };
+                let icon = ALERT_ICON * em;
+                let text_x = icon + 0.5 * em;
                 self.para.clear();
                 self.para.push_synthetic(label, 0, style);
-                let pl = self
-                    .ctx
-                    .layout(fonts, &self.para, avail, Align::Start, BODY_LH);
+                let pl = self.ctx.layout(
+                    fonts,
+                    &self.para,
+                    (avail - text_x).max(em),
+                    Align::Start,
+                    BODY_LH,
+                );
                 let s = out.push_style(style);
-                out.append_decor(&pl, s, indent, gap);
+                out.append_decor(&pl, s, indent + text_x, gap);
+                if let Some(line) = pl.lines.first() {
+                    // Centered on the label's capitals: about 0.36 em above the baseline.
+                    let top = gap + line.baseline - 0.36 * em - icon / 2.0;
+                    self.alert_icon(fonts, alert, (indent, top), &mut out, &mut missing);
+                }
                 pl.height
             }
             BlockKind::TableRow { table, .. } => self.table_row(
@@ -798,6 +811,68 @@ impl Layout {
         self.geoms[i].missing |= !missing.is_empty();
         self.report_missing(&missing);
         (out, gap + content_h + self.page_end(doc, i))
+    }
+
+    /// The icon in front of an alert's title (GitHub draws Octicons; ours are built from an
+    /// outline and a glyph of the embedded font): Note ⓘ, Tip ✓ and Caution ! in a circle,
+    /// Important ! in a rounded square, Warning ! cut out of a triangle. `top_left` is the corner
+    /// of its square, [`ALERT_ICON`] em wide.
+    fn alert_icon(
+        &mut self,
+        fonts: &Fonts,
+        alert: Alert,
+        (x, y): (f32, f32),
+        out: &mut BlockBox,
+        missing: &mut Vec<char>,
+    ) {
+        let em = self.em;
+        let size = ALERT_ICON * em;
+        let role = alert_role(alert);
+        let stroke = (0.09 * em).round().max(1.0);
+        let (radius, mark) = match alert {
+            Alert::Note => (size / 2.0, "i"),
+            Alert::Tip => (size / 2.0, "✓"),
+            Alert::Important => (0.25 * size, "!"),
+            Alert::Caution => (size / 2.0, "!"),
+            Alert::Warning => (0.0, "!"),
+        };
+        if alert != Alert::Warning {
+            out.rects.push(PRect {
+                x,
+                y,
+                w: size,
+                h: size,
+                role,
+                radius,
+                kind: RectKind::Stroke(stroke),
+            });
+        }
+        let mut glyph = |this: &mut Self, text: &str, size_em: f32, role: Role, center_y: f32| {
+            let style = TextStyle {
+                bold: true,
+                italic: false,
+                mono: false,
+                size: size_em * em,
+                role,
+                deco: 0,
+                shift: 0.0,
+                link: 0,
+            };
+            this.para.clear();
+            this.para.push_synthetic(text, 0, style);
+            let pl = this.ctx.layout(fonts, &this.para, size, Align::Center, 1.0);
+            missing.extend_from_slice(&pl.missing);
+            let s = out.push_style(style);
+            out.append_decor(&pl, s, x, center_y - pl.height / 2.0);
+        };
+        if alert == Alert::Warning {
+            // A filled triangle with the mark in the background color, low in it, where the
+            // triangle is widest.
+            glyph(self, "▲", 1.25, role, y + size / 2.0);
+            glyph(self, mark, 0.55, Role::Bg, y + size * 0.62);
+            return;
+        }
+        glyph(self, mark, 0.62, role, y + size / 2.0);
     }
 
     /// Physical width of a 1-logical-pixel line.
@@ -1386,9 +1461,12 @@ fn span_style(span: &Span, body: TextStyle) -> TextStyle {
         };
         s.deco |= deco::IMAGE_BOX;
     }
-    if span.style & style::FOOTREF != 0 {
+    if span.style & (style::FOOTREF | style::SUP) != 0 {
         s.size = body.size * 0.75;
         s.shift = body.size * 0.4;
+    } else if span.style & style::SUB != 0 {
+        s.size = body.size * 0.75;
+        s.shift = -body.size * 0.2;
     }
     s
 }

@@ -307,7 +307,12 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 }
                 (true, Some(r)) => r.face,
                 _ if c.is_control() || c.is_whitespace() || is_default_ignorable(c) => {
-                    let keep = last.map_or(primary, |r| r.face);
+                    // Spaces stay in the run before them (an Arabic or CJK fallback keeps one
+                    // shaping run), except after emoji: color fonts have very wide spaces.
+                    let keep = last
+                        .map(|r| r.face)
+                        .filter(|&f| !fonts.face(f).color)
+                        .unwrap_or(primary);
                     if c.is_control() || !c.is_whitespace() {
                         keep
                     } else {
@@ -409,11 +414,20 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
         } else {
             Direction::LeftToRight
         };
+        // Code shows its characters as typed: no ligatures or contextual alternates (JetBrains
+        // Mono would draw `://`, `->` or `!=` as joined shapes, unlike GitHub's code font).
+        let mono = para.styles[para.items[run.item].style as usize].mono;
+        let off: &[(&str, u16)] = if mono {
+            &[("liga", 0), ("calt", 0)]
+        } else {
+            &[]
+        };
         let mut shaper = ctx
             .builder(font)
             .size(run.size)
             .script(run.script)
             .direction(dir)
+            .features(off.iter().copied())
             .build();
         shaper.add_str(&text[run.range.clone()]);
         let base = run.range.start as u32;

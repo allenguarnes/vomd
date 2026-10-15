@@ -159,9 +159,6 @@ impl GlyphCache {
         render
             .format(Format::Alpha)
             .offset(Vector::new(key.subpx as f32 / SUBPX, 0.0));
-        if key.synth & synth::BOLD != 0 {
-            render.embolden(size / 40.0);
-        }
         if key.synth & synth::ITALIC != 0 {
             render.transform(Some(Transform::skew(
                 Angle::from_degrees(12.0),
@@ -178,15 +175,69 @@ impl GlyphCache {
         if color && matches!(img.source, Source::ColorBitmap(_)) {
             premultiply(&mut img.data);
         }
-        Some(GlyphImage {
+        let mut out = GlyphImage {
             left: p.left,
             top: p.top,
             width: p.width,
             height: p.height,
             color,
             data: img.data,
-        })
+        };
+        // Synthetic bold thickens the rendered mask, not the outline: swash's outline embolden
+        // thins glyphs whose contours run the other way (some CJK glyphs in Noto Sans CJK lose
+        // most of their ink). Same strength as before: size/20 wider, size/40 taller.
+        if key.synth & synth::BOLD != 0 && !color {
+            embolden(&mut out, size / 20.0, size / 40.0);
+        }
+        Some(out)
     }
+}
+
+/// Dilate a coverage mask (a max filter) `ex` pixels to the right and `ey` pixels up, the
+/// fractional part at partial strength, as FreeType emboldens bitmaps.
+fn embolden(img: &mut GlyphImage, ex: f32, ey: f32) {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let (dx, dy) = (ex.ceil() as usize, ey.ceil() as usize);
+    let (nw, nh) = (w + dx, h + dy);
+    // One-dimensional dilation of `len` samples read through `get` into `put`, over `n` whole
+    // pixels plus a fraction `f` of the next.
+    let dilate = |len: usize,
+                  out_len: usize,
+                  e: f32,
+                  get: &dyn Fn(usize) -> u8,
+                  put: &mut dyn FnMut(usize, u8)| {
+        let n = e.floor() as usize;
+        let f = e - n as f32;
+        for o in 0..out_len {
+            let mut v = 0u8;
+            for k in 0..=n {
+                if let Some(i) = o.checked_sub(k).filter(|&i| i < len) {
+                    v = v.max(get(i));
+                }
+            }
+            if let Some(i) = o.checked_sub(n + 1).filter(|&i| i < len) {
+                v = v.max((get(i) as f32 * f) as u8);
+            }
+            put(o, v);
+        }
+    };
+    let mut wide = vec![0u8; nw * h];
+    for y in 0..h {
+        let row = &img.data[y * w..(y + 1) * w];
+        let out = &mut wide[y * nw..(y + 1) * nw];
+        dilate(w, nw, ex, &|i| row[i], &mut |o, v| out[o] = v);
+    }
+    // Upward: output row r reads source rows below it, so rows are taken bottom up.
+    let mut tall = vec![0u8; nw * nh];
+    for x in 0..nw {
+        dilate(h, nh, ey, &|i| wide[(h - 1 - i) * nw + x], &mut |o, v| {
+            tall[(nh - 1 - o) * nw + x] = v
+        });
+    }
+    img.width = nw as u32;
+    img.height = nh as u32;
+    img.top += dy as i32;
+    img.data = tall;
 }
 
 /// Straight RGBA → premultiplied RGBA, in place.
@@ -255,6 +306,50 @@ mod tests {
         let mut px = [200, 100, 50, 128, 10, 20, 30, 255, 99, 99, 99, 0];
         premultiply(&mut px);
         assert_eq!(px, [100, 50, 25, 128, 10, 20, 30, 255, 0, 0, 0, 0]);
+    }
+
+    /// Synthetic bold adds ink to every glyph and grows the mask right and up.
+    #[test]
+    fn synthetic_bold_thickens() {
+        let fonts = Fonts::new().unwrap();
+        let mut cache = GlyphCache::default();
+        for ch in ['A', 'g', '|', 'o'] {
+            let plain = cache
+                .get(&fonts, key(&fonts, ch, 32.0, 0))
+                .cloned()
+                .unwrap();
+            let bold = cache
+                .get(&fonts, key(&fonts, ch, 32.0, synth::BOLD))
+                .cloned()
+                .unwrap();
+            let ink = |i: &GlyphImage| i.data.iter().map(|&a| a as u64).sum::<u64>();
+            assert!(ink(&bold) > ink(&plain) * 11 / 10, "{ch}");
+            assert_eq!(
+                (bold.width, bold.height),
+                (plain.width + 2, plain.height + 1)
+            );
+            assert_eq!((bold.left, bold.top), (plain.left, plain.top + 1));
+        }
+    }
+
+    #[test]
+    fn embolden_dilates_right_and_up() {
+        let mut img = GlyphImage {
+            left: 0,
+            top: 2,
+            width: 2,
+            height: 2,
+            color: false,
+            data: vec![0, 0, 200, 0],
+        };
+        embolden(&mut img, 1.5, 1.0);
+        assert_eq!((img.width, img.height, img.top), (4, 3, 3));
+        #[rustfmt::skip]
+        assert_eq!(img.data, vec![
+            0, 0, 0, 0,
+            200, 200, 100, 0,
+            200, 200, 100, 0,
+        ]);
     }
 
     /// Synthetic italic must lean right: ink in the top rows sits further right than ink in

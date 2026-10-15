@@ -1,0 +1,15 @@
+---
+source: src/doc/tests.rs
+expression: dump(&doc)
+---
+P | [C]"Ctrl" "+" [C]"C" ", H" [D]"2" "O, x" [U]"2" ", " [S]"gone" ", " [B]"strong " [BI]"both" ", " [L1]"html link" ", no href."
+P | "Unclosed " [B]"bold ends with the block."
+P | "Not bold. Inline script and style."
+P | "one two "
+P | "three "
+P | "See " [L2]"www.example.com/a" ", " [L3]"https://x.y/z" ") and " [L4]"me@mail.example" ". Not " [C]"https://in.code" " or " [L5]"https://in.link" ", nor xhttps://no.pe."
+link 1: https://a.b/&c
+link 2: http://www.example.com/a
+link 3: https://x.y/z
+link 4: mailto:me@mail.example
+link 5: https://t
