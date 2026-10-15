@@ -205,6 +205,119 @@ fn coverage(path: &Path, chars: &[char]) -> Coverage {
     faces
 }
 
+/// The faces of a family for regular, bold, italic and bold italic text.
+pub type Family = [Option<Found>; 4];
+
+/// Look up font families by name (`font_sans`, `font_mono`): one scan of the system
+/// font files for all of them. A family is found if some face of it is upright; styles it lacks
+/// stay `None` (and are synthesized).
+pub fn find_families(names: &[&str]) -> Vec<Option<Family>> {
+    find_families_in(&list_files(&font_dirs()), names)
+}
+
+pub fn find_families_in(files: &[PathBuf], names: &[&str]) -> Vec<Option<Family>> {
+    let wanted: Vec<String> = names.iter().map(|n| fold(n)).collect();
+    // Best face so far per family and style, by `style_distance`.
+    let mut best: Vec<[Option<(u32, Found)>; 4]> = vec![Default::default(); names.len()];
+    for path in files {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        // SAFETY: read-only mapping of a font file; see `Fonts::load`.
+        let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
+            continue;
+        };
+        let Some(data) = FontDataRef::new(&map) else {
+            continue;
+        };
+        for (index, font) in data.fonts().enumerate() {
+            let family_names = family_names(&font);
+            let attrs = font.attributes();
+            let face = (
+                attrs.weight().0,
+                attrs.style() != swash::Style::Normal,
+                attrs.stretch() == swash::Stretch::NORMAL,
+            );
+            for (w, slots) in wanted.iter().zip(best.iter_mut()) {
+                if !family_names.iter().any(|f| f == w) {
+                    continue;
+                }
+                for (slot, entry) in slots.iter_mut().enumerate() {
+                    let d = style_distance(slot, face);
+                    if entry.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                        *entry = Some((
+                            d,
+                            Found {
+                                path: path.clone(),
+                                index: index as u32,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    best.into_iter()
+        .map(|slots| {
+            // A style is only taken from a face that has it (an upright face standing in for
+            // italic would hide the synthesized slant); regular needs an upright face.
+            let mut out: Family = Default::default();
+            for (slot, entry) in slots.into_iter().enumerate() {
+                out[slot] = entry.filter(|(d, _)| *d < MISMATCH).map(|(_, f)| f);
+            }
+            out[0].as_ref()?;
+            Some(out)
+        })
+        .collect()
+}
+
+/// A face's distance from a style (0 regular, 1 bold, 2 italic, 3 bold italic): weight
+/// difference, plus [`MISMATCH`] for the wrong slant or boldness and a little for a condensed
+/// or expanded width.
+const MISMATCH: u32 = 10_000;
+
+fn style_distance(slot: usize, (weight, italic, normal_width): (u16, bool, bool)) -> u32 {
+    let (want_weight, want_italic) = match slot {
+        0 => (400, false),
+        1 => (700, false),
+        2 => (400, true),
+        _ => (700, true),
+    };
+    let mut d = u32::from(weight.abs_diff(want_weight));
+    if italic != want_italic || (weight >= 600) != (want_weight >= 600) {
+        d += MISMATCH;
+    }
+    if !normal_width {
+        d += 1000;
+    }
+    d
+}
+
+/// The family names a face answers to (name IDs 1 and 16, every language), case-folded.
+fn family_names(font: &swash::FontRef) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in font.localized_strings() {
+        if matches!(
+            s.id(),
+            swash::StringId::Family | swash::StringId::TypographicFamily
+        ) {
+            let name = fold(&s.chars().collect::<String>());
+            if !name.is_empty() && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Family names compare case-insensitively, ignoring surrounding and repeated blanks.
+fn fold(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Style words that make a file a poor fallback (prefer upright regular weights).
 fn style_penalty(path: &Path) -> u8 {
     let name = file_key(path).unwrap_or_default();
@@ -339,6 +452,58 @@ fn find_with<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::fallback as fb;
+
+    fn assets() -> Vec<PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+        list_files(&[dir])
+    }
+
+    #[test]
+    fn families_resolve_from_files() {
+        let files = assets();
+        let found = fb::find_families_in(&files, &["inter", "JetBrains  Mono", "No Such Family"]);
+        let name = |f: &Option<Found>| {
+            f.as_ref()
+                .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+        };
+        let inter = found[0].as_ref().expect("Inter");
+        assert_eq!(name(&inter[0]).as_deref(), Some("Inter-Regular.ttf"));
+        assert_eq!(name(&inter[1]).as_deref(), Some("Inter-Bold.ttf"));
+        assert_eq!(name(&inter[2]).as_deref(), Some("Inter-Italic.ttf"));
+        assert_eq!(name(&inter[3]).as_deref(), Some("Inter-BoldItalic.ttf"));
+        let mono = found[1].as_ref().expect("JetBrains Mono");
+        assert_eq!(name(&mono[0]).as_deref(), Some("JetBrainsMono-Regular.ttf"));
+        assert_eq!(name(&mono[1]).as_deref(), Some("JetBrainsMono-Bold.ttf"));
+        assert_eq!(
+            mono[2], None,
+            "no italic face: synthesized, not an upright stand-in"
+        );
+        assert!(found[2].is_none());
+    }
+
+    #[test]
+    fn style_distances() {
+        assert_eq!(style_distance(0, (400, false, true)), 0);
+        assert!(
+            style_distance(0, (500, false, true)) < style_distance(0, (300, false, true)) + 101
+        );
+        assert!(
+            style_distance(0, (700, false, true)) >= MISMATCH,
+            "bold isn't regular"
+        );
+        assert!(
+            style_distance(1, (500, false, true)) >= MISMATCH,
+            "medium isn't bold"
+        );
+        assert!(
+            style_distance(2, (400, false, true)) >= MISMATCH,
+            "upright isn't italic"
+        );
+        assert!(style_distance(0, (400, false, false)) > style_distance(0, (400, false, true)));
+        assert_eq!(fold("  Noto   Sans "), "noto sans");
+    }
+
     use std::cell::RefCell;
 
     use super::*;

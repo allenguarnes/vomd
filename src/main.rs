@@ -19,11 +19,10 @@ use vomd::cli::{self, Cli, Input};
 use vomd::doc::Doc;
 use vomd::fonts::Fonts;
 use vomd::platform;
-use vomd::text::fallback::{self, Found};
+use vomd::settings::{self, FontPaths, Prefs, Store};
+use vomd::text::fallback::{self, Family, Found};
 use vomd::view::{self, Outcome, Stamp, View, Wake};
 
-/// Default window size in logical pixels (P6 makes it the last-used size).
-const WINDOW_SIZE: (f64, f64) = (900.0, 1000.0);
 /// Idle layout runs in slices this long between events.
 const IDLE_SLICE: Duration = Duration::from_millis(4);
 const EMPTY_MESSAGE: &str = "Drop a Markdown file here";
@@ -31,6 +30,8 @@ const EMPTY_MESSAGE: &str = "Drop a Markdown file here";
 enum UserEvent {
     /// A fallback font scan finished.
     Fonts(Vec<Found>),
+    /// `font_sans` / `font_mono` families were looked up: (mono, family, faces if found).
+    Families(Vec<(bool, String, Option<Family>)>),
 }
 
 /// The document as read and parsed off the main thread.
@@ -76,6 +77,12 @@ struct App {
     /// A fallback font scan is running.
     scanning: bool,
     stamp: Option<Stamp>,
+    store: Store,
+    /// The `font_sans` and `font_mono` families applied to the view (`None`: embedded faces).
+    families: [Option<String>; 2],
+    /// Families (by `mono`) waiting for a lookup of their files.
+    unresolved: Vec<bool>,
+    resolving: bool,
     mods: ModifiersState,
     cursor: PhysicalPosition<f64>,
     shown: bool,
@@ -125,6 +132,78 @@ impl App {
             }
         }
         self.scan_fonts();
+        self.resolve_families();
+    }
+
+    /// Apply preferences from the settings file (at startup and when it changes). Font
+    /// families with files cached for them load at once; others are looked up in the
+    /// background after the first frame, the defaults standing in meanwhile.
+    fn apply(&mut self, prefs: &Prefs) {
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+        view.set_theme_mode(prefs.theme);
+        view.set_zoom(prefs.zoom);
+        view.set_text(prefs.font_size, prefs.line_width);
+        for mono in [false, true] {
+            let (family, cached) = if mono {
+                (&prefs.font_mono, &prefs.font_mono_path)
+            } else {
+                (&prefs.font_sans, &prefs.font_sans_path)
+            };
+            let slot = &mut self.families[mono as usize];
+            if same_family(family.as_deref(), slot.as_deref()) {
+                continue;
+            }
+            *slot = family.clone();
+            self.unresolved.retain(|&m| m != mono);
+            match (family, cached) {
+                (None, _) => {
+                    view.set_family(mono, None);
+                }
+                (Some(_), Some(c)) if c.exists() && view.set_family(mono, Some(&c.faces)) => {}
+                (Some(_), _) => {
+                    // No usable cache: the defaults now, and look the family up.
+                    view.set_family(mono, None);
+                    self.unresolved.push(mono);
+                }
+            }
+        }
+        self.redraw();
+    }
+
+    /// Look up the files of `font_sans` / `font_mono` families on a background thread (one
+    /// scan for both; never on the startup path).
+    fn resolve_families(&mut self) {
+        if self.resolving || self.bench || !self.shown || self.unresolved.is_empty() {
+            return;
+        }
+        let wanted: Vec<(bool, String)> = std::mem::take(&mut self.unresolved)
+            .into_iter()
+            .filter_map(|mono| Some((mono, self.families[mono as usize].clone()?)))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        self.resolving = true;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let names: Vec<&str> = wanted.iter().map(|(_, f)| f.as_str()).collect();
+            let found = fallback::find_families(&names);
+            let results = wanted
+                .into_iter()
+                .zip(found)
+                .map(|((mono, family), faces)| (mono, family, faces))
+                .collect();
+            let _ = proxy.send_event(UserEvent::Families(results));
+        });
+    }
+
+    /// Save the view's theme and zoom if they changed (debounced).
+    fn record(&mut self, now: Instant) {
+        if let Some(view) = &self.view {
+            self.store.record(view.theme_mode(), view.zoom(), now);
+        }
     }
 
     /// Start a fallback font scan for characters no loaded face covers (one at a time, off the
@@ -178,6 +257,17 @@ impl App {
         self.redraw();
     }
 
+    /// Run a settings save; a failure is reported (on a terminal) and otherwise ignored, since
+    /// preferences are not worth interrupting reading for.
+    fn save(&mut self, op: impl FnOnce(&mut Store) -> std::io::Result<()>) {
+        if let Err(e) = op(&mut self.store)
+            && platform::stderr_is_tty()
+        {
+            let path = self.store.path().map(|p| p.display().to_string());
+            eprintln!("vomd: cannot save {}: {e}", path.unwrap_or_default());
+        }
+    }
+
     fn outcome(&mut self, outcome: Outcome, event_loop: &ActiveEventLoop) {
         match outcome {
             Outcome::Nothing => {}
@@ -193,7 +283,8 @@ impl ApplicationHandler<UserEvent> for App {
         if self.gfx.is_some() {
             return;
         }
-        let mut size = LogicalSize::new(WINDOW_SIZE.0, WINDOW_SIZE.1);
+        let prefs = self.store.prefs();
+        let mut size = LogicalSize::new(f64::from(prefs.window.0), f64::from(prefs.window.1));
         // Clamp to the monitor where the system reports one (Wayland doesn't).
         if let Some(m) = event_loop.primary_monitor() {
             let avail = m.size().to_logical::<f64>(m.scale_factor());
@@ -256,6 +347,7 @@ impl ApplicationHandler<UserEvent> for App {
         });
         self.view = Some(view);
         self.gfx = Some(Gfx { window, surface });
+        self.apply(&prefs);
         self.redraw();
     }
 
@@ -269,6 +361,26 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
                 self.scan_fonts();
+            }
+            UserEvent::Families(results) => {
+                self.resolving = false;
+                let now = Instant::now();
+                for (mono, family, faces) in results {
+                    // Skip lookups the settings have moved on from.
+                    if !same_family(Some(&family), self.families[mono as usize].as_deref()) {
+                        continue;
+                    }
+                    let (Some(view), Some(faces)) = (self.view.as_mut(), faces) else {
+                        continue;
+                    };
+                    let faces = faces.map(|f| f.map(|f| (f.path, f.index)));
+                    if view.set_family(mono, Some(&faces)) {
+                        self.store
+                            .record_fonts(mono, &FontPaths { family, faces }, now);
+                    }
+                    self.redraw();
+                }
+                self.resolve_families();
             }
         }
     }
@@ -306,6 +418,10 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     self.reload();
                 }
+                // The same check for the settings file (live apply).
+                if let Some(prefs) = self.store.refresh() {
+                    self.apply(&prefs);
+                }
             }
             WindowEvent::DroppedFile(path) => self.open(Input::File(path)),
             WindowEvent::ModifiersChanged(m) => {
@@ -318,6 +434,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(action) = view::key_action(&event.logical_key, self.mods) {
                     let outcome = view.apply(action, now);
                     self.outcome(outcome, event_loop);
+                    self.record(now);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -336,6 +453,7 @@ impl ApplicationHandler<UserEvent> for App {
                     ),
                 }
                 self.redraw();
+                self.record(now);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
@@ -360,6 +478,22 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
+    /// However the window goes (close button, quit keys), save its size and anything else
+    /// waiting.
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        if let Some(g) = &self.gfx
+            && self.shown
+        {
+            let size = g
+                .window
+                .inner_size()
+                .to_logical::<f64>(g.window.scale_factor());
+            let logical = (size.width.round() as u32, size.height.round() as u32);
+            self.store.record_window(logical, Instant::now());
+        }
+        self.save(|s| s.flush());
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(view) = self.view.as_mut() else {
             return;
@@ -372,10 +506,13 @@ impl ApplicationHandler<UserEvent> for App {
             self.redraw();
         }
         self.scan_fonts();
-        event_loop.set_control_flow(match tick.wake {
-            Wake::Poll => ControlFlow::Poll,
-            Wake::At(t) => ControlFlow::WaitUntil(t),
-            Wake::Event => ControlFlow::Wait,
+        self.save(|s| s.poll(now));
+        let save = self.store.deadline();
+        event_loop.set_control_flow(match (tick.wake, save) {
+            (Wake::Poll, _) => ControlFlow::Poll,
+            (Wake::At(t), Some(s)) => ControlFlow::WaitUntil(t.min(s)),
+            (Wake::At(t), None) | (Wake::Event, Some(t)) => ControlFlow::WaitUntil(t),
+            (Wake::Event, None) => ControlFlow::Wait,
         });
     }
 }
@@ -383,7 +520,7 @@ impl ApplicationHandler<UserEvent> for App {
 fn main() {
     let start = Instant::now();
     platform::attach_console();
-    let input = match cli::parse(std::env::args_os().skip(1)) {
+    let (input, no_settings) = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Cli::Help) => {
             print!("{}", cli::USAGE);
             return;
@@ -392,14 +529,15 @@ fn main() {
             println!("vomd {}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        // `--no-settings` matters once there are settings (P6).
-        Ok(Cli::Run { input, .. }) => input,
+        Ok(Cli::Run { input, no_settings }) => (input, no_settings),
         Err(e) => {
             eprintln!("vomd: {e}\n\n{}", cli::USAGE);
             std::process::exit(2);
         }
     };
     let bench = std::env::var_os("VOMD_BENCH").is_some();
+    // Settings come first: they size the window and set theme and zoom.
+    let store = Store::open(if no_settings { None } else { settings::path() });
     // Read and parse in parallel with creating the window.
     let parse = {
         let input = input.clone();
@@ -423,6 +561,10 @@ fn main() {
         proxy: event_loop.create_proxy(),
         scanning: false,
         stamp: None,
+        store,
+        families: [None, None],
+        unresolved: Vec::new(),
+        resolving: false,
         mods: ModifiersState::empty(),
         cursor: PhysicalPosition::new(0.0, 0.0),
         shown: false,
@@ -433,4 +575,13 @@ fn main() {
         std::process::exit(1);
     }
     std::process::exit(app.exit_code);
+}
+
+/// Family names in settings compare case-insensitively.
+fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
+        _ => false,
+    }
 }

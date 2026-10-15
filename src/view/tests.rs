@@ -1027,4 +1027,44 @@ mod with_fonts {
         }
         assert!(moved > 0);
     }
+
+    #[test]
+    fn text_size_and_family_keep_the_reading_position() {
+        let mut v = view(&paras(300), 700, 500);
+        settle(&mut v);
+        v.set_scroll(v.layout().top(150) + 3.0);
+        let block = v.anchor().block;
+        v.set_text(20.0, 60.0);
+        assert_eq!(v.layout().params().font_size, 20.0);
+        assert_eq!(v.layout().params().line_width, 60.0);
+        assert_eq!(v.anchor().block, block);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+        let jb = [
+            Some((dir.join("JetBrainsMono-Regular.ttf"), 0)),
+            Some((dir.join("JetBrainsMono-Bold.ttf"), 0)),
+            None,
+            None,
+        ];
+        let before: Vec<_> = v.layout().geoms()[block as usize]
+            .content
+            .as_ref()
+            .unwrap()
+            .glyphs
+            .iter()
+            .map(|g| g.face)
+            .collect();
+        assert!(v.set_family(false, Some(&jb)));
+        assert_eq!(v.anchor().block, block);
+        let after: Vec<_> = v.layout().geoms()[block as usize]
+            .content
+            .as_ref()
+            .expect("remeasured around the anchor")
+            .glyphs
+            .iter()
+            .map(|g| g.face)
+            .collect();
+        assert_ne!(before, after, "set in the new family");
+        assert!(v.set_family(false, None));
+        assert_eq!(v.anchor().block, block);
+    }
 }

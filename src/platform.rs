@@ -27,6 +27,33 @@ pub fn attach_console() {
     // TODO(P14): AttachConsole(ATTACH_PARENT_PROCESS) on Windows.
 }
 
+/// Hand a file or URL to the desktop's default application (no shell; the target is
+/// one argument, never part of a command line). Doesn't wait for the application.
+pub fn open(target: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = Command::new("xdg-open");
+    #[cfg(target_os = "macos")]
+    // TODO(P14): untested.
+    let mut cmd = Command::new("open");
+    #[cfg(windows)]
+    // TODO(P14): untested.
+    let mut cmd = {
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    let mut child = cmd
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Reap it in the background so it doesn't linger as a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// Errors go to stderr only when someone can see them.
 pub fn stderr_is_tty() -> bool {
     use std::io::IsTerminal;

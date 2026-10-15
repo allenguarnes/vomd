@@ -337,6 +337,16 @@ impl Layout {
         self.params = params;
         self.set_geometry();
         let ratio = if old_em > 0.0 { self.em / old_em } else { 1.0 };
+        self.remeasure(ratio);
+    }
+
+    /// The faces text is set in changed (`font_sans` / `font_mono`): everything is remeasured.
+    pub fn invalidate_all(&mut self) {
+        self.remeasure(1.0);
+    }
+
+    /// Mark every block unmeasured, its old height scaled by `ratio` as the estimate.
+    fn remeasure(&mut self, ratio: f32) {
         for g in &mut self.geoms {
             g.h *= ratio;
             g.measured = false;

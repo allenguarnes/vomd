@@ -82,9 +82,10 @@ pub struct Tick {
     pub wake: Wake,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ThemeMode {
     /// Follow the OS.
+    #[default]
     System,
     Light,
     Dark,
@@ -221,6 +222,8 @@ pub struct View {
     /// Physical pixels per logical pixel from the window system.
     hidpi: f64,
     zoom: u16,
+    /// Base font size (logical px) and maximum characters per line (`font_size`, `line_width`).
+    text: (f32, f32),
     theme: ThemeMode,
     system_dark: bool,
     fade: ScrollbarFade,
@@ -248,7 +251,9 @@ impl View {
         hidpi: f64,
     ) -> View {
         let hidpi = sane_scale(hidpi);
-        let params = params(width, hidpi, 100);
+        let d = Params::default();
+        let text = (d.font_size, d.line_width);
+        let params = params(width, hidpi, 100, text);
         View {
             layout: Layout::new(&doc, params),
             doc,
@@ -262,6 +267,7 @@ impl View {
             top_inset: 0,
             hidpi,
             zoom: 100,
+            text,
             theme: ThemeMode::System,
             system_dark: false,
             fade: ScrollbarFade::default(),
@@ -330,6 +336,24 @@ impl View {
         self.relayout();
     }
 
+    /// Base font size in logical pixels and maximum characters per line
+    /// (`font_size`, `line_width`); the reading position is kept.
+    pub fn set_text(&mut self, font_size: f32, line_width: f32) {
+        self.text = (font_size, line_width);
+        self.relayout();
+    }
+
+    /// Set body text (`mono` false) or code (`mono` true) in a family loaded from disk, or back
+    /// in the default faces with `None` (see [`Fonts::set_family`]); everything is remeasured,
+    /// keeping the reading position. Returns false if the family's regular face couldn't be
+    /// loaded (the defaults are used).
+    pub fn set_family(&mut self, mono: bool, faces: Option<&[Option<(PathBuf, u32)>; 4]>) -> bool {
+        let ok = self.fonts.set_family(mono, faces);
+        self.layout.invalidate_all();
+        self.ensure();
+        ok
+    }
+
     /// The window size the view lays out and paints for (physical pixels).
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -370,7 +394,7 @@ impl View {
     /// above the position, and clamping against that would throw it away.
     fn relayout(&mut self) {
         self.layout
-            .set_params(params(self.width, self.hidpi, self.zoom));
+            .set_params(params(self.width, self.hidpi, self.zoom, self.text));
         self.ensure();
     }
 
@@ -690,7 +714,10 @@ impl View {
     pub fn open(&mut self, doc: Doc, message: Option<String>) {
         self.doc = doc;
         self.message = message;
-        self.layout = Layout::new(&self.doc, params(self.width, self.hidpi, self.zoom));
+        self.layout = Layout::new(
+            &self.doc,
+            params(self.width, self.hidpi, self.zoom, self.text),
+        );
         self.anchor = Anchor::TOP;
         self.drag = None;
         self.kept = None;
@@ -708,7 +735,10 @@ impl View {
             .unwrap_or_else(|| (self.place(), self.anchor));
         self.doc = doc;
         self.message = message;
-        self.layout = Layout::new(&self.doc, params(self.width, self.hidpi, self.zoom));
+        self.layout = Layout::new(
+            &self.doc,
+            params(self.width, self.hidpi, self.zoom, self.text),
+        );
         self.anchor = Anchor::TOP;
         if self.message.is_some() {
             self.kept = Some((place, old));
@@ -829,12 +859,13 @@ fn section_end(doc: &Doc, from: u32) -> u32 {
 }
 
 /// Layout parameters for a window `width` wide at `hidpi` and `zoom` percent.
-fn params(width: u32, hidpi: f64, zoom: u16) -> Params {
+fn params(width: u32, hidpi: f64, zoom: u16, (font_size, line_width): (f32, f32)) -> Params {
     Params {
         width: width as f32,
         scale: (hidpi * f64::from(zoom) / 100.0) as f32,
+        font_size,
+        line_width,
         page_pad: PAGE_PAD,
-        ..Params::default()
     }
 }
 

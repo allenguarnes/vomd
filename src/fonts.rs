@@ -112,6 +112,8 @@ pub enum Slot {
 pub struct Fonts {
     faces: Vec<Face>,
     slots: [FaceId; 6],
+    /// The slots as [`Fonts::new`] set them, for going back from a chosen family.
+    defaults: [FaceId; 6],
     /// Fallback faces in the order they were added.
     fallbacks: Vec<FaceId>,
 }
@@ -156,6 +158,7 @@ impl Fonts {
         Ok(Fonts {
             faces,
             slots,
+            defaults: slots,
             fallbacks: Vec::new(),
         })
     }
@@ -208,6 +211,7 @@ impl Fonts {
         let mut fonts = Fonts {
             faces: Vec::new(),
             slots: [FaceId(0); 6],
+            defaults: [FaceId(0); 6],
             fallbacks: Vec::new(),
         };
         let mut loaded: [Option<FaceId>; 6] = [None; 6];
@@ -228,6 +232,7 @@ impl Fonts {
             mono,
             loaded[5].unwrap_or(mono),
         ];
+        fonts.defaults = fonts.slots;
         fonts.fallbacks.clear();
         Ok(fonts)
     }
@@ -318,6 +323,54 @@ impl Fonts {
         Some(id)
     }
 
+    /// Set body text (`mono` false: the four sans slots) or code (`mono` true: the two mono
+    /// slots, from the regular and bold faces) in a family from disk (`font_sans` /
+    /// `font_mono`); `None` goes back to the defaults. `faces` are regular, bold,
+    /// italic and bold italic; missing styles use the nearest face, synthesized. Returns false
+    /// (and keeps the defaults) if the regular face can't be loaded.
+    pub fn set_family(&mut self, mono: bool, faces: Option<&[Option<(PathBuf, u32)>; 4]>) -> bool {
+        let range = if mono { 4..6 } else { 0..4 };
+        let Some(faces) = faces else {
+            self.slots[range.clone()].copy_from_slice(&self.defaults[range]);
+            return true;
+        };
+        let mut ids: [Option<FaceId>; 4] = [None; 4];
+        for (id, face) in ids.iter_mut().zip(faces) {
+            *id = face
+                .as_ref()
+                .and_then(|(path, index)| self.face_for(path, *index));
+        }
+        let Some(regular) = ids[0] else {
+            self.slots[range.clone()].copy_from_slice(&self.defaults[range]);
+            return false;
+        };
+        let bold = ids[1].unwrap_or(regular);
+        if mono {
+            self.slots[Slot::Mono as usize] = regular;
+            self.slots[Slot::MonoBold as usize] = bold;
+        } else {
+            let italic = ids[2].unwrap_or(regular);
+            self.slots[Slot::Regular as usize] = regular;
+            self.slots[Slot::Bold as usize] = bold;
+            self.slots[Slot::Italic as usize] = italic;
+            self.slots[Slot::BoldItalic as usize] = ids[3].or(ids[1]).or(ids[2]).unwrap_or(regular);
+        }
+        true
+    }
+
+    /// The face loaded from `path`/`index`, loading it if it isn't yet.
+    fn face_for(&mut self, path: &Path, index: u32) -> Option<FaceId> {
+        let existing = self.faces.iter().position(|f| {
+            f.source
+                .as_ref()
+                .is_some_and(|(p, i)| p == path && *i == index)
+        });
+        match existing {
+            Some(i) => Some(FaceId(i as u16)),
+            None => self.load(path, index),
+        }
+    }
+
     fn load(&mut self, path: &Path, index: u32) -> Option<FaceId> {
         if self.faces.len() >= u16::MAX as usize {
             return None;
@@ -355,6 +408,61 @@ mod tests {
         assert_eq!(fonts.select(regular, 'A'), Some(regular));
         assert_eq!(fonts.select(regular, '中'), None);
         assert!(fonts.face(regular).metrics().units_per_em > 0);
+    }
+
+    fn asset(name: &str) -> Option<(PathBuf, u32)> {
+        Some((
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/fonts")
+                .join(name),
+            0,
+        ))
+    }
+
+    #[test]
+    fn families_replace_and_restore_slots() {
+        let mut fonts = Fonts::new().unwrap();
+        let defaults = fonts.slots;
+        // Body text in JetBrains Mono (regular and bold only): italics fall back and synthesize.
+        let jb = [
+            asset("JetBrainsMono-Regular.ttf"),
+            asset("JetBrainsMono-Bold.ttf"),
+            None,
+            None,
+        ];
+        assert!(fonts.set_family(false, Some(&jb)));
+        let regular = fonts.slot(Slot::Regular);
+        assert_ne!(regular, defaults[Slot::Regular as usize]);
+        assert!(fonts.face(fonts.slot(Slot::Bold)).bold);
+        assert_eq!(fonts.slot(Slot::Italic), regular);
+        assert_eq!(fonts.slot(Slot::BoldItalic), fonts.slot(Slot::Bold));
+        assert_eq!(
+            fonts.synth_for(fonts.slot(Slot::Italic), false, true),
+            synth::ITALIC
+        );
+        assert_eq!(fonts.slots[4..], defaults[4..], "mono untouched");
+        // Loading the same family again reuses the faces.
+        let n = fonts.faces.len();
+        assert!(fonts.set_family(false, Some(&jb)));
+        assert_eq!(fonts.faces.len(), n);
+        // Mono in Inter: regular and bold.
+        let inter = [
+            asset("Inter-Regular.ttf"),
+            asset("Inter-Bold.ttf"),
+            None,
+            None,
+        ];
+        assert!(fonts.set_family(true, Some(&inter)));
+        assert!(fonts.face(fonts.slot(Slot::MonoBold)).bold);
+        // Back to the defaults.
+        assert!(fonts.set_family(false, None));
+        assert!(fonts.set_family(true, None));
+        assert_eq!(fonts.slots, defaults);
+        // A missing regular face keeps (restores) the defaults.
+        assert!(fonts.set_family(false, Some(&jb)));
+        let gone = [Some(("/nonexistent/x.ttf".into(), 0)), None, None, None];
+        assert!(!fonts.set_family(false, Some(&gone)));
+        assert_eq!(fonts.slots, defaults);
     }
 
     #[test]
