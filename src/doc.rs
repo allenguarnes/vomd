@@ -430,7 +430,8 @@ struct Builder {
     italic: usize,
     strike: usize,
     /// The open link, if any: anchors don't nest, in HTML or Markdown (opening one closes the
-    /// open one, and any end closes it), so this holds at most one.
+    /// open one, and any end closes it), so this holds at most one open anchor, plus a transient
+    /// autolink or footnote-reference id.
     links: Vec<u32>,
     /// Styles opened by inline HTML tags in the open block.
     html_inline: HtmlInline,

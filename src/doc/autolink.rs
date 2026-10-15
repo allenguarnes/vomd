@@ -15,6 +15,7 @@ pub fn find(s: &str, prev: char) -> Vec<(Range<usize>, String)> {
     if !candidate(s) {
         return out;
     }
+    let mut bad = Scan::default();
     let mut i = 0;
     while i < b.len() {
         // Links start with `w`, `h`, `f` or (for emails) contain `@`; only ASCII bytes are
@@ -26,7 +27,7 @@ pub fn find(s: &str, prev: char) -> Vec<(Range<usize>, String)> {
                 } else {
                     s[..i].chars().next_back().unwrap_or(' ')
                 };
-                if let Some((end, href)) = at(s, i, before) {
+                if let Some((end, href)) = at(s, i, before, &mut bad) {
                     out.push((i..end, href));
                     i = end;
                     continue;
@@ -66,7 +67,10 @@ fn candidate(s: &str) -> bool {
 /// its end and target. As in cmark-gfm a `www.` address must follow whitespace or one of
 /// `*_~(`, while a URL only can't follow a letter (which would make another scheme) and needs
 /// no period in its domain (`http://localhost:3000`).
-fn at(s: &str, i: usize, before: char) -> Option<(usize, String)> {
+///
+/// `bad` is the last failed domain scan; a `www.` inside it may fail without a scan of its own
+/// (after `_`, say), which keeps `www._www._www._…` linear.
+fn at(s: &str, i: usize, before: char, bad: &mut Scan) -> Option<(usize, String)> {
     let rest = &s[i..];
     let lower = |p: &str| {
         rest.as_bytes()
@@ -92,40 +96,85 @@ fn at(s: &str, i: usize, before: char) -> Option<(usize, String)> {
     if !boundary {
         return None;
     }
-    let domain_end = i + prefix + domain(&rest[prefix..], prefix > 0)?;
+    if prefix == 0 && bad.fails_www_at(i) {
+        return None;
+    }
+    let domain_end = match domain(s, i + prefix, prefix > 0) {
+        Ok(end) => end,
+        Err(scan) => {
+            *bad = scan;
+            return None;
+        }
+    };
     let end = trim_end(s, i, path_end(s, domain_end));
     Some((end, format!("{scheme}{}", &s[i..end])))
 }
 
-/// Length of a valid domain at the start of `s`: segments of alphanumerics, `_` and `-`
+/// A failed domain scan: the byte range it read and the last two segments it found (where
+/// each starts, 0 for none, and whether it holds `_`).
+#[derive(Default)]
+struct Scan {
+    from: usize,
+    stop: usize,
+    starts: [usize; 2],
+    under: [bool; 2],
+}
+
+impl Scan {
+    /// Whether a `www.` at `i` inside the scan fails too without scanning again. Its domain is
+    /// `www` and then the segments after the period at `i + 3`, ending as this one did, so it
+    /// fails with fewer than two segments or `_` in its last two.
+    fn fails_www_at(&self, i: usize) -> bool {
+        if i < self.from || i + 3 >= self.stop {
+            return false;
+        }
+        let after = i + 4;
+        if self.starts[0] >= after {
+            self.under[0] || self.under[1]
+        } else if self.starts[1] >= after {
+            self.under[1]
+        } else {
+            true
+        }
+    }
+}
+
+/// The end of the valid domain starting at `from`: segments of alphanumerics, `_` and `-`
 /// separated by periods, at least one period unless `short`, and no `_` in the last two
-/// segments.
-fn domain(s: &str, short: bool) -> Option<usize> {
-    let mut len = 0;
-    let mut segments: Vec<&str> = Vec::new();
-    for seg in s.split('.') {
-        let n = seg
-            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
-            .unwrap_or(seg.len());
-        if n == 0 {
+/// segments. Otherwise what was scanned, which stops at the first character that can't continue
+/// the domain: a failure costs no more than the domain-like text it read.
+fn domain(s: &str, from: usize, short: bool) -> Result<usize, Scan> {
+    let mut scan = Scan {
+        from,
+        stop: s.len(),
+        ..Scan::default()
+    };
+    let (mut segments, mut end, mut seg_start) = (0, 0, from);
+    let mut cur = false; // `_` in the current segment
+    // The sentinel ends the last segment when `s` is all domain characters.
+    let chars = s[from..].char_indices().map(|(i, c)| (from + i, c));
+    for (i, c) in chars.chain([(s.len(), ' ')]) {
+        if c.is_alphanumeric() || matches!(c, '_' | '-') {
+            cur |= c == '_';
+            continue;
+        }
+        if i > seg_start {
+            segments += 1;
+            end = i; // a trailing period isn't part of the domain
+            scan.starts = [scan.starts[1], seg_start];
+            scan.under = [scan.under[1], cur];
+        }
+        if c != '.' || i == seg_start {
+            scan.stop = i;
             break;
         }
-        segments.push(&seg[..n]);
-        len += n;
-        if n < seg.len() || len + 1 > s.len() {
-            break;
-        }
-        len += 1; // the period
+        cur = false;
+        seg_start = i + 1;
     }
-    // A trailing period isn't part of the domain.
-    if s[..len].ends_with('.') {
-        len -= 1;
+    if segments < if short { 1 } else { 2 } || scan.under.contains(&true) {
+        return Err(scan);
     }
-    let needed = if short { 1 } else { 2 };
-    if segments.len() < needed || segments.iter().rev().take(2).any(|g| g.contains('_')) {
-        return None;
-    }
-    Some(len)
+    Ok(end)
 }
 
 /// Where the path after a domain ends: at whitespace or `<`.
@@ -385,6 +434,85 @@ mod tests {
             "took {:?}",
             t.elapsed()
         );
+    }
+
+    /// Failed candidates cost what they read, never the rest of the run: every scan in this
+    /// module is linear over a whole text run (one line is one run), whatever the input.
+    #[test]
+    fn failing_candidates_are_scanned_in_linear_time() {
+        let mb = 1 << 20;
+        let cases: Vec<(&str, String)> = vec![
+            ("empty domains", "http:// ".repeat(mb / 7)),
+            ("underscore domains", "http://_ ".repeat(mb / 9)),
+            ("bare schemes", "https://".repeat(mb / 8)),
+            ("ftp and spaces", "ftp://\t".repeat(mb / 6)),
+            ("no periods", format!("www.{}", "a".repeat(mb))),
+            ("failing www runs", "www.a ".repeat(mb / 6)),
+            ("www underscores", "www._".repeat(mb / 5)),
+            ("www underscore dots", "www._www._www.a_b".repeat(mb / 17)),
+            ("www tildes", "www.a_b~".repeat(mb / 8)),
+            ("www empty segments", "www.a..._".repeat(mb / 9)),
+            ("www periods", format!("www.{}", ".".repeat(mb))),
+            ("www dashes", format!("www.{}", "a-.".repeat(mb / 3))),
+            ("www letters", "w".repeat(mb)),
+            ("www dots", "www.".repeat(mb / 4)),
+            ("scheme letters", "http".repeat(mb / 4)),
+            ("scheme colons", "http:/".repeat(mb / 6)),
+            ("local parts", "a".repeat(mb) + "@"),
+            ("local parts and dots", "a.".repeat(mb / 2) + "@a"),
+            ("local part plus signs", "+a".repeat(mb / 2) + "@b"),
+            ("at signs", "@".repeat(mb)),
+            ("a at a at", "a@".repeat(mb / 2)),
+            ("a at a dot", "a@a.".repeat(mb / 4)),
+            ("local parts between ats", "aaaa@".repeat(mb / 5)),
+            ("domains that fail", "a@".to_string() + &"b".repeat(mb)),
+            (
+                "domains of dots",
+                "a@".to_string() + &"b.".repeat(mb / 2) + "1",
+            ),
+            ("domain dots", "a@b".to_string() + &".".repeat(mb)),
+            ("dashes", "a@b.c-".repeat(mb / 6)),
+            ("emails apart", "a.b+c@d.e1 ".repeat(mb / 11)),
+            ("emails joined", "a@b.co+".repeat(mb / 7)),
+            ("emails in urls", "www.a.bc/x@y.zz ".repeat(mb / 16)),
+            ("overlapping emails", "http://a.b/@c.de ".repeat(mb / 17)),
+            ("urls", "http://a.b ".repeat(mb / 11)),
+            ("url entities", "http://a.b/&a;&a;&a; ".repeat(mb / 21)),
+            ("long entity", format!("http://a.b/&{};", "a".repeat(mb))),
+            ("semicolons", format!("http://a.b/{}", ";".repeat(mb))),
+            ("amps", format!("http://a.b/{}", "&;".repeat(mb / 2))),
+            ("trimmed links", "www.a.bc?! ".repeat(mb / 11)),
+            ("unicode", "é@é.é www.é_é.é_é ".repeat(mb / 28)),
+        ];
+        for (name, src) in cases {
+            assert!(src.len() >= mb / 2, "{name}: {}", src.len());
+            let t = std::time::Instant::now();
+            for prev in [' ', 'a'] {
+                let _ = find(&src, prev);
+            }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "{name} took {:?}",
+                t.elapsed()
+            );
+        }
+    }
+
+    /// A `www.` inside a failed domain scan (after `_`) is only skipped when it fails too.
+    #[test]
+    fn failed_domains_do_not_hide_later_links() {
+        // `_www` ends the first domain badly, the second starts clean after the `_`.
+        assert_eq!(links("www._www.x")[0].0, "www.x");
+        assert_eq!(links("www._www.x/p?q.")[0].0, "www.x/p?q");
+        assert_eq!(links("www.a_b._www.x/y")[0].0, "www.x/y");
+        assert!(links("www._www._www.a_b").is_empty());
+        assert!(links("www._www._").is_empty());
+        assert!(links("www._www.x_y.cc").is_empty());
+        assert!(links("www._www.").is_empty());
+        assert_eq!(links("www.a_b.c_d www.e.fg")[0].0, "www.e.fg");
+        assert_eq!(links("www.a_b.c_d_http://x.y")[0].0, "http://x.y");
+        assert_eq!(links("http://_ www.e.fg")[0].0, "www.e.fg");
+        assert_eq!(links("http:// http://a.b")[0].0, "http://a.b");
     }
 
     #[test]

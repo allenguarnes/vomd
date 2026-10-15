@@ -330,7 +330,8 @@ fn urls_with_emphasis_delimiters_are_split() {
     ));
 }
 
-/// Pathological autolink input is linear: trailing parentheses, one text run of many links.
+/// Pathological autolink input is linear: trailing parentheses, one text run of many links, and
+/// candidates that fail (more in `autolink::tests`).
 #[test]
 fn autolink_scans_are_linear() {
     let t = std::time::Instant::now();
@@ -338,10 +339,22 @@ fn autolink_scans_are_linear() {
     let alternating = format!("https://a.bc/{}\n\n", ".)".repeat(100_000));
     let lines = format!("www.a.bc/{}\n\n", ")".repeat(2_000)).repeat(100);
     let urls = "www.a.bc/x) http://a ftp://b a@b.cd ".repeat(20_000);
+    // Candidates that fail on one long line (a line is one text run): no period to stop a
+    // domain scan, repeated `www.` after `_`, and local parts running into each other.
+    let bare = "http:// ".repeat(150_000);
+    let underscores = "http://_ ftp://_ ".repeat(70_000);
+    let www = "www._www.".repeat(100_000);
+    let emails = "a@".repeat(300_000);
+    let locals = "a".repeat(1_000_000) + "@";
     for src in [parens, alternating, lines, urls] {
         let doc = Doc::parse(&src);
         check_invariants(&doc);
         assert!(!doc.links.is_empty());
+    }
+    for src in [bare, underscores, www, emails, locals] {
+        let doc = Doc::parse(&src);
+        check_invariants(&doc);
+        assert!(doc.links.is_empty());
     }
     assert!(
         t.elapsed() < std::time::Duration::from_secs(5),
