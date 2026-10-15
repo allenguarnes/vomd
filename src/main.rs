@@ -249,7 +249,7 @@ impl App {
         self.redraw();
     }
 
-    /// Open a dropped file in place of the current document.
+    /// Open a document in place of the current one (the back stack is the caller's business).
     fn open(&mut self, input: Input) {
         let loaded = load(&input);
         self.input = input;
@@ -263,31 +263,40 @@ impl App {
         self.redraw();
     }
 
+    /// Go to another document, leaving the current place on the back stack (see
+    /// [`BackStack::leave`]).
+    fn go_to(&mut self, input: Input) {
+        if let Some(view) = self.view.as_ref() {
+            let here = nav::Entry {
+                input: self.input.clone(),
+                anchor: view.anchor(),
+            };
+            self.back.leave(here, &input);
+        }
+        self.open(input);
+    }
+
     /// Follow a clicked link: `#anchor` scrolls, a relative Markdown file opens in
     /// this window, `http(s)`/`mailto` go to the desktop, anything else does nothing. Places
     /// left are pushed on the back stack.
     fn follow(&mut self, href: &str, now: Instant) {
         let base = nav::base_dir(&self.input);
-        let here = self.view.as_ref().map(|v| nav::Entry {
-            input: self.input.clone(),
-            anchor: v.anchor(),
-        });
         match nav::classify(href, base.as_deref()) {
             Target::Anchor(fragment) => {
-                if let Some(view) = self.view.as_mut()
-                    && view.jump_to_anchor(&fragment, now)
-                {
-                    if let Some(here) = here.clone() {
-                        self.back.push(here);
-                    }
+                let Some(view) = self.view.as_mut() else {
+                    return;
+                };
+                let here = nav::Entry {
+                    input: self.input.clone(),
+                    anchor: view.anchor(),
+                };
+                if view.jump_to_anchor(&fragment, now) {
+                    self.back.leave(here, &self.input);
                     self.redraw();
                 }
             }
             Target::Doc { path, fragment } => {
-                if let Some(here) = here {
-                    self.back.push(here);
-                }
-                self.open(Input::File(path));
+                self.go_to(Input::File(path));
                 if let (Some(view), Some(fragment)) = (self.view.as_mut(), fragment) {
                     view.jump_to_anchor(&fragment, now);
                 }
@@ -304,6 +313,7 @@ impl App {
     }
 
     /// Return to the last place on the back stack, reopening its file if it's another one.
+    /// (Stdin is never on the stack as a place to reopen, see [`BackStack::leave`].)
     fn go_back(&mut self) {
         let Some(entry) = self.back.pop() else {
             return;
@@ -327,19 +337,18 @@ impl App {
         } else {
             view.hover_end()
         };
-        if !changed {
-            return;
-        }
-        let pointer = view.hovered().is_some();
-        if pointer != self.pointer {
-            self.pointer = pointer;
-            gfx.window.set_cursor(if pointer {
+        let update = view::hover_change(self.pointer, view.hovered().is_some(), changed);
+        if update.set_cursor {
+            gfx.window.set_cursor(if update.pointer {
                 CursorIcon::Pointer
             } else {
                 CursorIcon::Default
             });
         }
-        gfx.window.request_redraw();
+        self.pointer = update.pointer;
+        if update.redraw {
+            gfx.window.request_redraw();
+        }
     }
 
     /// Run a settings save; a failure is reported (on a terminal) and otherwise ignored, since
@@ -473,6 +482,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.resolve_families();
             }
         }
+        // New faces change line breaks and heights, and so what's under the pointer.
+        self.update_hover();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -515,7 +526,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.apply(&prefs);
                 }
             }
-            WindowEvent::DroppedFile(path) => self.open(Input::File(path)),
+            WindowEvent::DroppedFile(path) => self.go_to(Input::File(path)),
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
                 if !(self.mods.control_key() || self.mods.super_key()) {

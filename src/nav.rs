@@ -5,7 +5,7 @@
 //! `mailto:` URLs do anything. Every other scheme (`javascript:`, `file:`, `data:`, ...),
 //! absolute paths and anything with control characters is inert.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::cli::Input;
 use crate::doc::Doc;
@@ -47,6 +47,7 @@ pub fn classify(href: &str, base: Option<&Path>) -> Target {
     }
     if let Some(scheme) = scheme(t) {
         return match scheme.to_ascii_lowercase().as_str() {
+            "mailto" if mailto_attaches(t) => Target::Ignore,
             "http" | "https" | "mailto" => Target::External(t.to_owned()),
             _ => Target::Ignore,
         };
@@ -61,7 +62,12 @@ pub fn classify(href: &str, base: Option<&Path>) -> Target {
     };
     let path = path.split_once('?').map_or(path, |(p, _)| p);
     let path = percent_decode(path);
-    let (Some(base), false) = (base, path.is_empty() || path.contains('\0')) else {
+    // Decoding can produce what the checks above refused (`%2Fetc%2Fx.md`, `C%3A%5Cx.md`):
+    // `Path::join` with an absolute path would replace the document's directory.
+    let (Some(base), false) = (
+        base,
+        path.is_empty() || path.chars().any(char::is_control) || is_absolute(&path),
+    ) else {
         return Target::Ignore;
     };
     let markdown = Path::new(&path)
@@ -75,6 +81,40 @@ pub fn classify(href: &str, base: Option<&Path>) -> Target {
         path: base.join(path),
         fragment,
     }
+}
+
+/// Whether `path` (decoded) is anchored somewhere other than the document's directory: a root,
+/// a UNC or drive prefix, on any platform (a Windows path is no relative path on Linux either,
+/// as far as a link is concerned).
+fn is_absolute(path: &str) -> bool {
+    let drive = path.as_bytes();
+    path.starts_with(['/', '\\'])
+        || (drive.len() >= 2 && drive[0].is_ascii_alphabetic() && drive[1] == b':')
+        || Path::new(path)
+            .components()
+            .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+}
+
+/// Whether a `mailto:` URL carries an `attach`/`attachment` header (RFC 6068 lets a link name
+/// any header, and some mail clients attach the file the value names): such links are inert.
+/// Names are compared decoded (as many times as it takes, so `%2561ttach` is no way round),
+/// ignoring case.
+fn mailto_attaches(url: &str) -> bool {
+    let query = url.split('#').next().unwrap_or(url);
+    let Some((_, query)) = query.split_once('?') else {
+        return false;
+    };
+    query.split(['&', ';']).any(|pair| {
+        let mut name = pair.split_once('=').map_or(pair, |(n, _)| n).to_owned();
+        loop {
+            let decoded = percent_decode(&name);
+            if decoded == name {
+                break;
+            }
+            name = decoded;
+        }
+        name.trim().to_ascii_lowercase().starts_with("attach")
+    })
 }
 
 /// The URI scheme of `s` (RFC 3986: a letter, then letters, digits, `+`, `-` or `.`, then
@@ -161,6 +201,21 @@ impl BackStack {
             self.entries.remove(0);
         }
         self.entries.push(entry);
+    }
+
+    /// Record that the reader is leaving `here` for `next` (another document, or a place in the
+    /// same one). A document that can't be opened again isn't worth coming back to: stdin is
+    /// read once at startup (a second read would block or find it empty), so leaving it for
+    /// another document forgets every stdin entry, and an empty window has nothing to return
+    /// to. Back then ends at the last document that can be reopened.
+    pub fn leave(&mut self, here: Entry, next: &Input) {
+        match here.input {
+            Input::None => {}
+            Input::Stdin if *next != Input::Stdin => {
+                self.entries.retain(|e| e.input != Input::Stdin);
+            }
+            _ => self.push(here),
+        }
     }
 
     pub fn pop(&mut self) -> Option<Entry> {

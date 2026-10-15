@@ -19,7 +19,7 @@ use crate::layout::{Anchor, BlockBox, Layout, Params};
 use crate::render::{self, Clip, Frame, ScrollbarFade, Viewport};
 use crate::text::cache::GlyphCache;
 use crate::text::fallback::Found;
-use crate::text::{Align, Para, TextCtx, TextStyle};
+use crate::text::{Align, Para, ParaLayout, TextCtx, TextStyle};
 use crate::theme::{DARK, LIGHT, Role, Theme};
 
 /// Zoom limits and step, in percent.
@@ -179,30 +179,88 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
     Some((meta.modified().ok(), meta.len()))
 }
 
-/// Read the document text. Invalid UTF-8 is replaced, never fatal. Errors come back
-/// as the message to show in the window.
-pub fn read_input(input: &Input) -> Result<(String, Option<Stamp>), String> {
+/// What the shell does after a hover update: see [`hover_change`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoverChange {
+    /// Whether the cursor is the hand from now on.
+    pub pointer: bool,
+    /// The window's cursor must be set (to the hand if `pointer`, else the default).
+    pub set_cursor: bool,
+    /// The window must be repainted (the URL preview came, went or changed).
+    pub redraw: bool,
+}
+
+/// Decide the cursor and the repaint after the link under the pointer was looked up again:
+/// `pointer` is whether the window shows the hand, `hovered` whether a link is under the
+/// pointer now, `changed` what [`View::hover`] / [`View::hover_end`] returned. The cursor is
+/// compared with the link every time, not only when the hover changed: a new document resets
+/// the hover without the shell's cursor knowing (following a link, Back, a reload, a drop),
+/// and the hand would stay over plain text.
+pub fn hover_change(pointer: bool, hovered: bool, changed: bool) -> HoverChange {
+    HoverChange {
+        pointer: hovered,
+        set_cursor: hovered != pointer,
+        redraw: changed,
+    }
+}
+
+/// The most a document may be: files over 10 MB render with a notice, but a link
+/// can point at a device or something endless, and reading it must end.
+pub const MAX_BYTES: u64 = 512 << 20;
+
+/// Read all of `reader`, or `None` if it holds more than `limit` bytes.
+fn read_limited(
+    reader: impl std::io::Read,
+    hint: u64,
+    limit: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::with_capacity(hint.min(limit) as usize);
+    std::io::Read::read_to_end(&mut reader.take(limit + 1), &mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
+
+/// [`read_input`] with a chosen size limit.
+fn read_input_limited(input: &Input, limit: u64) -> Result<(String, Option<Stamp>), String> {
     let lossy = |bytes: Vec<u8>| match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
     };
+    let too_big = |what: &str| format!("{what} is larger than {} MB", limit >> 20);
     match input {
         Input::None => Ok((String::new(), None)),
         Input::Stdin => {
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut bytes)
-                .map_err(|e| format!("Cannot read standard input: {e}"))?;
+            let stdin = std::io::stdin().lock();
+            let bytes = read_limited(stdin, 0, limit)
+                .map_err(|e| format!("Cannot read standard input: {e}"))?
+                .ok_or_else(|| too_big("Standard input"))?;
             Ok((lossy(bytes), None))
         }
         Input::File(path) => {
+            let shown = path.display();
             // Stamp first: a write landing between the two makes the next focus reload again
             // rather than miss the change.
             let st = stamp(path);
-            let bytes =
-                std::fs::read(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+            // Before opening: a FIFO blocks the open until something writes to it. Symlinks
+            // are followed, so a link to a device is refused too.
+            let meta = std::fs::metadata(path).map_err(|e| format!("Cannot open {shown}: {e}"))?;
+            if !meta.is_file() {
+                return Err(format!("Cannot open {shown}: not a regular file"));
+            }
+            let file =
+                std::fs::File::open(path).map_err(|e| format!("Cannot open {shown}: {e}"))?;
+            let bytes = read_limited(file, meta.len(), limit)
+                .map_err(|e| format!("Cannot open {shown}: {e}"))?
+                .ok_or_else(|| too_big(&shown.to_string()))?;
             Ok((lossy(bytes), st))
         }
     }
+}
+
+/// Read the document text. Invalid UTF-8 is replaced, never fatal. Only regular
+/// files up to [`MAX_BYTES`] are read (so a link can't hang or exhaust memory). Errors come back
+/// as the message to show in the window.
+pub fn read_input(input: &Input) -> Result<(String, Option<Stamp>), String> {
+    read_input_limited(input, MAX_BYTES)
 }
 
 /// The window title for an input: the file name, or `vomd`.
@@ -761,18 +819,7 @@ impl View {
         };
         let (pad_x, pad_y, margin) = (0.5 * size, 0.3 * size, (4.0 * scale).round());
         let max_w = (w * 0.6).min(w - 2.0 * (margin + pad_x)).max(size);
-        // About 0.55 em per character; the layout below is the real check.
-        let budget = ((max_w / (0.55 * size)) as usize).max(4);
-        let text: String = if url.chars().count() > budget {
-            url.chars().take(budget - 1).chain(['…']).collect()
-        } else {
-            url.to_owned()
-        };
-        let mut para = Para::default();
-        para.push_text(&text, 0, style);
-        let pl = self
-            .msg_ctx
-            .layout(&self.fonts, &para, 1.0e6, Align::Start, 1.4);
+        let (para, pl) = self.fit_preview(url, style, max_w);
         self.msg_missing
             .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
         let box_w = pl.width.min(max_w) + 2.0 * pad_x;
@@ -801,6 +848,45 @@ impl View {
             theme,
         );
         frame.set_clip(prev);
+    }
+
+    /// `url` laid out in one line no wider than `max_w`: cut short with a trailing `…` when it
+    /// is wider, at the longest prefix that fits when measured (character counts say little
+    /// about width: CJK and wide hosts take twice the room of ASCII).
+    fn fit_preview(&mut self, url: &str, style: TextStyle, max_w: f32) -> (Para, ParaLayout) {
+        let lay = |view: &mut View, text: &str| {
+            let mut para = Para::default();
+            para.push_text(text, 0, style);
+            let pl = view
+                .msg_ctx
+                .layout(&view.fonts, &para, 1.0e6, Align::Start, 1.4);
+            (para, pl)
+        };
+        // Characters narrower than a fifth of an em are rare, so a longer URL is cut to this
+        // many before measuring: a huge link isn't laid out whole on every paint.
+        let most = (max_w / (0.2 * style.size)) as usize + 1;
+        let prefix = |n: usize| -> String {
+            let mut text: String = url.chars().take(n).collect();
+            if url.chars().nth(n).is_some() {
+                text.push('…');
+            }
+            text
+        };
+        let first = lay(self, &prefix(most));
+        if first.1.width <= max_w || most == 0 {
+            return first;
+        }
+        // The widest prefix that fits (widths grow with the prefix); none still shows `…`.
+        let (mut lo, mut hi) = (0, most);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if lay(self, &prefix(mid)).1.width <= max_w {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lay(self, &prefix(lo))
     }
 
     /// One centered paragraph of muted text.

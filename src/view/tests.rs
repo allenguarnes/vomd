@@ -99,6 +99,132 @@ fn read_errors_and_lossy_utf8() {
     assert_eq!(read_input(&Input::None).unwrap(), (String::new(), None));
 }
 
+#[test]
+fn cursor_follows_the_link_under_the_pointer() {
+    let c = hover_change;
+    // Entering and leaving a link.
+    assert_eq!(
+        c(false, true, true),
+        HoverChange {
+            pointer: true,
+            set_cursor: true,
+            redraw: true
+        }
+    );
+    assert_eq!(
+        c(true, false, true),
+        HoverChange {
+            pointer: false,
+            set_cursor: true,
+            redraw: true
+        }
+    );
+    // From one link to another: the preview changes, the cursor stays.
+    assert_eq!(
+        c(true, true, true),
+        HoverChange {
+            pointer: true,
+            set_cursor: false,
+            redraw: true
+        }
+    );
+    // Nothing happened.
+    assert_eq!(
+        c(false, false, false),
+        HoverChange {
+            pointer: false,
+            set_cursor: false,
+            redraw: false
+        }
+    );
+    // A new document reset the hover behind the shell's back (hover unchanged since then,
+    // or not under a link any more): the hand must still go.
+    assert_eq!(
+        c(true, false, false),
+        HoverChange {
+            pointer: false,
+            set_cursor: true,
+            redraw: false
+        }
+    );
+    // And one that has a link under the pointer after all takes it.
+    assert_eq!(
+        c(false, true, false),
+        HoverChange {
+            pointer: true,
+            set_cursor: true,
+            redraw: false
+        }
+    );
+}
+
+/// What a click on a link can reach: only regular files, and a bounded amount of them.
+#[test]
+fn read_input_refuses_what_is_not_a_regular_file() {
+    let dir = std::env::temp_dir().join(format!("vomd-view-read-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let read = |p: &Path| read_input(&Input::File(p.to_owned()));
+    let err = read(&dir).unwrap_err();
+    assert!(err.contains("not a regular file"), "{err}");
+    #[cfg(unix)]
+    {
+        let link = dir.join("zero.md");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        let err = read(&link).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        // A symlink to a regular file is followed.
+        std::fs::write(dir.join("real.md"), "# hi").unwrap();
+        let ok = dir.join("alias.md");
+        std::os::unix::fs::symlink(dir.join("real.md"), &ok).unwrap();
+        assert_eq!(read(&ok).unwrap().0, "# hi");
+        // A FIFO blocks an open until something writes to it: it must not be opened.
+        let fifo = dir.join("pipe.md");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.is_ok_and(|s| s.success()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = fifo.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(read_input(&Input::File(path)));
+            });
+            let err = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("reading a FIFO blocked")
+                .unwrap_err();
+            assert!(err.contains("not a regular file"), "{err}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn reads_stop_at_the_limit() {
+    use std::io::Cursor;
+    assert_eq!(
+        read_limited(Cursor::new(b"abcd"), 0, 4).unwrap().unwrap(),
+        b"abcd"
+    );
+    assert_eq!(read_limited(Cursor::new(b"abcde"), 0, 4).unwrap(), None);
+    // An endless reader ends at the limit, not at the end of memory.
+    assert_eq!(read_limited(std::io::repeat(b'x'), 0, 1000).unwrap(), None);
+    // The size hint is only a hint, whatever it says.
+    assert_eq!(
+        read_limited(Cursor::new(b"ab"), u64::MAX, 4)
+            .unwrap()
+            .unwrap(),
+        b"ab"
+    );
+    let dir = std::env::temp_dir().join(format!("vomd-view-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("big.md");
+    std::fs::write(&path, "0123456789").unwrap();
+    let input = Input::File(path);
+    assert_eq!(read_input_limited(&input, 10).unwrap().0, "0123456789");
+    let err = read_input_limited(&input, 9).unwrap_err();
+    assert!(err.ends_with("is larger than 0 MB"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    const { assert!(MAX_BYTES > 10 << 20, "well above the 10 MB notice") };
+}
+
 #[cfg(feature = "embed-fonts")]
 mod with_fonts {
     use super::*;
@@ -1236,9 +1362,64 @@ mod with_fonts {
         v.hover(lx, ly);
         v.paint(&mut buf, 600, now);
         assert!(corner(&buf), "preview box drawn");
-        // A new document forgets the link under the pointer.
+        // A new document forgets the link under the pointer, and the hand cursor shown over it
+        // has to go although the hover reports no change any more.
+        let pointer = v.hovered().is_some();
+        assert!(pointer);
         v.replace(Doc::parse("Other."), None);
         assert_eq!(v.hovered(), None);
+        let changed = v.hover_end();
+        let update = hover_change(pointer, v.hovered().is_some(), changed);
+        assert!(!changed && update.set_cursor && !update.pointer);
+        v.hover(lx, ly);
+        v.open(Doc::parse("Other."), None);
+        let update = hover_change(true, v.hovered().is_some(), v.hover(lx, ly));
+        assert!(update.set_cursor && !update.pointer, "{update:?}");
+    }
+
+    /// The preview box is never wider than allowed and a cut URL always ends with `…` inside
+    /// it, whatever the characters measure (CJK, wide hosts).
+    #[test]
+    fn preview_ellipsis_stays_inside_the_box() {
+        let mut v = view("x", 600, 400);
+        let style = TextStyle {
+            bold: false,
+            italic: false,
+            mono: false,
+            size: 12.0,
+            role: Role::Muted,
+            deco: 0,
+            shift: 0.0,
+            link: 0,
+        };
+        let long_ascii = format!("https://example.com/{}", "segment/".repeat(60));
+        let long_cjk = format!("https://例え.jp/{}", "日本語のページ/".repeat(40));
+        let wide = format!("https://example.com/{}", "ＷＩＤＥ".repeat(40));
+        for max_w in [60.0, 200.0, 345.0] {
+            for url in [&long_ascii, &long_cjk, &wide] {
+                let (para, pl) = v.fit_preview(url, style, max_w);
+                assert!(pl.width <= max_w, "{} > {max_w}: {}", pl.width, para.text);
+                assert!(para.text.ends_with('…'), "{}", para.text);
+                assert!(url.starts_with(para.text.trim_end_matches('…')));
+                // The longest prefix that fits: one more character doesn't.
+                let n = para.text.chars().count() - 1;
+                let more: String = url.chars().take(n + 1).chain(['…']).collect();
+                let mut p = Para::default();
+                p.push_text(&more, 0, style);
+                let w = v
+                    .msg_ctx
+                    .layout(&v.fonts, &p, 1.0e6, Align::Start, 1.4)
+                    .width;
+                assert!(w > max_w || n + 1 >= url.chars().count(), "{max_w}: {w}");
+            }
+        }
+        // A URL that fits is shown whole.
+        let (para, pl) = v.fit_preview("https://a.b/c", style, 345.0);
+        assert_eq!(para.text, "https://a.b/c");
+        assert!(pl.width <= 345.0);
+        // A box too narrow for anything shows just the ellipsis.
+        let (para, _) = v.fit_preview(&long_ascii, style, 1.0);
+        assert_eq!(para.text, "…");
     }
 
     #[test]

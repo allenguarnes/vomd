@@ -113,6 +113,59 @@ fn dangerous_links_are_inert() {
     assert_eq!(classify("other.md", None), Target::Ignore);
 }
 
+/// A path that only becomes absolute once decoded would replace the document's directory in
+/// `Path::join`.
+#[test]
+fn encoded_absolute_paths_are_inert() {
+    for href in [
+        "%2Ftmp%2Fx.md",
+        "%2ftmp%2fx.md#top",
+        "%5Ctmp%5Cx.md",
+        "%2F%2Fhost%2Fx.md",
+        "%2F%2Fhost/x.md",
+        "%5C%5Cserver%5Cshare%5Cx.md",
+        "C%3A%5Cx.md",
+        "c%3A/x.md",
+        "x%0A.md",
+    ] {
+        assert_eq!(classify(href, base()), Target::Ignore, "{href}");
+    }
+    // Climbing out of the directory is still a relative link.
+    assert_eq!(
+        classify("..%2F..%2Fx.md", base()),
+        doc("/docs/guide/../../x.md", None)
+    );
+    assert_eq!(
+        classify("sub%2Fx.md", base()),
+        doc("/docs/guide/sub/x.md", None)
+    );
+}
+
+#[test]
+fn mailto_with_attachments_is_inert() {
+    for url in [
+        "mailto:a@b.c?attach=/etc/passwd",
+        "mailto:a@b.c?subject=hi&Attach=%2Fhome%2Fme%2Fkey",
+        "mailto:a@b.c?subject=hi&ATTACHMENT=/x",
+        "mailto:a@b.c?%61ttach=/etc/passwd",
+        "mailto:a@b.c?%41%74tachment=/etc/passwd",
+        "mailto:a@b.c?%2561ttach=/etc/passwd",
+        "MAILTO:a@b.c?body=x;attach=/etc/passwd",
+        "mailto:a@b.c?attach",
+        "mailto:?to=a@b.c&attachments=/x#frag",
+    ] {
+        assert_eq!(classify(url, base()), Target::Ignore, "{url}");
+    }
+    for url in [
+        "mailto:a@b.c",
+        "mailto:a@b.c?subject=attach%20the%20file&body=attach=x",
+        "mailto:a@b.c?subject=hi#attach=x",
+        "https://example.com/?attach=1",
+    ] {
+        assert_eq!(classify(url, base()), Target::External(url.into()), "{url}");
+    }
+}
+
 #[test]
 fn schemes() {
     assert_eq!(scheme("http://x"), Some("http"));
@@ -181,4 +234,45 @@ fn back_stack_is_bounded() {
         Some(Input::File("8.md".into())),
         "the oldest were dropped"
     );
+}
+
+fn entry(input: Input) -> Entry {
+    Entry {
+        input,
+        anchor: Anchor::TOP,
+    }
+}
+
+#[test]
+fn leaving_stdin_forgets_it() {
+    let mut s = BackStack::default();
+    // Jumps inside stdin come back to it.
+    s.leave(entry(Input::Stdin), &Input::Stdin);
+    s.leave(entry(Input::Stdin), &Input::Stdin);
+    assert_eq!(s.len(), 2);
+    // A dropped file replaces it: stdin can't be read again, so nothing points to it.
+    s.leave(entry(Input::Stdin), &Input::File("c.md".into()));
+    assert!(s.is_empty());
+    // a.md → b.md → drop c.md: Back returns to b.md, then a.md.
+    s.leave(
+        entry(Input::File("a.md".into())),
+        &Input::File("b.md".into()),
+    );
+    s.leave(
+        entry(Input::File("b.md".into())),
+        &Input::File("c.md".into()),
+    );
+    assert_eq!(s.pop().unwrap().input, Input::File("b.md".into()));
+    assert_eq!(s.pop().unwrap().input, Input::File("a.md".into()));
+    // Only stdin entries go; the rest of the history stays.
+    s.leave(
+        entry(Input::File("a.md".into())),
+        &Input::File("b.md".into()),
+    );
+    s.leave(entry(Input::Stdin), &Input::File("c.md".into()));
+    assert_eq!(s.len(), 1);
+    assert_eq!(s.pop().unwrap().input, Input::File("a.md".into()));
+    // The empty window is nothing to come back to.
+    s.leave(entry(Input::None), &Input::File("a.md".into()));
+    assert!(s.is_empty());
 }
