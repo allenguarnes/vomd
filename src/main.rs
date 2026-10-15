@@ -258,13 +258,17 @@ impl App {
     }
 
     /// Run a settings save; a failure is reported (on a terminal) and otherwise ignored, since
-    /// preferences are not worth interrupting reading for.
+    /// preferences are not worth interrupting reading for. Changes from outside that the save
+    /// merged into the file are applied at once.
     fn save(&mut self, op: impl FnOnce(&mut Store) -> std::io::Result<()>) {
         if let Err(e) = op(&mut self.store)
             && platform::stderr_is_tty()
         {
             let path = self.store.path().map(|p| p.display().to_string());
             eprintln!("vomd: cannot save {}: {e}", path.unwrap_or_default());
+        }
+        if let Some(prefs) = self.store.take_merged() {
+            self.apply(&prefs);
         }
     }
 

@@ -332,8 +332,12 @@ impl FontPaths {
         Some(FontPaths { family, faces })
     }
 
-    /// The setting's value, or `None` if a path can't be written on one line.
+    /// The setting's value, or `None` if the family or a path can't be written on one line.
     pub fn value(&self) -> Option<String> {
+        // A name with a `|` would read back as a shorter family (and never match again).
+        if self.family.contains(['|', '\n', '\r']) {
+            return None;
+        }
         let mut out = self.family.clone();
         for face in &self.faces {
             out.push_str(" | ");
@@ -442,9 +446,18 @@ fn resolve(path: &Path) -> PathBuf {
     p
 }
 
+/// The file has no write permission (a config frozen on purpose): saving would replace it all
+/// the same, so it is left alone.
+fn frozen(path: &Path) -> bool {
+    std::fs::metadata(resolve(path)).is_ok_and(|m| m.permissions().readonly())
+}
+
 /// Write atomically: a temporary file next to the (resolved) file, with its permissions, then
-/// rename over it. Returns the new stamp.
+/// rename over it. A read-only file is not replaced (`PermissionDenied`). Returns the new stamp.
 pub fn save(path: &Path, settings: &Settings) -> io::Result<Option<Stamp>> {
+    if frozen(path) {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
     let target = resolve(path);
     let dir = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
     std::fs::create_dir_all(dir)?;
@@ -520,7 +533,8 @@ pub struct Store {
     saver: Saver,
     /// Changes not written yet, one per key.
     pending: Vec<(String, String)>,
-    /// The file couldn't be read faithfully: used as far as it parsed, never written.
+    /// The file couldn't be read faithfully, or has no write permission: used as far as it
+    /// parsed, never written.
     read_only: bool,
     /// A save found changes from outside and merged them in; the next [`Store::refresh`] reports
     /// them though the file's stamp is ours.
@@ -558,12 +572,17 @@ impl Store {
         &self.settings
     }
 
+    /// `loaded` can't be written back (see `read_only`).
+    fn locked(&self, loaded: &Loaded) -> bool {
+        !loaded.faithful || self.path.as_deref().is_some_and(frozen)
+    }
+
     /// Take `loaded` as the file's state, with the pending changes still on top (those the file
     /// already has are dropped).
     fn adopt(&mut self, loaded: Loaded) {
+        self.read_only = self.locked(&loaded);
         self.settings = loaded.settings;
         self.stamp = loaded.stamp;
-        self.read_only = !loaded.faithful;
         let settings = &mut self.settings;
         if self.read_only {
             self.pending.clear();
@@ -676,6 +695,11 @@ impl Store {
             self.adopt(load(&path));
             self.foreign = true;
         }
+        // Made read-only since it was read (the stamp doesn't show a chmod).
+        if !self.read_only && frozen(&path) {
+            self.read_only = true;
+            self.pending.clear();
+        }
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -696,17 +720,30 @@ impl Store {
         }
     }
 
+    /// The preferences if a save merged changes from outside into the file (they are not in the
+    /// view yet), once; so the next [`Store::record`] doesn't write the old values back.
+    pub fn take_merged(&mut self) -> Option<Prefs> {
+        std::mem::take(&mut self.foreign).then(|| self.prefs())
+    }
+
     /// Re-read the file if it changed on disk since it was last read or written (on focus;
     /// live apply). Returns the new preferences then. Changes not saved yet stay on
     /// top of what the file says (last write wins, as with two windows, and a failed save isn't
-    /// lost); they are saved as usual.
+    /// lost); they are saved as usual. A read-only store looks at the file every time: a chmod
+    /// doesn't change the stamp.
     pub fn refresh(&mut self) -> Option<Prefs> {
         let path = self.path.clone()?;
-        let foreign = std::mem::take(&mut self.foreign);
-        if stamp(&path) == self.stamp {
-            return foreign.then(|| self.prefs());
+        let merged = self.take_merged();
+        let changed = stamp(&path) != self.stamp;
+        if !changed && !self.read_only {
+            return merged;
         }
-        self.adopt(load(&path));
+        let loaded = load(&path);
+        // Still read-only and the same file: what was changed in this window stays.
+        if !changed && self.locked(&loaded) {
+            return merged;
+        }
+        self.adopt(loaded);
         Some(self.prefs())
     }
 

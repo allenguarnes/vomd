@@ -149,6 +149,15 @@ fn font_paths_round_trip() {
         faces: [Some(("/a|b.ttf".into(), 0)), None, None, None],
     };
     assert_eq!(bad.value(), None);
+    // A family name with a `|` would read back as a shorter one: not cached at all.
+    let piped = FontPaths {
+        family: "A | B".into(),
+        faces: [Some(("/a.ttf".into(), 0)), None, None, None],
+    };
+    assert_eq!(piped.value(), None);
+    let mut st = Store::open(None);
+    st.record_fonts(false, &piped, Instant::now());
+    assert_eq!(st.settings().get("font_sans_path"), None);
 }
 
 #[test]
@@ -666,6 +675,35 @@ fn pending_changes_stay_on_top_when_the_file_is_refreshed() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn a_merged_external_change_is_not_reverted_by_the_next_record() {
+    let dir = temp_dir("merged-theme");
+    let path = dir.join("settings.ini");
+    write_file(&path, "theme = light\n");
+    let t0 = Instant::now();
+    let mut a = Store::open(Some(path.clone()));
+    tick();
+    write_file(&path, "theme = dark\n");
+    a.record(ThemeMode::Light, 110, t0);
+    a.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "theme = dark\nzoom = 110\n"
+    );
+    // The window applies what the save merged, as the app does after each save.
+    let p = a.take_merged().expect("external changes were merged");
+    assert_eq!((p.theme, p.zoom), (ThemeMode::Dark, 110));
+    assert!(a.take_merged().is_none(), "reported once");
+    a.record(p.theme, 120, t0);
+    a.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "theme = dark\nzoom = 120\n",
+        "the external theme survives"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // ---- Files that can't be read faithfully ------------------------------------------------------
 
 /// A store on `bytes` writes nothing: not on a change, nor when the file is replaced (then it
@@ -797,6 +835,74 @@ fn a_dangling_symlink_gets_the_template_at_its_target() {
         TEMPLATE
     );
     assert!(!ensure_template(&link).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_file_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("frozen");
+    let path = dir.join("settings.ini");
+    write_file(&path, "# frozen\nzoom = 150\n");
+    let mode = |m| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o444);
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    assert_eq!(st.prefs().zoom, 150, "still read");
+    st.record(ThemeMode::Dark, 150, t0);
+    assert_eq!(st.deadline(), None, "nothing to save");
+    st.flush().unwrap();
+    assert_eq!(
+        save(&path, &Settings::default()).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let text = "# frozen\nzoom = 150\n";
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    // Made read-only while a change waits: dropped, not retried.
+    mode(0o644);
+    let mut st = Store::open(Some(path.clone()));
+    st.record(ThemeMode::Dark, 150, t0);
+    mode(0o444);
+    st.flush().unwrap();
+    assert_eq!(st.deadline(), None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_store_recovers_after_chmod_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("chmod");
+    let path = dir.join("settings.ini");
+    write_file(&path, "zoom = 150\n");
+    let mode = |m| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o444);
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    st.record(ThemeMode::Dark, 150, t0);
+    assert!(st.refresh().is_none(), "unchanged and still read-only");
+    assert_eq!(
+        st.prefs().theme,
+        ThemeMode::Dark,
+        "this window's changes stay"
+    );
+    mode(0o644);
+    let p = st
+        .refresh()
+        .expect("writable again, though stamp is the same");
+    assert_eq!((p.theme, p.zoom), (ThemeMode::System, 150), "the file wins");
+    st.record(ThemeMode::Light, 150, t0);
+    st.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "zoom = 150\ntheme = light\n"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
