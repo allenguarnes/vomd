@@ -1805,6 +1805,20 @@ mod with_fonts {
         assert_eq!(v.apply(Action::Quit, now), Outcome::Quit);
     }
 
+    /// The wheel and the scrolling keys go to the open dropdown, not the document under it.
+    #[test]
+    fn open_dropdown_takes_the_scrolling() {
+        let now = Instant::now();
+        let mut v = open_menu_view(now);
+        settle(&mut v);
+        v.scroll_by(100.0, now);
+        v.apply(Action::Pages(1), now);
+        assert_eq!(v.scroll(), 0.0, "the document stays put");
+        assert_eq!(v.apply(Action::Escape, now), Outcome::Redraw);
+        v.scroll_by(100.0, now);
+        assert!(v.scroll() > 0.0, "closed: the document scrolls");
+    }
+
     /// Widening the window until nothing overflows closes the dropdown that went with the
     /// `⋯`: the next press is the document's and Escape quits.
     #[test]

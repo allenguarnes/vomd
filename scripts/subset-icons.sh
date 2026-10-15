@@ -15,8 +15,13 @@ out=$(cd "$(dirname "$0")/.." && pwd)/assets/fonts
 #   (ToC, v1.2), image E0F6 (remote images, P10), search E151 (find).
 icons="U+E048,U+E11C,U+E13D,U+E09D,U+E149,U+E154,U+E0B6"
 
-pyftsubset "$src/font/lucide.ttf" --output-file="$out/icons.ttf" --unicodes="$icons" \
-  --layout-features='' --no-hinting --drop-tables+=DSIG,STAT,GSUB,GPOS,FFTM \
-  --name-IDs=0,1,2,3,4,5,6 --notdef-outline
+# The tables a renderer doesn't need are dropped (OS/2, name, post), and the em is cut from 1000
+# to 128 units: 8 units per pixel at toolbar sizes, and the smaller outline deltas take fewer bytes.
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+pyftsubset "$src/font/lucide.ttf" --output-file="$tmp" --unicodes="$icons" \
+  --layout-features='' --no-hinting --drop-tables+=DSIG,STAT,GSUB,GPOS,FFTM,OS/2,name,post \
+  --notdef-outline
+fonttools ttLib.scaleUpem --output-file="$out/icons.ttf" "$tmp" 128
 cp "$src/LICENSE" "$out/LICENSE-Lucide.txt"
 printf '%-28s %7d bytes\n' icons.ttf "$(stat -c %s "$out/icons.ttf")"

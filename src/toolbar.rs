@@ -169,125 +169,97 @@ impl Item {
     }
 }
 
-/// The right group's runs of items, in collapse order (first collapses first) and with their
-/// logical widths.
-fn right_groups(ctx: &Ctx) -> &'static [&'static [(Item, f32)]] {
-    const ALL: [&[(Item, f32)]; 4] = [
-        &[
-            (Item::ZoomOut, BUTTON),
-            (Item::ZoomReset, PERCENT),
-            (Item::ZoomIn, BUTTON),
-        ],
-        &[(Item::Theme, BUTTON)],
-        &[(Item::Reload, BUTTON)],
-        &[(Item::Settings, BUTTON)],
-    ];
-    if ctx.settings { &ALL } else { &ALL[..3] }
+/// The right group's items, left to right, with their logical widths and collapse groups: the
+/// lowest group collapses into `⋯` first. ⚙ is the last, and only there with a settings file.
+const RIGHT: [(Item, f32, u8); 6] = [
+    (Item::ZoomOut, BUTTON, 0),
+    (Item::ZoomReset, PERCENT, 0),
+    (Item::ZoomIn, BUTTON, 0),
+    (Item::Theme, BUTTON, 1),
+    (Item::Reload, BUTTON, 2),
+    (Item::Settings, BUTTON, 3),
+];
+
+/// The right group's items in this window: ⚙ only with a settings file.
+fn right_items(ctx: &Ctx) -> &'static [(Item, f32, u8)] {
+    &RIGHT[..5 + usize::from(ctx.settings)]
+}
+
+/// How many of the right group's leading groups don't fit and collapse into `⋯`.
+fn collapsed(ctx: &Ctx) -> u8 {
+    let right = right_items(ctx);
+    let mut first = 0;
+    while first <= right.last().map_or(0, |r| r.2) {
+        let rest: f32 = right.iter().filter(|r| r.2 >= first).map(|r| r.1).sum();
+        let more = if first > 0 { BUTTON } else { 0.0 };
+        if (EDGE + BUTTON + GAP + rest + more + EDGE) * ctx.scale <= ctx.width as f32 {
+            break;
+        }
+        first += 1;
+    }
+    first
 }
 
 /// The bar's layout for this frame: Back on the left, the right group laid out from the right
 /// edge, and as many of its leading groups as don't fit collapsed into `⋯`.
 pub fn slots(ctx: &Ctx) -> Slots {
     let s = ctx.scale;
-    let w = ctx.width as f32;
     let h = BAR * s;
-    let groups = right_groups(ctx);
-    let width_of = |g: &[(Item, f32)]| g.iter().map(|(_, gw)| gw * s).sum::<f32>();
-    let left = (EDGE + BUTTON + GAP) * s;
-    let total: f32 = groups.iter().map(|g| width_of(g)).sum();
-    // Collapse groups from the left until the rest, plus `⋯`, fits.
-    let mut first_shown = 0;
-    if left + total + EDGE * s > w {
-        let mut rest = total + BUTTON * s;
-        while first_shown < groups.len() && left + rest + EDGE * s > w {
-            rest -= width_of(groups[first_shown]);
-            first_shown += 1;
-        }
+    let (right, first) = (right_items(ctx), collapsed(ctx));
+    let bar = |x0, x1| Rect {
+        x0,
+        y0: 0.0,
+        x1,
+        y1: h,
+    };
+    let mut items = vec![(Item::Back, bar(EDGE * s, (EDGE + BUTTON) * s))];
+    let mut x = ctx.width as f32 - EDGE * s;
+    for &(item, iw, _) in right.iter().rev().filter(|r| r.2 >= first) {
+        items.push((item, bar(x - iw * s, x)));
+        x -= iw * s;
     }
-    let mut items = vec![(
-        Item::Back,
-        Rect {
-            x0: EDGE * s,
-            y0: 0.0,
-            x1: (EDGE + BUTTON) * s,
-            y1: h,
-        },
-    )];
-    let mut x = w - EDGE * s;
-    for (item, gw) in groups[first_shown..].iter().flat_map(|g| g.iter()).rev() {
-        let x0 = x - gw * s;
-        items.push((
-            *item,
-            Rect {
-                x0,
-                y0: 0.0,
-                x1: x,
-                y1: h,
-            },
-        ));
-        x = x0;
-    }
-    let overflow: Vec<Item> = groups[..first_shown]
-        .iter()
-        .flat_map(|g| g.iter())
-        .map(|(i, _)| *i)
-        .collect();
-    if !overflow.is_empty() {
+    let overflow: Vec<Item> = right.iter().filter(|r| r.2 < first).map(|r| r.0).collect();
+    if first > 0 {
         // Never over Back: in a window too narrow for both, `⋯` runs off the right edge.
         let x0 = (x - BUTTON * s).max((EDGE + BUTTON) * s);
-        items.push((
-            Item::More,
-            Rect {
-                x0,
-                y0: 0.0,
-                x1: x0 + BUTTON * s,
-                y1: h,
-            },
-        ));
+        items.push((Item::More, bar(x0, x0 + BUTTON * s)));
     }
     Slots { items, overflow }
 }
 
-/// The dropdown's rows: right-aligned under `⋯`, kept inside the window.
-fn menu_rows(ctx: &Ctx, slots: &Slots) -> Vec<(Item, Rect)> {
+/// The dropdown's box: right-aligned under `⋯`, kept inside the window and cut short at its
+/// bottom edge.
+fn menu_box(ctx: &Ctx, slots: &Slots) -> Option<Rect> {
     let s = ctx.scale;
-    let Some((_, more)) = slots.items.iter().find(|(i, _)| *i == Item::More) else {
-        return Vec::new();
-    };
+    let (_, more) = slots.items.iter().find(|(i, _)| *i == Item::More)?;
     let w = (MENU_W * s).min(ctx.width as f32);
     let x1 = more.x1.max(w).min(ctx.width as f32);
-    let x0 = x1 - w;
-    let y0 = BAR * s + 2.0 * s;
-    slots
-        .overflow
-        .iter()
-        .enumerate()
-        .map(|(n, &item)| {
-            let top = y0 + (EDGE * s) + n as f32 * ROW * s;
-            (
-                item,
-                Rect {
-                    x0,
-                    y0: top,
-                    x1,
-                    y1: top + ROW * s,
-                },
-            )
-        })
-        .collect()
+    let y0 = (BAR + 2.0) * s;
+    Some(Rect {
+        x0: x1 - w,
+        y0,
+        x1,
+        y1: (y0 + menu_height(ctx, slots))
+            .min(ctx.height as f32)
+            .max(y0),
+    })
 }
 
-/// The dropdown's whole box (rows plus padding).
-fn menu_box(ctx: &Ctx, rows: &[(Item, Rect)]) -> Option<Rect> {
-    let first = rows.first()?.1;
-    let last = rows.last()?.1;
-    let pad = EDGE * ctx.scale;
-    Some(Rect {
-        x0: first.x0,
-        y0: first.y0 - pad,
-        x1: first.x1,
-        y1: last.y1 + pad,
-    })
+/// The height of all of the dropdown's rows plus padding.
+fn menu_height(ctx: &Ctx, slots: &Slots) -> f32 {
+    (2.0 * EDGE + slots.overflow.len() as f32 * ROW) * ctx.scale
+}
+
+/// Row `n` of the dropdown (in `b`), scrolled up by `scroll` pixels: it's only seen inside the
+/// box.
+fn menu_row(ctx: &Ctx, b: Rect, scroll: f32, n: usize) -> Rect {
+    let s = ctx.scale;
+    let y0 = b.y0 + (EDGE + n as f32 * ROW) * s - scroll;
+    Rect {
+        y0,
+        y1: y0 + ROW * s,
+        ..b
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -295,7 +267,8 @@ pub struct Toolbar {
     hidden: bool,
     hover: Option<Spot>,
     pressed: Option<Spot>,
-    menu: bool,
+    /// The dropdown is open, scrolled up by this many pixels.
+    menu: Option<f32>,
     /// When the pointer came to rest on the hovered bar item (the tooltip's timer).
     hover_since: Option<Instant>,
     tooltip: bool,
@@ -329,18 +302,23 @@ impl Toolbar {
     /// The dropdown is open and has something to show: one that lost its `⋯` (a window widened
     /// until nothing overflows) counts as closed.
     fn open(&self, ctx: &Ctx) -> bool {
-        self.menu && !slots(ctx).overflow.is_empty()
+        self.menu.is_some() && collapsed(ctx) > 0
     }
 
     fn spot_at(&self, ctx: &Ctx, x: f64, y: f64) -> Option<Spot> {
-        if self.hidden {
+        // Nothing outside the window (a drag can end there), nor anything cut off by its edge.
+        if self.hidden
+            || !(0.0..f64::from(ctx.width)).contains(&x)
+            || !(0.0..f64::from(ctx.height)).contains(&y)
+        {
             return None;
         }
         let slots = slots(ctx);
-        if self.menu
-            && let Some(n) = menu_rows(ctx, &slots)
-                .iter()
-                .position(|(_, r)| r.contains(x, y))
+        if let Some(scroll) = self.menu
+            && let Some(b) = menu_box(ctx, &slots)
+            && b.contains(x, y)
+            && let Some(n) =
+                (0..slots.overflow.len()).find(|&n| menu_row(ctx, b, scroll, n).contains(x, y))
         {
             return Some(Spot::Row(n));
         }
@@ -360,7 +338,7 @@ impl Toolbar {
         if y >= 0.0 && y < f64::from(self.height(ctx.scale)) {
             return true;
         }
-        self.menu && menu_box(ctx, &menu_rows(ctx, &slots(ctx))).is_some_and(|b| b.contains(x, y))
+        self.menu.is_some() && menu_box(ctx, &slots(ctx)).is_some_and(|b| b.contains(x, y))
     }
 
     /// The pointer moved to (`x`, `y`). Returns true if the toolbar needs a repaint.
@@ -388,27 +366,17 @@ impl Toolbar {
     /// Mouse button down at (`x`, `y`). Returns true if the toolbar took it: on one of its
     /// items, or anywhere while the dropdown is open (an outside press closes it).
     pub fn press(&mut self, ctx: &Ctx, x: f64, y: f64) -> bool {
-        self.menu = self.open(ctx);
+        let was_open = self.open(ctx);
         let spot = self.spot_at(ctx, x, y);
+        // Another button closes the dropdown (and still acts); `⋯` toggles on release and a row
+        // closes it on release.
+        if !(was_open && matches!(spot, Some(Spot::Row(_) | Spot::Bar(Item::More)))) {
+            self.menu = None;
+        }
+        self.pressed = spot;
         self.tooltip = false;
         self.hover_since = None;
-        match spot {
-            Some(spot) => {
-                // Another button closes the dropdown (and still acts); `⋯` toggles on release.
-                if let Spot::Bar(item) = spot
-                    && item != Item::More
-                {
-                    self.menu = false;
-                }
-                self.pressed = Some(spot);
-                true
-            }
-            None if self.menu => {
-                self.menu = false;
-                true
-            }
-            None => self.covers(ctx, x, y),
-        }
+        spot.is_some() || was_open || self.covers(ctx, x, y)
     }
 
     /// Mouse button up at (`x`, `y`): a press and release on the same enabled item is a click.
@@ -422,14 +390,14 @@ impl Toolbar {
         }
         let item = match pressed {
             Spot::Bar(Item::More) => {
-                self.menu = !self.menu;
+                self.menu = self.menu.is_none().then_some(0.0);
                 return (true, None);
             }
             Spot::Bar(item) => item,
             Spot::Row(n) => {
-                self.menu = false;
-                match menu_rows(ctx, &slots(ctx)).get(n) {
-                    Some(&(item, _)) => item,
+                self.menu = None;
+                match slots(ctx).overflow.get(n) {
+                    Some(&item) => item,
                     None => return (true, None),
                 }
             }
@@ -441,12 +409,24 @@ impl Toolbar {
     /// Close the dropdown (Escape, a resize). Returns true if it was open.
     pub fn close_menu(&mut self, ctx: &Ctx) -> bool {
         let was = self.open(ctx);
-        self.menu = false;
+        self.menu = None;
         was
     }
 
     pub fn menu_open(&self, ctx: &Ctx) -> bool {
         self.open(ctx)
+    }
+
+    /// The wheel (or an arrow key) moves the dropdown's rows by `dy` pixels when the window
+    /// cuts it short. Returns true if the dropdown is open: it takes the scrolling.
+    pub fn scroll_menu(&mut self, ctx: &Ctx, dy: f32) -> bool {
+        let slots = slots(ctx);
+        let (Some(scroll), Some(b)) = (self.menu, menu_box(ctx, &slots)) else {
+            return false;
+        };
+        let max = (menu_height(ctx, &slots) - (b.y1 - b.y0)).max(0.0);
+        self.menu = Some((scroll + dy).max(0.0).min(max));
+        true
     }
 
     /// When the loop must wake to show the tooltip (`None`: no timer).
@@ -488,62 +468,45 @@ impl Toolbar {
         frame.fill_rect(0, 0, w, h, theme.code_bg);
         frame.fill_rect(0, h - line, w, h, theme.border);
         let slots = slots(ctx);
-        let open = self.menu && !slots.overflow.is_empty();
+        let scroll = self.menu.filter(|_| !slots.overflow.is_empty());
+        let open = scroll.is_some();
         for &(item, rect) in &slots.items {
-            let spot = Spot::Bar(item);
             let on = item == Item::More && open;
-            self.paint_item(frame, ctx, item, rect, spot, on, fonts, cache, text, theme);
+            self.paint_item(
+                frame,
+                ctx,
+                item,
+                rect,
+                Spot::Bar(item),
+                on,
+                fonts,
+                cache,
+                text,
+                theme,
+            );
         }
-        if open {
-            let rows = menu_rows(ctx, &slots);
-            if let Some(b) = menu_box(ctx, &rows) {
-                let r = (4.0 * s).round();
-                frame.rounded_rect(b.px(), r, None, theme.bg, 255);
-                frame.rounded_rect(b.px(), r, Some(line as f32), theme.border, 255);
-            }
-            // Row text stays inside the box, however narrow the window.
-            let prev = rows.first().map(|(_, r)| {
-                frame.set_clip(render::Clip {
-                    x0: r.px().0,
-                    y0: 0,
-                    x1: r.px().2 - (EDGE * s) as i32,
-                    y1: ctx.height as i32,
-                })
+        if let Some(scroll) = scroll
+            && let Some(b) = menu_box(ctx, &slots)
+        {
+            let r = (4.0 * s).round();
+            frame.rounded_rect(b.px(), r, None, theme.bg, 255);
+            frame.rounded_rect(b.px(), r, Some(line as f32), theme.border, 255);
+            // Rows (and their text) stay inside the box, however narrow or short the window.
+            let (x0, y0, x1, y1) = b.px();
+            let prev = frame.set_clip(render::Clip {
+                x0,
+                y0,
+                x1: x1 - (EDGE * s) as i32,
+                y1,
             });
-            for (n, &(item, rect)) in rows.iter().enumerate() {
-                let hot = self.hover == Some(Spot::Row(n));
-                if hot {
-                    frame.fill_rect(
-                        rect.px().0 + line,
-                        rect.px().1,
-                        rect.px().2 - line,
-                        rect.px().3,
-                        theme.code_bg,
-                    );
-                }
-                let color = if item.enabled(ctx) {
-                    theme.text
-                } else {
-                    theme.border
-                };
-                let icon_box = Rect {
-                    x1: rect.x0 + ROW * s,
-                    ..rect
-                };
-                if let Some(c) = item.icon() {
-                    draw_icon(frame, fonts, cache, c, icon_box, s, color);
-                }
-                let label_box = Rect {
-                    x0: icon_box.x1,
-                    x1: rect.x1 - EDGE * s,
-                    ..rect
-                };
-                let p = layout_label(fonts, text, &item.label(ctx), label_box, s, true);
-                paint_label(frame, fonts, cache, &p, color, theme);
+            for (n, &item) in slots.overflow.iter().enumerate() {
+                let rect = menu_row(ctx, b, scroll, n);
+                let spot = Spot::Row(n);
+                self.paint_item(
+                    frame, ctx, item, rect, spot, false, fonts, cache, text, theme,
+                );
             }
-            if let Some(prev) = prev {
-                frame.set_clip(prev);
-            }
+            frame.set_clip(prev);
         }
         if self.tooltip
             && let Some(Spot::Bar(item)) = self.hover
@@ -580,7 +543,7 @@ impl Toolbar {
         let enabled = item.enabled(ctx);
         let hot = enabled && self.hover == Some(spot);
         let down = hot && self.pressed == Some(spot);
-        if hot || down || on {
+        if hot || on {
             let inset = 3.0 * s;
             let r = Rect {
                 x0: rect.x0 + inset,
@@ -591,19 +554,38 @@ impl Toolbar {
             let alpha = if down || on { 200 } else { 110 };
             frame.rounded_rect(r.px(), (4.0 * s).round(), None, theme.border, alpha);
         }
+        let row = matches!(spot, Spot::Row(_));
         let color = if !enabled {
             theme.border
-        } else if hot || on {
+        } else if hot || on || row {
             theme.text
         } else {
             theme.muted
         };
-        match item.icon() {
-            Some(c) => draw_icon(frame, fonts, cache, c, rect, s, color),
-            None => {
-                let p = layout_label(fonts, text, &format!("{}%", ctx.zoom), rect, s, false);
-                paint_label(frame, fonts, cache, &p, color, theme);
-            }
+        // A row has its icon in a square at the left and its label next to it; a bar item's
+        // icon, or the zoom percentage, is centered in its button.
+        let x = rect.x0 + ROW * s;
+        let (icon_box, label_box) = if row {
+            let label = Rect {
+                x0: x,
+                x1: rect.x1 - EDGE * s,
+                ..rect
+            };
+            (Rect { x1: x, ..rect }, label)
+        } else {
+            (rect, rect)
+        };
+        if let Some(c) = item.icon() {
+            draw_icon(frame, fonts, cache, c, icon_box, s, color);
+        }
+        let label = if row {
+            Some(item.label(ctx))
+        } else {
+            item.icon().is_none().then(|| format!("{}%", ctx.zoom))
+        };
+        if let Some(label) = label {
+            let p = layout_label(fonts, text, &label, label_box, s, row);
+            paint_label(frame, fonts, cache, &p, color, theme);
         }
     }
 }
@@ -704,24 +686,23 @@ fn paint_tooltip(
     under: Rect,
 ) {
     let s = ctx.scale;
-    let mut placed = layout_label(fonts, text, label, under, s, true);
-    let lw = placed.width;
-    let (pad_x, pad_y) = (8.0 * s, 4.0 * s);
-    let bw = lw + 2.0 * pad_x;
-    let bh = LABEL * 1.3 * s + 2.0 * pad_y;
+    let pad_x = 8.0 * s;
+    let y0 = under.y1 + 4.0 * s;
+    let y1 = y0 + (LABEL * 1.3 + 8.0) * s;
+    // The text is centered between the box's top and bottom; its left edge is set below.
+    let mut placed = layout_label(fonts, text, label, Rect { y0, y1, ..under }, s, true);
+    let bw = placed.width + 2.0 * pad_x;
     let x0 = ((under.x0 + under.x1 - bw) / 2.0)
         .min(ctx.width as f32 - bw - EDGE * s)
         .max(EDGE * s);
-    let y0 = under.y1 + 4.0 * s;
     let b = Rect {
         x0,
         y0,
         x1: x0 + bw,
-        y1: y0 + bh,
+        y1,
     };
     frame.rounded_rect(b.px(), (4.0 * s).round(), None, theme.text, 235);
-    placed.x = b.x0 + pad_x;
-    placed.y += b.y0 + (b.y1 - b.y0) / 2.0 - (under.y0 + under.y1) / 2.0;
+    placed.x = x0 + pad_x;
     paint_label(frame, fonts, cache, &placed, theme.bg, theme);
 }
 

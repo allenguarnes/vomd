@@ -626,7 +626,12 @@ impl View {
         self.anchor = self.layout.anchor_exact(y.clamp(0.0, self.max_scroll()));
     }
 
+    /// Scroll by `dy` physical pixels; the toolbar's open dropdown takes it instead of the
+    /// document.
     pub fn scroll_by(&mut self, dy: f64, now: Instant) {
+        if self.toolbar.scroll_menu(&self.toolbar_ctx(), dy as f32) {
+            return;
+        }
         self.set_scroll(self.scroll() + dy);
         self.fade.poke(now);
     }

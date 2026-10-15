@@ -16,6 +16,14 @@ fn items(s: &Slots) -> Vec<Item> {
     s.items.iter().map(|(i, _)| *i).collect()
 }
 
+/// The dropdown's rows, scrolled by `scroll`.
+fn menu_rows(c: &Ctx, s: &Slots, scroll: f32) -> Vec<(Item, Rect)> {
+    let b = menu_box(c, s).unwrap();
+    (0..s.overflow.len())
+        .map(|n| (s.overflow[n], menu_row(c, b, scroll, n)))
+        .collect()
+}
+
 fn center(s: &Slots, item: Item) -> (f64, f64) {
     let r = s.items.iter().find(|(i, _)| *i == item).unwrap().1;
     (
@@ -147,7 +155,7 @@ fn dropdown_opens_selects_and_closes() {
     t.press(&c, mx, my);
     assert_eq!(t.release(&c, mx, my), (true, None));
     assert!(t.menu_open(&c));
-    let rows = menu_rows(&c, &s);
+    let rows = menu_rows(&c, &s, 0.0);
     assert_eq!(rows.len(), s.overflow.len());
     assert!(
         rows.iter().all(|(_, r)| r.x0 >= 0.0 && r.x1 <= 200.0),
@@ -172,6 +180,98 @@ fn dropdown_opens_selects_and_closes() {
     t.release(&c, mx, my);
     assert!(t.close_menu(&c));
     assert!(!t.close_menu(&c));
+}
+
+/// Nothing outside the window is hit: a drag can end there, and rows or buttons the window's
+/// edge cuts off are only hit inside it.
+#[test]
+fn nothing_outside_the_window_is_hit() {
+    let c = Ctx {
+        height: 100,
+        ..ctx(200)
+    };
+    let s = slots(&c);
+    let mut t = Toolbar::default();
+    let (mx, my) = center(&s, Item::More);
+    t.press(&c, mx, my);
+    t.release(&c, mx, my);
+    let rows = menu_rows(&c, &s, 0.0);
+    let (item, r) = rows[2];
+    assert_eq!(item, Item::ZoomIn);
+    assert!(r.y1 > 100.0, "the row runs past the window");
+    let x = f64::from(r.x0 + 5.0);
+    assert!(t.press(&c, x, 98.0));
+    assert_eq!(t.release(&c, x, 110.0), (true, None), "released below");
+    assert!(t.menu_open(&c), "still open: no click happened");
+    // The same click that ends inside the window acts.
+    t.press(&c, x, 98.0);
+    assert_eq!(t.release(&c, x, 99.0), (true, item.command()));
+    // A bar button cut off by a very short window.
+    let c = Ctx {
+        height: 20,
+        ..ctx(900)
+    };
+    let (bx, _) = center(&slots(&c), Item::Back);
+    t.press(&c, bx, 19.0);
+    assert_eq!(t.release(&c, bx, 25.0), (true, None));
+    t.press(&c, bx, 19.0);
+    assert_eq!(t.release(&c, bx, 19.5), (true, Item::Back.command()));
+}
+
+/// Every row of a dropdown the window cuts short is reachable by scrolling it, and the
+/// scrolling stops at both ends.
+#[test]
+fn short_window_scrolls_the_dropdown() {
+    let c = Ctx {
+        height: 100,
+        ..ctx(150)
+    };
+    let s = slots(&c);
+    assert_eq!(s.overflow.len(), 4, "zoom and theme are in the dropdown");
+    let mut t = Toolbar::default();
+    assert!(!t.scroll_menu(&c, 10.0), "closed: the document's");
+    let (mx, my) = center(&s, Item::More);
+    for (n, &item) in s.overflow.iter().enumerate() {
+        t.press(&c, mx, my);
+        t.release(&c, mx, my);
+        assert!(t.menu_open(&c));
+        // Row `n` to the top, as far as the end of the list allows.
+        assert!(t.scroll_menu(&c, n as f32 * ROW));
+        let b = menu_box(&c, &s).unwrap();
+        assert!(b.y1 <= 100.0, "the box ends with the window");
+        let r = menu_row(&c, b, t.menu.unwrap(), n);
+        assert!(
+            r.y0 >= b.y0 && r.y1 <= b.y1,
+            "row {n} is in the box: {r:?} {b:?}"
+        );
+        let (x, y) = (f64::from(r.x0 + 5.0), f64::from((r.y0 + r.y1) / 2.0));
+        assert!(t.covers(&c, x, y));
+        t.press(&c, x, y);
+        assert_eq!(t.release(&c, x, y), (true, item.command()), "row {n}");
+    }
+    // The ends: nothing above the first row, nothing below the last.
+    t.press(&c, mx, my);
+    t.release(&c, mx, my);
+    assert!(t.scroll_menu(&c, -1.0e6));
+    assert_eq!(t.menu, Some(0.0));
+    assert!(t.scroll_menu(&c, 1.0e6));
+    let b = menu_box(&c, &s).unwrap();
+    let last = menu_row(&c, b, t.menu.unwrap(), 3);
+    assert_eq!(
+        last.y1 + EDGE,
+        b.y1,
+        "the last row ends at the box's padding"
+    );
+    assert!(t.scroll_menu(&c, f32::NAN));
+    assert_eq!(t.menu, Some(0.0), "NaN is no scroll");
+    // A dropdown that fits has nothing to scroll.
+    let tall = ctx(150);
+    let mut t = Toolbar::default();
+    let (mx, my) = center(&slots(&tall), Item::More);
+    t.press(&tall, mx, my);
+    t.release(&tall, mx, my);
+    assert!(t.scroll_menu(&tall, 50.0), "open: it takes the scrolling");
+    assert_eq!(t.menu, Some(0.0));
 }
 
 /// A press on another bar button closes the dropdown and still acts.
