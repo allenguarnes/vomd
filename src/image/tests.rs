@@ -364,6 +364,144 @@ fn a_png_read_by_rows_decodes_like_its_whole_frame() {
     assert_eq!(decode_png(cut, 10, 10, false), None);
 }
 
+/// The image resampled by averaging the source area under each target pixel a column at a time
+/// first (the order before rows were reduced to the target width as they came), a whole frame.
+fn resampled_columns_first(frame: &Frame, w: u32, h: u32) -> Vec<u32> {
+    let (xs, ys) = (spans(frame.width, w), spans(frame.height, h));
+    let (sw, ch) = (frame.width as usize, frame.channels);
+    let mut acc = vec![0f32; sw * 4];
+    let mut data = Vec::new();
+    for (y0, wy) in &ys {
+        acc.fill(0.0);
+        for (k, &weight) in wy.iter().enumerate() {
+            let row = &frame.data[(y0 + k) * frame.stride..];
+            for (a, p) in acc.chunks_exact_mut(4).zip(row.chunks_exact(ch)) {
+                let al = f32::from(p[3]) * weight;
+                a[0] += f32::from(p[0]) * al;
+                a[1] += f32::from(p[1]) * al;
+                a[2] += f32::from(p[2]) * al;
+                a[3] += al;
+            }
+        }
+        for (x0, wx) in &xs {
+            let mut px = [0f32; 4];
+            for (k, &weight) in wx.iter().enumerate() {
+                for c in 0..4 {
+                    px[c] += acc[(x0 + k) * 4 + c] * weight;
+                }
+            }
+            let q = |v: f32, scale: f32| (v / scale).round().clamp(0.0, 255.0) as u32;
+            let a = q(px[3], 1.0);
+            let (r, g, b) = (
+                q(px[0], 255.0).min(a),
+                q(px[1], 255.0).min(a),
+                q(px[2], 255.0).min(a),
+            );
+            data.push(a << 24 | r << 16 | g << 8 | b);
+        }
+    }
+    data
+}
+
+/// Reducing each row to the target width first gives the pixels the average of the area gives
+/// (the float sums are in another order: a channel may differ by 1 in the last place).
+#[test]
+fn rows_reduced_first_resample_like_columns_first() {
+    let noise = |x: u32, y: u32| {
+        let v = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503) ^ (x * y);
+        [
+            v as u8,
+            (v >> 8) as u8,
+            (v >> 16) as u8,
+            255 - (v >> 4) as u8 % 90,
+        ]
+    };
+    for (sw, sh) in [(1, 1), (7, 5), (64, 3), (3, 64), (101, 97), (640, 480)] {
+        let data: Vec<u8> = (0..sh)
+            .flat_map(|y| (0..sw).flat_map(move |x| noise(x, y)))
+            .collect();
+        for (w, h) in [
+            (1, 1),
+            (2, 3),
+            (sw, sh),
+            (sw / 2 + 1, sh * 2),
+            (200, 150),
+            (97, 61),
+        ] {
+            let frame = Frame {
+                data: &data,
+                width: sw,
+                height: sh,
+                stride: sw as usize * 4,
+                channels: 4,
+            };
+            let new = resample(
+                Frame {
+                    data: &data,
+                    ..frame
+                },
+                w,
+                h,
+            )
+            .unwrap();
+            let old = resampled_columns_first(&frame, w, h);
+            let mut exact = 0;
+            for (a, b) in new.data.iter().zip(&old) {
+                let d = |s: u32| ((a >> s) & 0xff).abs_diff((b >> s) & 0xff);
+                assert!(
+                    d(0).max(d(8)).max(d(16)).max(d(24)) <= 1,
+                    "{sw}×{sh} to {w}×{h}"
+                );
+                exact += usize::from(a == b);
+            }
+            assert!(
+                exact * 10 >= old.len() * 9,
+                "{sw}×{sh} to {w}×{h}: {exact}/{}",
+                old.len()
+            );
+        }
+    }
+}
+
+/// A PNG's side is at most 65,535, so no row of it (or sum over a row) is bigger than that:
+/// 64,000,000 × 1 is within the pixel limit but made rows of 256 MB and sums of 1 GB.
+#[test]
+fn a_very_wide_png_is_refused_or_decoded_in_rows() {
+    let ihdr = |w: u32, h: u32| {
+        let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        b.extend(w.to_be_bytes());
+        b.extend(h.to_be_bytes());
+        b.extend([8, 6, 0, 0, 0]);
+        b
+    };
+    for (w, h) in [
+        (64_000_000, 1),
+        (1, 64_000_000),
+        (65_536, 1),
+        (8_000_000, 8),
+    ] {
+        let png = ihdr(w, h);
+        assert_eq!(header(&mut &png[..]), None, "{w}×{h}");
+        assert_eq!(decode(&png, 100, 100), None, "{w}×{h}");
+    }
+    assert_eq!(
+        header(&mut &ihdr(65_535, 976)[..]),
+        Some((Format::Png, 65_535, 976))
+    );
+    // The widest, shrunk and enlarged, with a row a time held.
+    let noise = |x: u32, y: u32| [x as u8, (x >> 8) as u8 ^ y as u8, (x * 7) as u8, 255];
+    let png = png_bytes(MAX_SOURCE_SIDE, 4, noise);
+    let b = decode(&png, 300, 2).unwrap();
+    assert_eq!((b.width, b.height, b.data.len()), (300, 2, 600));
+    let tall = png_bytes(1, MAX_SOURCE_SIDE, noise);
+    let b = decode(&tall, 1, 300).unwrap();
+    assert_eq!((b.width, b.height, b.data.len()), (1, 300, 300));
+    let dir = scratch("wide");
+    std::fs::write(dir.join("w.png"), &png).unwrap();
+    assert_eq!(probe_file(&dir.join("w.png")), Some((MAX_SOURCE_SIDE, 4)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Pixels are premultiplied, and a transparent neighbor doesn't darken or tint an edge.
 #[test]
 fn transparency_is_premultiplied() {
@@ -614,6 +752,53 @@ fn images_beyond_the_cache_are_not_decoded_over_and_over() {
     let has = |i, images: &Images| images.cache.has(&Key::Local(i), 100, 100);
     assert!(has(1, &images) && has(2, &images) && has(3, &images));
     assert!(!has(4, &images), "the fourth doesn't fit");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A decode's own memory is kept free of the cache: slots not painted this frame are evicted
+/// to make room for the biggest job, and none painted this frame.
+#[test]
+fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
+    use crate::render::Pixels;
+    let dir = scratch("room");
+    std::fs::write(dir.join("a.jpg"), fixture("wide.jpg")).unwrap();
+    let doc = Doc::parse("![a](a.jpg) ![b](b.png) ![c](c.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    // The JPEG is 600 × 200: a frame of 360,000 bytes of RGB, and its file.
+    let file = std::fs::metadata(dir.join("a.jpg")).unwrap().len() as usize;
+    assert_eq!(images.cost(1), 360_000 + file);
+    // Two other slots of 100,000 bytes beside it, in a cache that has no room for them and the
+    // decode: one painted this frame.
+    let slot = |n| {
+        Data::Pixels(Bitmap {
+            width: n,
+            height: 1,
+            data: vec![0; n as usize],
+        })
+    };
+    images.cache.cap = 500_000;
+    images.srcs[1] = Src::File(dir.join("b.png"));
+    images.srcs[2] = Src::File(dir.join("c.png"));
+    images.cache.insert(Key::Local(2), slot(25_000));
+    images.cache.insert(Key::Local(3), slot(25_000));
+    images.begin_frame();
+    let _ = images.pixels(3, 25_000, 1);
+    images.request(&[(1, 600, 200)], 1);
+    assert_eq!(images.cache.reserve, 360_000 + file);
+    assert!(
+        !images.cache.has(&Key::Local(2), 25_000, 1),
+        "evicted for the decode"
+    );
+    assert!(images.cache.has(&Key::Local(3), 25_000, 1), "painted: kept");
+    // Once nothing is queued nothing is kept free.
+    images.request(&[], 0);
+    assert_eq!(
+        images.cache.reserve,
+        images.worker.as_ref().map_or(0, Worker::busy_cost)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

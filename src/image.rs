@@ -10,7 +10,7 @@
 // Without decoders nothing is ever queued: the worker and the cache are dead code.
 #![cfg_attr(not(feature = "images"), allow(dead_code))]
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -29,6 +29,9 @@ pub const MAX_PIXELS: u64 = 64_000_000;
 /// Largest side of an image box, and so of a decoded (resampled) image: layout never makes a
 /// box bigger, so what it asks for is what `decode` makes.
 pub const MAX_SIDE: u32 = 16_384;
+/// Largest side of an image decoded, at most: a JPEG's own limit. A PNG may claim 2³¹ − 1, which
+/// even within [`MAX_PIXELS`] (64,000,000 × 1) makes rows of hundreds of MB.
+pub const MAX_SOURCE_SIDE: u32 = 65_535;
 /// Bytes of a JPEG looked through for its size, at most (segments before the frame header are
 /// metadata: EXIF, color profiles, thumbnails).
 const MAX_HEADER_SCAN: u64 = 4 << 20;
@@ -54,7 +57,7 @@ pub enum Format {
 
 /// The format and natural size of the image `r` starts with, read from the PNG `IHDR` chunk
 /// or the JPEG frame header (`SOFn`). `None` for anything else (GIF, WebP, SVG, ...), broken
-/// data or a zero size.
+/// data, a zero size or a side over [`MAX_SOURCE_SIDE`].
 pub fn header(r: &mut impl Read) -> Option<(Format, u32, u32)> {
     let mut start = [0u8; 2];
     r.read_exact(&mut start).ok()?;
@@ -68,8 +71,7 @@ pub fn header(r: &mut impl Read) -> Option<(Format, u32, u32)> {
             }
             let be = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
             let (w, h) = (be(14), be(18));
-            // PNG sizes are at most 2³¹ − 1.
-            let ok = (1..=i32::MAX as u32).contains(&w) && (1..=i32::MAX as u32).contains(&h);
+            let ok = (1..=MAX_SOURCE_SIDE).contains(&w) && (1..=MAX_SOURCE_SIDE).contains(&h);
             ok.then_some((Format::Png, w, h))
         }
         [0xFF, 0xD8] => jpeg_size(r).map(|(w, h)| (Format::Jpeg, w, h)),
@@ -204,7 +206,7 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
 }
 
 /// The natural size of a local PNG or JPEG, from its header (`None`: missing, unreadable, not
-/// PNG or JPEG, or too large to decode).
+/// PNG or JPEG, or too large to decode: see [`MAX_PIXELS`] and [`MAX_SOURCE_SIDE`]).
 pub fn probe_file(path: &Path) -> Option<(u32, u32)> {
     let file = open_regular(path)?;
     let (_, w, h) = header(&mut std::io::BufReader::with_capacity(4096, file))?;
@@ -230,6 +232,37 @@ fn read_file(path: &Path) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(len + 1);
     file.take(MAX_FILE + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= MAX_FILE).then_some(bytes)
+}
+
+/// What decoding an image of `w` × `h` holds besides the file's bytes and the result, at most:
+/// a JPEG's whole frame of RGB (nothing smaller is had from its decoder), an interlaced PNG's
+/// whole frame, or a few rows of a PNG that isn't (read a row at a time).
+fn decode_cost(format: Format, interlaced: bool, w: u32, h: u32) -> usize {
+    let pixels = w as usize * h as usize;
+    match format {
+        Format::Jpeg => pixels * 3,
+        Format::Png if interlaced => pixels * 4,
+        Format::Png => w as usize * 32,
+    }
+}
+
+/// [`decode_cost`] of a local file and the file's bytes (read whole), from its header (`None`:
+/// see [`probe_file`]).
+fn file_cost(path: &Path) -> Option<usize> {
+    let file = open_regular(path)?;
+    let len = file.metadata().ok()?.len() as usize;
+    let mut r = std::io::BufReader::with_capacity(4096, file);
+    // The interlace method is the last byte of a PNG's `IHDR`.
+    let interlaced = r.fill_buf().ok()?.get(28) == Some(&1);
+    let (format, w, h) = header(&mut r)?;
+    Some(len.saturating_add(decode_cost(format, interlaced, w, h)))
+}
+
+/// [`decode_cost`] of an image already in memory.
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+fn bytes_cost(bytes: &[u8]) -> Option<usize> {
+    let (format, w, h) = header(&mut &bytes[..])?;
+    Some(decode_cost(format, bytes.get(28) == Some(&1), w, h))
 }
 
 // ---- Decoding ---------------------------------------------------------------------------
@@ -302,11 +335,7 @@ fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
         png::ColorType::Indexed => return None,
     };
     if rows && !reader.info().interlaced {
-        let mut frame = PngRows {
-            reader,
-            row: Vec::new(),
-            next: 0,
-        };
+        let mut frame = PngRows { reader, next: 0 };
         return resample_rows(&mut frame, (width, height), channels, w, h);
     }
     let mut buf = vec![0; reader.output_buffer_size()?];
@@ -321,11 +350,11 @@ fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
     resample(frame, w, h)
 }
 
-/// The source rows of an image, as [`resample_rows`] takes them: it only ever asks for the row
-/// it last had or the next ones.
+/// The source rows of an image, as [`resample_rows`] takes them: each at most once, in order.
 trait Rows {
-    /// Row `y` (`channels` bytes a pixel, at least a row's worth; more is ignored), or `None` if
-    /// it can't be had: the data ended, or `y` is before the row the source is at.
+    /// Row `y` (`channels` bytes a pixel, at least a row's worth; more is ignored), valid until
+    /// the next call, or `None` if it can't be had: the data ended, or `y` is before the row the
+    /// source is at.
     fn row(&mut self, y: usize) -> Option<&[u8]>;
 }
 
@@ -345,24 +374,25 @@ impl Rows for Frame<'_> {
     }
 }
 
-/// A PNG decoded a row at a time: `row` holds row `next - 1`.
+/// A PNG decoded a row at a time, `next` the row the decoder is at.
 #[cfg(feature = "images")]
 struct PngRows<'a> {
     reader: png::Reader<std::io::Cursor<&'a [u8]>>,
-    row: Vec<u8>,
     next: usize,
 }
 
 #[cfg(feature = "images")]
 impl Rows for PngRows<'_> {
     fn row(&mut self, y: usize) -> Option<&[u8]> {
-        while self.next <= y {
-            let row = self.reader.next_row().ok()??;
-            self.row.clear();
-            self.row.extend_from_slice(row.data());
-            self.next += 1;
+        if y < self.next {
+            return None;
         }
-        (self.next == y + 1).then_some(&self.row)
+        // Rows skipped are decoded and dropped; the one asked for is the decoder's own buffer.
+        for _ in self.next..y {
+            self.reader.next_row().ok()??;
+        }
+        self.next = y + 1;
+        Some(self.reader.next_row().ok()??.data())
     }
 }
 
@@ -391,10 +421,10 @@ fn spans(src: u32, dst: u32) -> Vec<(usize, Vec<f32>)> {
 
 /// Resample an image of `sw` × `sh` pixels to `w` × `h` by averaging the source area under each
 /// target pixel, premultiplied (transparent pixels don't bleed their color). Shrinking averages
-/// many pixels; enlarging (a HiDPI window) blends the one or two under each edge. Works a target
-/// row at a time and takes the source rows in order, each target row sharing at most its first
-/// source row with the last of the one before, so the only extra memory is one row of sums.
-/// `None` if the source ends early.
+/// many pixels; enlarging (a HiDPI window) blends the one or two under each edge. Each source row
+/// is taken once, in order, and reduced to the target width at once, then summed into the target
+/// row under it (the one row of the next target row it shares is kept): the extra memory is two
+/// rows of the target width however wide the source is. `None` if the source ends early.
 fn resample_rows(
     rows: &mut impl Rows,
     (sw, sh): (u32, u32),
@@ -404,34 +434,24 @@ fn resample_rows(
 ) -> Option<Bitmap> {
     let sw_px = sw as usize;
     let (xs, ys) = (spans(sw, w), spans(sh, h));
-    let mut acc = vec![0f32; sw_px * 4];
+    // The last source row, reduced to the target width: (its index, premultiplied sums).
+    let mut reduced = (usize::MAX, vec![0f32; w as usize * 4]);
+    let mut acc = vec![0f32; w as usize * 4];
     let mut data = Vec::with_capacity(w as usize * h as usize);
     for (y0, wy) in &ys {
         acc.fill(0.0);
         for (k, &weight) in wy.iter().enumerate() {
-            let row = rows.row(y0 + k)?.get(..sw_px * channels)?;
-            for (a, p) in acc.chunks_exact_mut(4).zip(row.chunks_exact(channels)) {
-                let (r, g, b, alpha) = match channels {
-                    1 => (p[0], p[0], p[0], 255),
-                    2 => (p[0], p[0], p[0], p[1]),
-                    3 => (p[0], p[1], p[2], 255),
-                    _ => (p[0], p[1], p[2], p[3]),
-                };
-                let al = f32::from(alpha) * weight;
-                a[0] += f32::from(r) * al;
-                a[1] += f32::from(g) * al;
-                a[2] += f32::from(b) * al;
-                a[3] += al;
+            let y = y0 + k;
+            if reduced.0 != y {
+                let row = rows.row(y)?.get(..sw_px * channels)?;
+                reduce_row(row, channels, &xs, &mut reduced.1);
+                reduced.0 = y;
+            }
+            for (a, r) in acc.iter_mut().zip(&reduced.1) {
+                *a += r * weight;
             }
         }
-        for (x0, wx) in &xs {
-            let mut px = [0f32; 4];
-            for (k, &weight) in wx.iter().enumerate() {
-                let a = &acc[(x0 + k) * 4..];
-                for c in 0..4 {
-                    px[c] += a[c] * weight;
-                }
-            }
+        for px in acc.chunks_exact(4) {
             // Color sums carry a factor 255 from the alpha they're premultiplied by.
             let ch = |v: f32, scale: f32| (v / scale).round().clamp(0.0, 255.0) as u32;
             let a = ch(px[3], 1.0);
@@ -448,6 +468,27 @@ fn resample_rows(
         height: h,
         data,
     })
+}
+
+/// One source row (`channels` bytes a pixel) averaged along its width into `out`, four floats
+/// (premultiplied r, g, b and alpha) per target pixel, by the `xs` spans.
+fn reduce_row(row: &[u8], channels: usize, xs: &[(usize, Vec<f32>)], out: &mut [f32]) {
+    for ((x0, wx), px) in xs.iter().zip(out.chunks_exact_mut(4)) {
+        px.fill(0.0);
+        for (p, &weight) in row[x0 * channels..].chunks_exact(channels).zip(wx) {
+            let (r, g, b, alpha) = match channels {
+                1 => (p[0], p[0], p[0], 255),
+                2 => (p[0], p[0], p[0], p[1]),
+                3 => (p[0], p[1], p[2], 255),
+                _ => (p[0], p[1], p[2], p[3]),
+            };
+            let al = f32::from(alpha) * weight;
+            px[0] += f32::from(r) * al;
+            px[1] += f32::from(g) * al;
+            px[2] += f32::from(b) * al;
+            px[3] += al;
+        }
+    }
 }
 
 // ---- The cache ------------------------------------------------------------------------------
@@ -495,6 +536,8 @@ struct Cache {
     slots: Vec<Slot>,
     bytes: usize,
     cap: usize,
+    /// What the worker's decodes hold while they run, at most: it comes out of the budget.
+    reserve: usize,
     frame: u64,
 }
 
@@ -504,6 +547,7 @@ impl Cache {
             slots: Vec::new(),
             bytes: 0,
             cap,
+            reserve: 0,
             frame: 0,
         }
     }
@@ -578,10 +622,10 @@ impl Cache {
         self.evict();
     }
 
-    /// Drop the least recently painted slots until the budget holds, never one painted in the
-    /// current frame.
+    /// Drop the least recently painted slots until the budget holds beside what decoding needs
+    /// ([`Cache::reserve`]), never one painted in the current frame.
     fn evict(&mut self) {
-        while self.bytes > self.cap {
+        while self.bytes.saturating_add(self.reserve) > self.cap {
             let Some((i, _)) = self
                 .slots
                 .iter()
@@ -623,6 +667,8 @@ pub(crate) struct Job {
     source: Source,
     w: u32,
     h: u32,
+    /// What it holds while it runs, besides its result: see [`decode_cost`].
+    cost: usize,
 }
 
 /// What the worker threads send back.
@@ -643,8 +689,8 @@ pub(crate) enum Done {
 #[derive(Default)]
 struct Queue {
     jobs: Vec<Job>,
-    /// The job being decoded: (key, size) — not queued again while it runs.
-    busy: Option<(Key, u32, u32)>,
+    /// The job being decoded: (key, size, cost) — not queued again while it runs.
+    busy: Option<(Key, u32, u32, usize)>,
     quit: bool,
 }
 
@@ -670,7 +716,7 @@ impl Worker {
                         return;
                     }
                     let job = q.jobs.remove(0);
-                    q.busy = Some((job.key.clone(), job.w, job.h));
+                    q.busy = Some((job.key.clone(), job.w, job.h, job.cost));
                     job
                 };
                 let bitmap = decode_job(&job);
@@ -693,11 +739,18 @@ impl Worker {
     fn set(&self, mut jobs: Vec<Job>) {
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((key, w, h)) = &q.busy {
+        if let Some((key, w, h, _)) = &q.busy {
             jobs.retain(|j| (&j.key, j.w, j.h) != (key, *w, *h));
         }
         q.jobs = jobs;
         cv.notify_one();
+    }
+
+    /// What the job being decoded holds, if any.
+    fn busy_cost(&self) -> usize {
+        let (lock, _) = &*self.shared;
+        let q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.busy.as_ref().map_or(0, |b| b.3)
     }
 }
 
@@ -741,6 +794,8 @@ pub struct Images {
     /// Bumped for every document: results for an older one are dropped.
     doc_gen: u64,
     srcs: Vec<Src>,
+    /// What decoding each local image holds (see [`decode_cost`]), once its header is read.
+    costs: Vec<Option<usize>>,
     cache: Cache,
     tx: Sender<Done>,
     rx: Receiver<Done>,
@@ -757,6 +812,7 @@ impl Default for Images {
             base: None,
             doc_gen: 0,
             srcs: Vec::new(),
+            costs: Vec::new(),
             cache: Cache::new(CACHE_BYTES),
             tx,
             rx,
@@ -799,6 +855,7 @@ impl Images {
                 }
             })
             .collect();
+        self.costs = vec![None; self.srcs.len()];
         if let Some(w) = &self.worker {
             w.set(Vec::new());
         }
@@ -840,6 +897,25 @@ impl Images {
         }
     }
 
+    /// What decoding image `id` holds while it runs, besides its result (0 if not known yet: a
+    /// remote image's bytes aren't fetched).
+    fn cost(&mut self, id: u32) -> usize {
+        let i = id.checked_sub(1).map_or(usize::MAX, |i| i as usize);
+        match self.src(id).clone() {
+            Src::File(path) => match self.costs.get_mut(i) {
+                Some(c) => *c.get_or_insert_with(|| file_cost(&path).unwrap_or(0)),
+                None => 0,
+            },
+            #[cfg(feature = "remote-images")]
+            Src::Remote(url) if self.remote.on => self
+                .cache
+                .bytes_of(&url)
+                .and_then(|b| bytes_cost(&b))
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// A new frame is being painted: what it paints is the most recently used.
     pub fn begin_frame(&mut self) {
         self.cache.frame += 1;
@@ -855,6 +931,11 @@ impl Images {
     /// them are, and those already decoded are kept (as if painted) while they are. Otherwise
     /// a screen of images bigger than the cache would evict each other, decoded again and
     /// again.
+    ///
+    /// Decoding holds memory of its own (the whole frame of a JPEG, see [`decode_cost`]): the
+    /// most any job queued or running holds is kept free of the cache, the slots not painted
+    /// evicted to make it, so the cache and a decode together stay within the budget. (Slots
+    /// painted in the current frame are never evicted: a window of them is over it, as above.)
     pub fn request(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) {
         // Without decoders there's nothing to ask for (and the worker isn't built in).
         if !cfg!(feature = "images") {
@@ -864,17 +945,21 @@ impl Images {
         #[cfg(feature = "remote-images")]
         let mut fetch: Vec<Arc<str>> = Vec::new();
         let mut wanted = 0usize;
+        let mut reserve = self.worker.as_ref().map_or(0, Worker::busy_cost);
         for (n, &(id, w, h)) in boxes.iter().enumerate() {
             let Some(key) = self.key(id) else {
                 continue;
             };
             let (w, h) = clamp_box(w, h);
-            let over = n >= on_screen && wanted >= self.cache.cap;
+            let cached = self.cache.has(&key, w, h);
+            let cost = if cached { 0 } else { self.cost(id) };
+            let room = self.cache.cap.saturating_sub(reserve.max(cost));
+            let over = n >= on_screen && wanted >= room;
             wanted = wanted.saturating_add(w as usize * h as usize * 4);
             if over {
                 continue;
             }
-            if self.cache.has(&key, w, h) {
+            if cached {
                 self.cache.touch(&key, w, h);
                 continue;
             }
@@ -899,14 +984,18 @@ impl Images {
                 },
                 _ => continue,
             };
+            reserve = reserve.max(cost);
             jobs.push(Job {
                 doc_gen: self.doc_gen,
                 key,
                 source,
                 w,
                 h,
+                cost,
             });
         }
+        self.cache.reserve = reserve;
+        self.cache.evict();
         if !jobs.is_empty() && self.worker.is_none() {
             self.worker = Some(Worker::spawn(self.tx.clone(), self.wake.clone()));
         }
