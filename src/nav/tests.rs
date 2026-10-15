@@ -211,6 +211,43 @@ fn base_dirs() {
     );
     assert_eq!(base_dir(&Input::Stdin), None);
     assert_eq!(base_dir(&Input::None), None);
+    // A file that is gone still has a directory: opening it reports why.
+    assert_eq!(
+        base_dir(&Input::File("/nonexistent-vomd-dir/c.md".into())),
+        Some(PathBuf::from("/nonexistent-vomd-dir"))
+    );
+}
+
+/// `cat p.md | vomd /dev/stdin`, `vomd <(cmd)`: the document can't be read again, so a relative
+/// link must not replace it (Back couldn't return); anchors still work.
+#[cfg(unix)]
+#[test]
+fn relative_links_are_inert_in_a_piped_document() {
+    let classify_in = |input: &Input, href: &str| classify(href, base_dir(input).as_deref());
+    let null = Input::File("/dev/null".into());
+    assert_eq!(base_dir(&null), None);
+    assert_eq!(classify_in(&null, "other.md"), Target::Ignore);
+    assert_eq!(classify_in(&null, "#x"), Target::Anchor("x".into()));
+    let dir = std::env::temp_dir().join(format!("vomd-nav-pipe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("pipe.md");
+    if std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let input = Input::File(fifo);
+        assert_eq!(classify_in(&input, "other.md"), Target::Ignore);
+        assert_eq!(classify_in(&input, "#x"), Target::Anchor("x".into()));
+    }
+    // A regular file still resolves against its directory.
+    let file = dir.join("a.md");
+    std::fs::write(&file, "x").unwrap();
+    assert_eq!(
+        classify_in(&Input::File(file), "other.md"),
+        doc(&dir.join("other.md").to_string_lossy(), None)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

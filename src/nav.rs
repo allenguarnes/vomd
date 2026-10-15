@@ -171,15 +171,18 @@ pub fn find_anchor(doc: &Doc, fragment: &str) -> Option<u32> {
     })
 }
 
-/// The directory relative links in a document resolve against.
+/// The directory relative links in a document resolve against. None for a document that can't
+/// be opened again (stdin, `/dev/stdin`, `<(cmd)`): following a link would replace it for good
+/// ([`rereadable`]), and its directory (`/dev`, `/dev/fd`) holds nothing of the author's.
+/// `#anchor` links still work there.
 pub fn base_dir(input: &Input) -> Option<PathBuf> {
     match input {
-        Input::File(path) => Some(
+        Input::File(path) if rereadable(input) => Some(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
         ),
-        Input::Stdin | Input::None => None,
+        Input::File(_) | Input::Stdin | Input::None => None,
     }
 }
 

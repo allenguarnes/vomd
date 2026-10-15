@@ -59,6 +59,37 @@ pub fn open(target: &std::ffi::OsStr) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open `path` for reading without ever waiting for a writer: a FIFO opens at once instead of
+/// blocking until something writes to it (Linux: `O_NONBLOCK`; reading a regular file is
+/// unaffected). The caller inspects the opened file (`File::metadata`) and decides what to do
+/// with a pipe or device; this is what makes that check immune to the path changing after it
+/// was looked at.
+pub fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "loongarch64"
+        )
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK is 0o4000 on these architectures (not on mips, sparc, alpha, parisc).
+        options.custom_flags(0o4000);
+    }
+    // TODO(P14): other targets open plainly, so a FIFO swapped in after the caller's own check
+    // can still block there (O_NONBLOCK differs per OS and architecture).
+    options.open(path)
+}
+
 /// Errors go to stderr only when someone can see them.
 pub fn stderr_is_tty() -> bool {
     use std::io::IsTerminal;
@@ -104,6 +135,52 @@ mod tests {
         assert!(!gtk_theme_dark(Some("Adwaita:light")));
         assert!(!gtk_theme_dark(Some("dark")));
         assert!(!gtk_theme_dark(None));
+    }
+
+    /// The open must return at once on a FIFO with no writer, and a regular file reads normally.
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64",
+            target_arch = "powerpc64",
+            target_arch = "s390x",
+            target_arch = "loongarch64"
+        )
+    ))]
+    #[test]
+    fn open_nonblocking_does_not_wait_for_a_writer() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("vomd-platform-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.is_ok_and(|s| s.success()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = fifo.clone();
+            std::thread::spawn(move || {
+                let file = open_nonblocking(&path);
+                let _ = tx.send(file.map(|f| f.metadata().map(|m| m.is_file())));
+            });
+            let regular = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("opening a FIFO blocked")
+                .unwrap()
+                .unwrap();
+            assert!(!regular);
+        }
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# hi").unwrap();
+        let mut text = String::new();
+        let mut f = open_nonblocking(&file).unwrap();
+        assert!(f.metadata().unwrap().is_file());
+        f.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "# hi");
+        assert!(open_nonblocking(&dir.join("missing")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]

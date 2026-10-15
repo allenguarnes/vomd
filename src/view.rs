@@ -16,6 +16,7 @@ use crate::cli::Input;
 use crate::doc::{Doc, Heading};
 use crate::fonts::Fonts;
 use crate::layout::{Anchor, BlockBox, Layout, Params};
+use crate::platform;
 use crate::render::{self, Clip, Frame, ScrollbarFade, Viewport};
 use crate::text::cache::GlyphCache;
 use crate::text::fallback::Found;
@@ -263,20 +264,27 @@ fn read_input_limited(
         }
         Input::File(path) => {
             let shown = path.display();
-            // Before opening: a FIFO blocks the open until something writes to it, and a
-            // document reached from another one must not be able to do that. Symlinks are
-            // followed, so a link to a device is refused too. (The file may change between
-            // this and the open; the size limit below holds whatever it becomes.)
-            let meta = std::fs::metadata(path).map_err(|e| format!("Cannot open {shown}: {e}"))?;
+            // Stamp first: a write landing between the two makes the next focus reload again
+            // rather than miss the change.
+            let before = stamp(path);
+            // A document reached from another one is opened without waiting for a writer (a
+            // FIFO would otherwise hang the window) and judged by the file actually opened,
+            // so a path swapped for a FIFO or device after any earlier look is still refused.
+            // The command-line argument opens plainly: a pipe there waits for its writer.
+            let opened = match origin {
+                Origin::Navigation => platform::open_nonblocking(path),
+                Origin::Argument => std::fs::File::open(path),
+            };
+            let file = opened.map_err(|e| format!("Cannot open {shown}: {e}"))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("Cannot open {shown}: {e}"))?;
             let regular = meta.is_file();
             if !regular && origin == Origin::Navigation {
                 return Err(format!("Cannot open {shown}: not a regular file"));
             }
-            // Stamp first: a write landing between the two makes the next focus reload again
-            // rather than miss the change. A pipe or device has no state to compare.
-            let st = if regular { stamp(path) } else { None };
-            let file =
-                std::fs::File::open(path).map_err(|e| format!("Cannot open {shown}: {e}"))?;
+            // A pipe or device has no state to compare.
+            let st = if regular { before } else { None };
             let bytes = read_limited(file, meta.len(), limit)
                 .map_err(|e| format!("Cannot open {shown}: {e}"))?
                 .ok_or_else(|| too_big(&shown.to_string()))?;
