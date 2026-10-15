@@ -656,6 +656,48 @@ fn oversized_table_rows_split_into_fragments() {
 }
 
 #[test]
+fn row_fragments_only_visit_the_cells_with_text_left() {
+    // One cell with a lot of text among many one-character cells: after the first fragment the
+    // short cells are done, and visiting them again for each fragment would be quadratic.
+    let visits = |n: usize| {
+        let long = "word ".repeat(16 * n);
+        let long = long.trim_end();
+        let head = "| h ".repeat(n) + "|\n" + &"|-".repeat(n) + "|\n";
+        let src = format!("{head}| {long} {}|\n", "| x ".repeat(n - 1));
+        super::ROW_CELL_VISITS.with(|v| v.set(0));
+        let doc = Doc::parse(&src);
+        let visits = super::ROW_CELL_VISITS.with(|v| v.get());
+        check_invariants(&doc);
+        // Header row, then the body row's fragments: the long cell comes back whole.
+        let rows: Vec<_> = doc.blocks.iter().filter(|b| !b.joined).collect();
+        assert_eq!(rows.len(), 2);
+        let body: Vec<_> = doc.blocks[1..].iter().collect();
+        let first = cell_texts(&doc, body[0]);
+        assert_eq!(first.len(), n);
+        let mut text = first[0].clone();
+        for b in &body[1..] {
+            text += &cell_texts(&doc, b)[0];
+        }
+        assert_eq!(text, long);
+        (visits, doc.blocks.len())
+    };
+    let mut prev = None;
+    for n in [4000, 8000, 16000] {
+        let (visits, blocks) = visits(n);
+        assert!(blocks > 20, "{n} columns: {blocks} blocks");
+        // The cells once, and one cell per fragment after the first (a small constant each).
+        assert!(visits <= 4 * (n + blocks), "{n} columns: {visits} visits");
+        if let Some(prev) = prev {
+            assert!(
+                visits < prev * 5 / 2,
+                "{n} columns: {prev} -> {visits} visits"
+            );
+        }
+        prev = Some(visits);
+    }
+}
+
+#[test]
 fn table_row_fragments_cut_on_char_boundaries_and_keep_headers() {
     // 3-byte chars with no whitespace: the cell budget lands inside characters.
     let wide = "語".repeat(12_000);
@@ -1827,6 +1869,31 @@ fn a_list_fence_does_not_stop_segmentation() {
 }
 
 #[test]
+fn metadata_lookahead_is_linear_in_the_text() {
+    // Every `---\t` may open a metadata block (it can't close one), and the only closing line
+    // is the last: a search from each opener would read the rest of the text each time.
+    let doc = |n: usize| "text\n---\t\nx\n".repeat(n) + "...\n";
+    let mut prev = 0;
+    for n in [1000, 2000, 4000, 8000] {
+        let src = doc(n);
+        let (_, work) = segment::plan_with_work(&src, 400);
+        let lines = 3 * n + 1;
+        assert!(work <= 4 * lines, "{n} reps: {work} lines examined");
+        if prev > 0 {
+            assert!(
+                work < prev * 5 / 2,
+                "{n} reps: {prev} -> {work} lines examined"
+            );
+        }
+        prev = work;
+    }
+    for n in [3, 50, 400] {
+        let src = format!("{}{}\n{}", filler(20), doc(n), filler(20));
+        assert!(assert_same("metadata lookahead", &src, 400) > 1);
+    }
+}
+
+#[test]
 fn footnote_labels_match_case_insensitively() {
     insta::assert_snapshot!(parse("Ref[^A]\n\n[^a]: note\n"));
     for src in [
@@ -1884,6 +1951,48 @@ fn duplicate_footnote_definitions_keep_the_first() {
     check_invariants(&doc);
     check_anchors(&doc);
     assert!(doc.text.contains("first") && !doc.text.contains("second"));
+}
+
+#[test]
+fn definitions_inside_a_duplicate_definition_still_count() {
+    // The second `[^a]` is dropped, but the `[^b]` in it is a definition of a label that is free.
+    let src = "r[^a][^b]\n\n[^a]: first\n\n[^a]: second\n\n    > [^b]: inner\n";
+    let doc = Doc::parse(src);
+    check_invariants(&doc);
+    check_anchors(&doc);
+    assert!(doc.text.contains("first") && doc.text.contains("inner"));
+    assert!(!doc.text.contains("second"));
+    for id in ["fn-a", "fn-b", "fnref-a", "fnref-b"] {
+        assert!(doc.anchors.iter().any(|(s, _)| s == id), "{id}");
+    }
+    let notes = doc
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.marker, Marker::Footnote(_)))
+        .count();
+    assert_eq!(notes, 2);
+    // A label that is taken is dropped there too, and the text after the dropped definition and
+    // inside it still reads as it did: a dropped nested duplicate, then a definition after it.
+    let src = "r[^a][^b][^c]\n\n[^a]: first\n\n[^b]: first b\n\n[^a]: dup\n\n    [^b]: dup b\n\n    [^c]: inner c\n\n[^d]: after\n";
+    let doc = Doc::parse(src);
+    check_invariants(&doc);
+    check_anchors(&doc);
+    assert!(doc.text.contains("inner c") && doc.text.contains("after"));
+    assert!(!doc.text.contains("dup") && !doc.text.contains("dup b"));
+    // Inside another note, and across segments.
+    let doc =
+        Doc::parse("r[^a][^c]\n\n[^a]: top\n\n    > [^a]: y\n    >\n    >     > [^c]: deep\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    assert!(doc.text.contains("deep") && !doc.text.contains('y'));
+    let filler = filler(30);
+    let src = format!(
+        "{filler}r[^a][^b]\n\n[^a]: first\n\n{filler}[^a]: second\n\n    > [^b]: inner\n\n{filler}"
+    );
+    assert!(assert_same("nested in a duplicate", &src, 400) > 5);
+    let doc = Doc::parse_segments(&src, 400).unwrap();
+    check_anchors(&doc);
+    assert!(doc.text.contains("inner"));
 }
 
 /// The text of the block's spans, back-link arrows included.

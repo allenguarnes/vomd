@@ -359,6 +359,15 @@ pub(super) fn plan(src: &str, budget: usize) -> Option<Plan> {
     scan.finish()
 }
 
+/// [`plan`], and how many lines the lookahead for metadata blocks examined.
+#[cfg(test)]
+pub(super) fn plan_with_work(src: &str, budget: usize) -> (Option<Plan>, usize) {
+    let mut scan = Scan::new(src, budget);
+    scan.run();
+    let work = scan.work;
+    (scan.finish(), work)
+}
+
 struct Scan<'a> {
     src: &'a str,
     budget: usize,
@@ -373,8 +382,12 @@ struct Scan<'a> {
     /// Every reading of the text so far (never empty until the scan stops).
     states: Vec<State>,
     scratch: Vec<State>,
-    /// A search for the closing line of a metadata block failed: there are none further on.
-    no_meta_close: bool,
+    /// Start of the last line that could close a metadata block (checked on the first need), so
+    /// that whether one follows a line is a comparison and not a search.
+    last_meta_close: Option<Option<usize>>,
+    /// Lines the lookahead for metadata blocks has examined (for tests of its cost).
+    #[cfg(test)]
+    work: usize,
     /// Too many readings to follow: no more cuts.
     stopped: bool,
     /// Whether the header at this start offset is a table for pulldown-cmark (checked lazily).
@@ -404,7 +417,9 @@ impl<'a> Scan<'a> {
                 table: None,
             }],
             scratch: Vec::new(),
-            no_meta_close: false,
+            last_meta_close: None,
+            #[cfg(test)]
+            work: 0,
             stopped: false,
             valid_head: None,
         }
@@ -651,27 +666,51 @@ impl<'a> Scan<'a> {
     /// pulldown-cmark ignores the opener otherwise, and when the first line after it is blank or
     /// a closing line.
     fn meta_closes(&mut self) -> bool {
-        if self.no_meta_close {
+        let src = self.src;
+        if self.next >= src.len() {
             return false;
         }
-        let src = self.src;
-        let mut pos = self.next;
-        let mut first = true;
-        while pos < src.len() {
-            let end = src[pos..].find('\n').map_or(src.len(), |i| pos + i);
-            let line = src[pos..end].strip_suffix('\r').unwrap_or(&src[pos..end]);
-            let close = is_meta_close(line.as_bytes());
-            if first && (close || is_blank_ws(line.as_bytes())) {
-                return false;
-            }
-            first = false;
-            if close {
-                return true;
-            }
-            pos = end + 1;
+        let first = src[self.next..].split('\n').next().unwrap_or("");
+        let first = first.strip_suffix('\r').unwrap_or(first).as_bytes();
+        #[cfg(test)]
+        {
+            self.work += 1;
         }
-        self.no_meta_close = true;
-        false
+        if is_meta_close(first) || is_blank_ws(first) {
+            return false;
+        }
+        // Closing lines are found once, from the end: opener after opener asks about the same
+        // last one, and a search from each would read the rest of the text again and again.
+        let last = match self.last_meta_close {
+            Some(last) => last,
+            None => {
+                let last = self.find_last_meta_close();
+                self.last_meta_close = Some(last);
+                last
+            }
+        };
+        last.is_some_and(|at| at >= self.next)
+    }
+
+    fn find_last_meta_close(&mut self) -> Option<usize> {
+        let src = self.src;
+        let mut end = src.len();
+        loop {
+            let start = src[..end].rfind('\n').map_or(0, |i| i + 1);
+            let line = &src[start..end];
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            #[cfg(test)]
+            {
+                self.work += 1;
+            }
+            if is_meta_close(line.as_bytes()) {
+                return Some(start);
+            }
+            if start == 0 {
+                return None;
+            }
+            end = start - 1;
+        }
     }
 
     /// Track a table whose rows all start with `|` in column 0 (so it is not inside a list

@@ -5,7 +5,7 @@
 //! then a scan of every font's cmap. Files are memory-mapped, so a coverage check touches only
 //! the header and cmap pages, never whole multi-megabyte CJK files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use swash::FontDataRef;
@@ -174,13 +174,23 @@ fn preferred(c: char) -> &'static [&'static str] {
     }
 }
 
-/// The face in `path` covering the most of `chars`, with the characters it covers.
-fn best_face(path: &Path, chars: &[char]) -> Option<(u32, Vec<char>)> {
-    let file = std::fs::File::open(path).ok()?;
+/// What each face of a font file covers of some characters: the face's index in the file and the
+/// characters (faces that cover none are left out).
+type Coverage = Vec<(u32, Vec<char>)>;
+
+/// The faces in `path` and which of `chars` each covers; nothing if the file can't be read.
+fn coverage(path: &Path, chars: &[char]) -> Coverage {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
     // SAFETY: read-only mapping of a font file; see `Fonts::load`.
-    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    let data = FontDataRef::new(&map)?;
-    let mut best: Option<(u32, Vec<char>)> = None;
+    let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
+        return Vec::new();
+    };
+    let Some(data) = FontDataRef::new(&map) else {
+        return Vec::new();
+    };
+    let mut faces = Vec::new();
     for (i, font) in data.fonts().enumerate() {
         let charmap = font.charmap();
         let covered: Vec<char> = chars
@@ -188,11 +198,11 @@ fn best_face(path: &Path, chars: &[char]) -> Option<(u32, Vec<char>)> {
             .copied()
             .filter(|&c| charmap.map(c) != 0)
             .collect();
-        if !covered.is_empty() && best.as_ref().is_none_or(|(_, b)| covered.len() > b.len()) {
-            best = Some((i as u32, covered));
+        if !covered.is_empty() {
+            faces.push((i as u32, covered));
         }
     }
-    best
+    faces
 }
 
 /// Style words that make a file a poor fallback (prefer upright regular weights).
@@ -231,39 +241,84 @@ pub fn find_in(
     missing: &[char],
     skip: &dyn Fn(&Path, u32) -> bool,
 ) -> Vec<Found> {
-    let mut remaining: Vec<char> = missing.to_vec();
-    remaining.sort_unstable();
-    remaining.dedup();
+    find_with(files, missing, skip, &mut coverage)
+}
+
+/// [`find_in`] with the reading of font files (`read`) in the caller's hands. A file is read at
+/// most once, however many characters are missing.
+fn find_with<'a>(
+    files: &'a [PathBuf],
+    missing: &[char],
+    skip: &dyn Fn(&Path, u32) -> bool,
+    read: &mut dyn FnMut(&Path, &[char]) -> Coverage,
+) -> Vec<Found> {
+    let mut all: Vec<char> = missing.to_vec();
+    all.sort_unstable();
+    all.dedup();
+    let mut remaining: BTreeSet<char> = all.iter().copied().collect();
     let mut found: Vec<Found> = Vec::new();
-    let mut take = |path: &Path, remaining: &mut Vec<char>| {
-        if let Some((index, covered)) = best_face(path, remaining)
+    // What the files already read cover (of `all`); a file read in the scan below is not needed
+    // again, and is kept as covering nothing.
+    let mut read_files: HashMap<&'a Path, Coverage> = HashMap::new();
+    let mut take = |path: &'a Path, remaining: &mut BTreeSet<char>, preferred: bool| {
+        let faces = read_files.entry(path).or_insert_with(|| {
+            if preferred {
+                read(path, &all)
+            } else {
+                let chars: Vec<char> = remaining.iter().copied().collect();
+                read(path, &chars)
+            }
+        });
+        // The face covering the most of what is still missing.
+        let mut best: Option<(u32, usize)> = None;
+        for (index, covered) in faces.iter() {
+            let n = covered.iter().filter(|c| remaining.contains(c)).count();
+            if n > 0 && best.is_none_or(|(_, b)| n > b) {
+                best = Some((*index, n));
+            }
+        }
+        if let Some((index, _)) = best
             && !skip(path, index)
             && !found.iter().any(|f| f.path == path && f.index == index)
         {
-            remaining.retain(|c| !covered.contains(c));
+            for c in faces
+                .iter()
+                .filter(|(i, _)| *i == index)
+                .flat_map(|(_, c)| c)
+            {
+                remaining.remove(c);
+            }
             found.push(Found {
                 path: path.to_owned(),
                 index,
             });
+        }
+        if !preferred {
+            *faces = Vec::new();
         }
     };
     let by_name: HashMap<String, &PathBuf> = files
         .iter()
         .filter_map(|p| Some((file_key(p)?, p)))
         .collect();
-    let mut i = 0;
-    while i < remaining.len() {
-        let c = remaining[i];
-        for name in preferred(c) {
-            if let Some(path) = by_name.get(*name) {
-                take(path, &mut remaining);
-                if !remaining.contains(&c) {
-                    break;
-                }
-            }
+    // Characters that share a preference list are looked up together, so that each preferred
+    // file is read once for all of them.
+    let mut groups: Vec<(&[&str], Vec<char>)> = Vec::new();
+    for &c in &all {
+        let list = preferred(c);
+        match groups.iter_mut().find(|(l, _)| *l == list) {
+            Some((_, chars)) => chars.push(c),
+            None => groups.push((list, vec![c])),
         }
-        if remaining.get(i) == Some(&c) {
-            i += 1;
+    }
+    for (list, chars) in &groups {
+        for name in *list {
+            if !chars.iter().any(|c| remaining.contains(c)) {
+                break;
+            }
+            if let Some(path) = by_name.get(*name) {
+                take(path, &mut remaining, true);
+            }
         }
     }
     if !remaining.is_empty() {
@@ -273,7 +328,7 @@ pub fn find_in(
             if remaining.is_empty() {
                 break;
             }
-            take(path, &mut remaining);
+            take(path, &mut remaining, false);
         }
     }
     found
@@ -281,6 +336,8 @@ pub fn find_in(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     #[test]
@@ -312,9 +369,84 @@ mod tests {
         }
         // Every returned face covers at least one requested character.
         for f in &found {
-            assert!(best_face(&f.path, &chars).is_some());
+            assert!(!coverage(&f.path, &chars).is_empty());
         }
         // Skipping everything finds nothing.
         assert!(find_in(&files, &chars, &|_, _| true).is_empty());
+    }
+
+    /// Reading is counted per file, as a font file would be opened: with thousands of missing
+    /// characters every file (preferred or not) is still read once.
+    #[test]
+    fn each_font_file_is_read_once() {
+        let names = [
+            "NotoSansCJK-Regular.ttc",
+            "NotoSansCJKsc-Regular.otf",
+            "DejaVuSans.ttf",
+            "NotoSansArabic-Regular.ttf",
+            "NotoColorEmoji.ttf",
+        ];
+        let mut files: Vec<PathBuf> = names.iter().map(|n| Path::new("/fonts").join(n)).collect();
+        files.extend((0..300).map(|i| PathBuf::from(format!("/fonts/extra/Other{i}.ttf"))));
+        // Characters of several scripts (each with its own preference list), the CJK ones
+        // spread over many blocks, interleaved: more than any one file covers.
+        let mut missing: Vec<char> = (0..4000u32)
+            .filter_map(|i| char::from_u32(0x30000 + i))
+            .collect();
+        missing.extend((0..300u32).filter_map(|i| char::from_u32(0x4E00 + i * 3)));
+        missing.extend(['Ж', 'م', '😀', '\u{10FFFF}']);
+        // The CJK collection has two faces; the second covers more. Each of the other files
+        // covers a share of the characters by their value.
+        let reads: RefCell<HashMap<PathBuf, usize>> = RefCell::default();
+        let mut read = |path: &Path, chars: &[char]| -> Coverage {
+            *reads.borrow_mut().entry(path.to_owned()).or_default() += 1;
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let face = |modulus: u32, rem: u32| -> Vec<char> {
+                chars
+                    .iter()
+                    .copied()
+                    .filter(|&c| c as u32 % modulus == rem)
+                    .collect()
+            };
+            match name {
+                "NotoSansCJK-Regular.ttc" => vec![(0, face(5, 0)), (1, face(2, 0))],
+                "NotoSansArabic-Regular.ttf" => vec![(0, vec!['م'])],
+                "DejaVuSans.ttf" => vec![(0, vec!['Ж'])],
+                n if n.starts_with("Other") => vec![(0, face(2, 1))],
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .filter(|(_, covered)| !covered.is_empty())
+            .collect()
+        };
+        let found = find_with(&files, &missing, &|_, _| false, &mut read);
+        for (path, n) in reads.borrow().iter() {
+            assert_eq!(*n, 1, "{} was read {n} times", path.display());
+        }
+        // The CJK collection's second face (it covers more than the first) comes before the scan's
+        // finds, which pick up the odd characters it left.
+        let at = |name: &str| found.iter().position(|f| f.path.ends_with(name));
+        assert_eq!(found[at("NotoSansCJK-Regular.ttc").unwrap()].index, 1);
+        assert!(at("NotoSansCJK-Regular.ttc") < at("Other0.ttf"));
+        assert!(found.iter().any(|f| f.path.ends_with("DejaVuSans.ttf")));
+        assert!(
+            found
+                .iter()
+                .any(|f| f.path.ends_with("NotoSansArabic-Regular.ttf"))
+        );
+        assert!(found.iter().any(|f| f.path.ends_with("Other0.ttf")));
+        // Only the files that were needed were read in the scan: it stops once nothing is missing.
+        assert!(reads.borrow().len() < files.len());
+
+        // A face that is already loaded is passed over, not read again.
+        reads.borrow_mut().clear();
+        let found = find_with(
+            &files,
+            &missing,
+            &|p, _| p.ends_with("DejaVuSans.ttf"),
+            &mut read,
+        );
+        assert!(reads.borrow().values().all(|&n| n == 1));
+        assert!(!found.iter().any(|f| f.path.ends_with("DejaVuSans.ttf")));
     }
 }

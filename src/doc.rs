@@ -387,9 +387,14 @@ struct Builder {
     continue_table: bool,
     /// Skipping the repeated header rows of a continued table.
     skip_head: bool,
-    /// Skipping a footnote definition (a stub, or a repeat of a label): how many definitions
-    /// are open inside it, itself included.
+    /// Skipping a footnote definition (a stub, or a repeat of a label): its depth (see
+    /// `fn_depth`), 0 when not skipping. Definitions of new labels inside it are not skipped.
     skip_def: usize,
+    /// Footnote definitions open now, nested ones included.
+    fn_depth: usize,
+    /// Skips that a definition inside a skipped one interrupted: the `skip_def` to go back to
+    /// and the definition's `fn_depth`.
+    suspended: Vec<(usize, usize)>,
     footnotes: Footnotes,
     /// Every heading slug handed out so far.
     slugs: HashSet<String>,
@@ -424,6 +429,8 @@ impl Builder {
             continue_table: false,
             skip_head: false,
             skip_def: 0,
+            fn_depth: 0,
+            suspended: Vec::new(),
             footnotes: Footnotes::default(),
             slugs: HashSet::new(),
             slug_suffix: HashMap::new(),
@@ -444,13 +451,33 @@ impl Builder {
             self.skip_head = !matches!(event, Event::End(TagEnd::TableHead));
             return;
         }
+        if let Event::Start(Tag::FootnoteDefinition(_)) = event {
+            self.fn_depth += 1;
+        }
         if self.skip_def > 0 {
-            match event {
-                Event::Start(Tag::FootnoteDefinition(_)) => self.skip_def += 1,
-                Event::End(TagEnd::FootnoteDefinition) => self.skip_def -= 1,
-                _ => {}
+            match &event {
+                // What a dropped definition holds is dropped, but a definition of a label that is
+                // still free inside it counts as it would anywhere (a reference to it needs
+                // its target).
+                Event::Start(Tag::FootnoteDefinition(label))
+                    if self.footnotes.stubs == 0
+                        && !self
+                            .footnotes
+                            .defined
+                            .contains(&UniCase::new(label.to_string())) =>
+                {
+                    self.suspended.push((self.skip_def, self.fn_depth));
+                    self.skip_def = 0;
+                }
+                Event::End(TagEnd::FootnoteDefinition) => {
+                    if self.fn_depth == self.skip_def {
+                        self.skip_def = 0;
+                    }
+                    self.fn_depth -= 1;
+                    return;
+                }
+                _ => return,
             }
-            return;
         }
         if self.metadata {
             if let Event::End(TagEnd::MetadataBlock(_)) = event {
@@ -482,7 +509,20 @@ impl Builder {
         }
         match event {
             Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
+            Event::End(tag) => {
+                let def = matches!(tag, TagEnd::FootnoteDefinition);
+                self.end(tag);
+                if def {
+                    // The definition that interrupted a skip is over: the skip goes on.
+                    if let Some(&(skip, depth)) = self.suspended.last()
+                        && depth == self.fn_depth
+                    {
+                        self.skip_def = skip;
+                        self.suspended.pop();
+                    }
+                    self.fn_depth -= 1;
+                }
+            }
             Event::Text(s) => {
                 let extra = if self.code_block() { style::CODE } else { 0 };
                 self.text(&s, extra, 0);
@@ -559,7 +599,7 @@ impl Builder {
                 // first counts (as on GitHub), the others are dropped.
                 if self.footnotes.stubs > 0 {
                     self.footnotes.stubs -= 1;
-                    self.skip_def = 1;
+                    self.skip_def = self.fn_depth;
                     return;
                 }
                 if !self
@@ -567,7 +607,7 @@ impl Builder {
                     .defined
                     .insert(UniCase::new(label.to_string()))
                 {
-                    self.skip_def = 1;
+                    self.skip_def = self.fn_depth;
                     return;
                 }
                 if self.footnotes.active {
@@ -870,15 +910,19 @@ impl Builder {
             .collect();
         let mut k = 0;
         loop {
+            // The first fragment goes through every cell; after it `rest` only holds the cells
+            // that still have text.
             let active = rest.iter().filter(|r| r.at < r.end).count();
             let budget = (MAX_BLOCK_BYTES / active.max(1)).max(MIN_CELL_BYTES);
             let (span_from, cell_from) = (self.doc.spans.len(), self.doc.cells.len());
-            for r in rest.iter_mut().filter(|r| k == 0 || r.at < r.end) {
+            for r in rest.iter_mut() {
                 let from = self.doc.spans.len() as u32;
                 take_chunk(&self.doc.text, r, budget, &mut self.doc.spans);
                 let spans = from..self.doc.spans.len() as u32;
                 self.doc.cells.push(Cell { col: r.col, spans });
             }
+            #[cfg(test)]
+            ROW_CELL_VISITS.with(|n| n.set(n.get() + 2 * rest.len()));
             let kind = BlockKind::TableRow {
                 table,
                 header,
@@ -888,7 +932,8 @@ impl Builder {
             let spans = span_from as u32..self.doc.spans.len() as u32;
             self.push_joined(kind, spans, k > 0);
             k += 1;
-            if rest.iter().all(|r| r.at >= r.end) {
+            rest.retain(|r| r.at < r.end);
+            if rest.is_empty() {
                 break;
             }
         }
@@ -1433,6 +1478,12 @@ fn attr(tag: &str, name: &str) -> Option<String> {
             return Some(value.to_owned());
         }
     }
+}
+
+// Cells visited while splitting oversized table rows, on this thread (for tests of its cost).
+#[cfg(test)]
+thread_local! {
+    static ROW_CELL_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A table cell whose text is being cut into pieces: `spans` are its spans, `at..end` the text
