@@ -328,8 +328,10 @@ pub struct Viewport {
 }
 
 impl Viewport {
-    pub fn height(&self) -> f32 {
-        (self.area.y1 - self.area.y0).max(0) as f32
+    /// The area's height in pixels (zero if inverted). f64 and i64: the i32 extents of an
+    /// area reaching far off screen overflow when subtracted, and f32 loses whole pixels.
+    pub fn height(&self) -> f64 {
+        (i64::from(self.area.y1) - i64::from(self.area.y0)).max(0) as f64
     }
 }
 
@@ -349,11 +351,16 @@ pub fn paint(
         frame.fill_rect(a.x0, a.y0, a.x1, a.y1, theme.bg);
         let (col_x, _) = layout.column();
         let ox = vp.area.x0 as f32 + col_x;
-        for i in layout.range_exact(vp.scroll, vp.scroll + f64::from(vp.height())) {
+        // Only the part of the area inside the frame, in document y (exact: i64 offsets). A NaN
+        // scroll counts as the top.
+        let scroll = if vp.scroll.is_nan() { 0.0 } else { vp.scroll };
+        let top = scroll + (i64::from(a.y0) - i64::from(vp.area.y0)) as f64;
+        let bottom = scroll + (i64::from(a.y1) - i64::from(vp.area.y0)) as f64;
+        for i in layout.range_exact(top, bottom) {
             let Some(content) = layout.geoms()[i].content.as_deref() else {
                 continue;
             };
-            let oy = (vp.area.y0 as f64 + layout.top(i) - vp.scroll) as f32;
+            let oy = (vp.area.y0 as f64 + layout.top(i) - scroll) as f32;
             paint_block(frame, content, ox, oy, fonts, cache, theme);
         }
     }
@@ -406,7 +413,8 @@ fn paint_block(
         let style = &content.styles[g.style as usize];
         let baseline = px(oy + g.y);
         // Glyphs reach at most about one size above and below their baseline.
-        let reach = style.size as i32 * 2 + 2;
+        // (Capped, with `baseline` within i32/2: the sums below can't overflow.)
+        let reach = style.size.min(1e6) as i32 * 2 + 2;
         if baseline + reach < clip.y0 || baseline - reach >= clip.y1 {
             continue;
         }
@@ -418,7 +426,10 @@ fn paint_block(
         let Some(img) = cache.get(fonts, key) else {
             continue;
         };
-        let (gx, gy) = (xi + img.left, baseline - img.top);
+        let (gx, gy) = (
+            xi.saturating_add(img.left),
+            baseline.saturating_sub(img.top),
+        );
         if img.color {
             frame.blit_rgba(gx, gy, img.width, img.height, &img.data);
         } else {
@@ -469,9 +480,10 @@ pub struct Thumb {
 /// The thumb for a document `total` pixels tall in `vp`, or `None` when it all fits. `scale`
 /// is physical pixels per logical pixel.
 pub fn thumb(vp: Viewport, total: f32, scale: f32) -> Option<Thumb> {
-    let view = vp.height() as f64;
+    let view = vp.height();
     let total = total as f64;
-    if view <= 0.0 || total <= view {
+    // `is_nan` too: a NaN `total` fits nothing either.
+    if view <= 0.0 || total <= view || total.is_nan() {
         return None;
     }
     let scale = scale.max(0.01) as f64;
@@ -484,15 +496,19 @@ pub fn thumb(vp: Viewport, total: f32, scale: f32) -> Option<Thumb> {
         .max(THUMB_MIN as f64 * scale)
         .min(track);
     let max_scroll = total - view;
-    let pos = (vp.scroll / max_scroll).clamp(0.0, 1.0) * (track - len);
-    let w = (THUMB_W as f64 * scale).round().max(1.0) as i32;
-    let x1 = vp.area.x1 - margin as i32;
-    let y0 = vp.area.y0 + (margin + pos).round() as i32;
+    // NaN (a NaN scroll, or infinity over infinity) counts as the top.
+    let frac = (vp.scroll / max_scroll).clamp(0.0, 1.0);
+    let pos = if frac.is_nan() { 0.0 } else { frac } * (track - len);
+    let w = (THUMB_W as f64 * scale).round().max(1.0);
+    // f64 throughout, narrowed last: an area near the i32 limits (or a huge `scale`) puts the
+    // thumb past them. Saturating keeps whatever part is on screen exactly where it belongs.
+    let x1 = f64::from(vp.area.x1) - margin;
+    let y0 = f64::from(vp.area.y0) + (margin + pos).round();
     Some(Thumb {
-        x0: x1 - w,
-        y0,
-        x1,
-        y1: y0 + len.round().max(1.0) as i32,
+        x0: (x1 - w) as i32,
+        y0: y0 as i32,
+        x1: x1 as i32,
+        y1: (y0 + len.round().max(1.0)) as i32,
     })
 }
 
@@ -502,7 +518,8 @@ pub fn paint_scrollbar(frame: &mut Frame, vp: Viewport, total: f32, scale: f32, 
         return;
     };
     let prev = frame.set_clip(vp.area);
-    let r = (t.x1 - t.x0) as f32 / 2.0;
+    // i64: a saturated thumb can span more than i32.
+    let r = (i64::from(t.x1) - i64::from(t.x0)) as f32 / 2.0;
     frame.rounded_rect((t.x0, t.y0, t.x1, t.y1), r, None, theme.muted, THUMB_ALPHA);
     frame.set_clip(prev);
 }
@@ -517,7 +534,8 @@ pub struct ScrollbarFade {
 impl ScrollbarFade {
     /// Show the scrollbar (on scroll) and push the hide deadline back.
     pub fn poke(&mut self, now: Instant) {
-        self.until = Some(now + SCROLLBAR_LINGER);
+        // An instant too close to the end of time to add to has no deadline to wait for.
+        self.until = Some(now.checked_add(SCROLLBAR_LINGER).unwrap_or(now));
     }
 
     pub fn visible(&self, now: Instant) -> bool {

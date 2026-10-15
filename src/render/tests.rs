@@ -334,6 +334,106 @@ fn scrollbar_paints_inside_area() {
     assert!((0..100).all(|y| b.at(390, y) == 0 && b.at(399, y) == 0));
 }
 
+fn area(x0: i32, y0: i32, x1: i32, y1: i32) -> Viewport {
+    Viewport {
+        area: Clip { x0, y0, x1, y1 },
+        scroll: 0.0,
+    }
+}
+
+/// Areas reaching past i32 when subtracted still report their true height.
+#[test]
+fn viewport_height_does_not_overflow() {
+    assert_eq!(area(0, i32::MIN, 1, i32::MAX).height(), 4_294_967_295.0);
+    assert_eq!(area(0, i32::MAX, 1, i32::MIN).height(), 0.0, "inverted");
+    assert_eq!(area(0, -5, 1, 5).height(), 10.0);
+    assert_eq!(area(0, 7, 1, 7).height(), 0.0);
+}
+
+/// The thumb of an area at the i32 limits saturates instead of overflowing, and what lies in
+/// the frame is placed as it would be near the origin.
+#[test]
+fn thumb_survives_extreme_areas() {
+    // Entirely off to the left, one pixel wide.
+    let t = thumb(area(i32::MIN, 0, i32::MIN + 1, 100), 1000.0, 1.0).unwrap();
+    assert!(t.x0 <= t.x1 && t.x1 < 0, "{t:?}");
+    // Off to the right, and a tall area at the bottom limit.
+    let t = thumb(area(i32::MAX - 1, 0, i32::MAX, 100), 1000.0, 1.0).unwrap();
+    assert_eq!(t.x1, i32::MAX - 2);
+    let t = thumb(area(0, i32::MAX - 100, 400, i32::MAX), 1000.0, 1.0).unwrap();
+    assert_eq!(t.y0, i32::MAX - 98);
+    assert!(t.y0 <= t.y1);
+    // A huge scale or document, and an area spanning the whole range.
+    let wide = thumb(area(0, 0, 1000, 1000), 1e30, 1e9);
+    assert!(wide.is_none(), "margins swallow the track");
+    let t = thumb(area(i32::MIN, i32::MIN, i32::MAX, i32::MAX), 1e12, 1.0).unwrap();
+    assert!(t.y0 < t.y1 && t.x0 < t.x1);
+    let t = thumb(area(0, 0, 400, 100), 1000.0, 3e7);
+    assert!(t.is_none_or(|t| t.x0 <= t.x1));
+    // Garbage in a float: no thumb for a NaN document, the top for a NaN scroll.
+    assert_eq!(thumb(vp(100, 0.0), f32::NAN, 1.0), None);
+    let v = Viewport {
+        scroll: f64::NAN,
+        ..vp(100, 0.0)
+    };
+    assert_eq!(thumb(v, 1000.0, 1.0), thumb(vp(100, 0.0), 1000.0, 1.0));
+    let v = Viewport {
+        scroll: f64::INFINITY,
+        ..vp(100, 0.0)
+    };
+    assert_eq!(
+        thumb(v, f32::INFINITY, 1.0),
+        thumb(vp(100, 0.0), f32::INFINITY, 1.0)
+    );
+}
+
+/// Scrollbars of areas far off the frame, or covering it, neither panic nor stray.
+#[test]
+fn scrollbar_survives_extreme_areas() {
+    let mut b = Buf::new(20, 20, 20);
+    b.frame().fill_rect(0, 0, 20, 20, 0);
+    let before = b.px.clone();
+    let theme = &crate::theme::LIGHT;
+    for (x0, y0, x1, y1) in [
+        (i32::MIN, 0, i32::MIN + 1, 100),
+        (i32::MAX - 1, 0, i32::MAX, 100),
+        (0, i32::MIN, 20, i32::MIN + 100),
+        (0, i32::MAX - 100, 20, i32::MAX),
+    ] {
+        paint_scrollbar(&mut b.frame(), area(x0, y0, x1, y1), 1000.0, 1.0, theme);
+    }
+    assert!(b.px == before);
+    // Covering the whole i32 range, the thumb sits at the far right edge: off the frame.
+    paint_scrollbar(
+        &mut b.frame(),
+        area(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        1e12,
+        1.0,
+        theme,
+    );
+    assert!(b.px == before);
+}
+
+#[test]
+fn scrollbar_fade_survives_the_end_of_time() {
+    // The latest instant this platform can represent, found by bisecting `checked_add`.
+    let t0 = Instant::now();
+    let (mut lo, mut hi) = (0u64, u64::MAX);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if t0.checked_add(Duration::from_secs(mid)).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let end = t0 + Duration::from_secs(lo);
+    let mut f = ScrollbarFade::default();
+    f.poke(end);
+    assert!(!f.visible(end), "no room for a deadline");
+    assert!(f.expire(end));
+}
+
 #[test]
 fn scrollbar_fade_is_one_deadline() {
     let t0 = Instant::now();
@@ -484,6 +584,84 @@ mod doc {
                 "block {} at the top row",
                 k - 1
             );
+        }
+    }
+
+    /// An area reaching past i32 on either side paints like the same frame rows of a normal one.
+    #[test]
+    fn huge_area_paints_like_a_normal_one() {
+        let src = "# Title\n\nSome *text* and `code`.\n\n---\n\nMore text.";
+        let fonts = Fonts::new().unwrap();
+        let doc = Doc::parse(src);
+        let mut layout = Layout::new(
+            &doc,
+            Params {
+                width: 300.0,
+                ..Params::default()
+            },
+        );
+        layout.ensure(&doc, &fonts, Anchor::TOP, 120.0);
+        let mut cache = GlyphCache::default();
+        let mut paint_with = |area: Clip, scroll: f64| {
+            let mut b = Buf::new(300, 120, 300);
+            let v = Viewport { area, scroll };
+            paint(&mut b.frame(), v, &layout, &fonts, &mut cache, &LIGHT);
+            b
+        };
+        let normal = paint_with(
+            Clip {
+                x0: 0,
+                y0: 0,
+                x1: 300,
+                y1: 120,
+            },
+            0.0,
+        );
+        assert!(colors(&normal, 0..120).contains(&LIGHT.text));
+        // The document's top is at frame row 0 when `scroll` is `area.y0` less than it.
+        let min = f64::from(i32::MIN);
+        let tall = paint_with(
+            Clip {
+                x0: 0,
+                y0: i32::MIN,
+                x1: 300,
+                y1: i32::MAX,
+            },
+            min,
+        );
+        assert!(tall.px == normal.px, "area spanning i32");
+        let below = paint_with(
+            Clip {
+                x0: 0,
+                y0: 0,
+                x1: 300,
+                y1: i32::MAX,
+            },
+            0.0,
+        );
+        assert!(below.px == normal.px, "area extending past the frame");
+        // Entirely off screen, or garbage scrolls: nothing to paint, nothing to panic.
+        let blank = paint_with(
+            Clip {
+                x0: 0,
+                y0: i32::MIN,
+                x1: 1,
+                y1: i32::MIN + 5,
+            },
+            0.0,
+        );
+        assert!(blank.px.iter().all(|&p| p == PAD));
+        for scroll in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
+            let mut b = Buf::new(300, 120, 300);
+            let area = Clip {
+                x0: 0,
+                y0: 0,
+                x1: 300,
+                y1: 120,
+            };
+            let v = Viewport { area, scroll };
+            paint(&mut b.frame(), v, &layout, &fonts, &mut cache, &LIGHT);
+            paint_scrollbar(&mut b.frame(), v, 1000.0, 1.0, &LIGHT);
         }
     }
 
