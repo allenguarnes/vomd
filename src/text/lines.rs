@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use unicode_linebreak::{BreakOpportunity, linebreaks};
 
-use super::shape::{Shaped, flags};
+use super::shape::{Cluster, Segment, Shaped, flags};
 use super::{Align, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, deco};
 use crate::fonts::Fonts;
 use crate::theme::Role;
@@ -256,12 +256,7 @@ pub fn position(
                     pen += g.advance;
                 }
             }
-            out.hits.push(PHit {
-                x0,
-                x1: pen,
-                doc: para.doc_offset(c.start),
-                style: c.style,
-            });
+            cluster_hits(para, shaped, c, x0, pen, &mut out.hits);
         }
         let hits = hits_start..out.hits.len() as u32;
         decorations(
@@ -284,6 +279,45 @@ pub fn position(
     }
     out.height = y;
     out
+}
+
+/// Hit spans for a cluster covering `x0..x1`: one, or one per style segment for a cluster that
+/// spans items of different styles (a ligature across a link boundary). Segments split the
+/// advance by weight, laid out in visual order (the reverse of logical in RTL clusters).
+fn cluster_hits(para: &Para, shaped: &Shaped, c: &Cluster, x0: f32, x1: f32, hits: &mut Vec<PHit>) {
+    let segs = &shaped.segments[c.segs.start as usize..c.segs.end as usize];
+    if segs.is_empty() {
+        hits.push(PHit {
+            x0,
+            x1,
+            doc: para.doc_offset(c.start),
+            style: c.style,
+        });
+        return;
+    }
+    let total: u32 = segs.iter().map(|s| s.weight).sum::<u32>().max(1);
+    let (mut done, mut x) = (0, x0);
+    let mut emit = |s: &Segment| {
+        done += s.weight;
+        // Land exactly on `x1` after the last segment, whatever the rounding.
+        let end = if done >= total {
+            x1
+        } else {
+            x0 + (x1 - x0) * done as f32 / total as f32
+        };
+        hits.push(PHit {
+            x0: x,
+            x1: end,
+            doc: para.doc_offset(s.start),
+            style: s.style,
+        });
+        x = end;
+    };
+    if c.level % 2 == 1 {
+        segs.iter().rev().for_each(&mut emit);
+    } else {
+        segs.iter().for_each(&mut emit);
+    }
 }
 
 /// Rects for decorated runs: consecutive clusters sharing a decorated style.
@@ -341,5 +375,108 @@ fn decorations(fonts: &Fonts, para: &Para, hits: &[PHit], baseline: f32, rects: 
             }
         }
         i = j;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::TextStyle;
+
+    fn style(link: u32) -> TextStyle {
+        TextStyle {
+            bold: false,
+            italic: false,
+            mono: false,
+            size: 16.0,
+            role: Role::Link,
+            deco: 0,
+            shift: 0.0,
+            link,
+        }
+    }
+
+    /// Two items ("ab" doc 10, "cd" doc 50) and a synthetic cluster over all of "abcd".
+    fn spanning(level: u8, weights: [u32; 2]) -> (Para, Shaped) {
+        let mut para = Para::default();
+        para.push_text("ab", 10, style(1));
+        para.push_text("cd", 50, style(2));
+        let cluster = Cluster {
+            start: 0,
+            end: 4,
+            glyphs: 0..0,
+            advance: 30.0,
+            face: crate::fonts::FaceId(0),
+            style: 0,
+            segs: 0..2,
+            level,
+            flags: 0,
+        };
+        let seg = |start, style, weight| Segment {
+            start,
+            style,
+            weight,
+        };
+        let shaped = Shaped {
+            clusters: vec![cluster],
+            segments: vec![seg(0, 0, weights[0]), seg(2, 1, weights[1])],
+            base_level: level,
+            ..Shaped::default()
+        };
+        (para, shaped)
+    }
+
+    fn hits(para: &Para, shaped: &Shaped) -> Vec<PHit> {
+        let mut out = Vec::new();
+        cluster_hits(para, shaped, &shaped.clusters[0], 100.0, 130.0, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_cluster_over_two_items_gets_one_hit_each() {
+        let (para, shaped) = spanning(0, [1, 1]);
+        let h = hits(&para, &shaped);
+        let links: Vec<u32> = h
+            .iter()
+            .map(|h| para.styles[h.style as usize].link)
+            .collect();
+        assert_eq!(links, [1, 2]);
+        assert_eq!(
+            (h[0].x0, h[0].x1, h[1].x0, h[1].x1),
+            (100.0, 115.0, 115.0, 130.0)
+        );
+        assert_eq!((h[0].doc, h[1].doc), (10, 50));
+        // Weights divide the advance.
+        let (para, shaped) = spanning(0, [1, 2]);
+        let h = hits(&para, &shaped);
+        assert_eq!((h[0].x1, h[1].x1), (110.0, 130.0));
+    }
+
+    #[test]
+    fn rtl_clusters_lay_their_segments_out_in_reverse() {
+        let (para, shaped) = spanning(1, [1, 2]);
+        let h = hits(&para, &shaped);
+        let links: Vec<u32> = h
+            .iter()
+            .map(|h| para.styles[h.style as usize].link)
+            .collect();
+        assert_eq!(links, [2, 1]);
+        assert_eq!(
+            (h[0].x0, h[0].x1, h[1].x0, h[1].x1),
+            (100.0, 120.0, 120.0, 130.0)
+        );
+        assert_eq!((h[0].doc, h[1].doc), (50, 10));
+    }
+
+    #[test]
+    fn a_cluster_without_segments_is_one_hit() {
+        let (para, mut shaped) = spanning(0, [1, 1]);
+        shaped.clusters[0].segs = 0..0;
+        let h = hits(&para, &shaped);
+        assert_eq!(h.len(), 1);
+        assert_eq!(
+            (h[0].x0, h[0].x1, h[0].doc, h[0].style),
+            (100.0, 130.0, 10, 0)
+        );
     }
 }

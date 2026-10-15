@@ -42,6 +42,8 @@ const FOOTNOTE_SIZE: f32 = 0.875;
 const KEEP_SCREENS: f32 = 4.0;
 /// Blocks within this many viewport heights are measured exactly by `ensure`.
 const MEASURE_SCREENS: f32 = 2.0;
+/// Passes `ensure` makes over the blocks around the viewport (heights shift as they are measured).
+const MEASURE_PASSES: usize = 4;
 /// Line width for text that must never wrap (list markers).
 const NO_WRAP: f32 = 1.0e6;
 /// A table's column widths come from its first rows only: at most this many blocks (row
@@ -559,12 +561,19 @@ impl Layout {
     /// blocks above it change height.
     pub fn ensure(&mut self, doc: &Doc, fonts: &Fonts, top: Anchor, view_h: f32) -> f32 {
         let view_h = view_h.max(self.em);
-        for _ in 0..4 {
+        for pass in 0.. {
             let y = self.y_of(top);
-            let r = self.range(
-                y - MEASURE_SCREENS * view_h,
-                y + (1.0 + MEASURE_SCREENS) * view_h,
-            );
+            let view = self.range(y, y + view_h);
+            // The margin around the viewport is measured for a few passes only; after that
+            // just the viewport itself is filled in.
+            let r = if pass < MEASURE_PASSES {
+                self.range(
+                    y - MEASURE_SCREENS * view_h,
+                    y + (1.0 + MEASURE_SCREENS) * view_h,
+                )
+            } else {
+                view
+            };
             let mut changed = false;
             for i in r {
                 if self.geoms[i].content.is_some() {
@@ -578,7 +587,14 @@ impl Layout {
                 self.set_height(i, h);
                 self.live.push(i as u32);
             }
-            if !changed {
+            // Exact heights move blocks, and strongly overestimated ones can leave the
+            // viewport showing blocks that were never built. Each such pass builds at least one
+            // block, so this ends.
+            let y = self.y_of(top);
+            let bare = self
+                .range(y, y + view_h)
+                .any(|i| self.geoms[i].content.is_none());
+            if !bare && (!changed || pass + 1 >= MEASURE_PASSES) {
                 break;
             }
         }

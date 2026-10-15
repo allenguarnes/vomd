@@ -27,7 +27,8 @@
 //! starts with the table's header and delimiter rows again ([`Segment::head`]), which the builder
 //! drops (see `Builder::continue_table`). The header is checked once with pulldown-cmark itself.
 //! A table whose short rows would make pulldown-cmark end it partway (it only fills in so many
-//! empty cells) is not cut: segments would count afresh and go on.
+//! empty cells) is not cut: segments would count afresh and go on. Nor is a table cut before
+//! the segment is [`TABLE_HEAD_RATIO`] times its header, so repeating a huge header stays linear.
 //!
 //! **Definitions.** Link reference definitions and footnote definitions may come after their
 //! use, in another segment. They are not guessed from the text: [`Plan::definitions`] parses
@@ -54,6 +55,11 @@ const MAX_STATES: usize = 16;
 /// How many cells of short rows pulldown-cmark fills in for one table before it ends the table
 /// there (its `MAX_AUTOCOMPLETED_CELLS`).
 const MAX_AUTOCOMPLETED_CELLS: usize = 1 << 18;
+
+/// A segment cut inside a table is at least this many times as long as the table's header, which
+/// the next segment repeats: a giant header costs at most `1 / TABLE_HEAD_RATIO` of the text in
+/// extra parsing, however often it is repeated.
+const TABLE_HEAD_RATIO: usize = 4;
 
 /// A part of the text to parse on its own.
 pub(super) struct Segment {
@@ -453,7 +459,10 @@ impl<'a> Scan<'a> {
         }
         if line.l_start && verdict.plain {
             self.cut(pos, None);
-        } else if let Some(head) = verdict.table.filter(|_| verdict.table_ok) {
+        } else if let Some(head) = verdict
+            .table
+            .filter(|h| verdict.table_ok && pos - self.start >= TABLE_HEAD_RATIO * h.len())
+        {
             self.cut(pos, Some(head));
         }
     }

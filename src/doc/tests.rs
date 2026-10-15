@@ -1084,6 +1084,40 @@ fn segmented_parse_cuts_giant_tables_between_rows() {
     assert_eq!(doc.blocks.len(), 1 + (1 + 3000) + 1 + (1 + 40));
 }
 
+/// Bytes the parsers read for `src` cut at `budget`: every segment with the header it repeats.
+fn parser_input_bytes(src: &str, budget: usize) -> usize {
+    segment::plan(src, budget).map_or(src.len(), |p| {
+        let head = |s: &segment::Segment| s.head.as_ref().map_or(0, |h| h.len());
+        p.segments.iter().map(|s| head(s) + s.range.len()).sum()
+    })
+}
+
+#[test]
+fn repeated_table_headers_cost_a_bounded_share_of_the_text() {
+    // The header and the body grow together; repeating the header at every cut would cost
+    // header × segments, quadratic in the size.
+    let budget = 1024;
+    let mut last = 0;
+    for k in 0..4 {
+        let cell = "h".repeat(512 << k);
+        let mut src = format!("| {cell} | {cell} | {cell} | {cell} |\n|---|:-:|--:|---|\n");
+        for i in 0..(1600 << k) {
+            src.push_str(&format!("| row {i} | a | b | c |\n"));
+        }
+        let read = parser_input_bytes(&src, budget);
+        assert!(
+            read <= 2 * src.len(),
+            "k={k}: {read} bytes read for {}",
+            src.len()
+        );
+        // Still cut between rows, so the table is segmented at all.
+        let n = assert_same("table header", &src, budget);
+        assert!(n >= 4, "k={k}: {n} segments");
+        assert!(read > last);
+        last = read;
+    }
+}
+
 #[test]
 fn segmented_parse_resolves_definitions_from_other_segments() {
     let filler = "Some filler text to make the document longer.\n\n".repeat(30);
@@ -2312,5 +2346,32 @@ fn footnotes_inside_footnotes_stay_part_of_the_outer_note() {
             block_text(&doc, &doc.blocks[inner as usize]).contains(['y', 'z']),
             "{src:?}"
         );
+    }
+}
+
+#[test]
+fn heading_slugs_keep_marks_and_connectors_like_github() {
+    let slug = |src: &str| Doc::parse(src).headings[0].slug.clone();
+    // A virama (Mn) and a decomposed accent are part of their word.
+    assert_eq!(slug("# हिन्दी\n"), "हिन्दी");
+    assert_eq!(slug("# cafe\u{0301}\n"), "cafe\u{0301}");
+    assert_eq!(slug("# Café Ünï\n"), "café-ünï");
+    // Connector punctuation (`_`, `‿`) and `-` stay; other punctuation, symbols and emoji go.
+    assert_eq!(slug("# snake_case and a‿b\n"), "snake_case-and-a‿b");
+    assert_eq!(
+        slug("# Hello, World! 🎉 — 100% (ok) #1\n"),
+        "hello-world---100-ok-1"
+    );
+    assert_eq!(slug("# foo-bar\n"), "foo-bar");
+    // Links to such headings resolve.
+    let doc = Doc::parse("[go](#हिन्दी) [a](#cafe\u{0301})\n\n# हिन्दी\n\n# cafe\u{0301}\n");
+    let targets: Vec<&str> = doc
+        .links
+        .iter()
+        .filter_map(|l| l.strip_prefix('#'))
+        .collect();
+    assert_eq!(targets, ["हिन्दी", "cafe\u{0301}"]);
+    for t in targets {
+        assert!(doc.anchors.iter().any(|(s, _)| s == t), "dangling #{t}");
     }
 }

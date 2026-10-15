@@ -1090,15 +1090,17 @@ impl Builder {
         }
     }
 
-    /// GitHub-compatible heading anchor: lowercase, keep alphanumerics, `-` and `_`, spaces
-    /// become `-`, duplicates get the first unused suffix (see `unique_id`).
+    /// GitHub-compatible heading anchor (github-slugger): lowercase, keep letters, numbers,
+    /// combining marks (a virama or an accent is part of its word), connector punctuation (`_`)
+    /// and `-`, spaces become `-`, everything else goes; duplicates get the first unused
+    /// suffix (see `unique_id`).
     fn slug(&mut self, spans: Range<u32>) -> Option<String> {
         let mut slug = String::new();
         for span in &self.doc.spans[spans.start as usize..spans.end as usize] {
             for c in self.doc.text[span.start as usize..span.end as usize].chars() {
                 if c == ' ' || c == '\n' {
                     slug.push('-');
-                } else if c.is_alphanumeric() || c == '-' || c == '_' {
+                } else if c.is_alphanumeric() || c == '-' || is_mark_or_connector(c) {
                     slug.extend(c.to_lowercase());
                 }
             }
@@ -1445,6 +1447,19 @@ fn tag_end(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Combining marks (Mn, Mc, Me) and connector punctuation (Pc, `_` and its kin): characters
+/// github-slugger keeps in an anchor although they aren't alphanumeric.
+fn is_mark_or_connector(c: char) -> bool {
+    use swash::text::{Category, Codepoint};
+    matches!(
+        c.category(),
+        Category::NonspacingMark
+            | Category::SpacingMark
+            | Category::EnclosingMark
+            | Category::ConnectorPunctuation
+    )
 }
 
 /// Push and return the item's 1-based id (0 is reserved for "none").

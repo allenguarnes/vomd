@@ -1607,3 +1607,53 @@ fn table_rows_clip_columns_past_the_document_width() {
     let first = l.geoms()[0].content.as_ref().unwrap();
     assert!(first.glyphs.len() >= 4 * 6, "{} glyphs", first.glyphs.len());
 }
+
+/// Every block overlapping the viewport `[y, y + view_h)` has content after `ensure`.
+fn assert_viewport_built(l: &Layout, y: f32, view_h: f32, what: &str) {
+    for i in l.range(y, y + view_h) {
+        assert!(
+            l.geoms()[i].content.is_some(),
+            "{what}: block {i} in the viewport has no content (y {y})"
+        );
+    }
+}
+
+#[test]
+fn ensure_builds_every_block_in_the_viewport_however_wrong_the_estimates() {
+    let fonts = Fonts::new().unwrap();
+    // A wide table whose last, clipped column is huge: the row heights are estimated far above
+    // what the rows measure, and each pass only shrinks them a little.
+    let wide = "x".repeat(100_000);
+    let mut src = String::from("| a | b | c | d | e | f | g | h | i | j | k | l |\n");
+    src.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for _ in 0..12 {
+        src.push_str(&format!(
+            "| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | {wide} |\n"
+        ));
+    }
+    let doc = Doc::parse(&src);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let y = l.ensure(&doc, &fonts, Anchor::TOP, 1080.0);
+    assert_viewport_built(&l, y, 1080.0, "wide table");
+}
+
+#[test]
+fn ensure_builds_the_viewport_of_many_overestimated_rows() {
+    let fonts = Fonts::new().unwrap();
+    // Many rows, each estimated at more than a screen but measuring one short line: the
+    // viewport holds dozens of them, and every pass only reveals the next one or two.
+    let wide = "x".repeat(6000);
+    let mut src = String::from("| a | b | c | d | e | f | g | h | i | j | k | l |\n");
+    src.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for _ in 0..80 {
+        src.push_str(&format!(
+            "| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | {wide} |\n"
+        ));
+    }
+    let doc = Doc::parse(&src);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let y = l.ensure(&doc, &fonts, Anchor::TOP, 1080.0);
+    assert_viewport_built(&l, y, 1080.0, "many rows");
+    let blocks = l.range(y, y + 1080.0).len();
+    assert!(blocks > 20, "{blocks} blocks in the viewport");
+}

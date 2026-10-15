@@ -633,3 +633,83 @@ fn arabic_keeps_joining_across_style_boundaries() {
     docs.sort_unstable();
     assert_eq!(docs, [0, 2, 4, 6]);
 }
+
+/// One `Fonts` per installed Arabic-capable file (DejaVu, Noto Naskh/Sans Arabic, ...), each
+/// with just that face added as a fallback. A few at most.
+fn arabic_fonts() -> Vec<Fonts> {
+    let named = |p: &std::path::PathBuf| {
+        let n = p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        n.is_some_and(|n| {
+            ["arabic", "naskh", "dejavusans."]
+                .iter()
+                .any(|k| n.contains(k))
+        })
+    };
+    fallback::list_files(&fallback::font_dirs())
+        .iter()
+        .filter(|p| named(p))
+        .take(24)
+        .filter_map(|p| {
+            let mut fonts = Fonts::new().unwrap();
+            fonts.add_fallback(p, 0)?;
+            Some(fonts)
+        })
+        .collect()
+}
+
+#[test]
+fn ligatures_across_link_boundaries_keep_every_link_hittable() {
+    // Lam + alef is one mandatory ligature glyph in the Arabic faces that have it.
+    let mut ctx = TextCtx::default();
+    for fonts in arabic_fonts() {
+        let plain = ctx.shape(&fonts, &para("لا"));
+        // Needs a face that ligates the pair into one cluster.
+        if !plain.missing.is_empty() || plain.clusters.len() != 1 || plain.glyphs.len() != 1 {
+            continue;
+        }
+        lam_alef_links(&mut ctx, &fonts);
+    }
+}
+
+fn lam_alef_links(ctx: &mut TextCtx, fonts: &Fonts) {
+    let link = |n: u32| {
+        move |s: &mut TextStyle| {
+            s.link = n;
+            s.role = Role::Link;
+        }
+    };
+    let nolink = |_: &mut TextStyle| {};
+    let (l1, l2) = (link(1), link(2));
+    let hit_of = |l: &ParaLayout, n: u32, p: &Para| {
+        let h: Vec<&PHit> = l
+            .hits
+            .iter()
+            .filter(|h| p.styles[h.style as usize].link == n)
+            .collect();
+        assert_eq!(h.len(), 1, "link {n}: {:?}", l.hits);
+        *h[0]
+    };
+    // Linked tail: the unlinked first item owns the cluster's glyph, but the link still has a
+    // hit of its own.
+    let p = items_para(&[("ل", &nolink as &dyn Fn(&mut TextStyle)), ("ا", &l1)]);
+    let shaped = ctx.shape(fonts, &p);
+    assert_eq!(shaped.runs, 1);
+    assert_eq!(shaped.clusters.len(), 1, "the pair must stay one cluster");
+    assert_eq!(shaped.clusters[0].segs, 0..2);
+    let l = ctx.layout(fonts, &p, 1000.0, Align::Start, 1.5);
+    let (tail, head) = (hit_of(&l, 1, &p), hit_of(&l, 0, &p));
+    assert!(tail.x1 > tail.x0 && head.x1 > head.x0, "{:?}", l.hits);
+    // RTL: the later letter is on the left.
+    assert_eq!(tail.x1, head.x0);
+    assert_eq!((tail.doc, head.doc), (2, 0));
+    // Two links: both activate, each over its own half, in visual order.
+    let p = items_para(&[("ل", &l1 as &dyn Fn(&mut TextStyle)), ("ا", &l2)]);
+    let l = ctx.layout(fonts, &p, 1000.0, Align::Start, 1.5);
+    let (second, first) = (hit_of(&l, 2, &p), hit_of(&l, 1, &p));
+    assert!(second.x1 > second.x0 && first.x1 > first.x0, "{:?}", l.hits);
+    assert_eq!(second.x1, first.x0);
+    assert_eq!((second.doc, first.doc), (2, 0));
+    // The glyph itself is drawn once, in the first segment's style.
+    assert_eq!(l.glyphs.len(), 1);
+    assert_eq!(p.styles[l.glyphs[0].style as usize].link, 1);
+}

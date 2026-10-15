@@ -8,10 +8,11 @@
 use std::ops::Range;
 
 use swash::shape::{Direction, ShapeContext};
+use swash::text::cluster::SourceRange;
 use swash::text::{Category, Codepoint, Script};
 use unicode_bidi::{BidiClass, BidiInfo, bidi_class};
 
-use super::Para;
+use super::{Para, ParaItem};
 use crate::fonts::{FaceId, Fonts};
 
 pub mod flags {
@@ -40,10 +41,28 @@ pub struct Cluster {
     pub glyphs: Range<u32>,
     pub advance: f32,
     pub face: FaceId,
+    /// Style of the item the cluster starts in; the glyphs are drawn in it. A cluster that
+    /// spans several items (a ligature across a link boundary) is one glyph, so it has one
+    /// color: the first segment's.
     pub style: u32,
+    /// Range into `Shaped::segments` when the cluster spans items of different styles; empty
+    /// otherwise (the common case, which allocates nothing).
+    pub segs: Range<u32>,
     /// Bidi embedding level (odd = RTL).
     pub level: u8,
     pub flags: u8,
+}
+
+/// The part of a multi-item cluster that belongs to one item style. Hit-testing and
+/// decorations treat each segment as its own span of the cluster's advance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Segment {
+    /// Start in `Para::text`; a segment runs to the next one's start (the last, to the
+    /// cluster's end).
+    pub start: u32,
+    pub style: u32,
+    /// Share of the cluster's advance: ligature components (or characters) in the segment.
+    pub weight: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -51,6 +70,8 @@ pub struct Shaped {
     /// Clusters in logical order.
     pub clusters: Vec<Cluster>,
     pub glyphs: Vec<Glyph>,
+    /// Style segments of the clusters that span items of different styles.
+    pub segments: Vec<Segment>,
     /// Paragraph base level (0 = LTR, 1 = RTL).
     pub base_level: u8,
     /// Characters no face covers (sorted, deduplicated).
@@ -70,6 +91,54 @@ struct Run {
     size: f32,
     script: Script,
     level: u8,
+}
+
+/// Splits a cluster that reaches past its first item into one segment per item style, pushing
+/// them onto `segments` (nothing when every item has the same style). `items` starts at the
+/// item holding the cluster's start; `span` is the cluster's byte range in `text`. A segment's
+/// weight is the number of ligature components starting in it (`components` are relative to
+/// `base`) when every segment has some, else its characters.
+fn split_cluster(
+    segments: &mut Vec<Segment>,
+    text: &str,
+    items: &[ParaItem],
+    span: Range<u32>,
+    base: u32,
+    components: &[SourceRange],
+) {
+    let seg0 = segments.len();
+    for (k, it) in items.iter().enumerate() {
+        if it.range.start >= span.end {
+            break;
+        }
+        if segments.len() == seg0 || segments.last().is_some_and(|s| s.style != it.style) {
+            segments.push(Segment {
+                start: if k == 0 { span.start } else { it.range.start },
+                style: it.style,
+                weight: 0,
+            });
+        }
+    }
+    if segments.len() - seg0 < 2 {
+        segments.truncate(seg0);
+        return;
+    }
+    let mut ends: Vec<u32> = segments[seg0 + 1..].iter().map(|s| s.start).collect();
+    ends.push(span.end);
+    let mut by_components = !components.is_empty();
+    for (seg, &end) in segments[seg0..].iter_mut().zip(&ends) {
+        let n = components
+            .iter()
+            .filter(|c| (seg.start..end).contains(&(base + c.start)))
+            .count();
+        seg.weight = n as u32;
+        by_components &= n > 0;
+    }
+    if !by_components {
+        for (seg, &end) in segments[seg0..].iter_mut().zip(&ends) {
+            seg.weight = text[seg.start as usize..end as usize].chars().count() as u32;
+        }
+    }
 }
 
 /// Characters that must stay in the face of the character before them: joiners, variation
@@ -326,6 +395,7 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 advance: b.width,
                 face: run.face,
                 style: item.style,
+                segs: 0..0,
                 level: run.level,
                 flags: flags::BOX,
             });
@@ -349,11 +419,24 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
         let base = run.range.start as u32;
         let glyphs = &mut out.glyphs;
         let clusters = &mut out.clusters;
+        let segments = &mut out.segments;
         shaper.shape_with(|c| {
             let start = base + c.source.start;
             let end = base + c.source.end;
             let src = &text[start as usize..end as usize];
-            let style = items[items.partition_point(|it| it.range.end <= start)].style;
+            let first = items.partition_point(|it| it.range.end <= start);
+            let style = items[first].style;
+            let seg0 = segments.len() as u32;
+            if items[first].range.end < end {
+                split_cluster(
+                    segments,
+                    text,
+                    &items[first..],
+                    start..end,
+                    base,
+                    c.components,
+                );
+            }
             // Invisible formatting characters render nothing, even when the face lacks them:
             // a cluster that is all of them drops every `.notdef`, one that carries them next
             // to a base (`e` + variation selector + mark) drops one per such character.
@@ -392,6 +475,7 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 advance,
                 face: run.face,
                 style,
+                segs: seg0..segments.len() as u32,
                 level: run.level,
                 flags: f,
             });
