@@ -20,6 +20,10 @@ check-other:
 size:
     cargo xtask size
 
+# Regenerate the render goldens (tests/golden/); review the images before committing.
+bless:
+    cargo xtask bless
+
 bench fixture="":
     cargo xtask bench {{fixture}}
 

@@ -1,4 +1,4 @@
-//! Dev tooling: `cargo xtask <size|bench|fixtures>`. Never shipped.
+//! Dev tooling: `cargo xtask <size|bench|fixtures|bless>`. Never shipped.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -21,8 +21,9 @@ fn main() {
         Some("size") => size(),
         Some("bench") => bench(args.get(1).map(String::as_str)),
         Some("fixtures") => fixtures(),
+        Some("bless") => bless(),
         _ => {
-            eprintln!("usage: cargo xtask <size | bench [fixture] | fixtures>");
+            eprintln!("usage: cargo xtask <size | bench [fixture] | fixtures | bless>");
             false
         }
     };
@@ -183,6 +184,26 @@ fn bench(only: Option<&str>) -> bool {
 }
 
 /// Generate large fixtures that aren't committed.
+/// Regenerate the render goldens in `tests/golden/`. Review the images before
+/// committing them.
+fn bless() -> bool {
+    Command::new(env!("CARGO"))
+        .current_dir(root())
+        .args([
+            "test",
+            "--package",
+            "vomd",
+            "--test",
+            "golden",
+            "--",
+            "--nocapture",
+        ])
+        .env("VOMD_BLESS", "1")
+        .status()
+        .expect("run cargo")
+        .success()
+}
+
 fn fixtures() -> bool {
     let dir = root().join("fixtures");
     let mut seed = fs::read_to_string(dir.join("readme.md")).expect("fixtures/readme.md");

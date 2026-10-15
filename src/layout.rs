@@ -281,6 +281,12 @@ impl Layout {
         self.heights.prefix(i) as f32
     }
 
+    /// [`Layout::y`] without rounding to f32, for painting: on a tall document f32 tops are
+    /// whole pixels or worse, and blocks would jitter against each other.
+    pub fn top(&self, i: usize) -> f64 {
+        self.heights.prefix(i)
+    }
+
     /// Left edge and width of the content column.
     pub fn column(&self) -> (f32, f32) {
         (self.col_x, self.col_w)

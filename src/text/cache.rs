@@ -162,19 +162,36 @@ impl GlyphCache {
                 Angle::ZERO,
             )));
         }
-        let img = render.render(&mut scaler, key.id)?;
+        let mut img = render.render(&mut scaler, key.id)?;
         let p = img.placement;
         if p.width == 0 || p.height == 0 {
             return None;
+        }
+        let color = matches!(img.content, Content::Color);
+        // Color outlines come out premultiplied; embedded bitmaps (CBDT/sbix PNGs) don't.
+        if color && matches!(img.source, Source::ColorBitmap(_)) {
+            premultiply(&mut img.data);
         }
         Some(GlyphImage {
             left: p.left,
             top: p.top,
             width: p.width,
             height: p.height,
-            color: matches!(img.content, Content::Color),
+            color,
             data: img.data,
         })
+    }
+}
+
+/// Straight RGBA → premultiplied RGBA, in place.
+fn premultiply(rgba: &mut [u8]) {
+    for p in rgba.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a < 255 {
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
     }
 }
 
@@ -225,6 +242,13 @@ mod tests {
                 .get(&fonts, key(&fonts, 'z', 24.0 + 51.0, 0))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn premultiplies() {
+        let mut px = [200, 100, 50, 128, 10, 20, 30, 255, 99, 99, 99, 0];
+        premultiply(&mut px);
+        assert_eq!(px, [100, 50, 25, 128, 10, 20, 30, 255, 0, 0, 0, 0]);
     }
 
     /// Synthetic italic must lean right: ink in the top rows sits further right than ink in

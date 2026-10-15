@@ -44,3 +44,4 @@ incremental = false
 
 [dev-dependencies]
 insta = "1"
+png = "0.18" # golden images (tests/golden.rs); already a dependency with `images`
