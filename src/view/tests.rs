@@ -1463,6 +1463,92 @@ mod with_fonts {
         assert!(update.set_cursor && !update.pointer, "{update:?}");
     }
 
+    /// Scrolling away evicts the blocks at the top, and scrolling back leaves them unbuilt
+    /// until the next paint: the hover refresh that follows an input event (and comes first)
+    /// must still find the link under a pointer that hasn't moved.
+    #[test]
+    fn hover_refresh_finds_links_in_blocks_not_yet_rebuilt() {
+        let now = Instant::now();
+        let src = format!(
+            "Intro with [a link](https://example.com/x) here.\n\n{}",
+            paras(300)
+        );
+        let mut v = view(&src, 600, 400);
+        settle(&mut v);
+        let (lx, ly) = point_at(&v, 0, "a link");
+        assert!(v.hover(lx, ly));
+        let mut buf = vec![0; 600 * 400];
+        v.scroll_by(1.0e9, now);
+        v.paint(&mut buf, 600, now);
+        assert!(
+            v.layout().geoms()[0].content.is_none(),
+            "the top was evicted"
+        );
+        assert!(v.hover(lx, ly), "a screen of other text under the pointer");
+        assert_eq!(v.hovered(), None);
+        // Back at the top, as the End/Home keys do, with no paint in between.
+        v.scroll_by(-1.0e9, now);
+        assert!(v.layout().geoms()[0].content.is_none(), "not rebuilt yet");
+        let changed = v.hover(lx, ly);
+        assert!(changed, "hover finds the link again without a paint");
+        assert_eq!(v.hovered(), Some("https://example.com/x"));
+        // A click that comes before the repaint hits it too.
+        v.scroll_by(1.0e9, now);
+        v.paint(&mut buf, 600, now);
+        v.scroll_by(-1.0e9, now);
+        assert!(!v.press(lx, ly, now));
+        assert_eq!(v.click(lx, ly).as_deref(), Some("https://example.com/x"));
+    }
+
+    /// A bidi override in a URL would show `…/report\u{202E}fdp.exe` as `…/reportexe.pdf`:
+    /// the preview spells such characters out.
+    #[test]
+    fn preview_spells_out_invisible_characters() {
+        let mut v = view("x", 600, 400);
+        let style = TextStyle {
+            bold: false,
+            italic: false,
+            mono: false,
+            size: 12.0,
+            role: Role::Muted,
+            deco: 0,
+            shift: 0.0,
+            link: 0,
+        };
+        let (para, _) = v.fit_preview(
+            "https://example.invalid/report\u{202E}fdp.exe",
+            style,
+            1.0e4,
+        );
+        assert_eq!(para.text, "https://example.invalid/report\\u{202E}fdp.exe");
+        let hidden =
+            "a\u{200B}b\u{200E}c\u{2066}d\u{2069}e\u{FEFF}f\u{061C}g\u{202A}h\u{00AD}i\u{2060}j";
+        let (para, _) = v.fit_preview(hidden, style, 1.0e4);
+        assert_eq!(
+            para.text,
+            "a\\u{200B}b\\u{200E}c\\u{2066}d\\u{2069}e\\u{FEFF}f\\u{061C}g\\u{202A}h\\u{00AD}i\\u{2060}j"
+        );
+        assert!(!para.text.chars().any(crate::nav::is_invisible));
+        // A cut never falls inside an escape: the text before `…` is a whole number of
+        // characters of the shown URL.
+        let url = format!("https://a.b/{}", "\u{202E}".repeat(40));
+        for max_w in [40.0, 90.0, 150.0, 220.0] {
+            let (para, pl) = v.fit_preview(&url, style, max_w);
+            assert!(pl.width <= max_w);
+            let shown = para.text.trim_end_matches('…');
+            let tail = shown.strip_prefix("https://a.b/").unwrap_or("");
+            assert!(tail.split("\\u{202E}").all(str::is_empty), "{shown}");
+            assert!(shown.matches('\\').count() == tail.matches("\\u{202E}").count());
+        }
+        // Right-to-left text in a host or path stays: it is not an invisible character, and
+        // the URL is laid out left to right even when it starts with it.
+        for url in ["https://example.com/مثال/اختبار", "מבחן.example/x"] {
+            let (para, _) = v.fit_preview(url, style, 1.0e4);
+            assert!(para.text.ends_with(url), "{}", para.text);
+            assert_eq!(v.msg_ctx.shape(&v.fonts, &para).base_level, 0, "{url}");
+        }
+    }
+
     /// The preview box is never wider than allowed and a cut URL always ends with `…` inside
     /// it, whatever the characters measure (CJK, wide hosts).
     #[test]

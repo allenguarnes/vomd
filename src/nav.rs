@@ -3,7 +3,8 @@
 //!
 //! Links are classified strictly: only `#anchors`, relative Markdown files, and `http(s):` /
 //! `mailto:` URLs do anything. Every other scheme (`javascript:`, `file:`, `data:`, ...),
-//! absolute paths and anything with control characters is inert.
+//! absolute paths, anything with control characters and external URLs with bidi controls
+//! (which can make a link read like another one) is inert.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -48,6 +49,7 @@ pub fn classify(href: &str, base: Option<&Path>) -> Target {
     }
     if let Some(scheme) = scheme(t) {
         return match scheme.to_ascii_lowercase().as_str() {
+            "http" | "https" | "mailto" if t.chars().any(is_bidi_control) => Target::Ignore,
             "mailto" if mailto_attaches(t) => Target::Ignore,
             "http" | "https" | "mailto" => Target::External(t.to_owned()),
             _ => Target::Ignore,
@@ -96,26 +98,56 @@ fn is_absolute(path: &str) -> bool {
             .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
 }
 
+/// Longest header name of a `mailto:` URL that is looked at: real ones are a few characters,
+/// so a longer one is treated as an attachment (the link is inert) instead of decoded.
+const MAILTO_NAME_MAX: usize = 64;
+
+/// How many times a header name is percent-decoded: `%2561ttach` is `attach` after two rounds,
+/// and nothing real is encoded more than once.
+const MAILTO_DECODE_ROUNDS: usize = 8;
+
 /// Whether a `mailto:` URL carries an `attach`/`attachment` header (RFC 6068 lets a link name
 /// any header, and some mail clients attach the file the value names): such links are inert.
-/// Names are compared decoded (as many times as it takes, so `%2561ttach` is no way round),
-/// ignoring case.
+/// Names are compared decoded (up to [`MAILTO_DECODE_ROUNDS`] times, so `%2561ttach` is no way
+/// round), ignoring case. A name that is too long ([`MAILTO_NAME_MAX`]) or still changes after
+/// the last round couldn't be checked completely, and counts as one: the work stays linear in
+/// the length of the URL however it is nested.
 fn mailto_attaches(url: &str) -> bool {
     let query = url.split('#').next().unwrap_or(url);
     let Some((_, query)) = query.split_once('?') else {
         return false;
     };
     query.split(['&', ';']).any(|pair| {
-        let mut name = pair.split_once('=').map_or(pair, |(n, _)| n).to_owned();
-        loop {
+        let name = pair.split_once('=').map_or(pair, |(n, _)| n);
+        if name.len() > MAILTO_NAME_MAX {
+            return true;
+        }
+        let mut name = name.to_owned();
+        for _ in 0..MAILTO_DECODE_ROUNDS {
             let decoded = percent_decode(&name);
             if decoded == name {
-                break;
+                return name.trim().to_ascii_lowercase().starts_with("attach");
             }
             name = decoded;
         }
-        name.trim().to_ascii_lowercase().starts_with("attach")
+        true
     })
+}
+
+/// Bidirectional formatting characters (embeddings, overrides, isolates, marks): they reorder
+/// the text around them, so `report\u{202E}fdp.exe` reads `reportexe.pdf`.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Characters that show nothing and could hide or fake a part of a URL: the bidi controls,
+/// zero-width characters, the word joiner and the byte order mark, and the soft hyphen.
+pub fn is_invisible(c: char) -> bool {
+    is_bidi_control(c)
+        || matches!(
+            c,
+            '\u{00AD}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
+        )
 }
 
 /// The URI scheme of `s` (RFC 3986: a letter, then letters, digits, `+`, `-` or `.`, then

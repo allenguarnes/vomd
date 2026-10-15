@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use unicode_bidi::{BidiClass, bidi_class};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::cli::Input;
@@ -648,6 +649,7 @@ impl View {
     /// scrollbar is showing, so links and other things under a hidden one stay clickable.
     /// Returns true if it took the press.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        self.ensure_content();
         let taken = self.press_scrollbar(x, y, now);
         // Not the scrollbar's: remember the link under it, for a click on release.
         self.pressed = if taken { None } else { self.link_at(x, y) };
@@ -711,6 +713,14 @@ impl View {
 
     // ---- Links and headings ---------------------------------------------------------------
 
+    /// Hit-testing needs the blocks on screen built: scrolling, a jump or a resize evicts and
+    /// rebuilds them in the next paint, which is after the shell asked who is under the pointer.
+    fn ensure_content(&mut self) {
+        if self.message.is_none() {
+            self.ensure();
+        }
+    }
+
     /// The link (1-based id into `Doc::links`) under window point (`x`, `y`), if any. Only
     /// blocks near the viewport have content to hit, which covers everything on screen.
     pub fn link_at(&self, x: f64, y: f64) -> Option<u32> {
@@ -725,6 +735,7 @@ impl View {
     /// The pointer moved to (`x`, `y`). Returns true if the link under it changed: repaint
     /// for the URL preview (and switch the pointer cursor, see [`View::hovered`]).
     pub fn hover(&mut self, x: f64, y: f64) -> bool {
+        self.ensure_content();
         let link = if self.drag.is_some() {
             None
         } else {
@@ -748,6 +759,7 @@ impl View {
     /// released on the same link), if any.
     pub fn click(&mut self, x: f64, y: f64) -> Option<String> {
         let pressed = self.pressed.take()?;
+        self.ensure_content();
         if self.link_at(x, y) != Some(pressed) {
             return None;
         }
@@ -898,8 +910,39 @@ impl View {
 
     /// `url` laid out in one line no wider than `max_w`: cut short with a trailing `…` when it
     /// is wider, at the longest prefix that fits when measured (character counts say little
-    /// about width: CJK and wide hosts take twice the room of ASCII).
+    /// about width: CJK and wide hosts take twice the room of ASCII). Invisible characters
+    /// (bidi controls, zero-width ones) are shown as `\u{202E}`, never acted on, and a URL that
+    /// starts with right-to-left text is still laid out left to right.
     fn fit_preview(&mut self, url: &str, style: TextStyle, max_w: f32) -> (Para, ParaLayout) {
+        // Characters narrower than a fifth of an em are rare, so a longer URL is cut to this
+        // many before measuring: a huge link isn't laid out whole on every paint.
+        let most = (max_w / (0.2 * style.size)) as usize + 1;
+        // The first `most` characters as shown, and where each one ends in `text`: a cut never
+        // falls inside an escape.
+        let (mut text, mut ends) = (String::new(), Vec::new());
+        let mut chars = url.chars();
+        for c in chars.by_ref().take(most) {
+            if crate::nav::is_invisible(c) {
+                text.push_str(&format!("\\u{{{:04X}}}", c as u32));
+            } else {
+                text.push(c);
+            }
+            ends.push(text.len());
+        }
+        let cut = chars.next().is_some();
+        // The first strong character would otherwise set the paragraph's direction.
+        let rtl = text
+            .chars()
+            .any(|c| matches!(bidi_class(c), BidiClass::R | BidiClass::AL));
+        let prefix = |n: usize| -> String {
+            let n = n.min(ends.len());
+            let mut shown = String::from(if rtl { "\u{200E}" } else { "" });
+            shown.push_str(&text[..n.checked_sub(1).map_or(0, |i| ends[i])]);
+            if n < ends.len() || cut {
+                shown.push('…');
+            }
+            shown
+        };
         let lay = |view: &mut View, text: &str| {
             let mut para = Para::default();
             para.push_text(text, 0, style);
@@ -907,16 +950,6 @@ impl View {
                 .msg_ctx
                 .layout(&view.fonts, &para, 1.0e6, Align::Start, 1.4);
             (para, pl)
-        };
-        // Characters narrower than a fifth of an em are rare, so a longer URL is cut to this
-        // many before measuring: a huge link isn't laid out whole on every paint.
-        let most = (max_w / (0.2 * style.size)) as usize + 1;
-        let prefix = |n: usize| -> String {
-            let mut text: String = url.chars().take(n).collect();
-            if url.chars().nth(n).is_some() {
-                text.push('…');
-            }
-            text
         };
         let first = lay(self, &prefix(most));
         if first.1.width <= max_w || most == 0 {

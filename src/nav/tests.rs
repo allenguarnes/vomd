@@ -166,6 +166,82 @@ fn mailto_with_attachments_is_inert() {
     }
 }
 
+/// A header name nested in percent escapes used to be decoded again and again, losing two
+/// bytes a round: seconds for a link of 100 KB. The work is bounded now, and a name that can't
+/// be checked completely counts as an attachment.
+#[test]
+fn nested_mailto_names_are_bounded() {
+    let start = std::time::Instant::now();
+    for n in [100, 20_000, 60_000, 120_000] {
+        let url = format!("mailto:a@b.c?%{}61ttach=/etc/passwd", "25".repeat(n));
+        assert_eq!(classify(&url, base()), Target::Ignore, "{n}");
+        let url = format!("mailto:a@b.c?subject=hi&%{}61ttach=/x", "25".repeat(n));
+        assert_eq!(classify(&url, base()), Target::Ignore, "{n}");
+    }
+    // Long names, many pairs, a long value, and one long unbroken query: linear work.
+    let long = format!("mailto:a@b.c?{}=x", "n".repeat(200_000));
+    assert_eq!(classify(&long, base()), Target::Ignore);
+    let pairs = format!("mailto:a@b.c?{}", "s=1&".repeat(100_000));
+    assert_eq!(classify(&pairs, base()), Target::External(pairs.clone()));
+    let body = format!("mailto:a@b.c?body={}", "x%20".repeat(100_000));
+    assert_eq!(classify(&body, base()), Target::External(body.clone()));
+    // Up to the round limit the names are still decoded.
+    let mut name = String::from("attach");
+    for _ in 0..MAILTO_DECODE_ROUNDS {
+        name = name.replace('%', "%25").replacen('a', "%61", 1);
+        assert_eq!(
+            classify(&format!("mailto:a@b.c?{name}=/x"), base()),
+            Target::Ignore,
+            "{name}"
+        );
+    }
+    // Other links with huge text: one pass each.
+    let big = "%2525".repeat(40_000);
+    classify(&format!("https://example.com/{big}#{big}"), base());
+    classify(&format!("sub/{big}.md#{big}"), base());
+    classify(&format!("#{big}"), base());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// Bidi controls reorder the text around them (`report\u{202E}fdp.exe` reads `reportexe.pdf`):
+/// an external link holding one is never opened.
+#[test]
+fn bidi_controls_make_external_links_inert() {
+    for c in [
+        '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}',
+    ] {
+        for url in [
+            format!("https://example.invalid/report{c}fdp.exe"),
+            format!("http://exam{c}ple.com"),
+            format!("mailto:a@b.c?subject=x{c}y"),
+            format!("https://example.com/#a{c}"),
+        ] {
+            assert_eq!(classify(&url, base()), Target::Ignore, "{url:?}");
+        }
+    }
+    // Right-to-left text itself is fine, and so are zero-width joiners in names that need them.
+    for url in [
+        "https://example.com/مثال/اختبار",
+        "https://مثال.example/path",
+        "https://example.com/שלום",
+        "https://example.com/می\u{200C}خواهم",
+    ] {
+        assert_eq!(classify(url, base()), Target::External(url.into()), "{url}");
+    }
+    assert!(is_bidi_control('\u{202E}') && !is_bidi_control('א') && !is_bidi_control('\u{200D}'));
+    assert!(is_invisible('\u{200D}') && is_invisible('\u{202E}') && !is_invisible('ا'));
+    // A relative link or an anchor is no external URL: nothing there to be mistaken for one.
+    assert_eq!(
+        classify("#a\u{202E}b", base()),
+        Target::Anchor("a\u{202E}b".into())
+    );
+}
+
 #[test]
 fn schemes() {
     assert_eq!(scheme("http://x"), Some("http"));
