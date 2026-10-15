@@ -1,0 +1,8 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"| <b>x | y | <i>z |\\n|---|---|---|\\n| <a href=\\\"u\\\">l | m | n |\\n| <b>b</b> c | <kbd>k</kbd> | d |\\n\")"
+---
+Row(t0,head) | [ [B]"x" ] [ "y" ] [ [I]"z" ]
+Row(t0) | [ [L1]"l" ] [ "m" ] [ "n" ]
+Row(t0) | [ [B]"b" " c" ] [ [C]"k" ] [ "d" ]
+link 1: u

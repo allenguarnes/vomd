@@ -1,0 +1,8 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"https://github.com/a/b/blob/main/pkg/__init__.py and https://x.y/a_b_c and \\\n         https://x.y/a*b*c\\n\")"
+---
+P | [L1]"https://github.com/a/b/blob/main/pkg/" [B]"init" ".py and " [L2]"https://x.y/a_b_c" " and " [L3]"https://x.y/a" [I]"b" "c"
+link 1: https://github.com/a/b/blob/main/pkg/
+link 2: https://x.y/a_b_c
+link 3: https://x.y/a

@@ -429,12 +429,16 @@ struct Builder {
     bold: usize,
     italic: usize,
     strike: usize,
+    /// The open link, if any: anchors don't nest, in HTML or Markdown (opening one closes the
+    /// open one, and any end closes it), so this holds at most one.
     links: Vec<u32>,
-    /// Styles and links opened by inline HTML tags in the open block.
+    /// Styles opened by inline HTML tags in the open block.
     html_inline: HtmlInline,
     /// Plain text waiting for autolink detection: pulldown-cmark splits a run of text into
     /// several events (at entities, escapes, unmatched delimiters), and a URL can span them.
     pending: String,
+    /// The source character before `pending`, for autolink boundaries (see `boundary_after`).
+    prev: char,
     /// Next number for each open list (`None` = bullet list).
     lists: Vec<Option<u64>>,
     quote: u8,
@@ -486,8 +490,6 @@ struct HtmlInline {
     strike: u32,
     sup: u32,
     sub: u32,
-    /// Links on `Builder::links` pushed by `<a href>`.
-    links: usize,
     /// Inside `<script>` or `<style>` (the tag name): content is dropped.
     skip: Option<&'static str>,
 }
@@ -507,6 +509,7 @@ impl Builder {
             links: Vec::new(),
             html_inline: HtmlInline::default(),
             pending: String::new(),
+            prev: ' ',
             lists: Vec::new(),
             quote: 0,
             quote_lists: Vec::new(),
@@ -574,6 +577,7 @@ impl Builder {
     fn event(&mut self, event: Event) {
         if !matches!(event, Event::Text(_)) {
             self.flush_text();
+            self.prev = boundary_after(&event);
         }
         if self.skip_head {
             self.skip_head = !matches!(event, Event::End(TagEnd::TableHead));
@@ -796,12 +800,17 @@ impl Builder {
                     cells: 0,
                 });
             }
-            Tag::TableCell => self.merge_floor = self.doc.spans.len(),
+            Tag::TableCell => {
+                // An unclosed tag in a cell doesn't go on in the next one.
+                self.end_inline_html();
+                self.merge_floor = self.doc.spans.len();
+            }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
             Tag::Link { dest_url, .. } => {
                 let id = push_id(&mut self.doc.links, dest_url.into_string());
+                self.links.clear();
                 self.links.push(id);
             }
             Tag::Image { dest_url, .. } => {
@@ -864,9 +873,7 @@ impl Builder {
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
             TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
-            TagEnd::Link => {
-                self.links.pop();
-            }
+            TagEnd::Link => self.links.clear(),
             TagEnd::Image => self.end_image(),
             TagEnd::HtmlBlock
             | TagEnd::Table
@@ -921,6 +928,10 @@ impl Builder {
 
     fn open(&mut self, kind: BlockKind) {
         self.close();
+        self.begin(kind);
+    }
+
+    fn begin(&mut self, kind: BlockKind) {
         self.open = Some(Open {
             kind,
             span_start: self.doc.spans.len() as u32,
@@ -928,8 +939,6 @@ impl Builder {
         self.merge_floor = self.doc.spans.len();
     }
 
-    /// Append text to the open block, opening an implicit paragraph if needed (tight list
-    /// items and inline content after HTML have no explicit paragraph).
     /// Emit the pending plain text, with GFM autolinks (`www.`, `http(s)://`, emails) as links.
     fn flush_text(&mut self) {
         if self.pending.is_empty() {
@@ -937,7 +946,7 @@ impl Builder {
         }
         let text = std::mem::take(&mut self.pending);
         let mut at = 0;
-        for (range, href) in autolink::find(&text) {
+        for (range, href) in autolink::find(&text, self.prev) {
             self.text(&text[at..range.start], 0, 0);
             let id = push_id(&mut self.doc.links, href);
             self.links.push(id);
@@ -951,12 +960,16 @@ impl Builder {
         self.pending.clear();
     }
 
+    /// Append text to the open block, opening an implicit paragraph if needed (tight list
+    /// items and inline content after HTML have no explicit paragraph).
     fn text(&mut self, s: &str, extra_style: u16, image: u32) {
         if s.is_empty() {
             return;
         }
         if self.open.is_none() {
-            self.open(BlockKind::Paragraph);
+            // Nothing to close, and the inline HTML state stays: `- <b>bold</b> item` opened
+            // `<b>` before there was a block.
+            self.begin(BlockKind::Paragraph);
         }
         let style = self.style() | extra_style;
         let link = self.link();
@@ -983,11 +996,14 @@ impl Builder {
         });
     }
 
+    /// Inline HTML can't leave a style or link open past its block (or table cell).
+    fn end_inline_html(&mut self) {
+        self.html_inline = HtmlInline::default();
+        self.links.clear();
+    }
+
     fn close(&mut self) {
-        // Inline HTML can't leave a style or link open past its block.
-        let h = std::mem::take(&mut self.html_inline);
-        self.links
-            .truncate(self.links.len().saturating_sub(h.links));
+        self.end_inline_html();
         let Some(open) = self.open.take() else { return };
         let mut kind = open.kind;
         if kind == BlockKind::Code {
@@ -1449,13 +1465,10 @@ impl Builder {
                 return true;
             }
             "a" => {
-                if closing {
-                    if h.links > 0 {
-                        h.links -= 1;
-                        self.links.pop();
-                    }
-                } else if let Some(href) = attr(tag, "href") {
-                    h.links += 1;
+                // As in a browser, an anchor can't hold another: both an end tag and a new
+                // anchor close the open one, whichever kind of link it is.
+                self.links.clear();
+                if !closing && let Some(href) = attr(tag, "href") {
                     let id = push_id(&mut self.doc.links, decode_entities(&href));
                     self.links.push(id);
                 }
@@ -1609,6 +1622,21 @@ impl Builder {
             self.doc.headings.append(&mut noted);
         }
         self.doc
+    }
+}
+
+/// The character before the text that follows `event`, as far as autolinks go (whether a `www.`
+/// address or URL may start there): what the event's source ends with. Breaks, delimiters and
+/// block starts count as whitespace or `*`, which are boundaries.
+fn boundary_after(event: &Event) -> char {
+    match event {
+        Event::Code(_) => '`',
+        Event::Html(_) | Event::InlineHtml(_) => '>',
+        Event::InlineMath(_) | Event::DisplayMath(_) => '$',
+        Event::FootnoteReference(_) => ']',
+        Event::Start(Tag::Link { .. } | Tag::Image { .. }) => '[',
+        Event::End(TagEnd::Link | TagEnd::Image) => ')',
+        _ => ' ',
     }
 }
 

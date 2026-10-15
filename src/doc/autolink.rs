@@ -1,11 +1,14 @@
-//! GFM extended autolinks (GitHub Flavored Markdown spec §6.9): `www.` addresses, `http://` and
-//! `https://` URLs, and email addresses written as plain text become links, as on GitHub.
-//! pulldown-cmark doesn't do this, so the builder runs [`find`] over plain text runs.
+//! GFM extended autolinks (GitHub Flavored Markdown spec §6.9): `www.` addresses, `http://`,
+//! `https://` and `ftp://` URLs, and email addresses written as plain text become links, as on
+//! GitHub (cmark-gfm's rules). pulldown-cmark doesn't do this, so the builder runs [`find`] over
+//! plain text runs.
 
 use std::ops::Range;
 
-/// The autolinks in `s`: byte range of the link text and the link target.
-pub fn find(s: &str) -> Vec<(Range<usize>, String)> {
+/// The autolinks in `s`: byte range of the link text and the link target. `prev` is the
+/// character before `s` in the source (a space at the start of a block); whether a link may
+/// start depends on the character before it.
+pub fn find(s: &str, prev: char) -> Vec<(Range<usize>, String)> {
     let mut out = Vec::new();
     let b = s.as_bytes();
     // Every link needs one of these; most text has none, and the parser runs this on all of it.
@@ -14,16 +17,16 @@ pub fn find(s: &str) -> Vec<(Range<usize>, String)> {
     }
     let mut i = 0;
     while i < b.len() {
-        // Links start with `w`, `h` or (for emails) contain `@`; only ASCII bytes are tested,
-        // so `i` is on a character boundary whenever it is sliced at.
+        // Links start with `w`, `h`, `f` or (for emails) contain `@`; only ASCII bytes are
+        // tested, so `i` is on a character boundary whenever it is sliced at.
         match b[i] {
-            b'w' | b'W' | b'h' | b'H' => {
-                // At the beginning, after whitespace, or after `*`, `_`, `~` or `(`.
-                let boundary = i == 0 || {
-                    let prev = s[..i].chars().next_back().unwrap_or(' ');
-                    prev.is_whitespace() || matches!(prev, '*' | '_' | '~' | '(')
+            b'w' | b'W' | b'h' | b'H' | b'f' | b'F' => {
+                let before = if i == 0 {
+                    prev
+                } else {
+                    s[..i].chars().next_back().unwrap_or(' ')
                 };
-                if boundary && let Some((end, href)) = at(s, i) {
+                if let Some((end, href)) = at(s, i, before) {
                     out.push((i..end, href));
                     i = end;
                     continue;
@@ -59,8 +62,11 @@ fn candidate(s: &str) -> bool {
     })
 }
 
-/// A `www.` or `http(s)://` autolink starting at `i`: its end and target.
-fn at(s: &str, i: usize) -> Option<(usize, String)> {
+/// A `www.` or `http(s)://` or `ftp://` autolink starting at `i`, after the character `before`:
+/// its end and target. As in cmark-gfm a `www.` address must follow whitespace or one of
+/// `*_~(`, while a URL only can't follow a letter (which would make another scheme) and needs
+/// no period in its domain (`http://localhost:3000`).
+fn at(s: &str, i: usize, before: char) -> Option<(usize, String)> {
     let rest = &s[i..];
     let lower = |p: &str| {
         rest.as_bytes()
@@ -71,19 +77,30 @@ fn at(s: &str, i: usize) -> Option<(usize, String)> {
         (8, "")
     } else if lower("http://") {
         (7, "")
+    } else if lower("ftp://") {
+        (6, "")
     } else if lower("www.") {
         (0, "http://")
     } else {
         return None;
     };
-    let domain_end = i + prefix + domain(&rest[prefix..])?;
+    let boundary = if prefix > 0 {
+        !before.is_ascii_alphabetic()
+    } else {
+        before.is_whitespace() || matches!(before, '*' | '_' | '~' | '(')
+    };
+    if !boundary {
+        return None;
+    }
+    let domain_end = i + prefix + domain(&rest[prefix..], prefix > 0)?;
     let end = trim_end(s, i, path_end(s, domain_end));
     Some((end, format!("{scheme}{}", &s[i..end])))
 }
 
 /// Length of a valid domain at the start of `s`: segments of alphanumerics, `_` and `-`
-/// separated by periods, at least one period, and no `_` in the last two segments.
-fn domain(s: &str) -> Option<usize> {
+/// separated by periods, at least one period unless `short`, and no `_` in the last two
+/// segments.
+fn domain(s: &str, short: bool) -> Option<usize> {
     let mut len = 0;
     let mut segments: Vec<&str> = Vec::new();
     for seg in s.split('.') {
@@ -104,7 +121,8 @@ fn domain(s: &str) -> Option<usize> {
     if s[..len].ends_with('.') {
         len -= 1;
     }
-    if segments.len() < 2 || segments.iter().rev().take(2).any(|g| g.contains('_')) {
+    let needed = if short { 1 } else { 2 };
+    if segments.len() < needed || segments.iter().rev().take(2).any(|g| g.contains('_')) {
         return None;
     }
     Some(len)
@@ -120,6 +138,10 @@ fn path_end(s: &str, from: usize) -> usize {
 /// Trailing punctuation isn't part of a link (GFM "extended autolink path validation"):
 /// `?!.,:*_~'"`, an unbalanced `)`, and an entity-like `&name;` at the end.
 fn trim_end(s: &str, start: usize, mut end: usize) -> usize {
+    // Counted once: only a trimmed `)` changes them (the other trimmed characters, entity-like
+    // runs included, hold no parentheses), so the loop is linear.
+    let open = s[start..end].matches('(').count();
+    let mut close = s[start..end].matches(')').count();
     loop {
         let link = &s[start..end];
         let Some(last) = link.chars().next_back() else {
@@ -128,9 +150,8 @@ fn trim_end(s: &str, start: usize, mut end: usize) -> usize {
         match last {
             '?' | '!' | '.' | ',' | ':' | '*' | '_' | '~' | '\'' | '"' => end -= 1,
             ')' => {
-                let open = link.matches('(').count();
-                let close = link.matches(')').count();
                 if close > open {
+                    close -= 1;
                     end -= 1;
                 } else {
                     return end;
@@ -155,8 +176,8 @@ fn trim_end(s: &str, start: usize, mut end: usize) -> usize {
 }
 
 /// An email address around the `@` at `at`: its start and end. The local part is
-/// alphanumerics and `.+-_`; the domain is like [`domain`] but the last character can't be
-/// `-` or `_` (and a trailing `.` isn't part of it).
+/// alphanumerics and `.+-_`; the domain is like [`domain`] but the last character must be a
+/// letter (a trailing `.` isn't part of it).
 fn email(s: &str, at: usize) -> Option<(usize, usize)> {
     let local = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_');
     let start = s[..at]
@@ -173,7 +194,10 @@ fn email(s: &str, at: usize) -> Option<(usize, usize)> {
         end -= 1;
     }
     let dom = &after[..end];
-    if !dom.contains('.') || dom.ends_with(['-', '_']) || dom.starts_with('.') {
+    if !dom.contains('.')
+        || !dom.ends_with(|c: char| c.is_ascii_alphabetic())
+        || dom.starts_with('.')
+    {
         return None;
     }
     Some((start, at + 1 + end))
@@ -184,7 +208,7 @@ mod tests {
     use super::*;
 
     fn links(s: &str) -> Vec<(&str, String)> {
-        find(s).into_iter().map(|(r, h)| (&s[r], h)).collect()
+        find(s, ' ').into_iter().map(|(r, h)| (&s[r], h)).collect()
     }
 
     #[test]
@@ -252,10 +276,8 @@ mod tests {
             "www.google.com/search?q=commonmark"
         );
         assert_eq!(links("see https://a.b/c, then")[0].0, "https://a.b/c");
-        assert!(
-            links("\"https://a.b/c\"").is_empty(),
-            "a quote isn't a GFM boundary"
-        );
+        // Quotes trail a URL (not part of it) and don't stop one from starting.
+        assert_eq!(links("\"https://a.b/c\"")[0].0, "https://a.b/c");
         assert_eq!(
             links("www.commonmark.org/he<lp")[0].0,
             "www.commonmark.org/he"
@@ -270,11 +292,99 @@ mod tests {
             "underscore in the last two segments"
         );
         assert_eq!(links("www.a_b.cd.ef")[0].0, "www.a_b.cd.ef");
-        assert!(links("http://localhost").is_empty(), "needs a period");
         assert!(links("xwww.example.com").is_empty(), "not at a boundary");
         assert_eq!(links("*www.example.com*")[0].0, "www.example.com");
         assert!(links("no links here.").is_empty());
-        assert!(links("ftp://x.y").is_empty());
+    }
+
+    /// cmark-gfm's rules for URLs with a scheme: http, https and ftp, no period needed in the
+    /// domain, and anything but a letter (which would make it another scheme) may come before.
+    #[test]
+    fn scheme_urls_follow_cmark_gfm() {
+        for url in [
+            "http://localhost:3000",
+            "http://localhost",
+            "ftp://x.y/z",
+            "FTP://X.Y",
+            "https://a.b/c",
+        ] {
+            assert_eq!(links(&format!("go to {url} now"))[0].0, url);
+        }
+        assert_eq!(links("URL:https://a.b/d")[0].0, "https://a.b/d");
+        assert_eq!(links("(https://a.b/d)")[0].0, "https://a.b/d");
+        assert_eq!(links("1https://a.b")[0].0, "https://a.b");
+        assert_eq!(links("-http://a.b")[0].0, "http://a.b");
+        assert_eq!(links("x'http://a.b/'x")[0].0, "http://a.b/'x");
+        for none in [
+            "xhttps://no.pe",
+            "shttp://a.b",
+            "gopher://a.b",
+            "file://a.b",
+            "http://",
+            "https:// a.b",
+            "ftp://_.x_",
+            "http://a_b",
+        ] {
+            assert!(links(none).is_empty(), "{none}");
+        }
+        // The text before the URL is the caller's `prev` for the first character.
+        assert!(find("https://a.b", 'x').is_empty());
+        assert_eq!(find("https://a.b", '`').len(), 1);
+    }
+
+    /// `www.` addresses need whitespace, `*`, `_`, `~` or `(` before them, also across the
+    /// caller's text runs (code spans and HTML tags end a run without being whitespace).
+    #[test]
+    fn www_boundary_uses_the_character_before_the_text() {
+        for (prev, linked) in [
+            (' ', true),
+            ('\n', true),
+            ('*', true),
+            ('_', true),
+            ('~', true),
+            ('(', true),
+            ('`', false),
+            ('>', false),
+            (')', false),
+            (']', false),
+            ('a', false),
+        ] {
+            assert_eq!(
+                find("www.a.com", prev).len(),
+                usize::from(linked),
+                "{prev:?}"
+            );
+        }
+        // Later positions look at the text itself.
+        assert_eq!(find("`c` www.a.com", '>').len(), 1);
+        assert!(find("c`www.a.com", ' ').is_empty());
+    }
+
+    #[test]
+    fn pathological_trailing_parentheses_are_trimmed_in_linear_time() {
+        let t = std::time::Instant::now();
+        for url in ["www.a.bc/", "https://a.bc/"] {
+            let all = format!("{url}{}", ")".repeat(200_000));
+            assert_eq!(links(&all)[0].0, url);
+            let alternating = format!("{url}{}", ".)".repeat(100_000));
+            assert_eq!(links(&alternating)[0].0, url);
+            // Balanced pairs stay, the rest goes.
+            let paired = format!("{url}{}{}", "()".repeat(50_000), ")".repeat(50_000));
+            assert_eq!(links(&paired)[0].0, format!("{url}{}", "()".repeat(50_000)));
+            // Many lines of it, as a document of such lines would be.
+            let lines = format!("{url}{}\n", ")".repeat(2_000)).repeat(100);
+            assert_eq!(links(&lines).len(), 100);
+            // And entity-like endings and long runs of other trailing punctuation.
+            let entities = format!("{url}{}", "&a;".repeat(50_000));
+            assert_eq!(links(&entities)[0].0, url);
+            let punct = format!("{url}{}", "?!.,:*_~'\"".repeat(20_000));
+            assert_eq!(links(&punct)[0].0, url);
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
@@ -296,6 +406,12 @@ mod tests {
         assert!(links("a.b-c_d@a.b_").is_empty());
         assert!(links("@a.b").is_empty());
         assert!(links("a@b").is_empty());
+        // The domain must end in a letter, as in cmark-gfm.
+        assert!(links("a@b.c1").is_empty());
+        assert!(links("a@b.c1.").is_empty());
+        assert!(links("a@1.2").is_empty());
+        assert_eq!(links("a@b.c1d")[0].0, "a@b.c1d");
+        assert_eq!(links("a@b1.co")[0].0, "a@b1.co");
     }
 
     #[test]
@@ -307,7 +423,7 @@ mod tests {
         // Never panics on arbitrary slices around multi-byte text.
         for i in 0..s.len() {
             if s.is_char_boundary(i) {
-                let _ = find(&s[i..]);
+                let _ = find(&s[i..], ' ');
             }
         }
     }

@@ -1,0 +1,18 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"`c`www.a.com and `d` www.b.com and <b>www.c.com</b> and x<b> www.d.com</b> and \\\n         **www.e.com** and (www.f.com) and [x](y)www.g.com and ![i](j)www.h.com.\\n\\n\\\n         www.start.com of a paragraph\\n\\n- www.item.com of an item\\n\\n\\\n         `c`https://i.com and <b>https://j.com</b> and xhttps://k.com.\\n\")"
+---
+P | [C]"c" "www.a.com and " [C]"d" " " [L1]"www.b.com" " and " [B]"www.c.com" " and x" [B]" " [BL2]"www.d.com" " and " [BL3]"www.e.com" " and (" [L4]"www.f.com" ") and " [L5]"x" "www.g.com and " [Mm1]"i" "www.h.com."
+P | [L6]"www.start.com" " of a paragraph"
+P list=1 Bullet | [L7]"www.item.com" " of an item"
+P | [C]"c" [L8]"https://i.com" " and " [BL9]"https://j.com" " and xhttps://k.com."
+link 1: http://www.b.com
+link 2: http://www.d.com
+link 3: http://www.e.com
+link 4: http://www.f.com
+link 5: y
+link 6: http://www.start.com
+link 7: http://www.item.com
+link 8: https://i.com
+link 9: https://j.com
+image 1: j remote=false

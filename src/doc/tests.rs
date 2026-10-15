@@ -250,6 +250,106 @@ fn inline_html_styles_and_autolinks() {
     insta::assert_snapshot!(dump(&doc));
 }
 
+/// Inline HTML at the start of a tight item (no paragraph event opens a block there), of a task
+/// item and of a loose one keeps its styles and links; an unclosed tag ends with its item.
+#[test]
+fn inline_html_at_the_start_of_items() {
+    insta::assert_snapshot!(parse(
+        "- <b>bold</b> item\n\
+         - <kbd>Ctrl</kbd>+C\n\
+         - <a href=\"x\">link</a> y\n\
+         - [ ] <b>task</b> done\n\
+         - [x] <a href=\"t\">task link</a> and <i>it</i>\n\
+         - <i>unclosed\n\
+         - plain after it\n\
+         - <b></b><b>\n\
+         - plain after a tag with no text\n\
+         - <a href=\"open\">\n\
+         - plain after a link with no text\n\n\
+         - loose <b>one</b>\n\n\
+         - <b>loose bold</b> two\n\n\
+         1. <b>a</b> then\n   \
+            - <i>nested</i> item\n   \
+            - plain nested\n\
+         2. <sup>2</sup> end\n\n\
+         Plain after the lists.\n"
+    ));
+}
+
+/// An unclosed tag in a table cell doesn't style the cells after it.
+#[test]
+fn inline_html_in_table_cells_ends_with_the_cell() {
+    insta::assert_snapshot!(parse(
+        "| <b>x | y | <i>z |\n|---|---|---|\n| <a href=\"u\">l | m | n |\n| <b>b</b> c | <kbd>k</kbd> | d |\n"
+    ));
+}
+
+/// An anchor can't hold another, as in a browser: a new one or any end closes the open one,
+/// whether the links are HTML or Markdown.
+#[test]
+fn interleaved_html_and_markdown_links() {
+    insta::assert_snapshot!(parse(
+        "[a <a href=x>b](y) c</a> d\n\n\
+         <a href=x>foo [bar</a>](y) baz\n\n\
+         <a href=\"x\">foo [bar](y) baz</a> qux\n\n\
+         [a <a name=n>b</a> c](y) d\n\n\
+         <a href=x>one <a href=z>two</a> three</a> four\n\n\
+         [md](y) then <a href=x>html</a> then [md2](z) end\n"
+    ));
+}
+
+/// Autolinks look at the character before them: `www.` addresses need whitespace or `*_~(`
+/// (not a code span or a tag, which end a text run without being one), URLs only a non-letter.
+#[test]
+fn autolinks_after_code_spans_and_tags() {
+    insta::assert_snapshot!(parse(
+        "`c`www.a.com and `d` www.b.com and <b>www.c.com</b> and x<b> www.d.com</b> and \
+         **www.e.com** and (www.f.com) and [x](y)www.g.com and ![i](j)www.h.com.\n\n\
+         www.start.com of a paragraph\n\n- www.item.com of an item\n\n\
+         `c`https://i.com and <b>https://j.com</b> and xhttps://k.com.\n"
+    ));
+}
+
+/// cmark-gfm's URL rules (see `autolink`): schemes http, https and ftp, in quotes or after a
+/// colon, no period needed, and emails that end in a letter.
+#[test]
+fn autolinks_follow_cmark_gfm() {
+    insta::assert_snapshot!(parse(
+        "\"https://a.b/c\" and URL:https://a.b/d and http://localhost:3000 and ftp://x.y/z.\n\n\
+         a@b.c1 and a@b.co and a@b.c1d.\n"
+    ));
+}
+
+/// Known gap: the Markdown parser reads `__init__` in a URL as strong text before
+/// the autolink pass sees it, so the link ends there (cmark-gfm matches the URL first).
+#[test]
+fn urls_with_emphasis_delimiters_are_split() {
+    insta::assert_snapshot!(parse(
+        "https://github.com/a/b/blob/main/pkg/__init__.py and https://x.y/a_b_c and \
+         https://x.y/a*b*c\n"
+    ));
+}
+
+/// Pathological autolink input is linear: trailing parentheses, one text run of many links.
+#[test]
+fn autolink_scans_are_linear() {
+    let t = std::time::Instant::now();
+    let parens = format!("www.a.bc/{}\n", ")".repeat(200_000));
+    let alternating = format!("https://a.bc/{}\n\n", ".)".repeat(100_000));
+    let lines = format!("www.a.bc/{}\n\n", ")".repeat(2_000)).repeat(100);
+    let urls = "www.a.bc/x) http://a ftp://b a@b.cd ".repeat(20_000);
+    for src in [parens, alternating, lines, urls] {
+        let doc = Doc::parse(&src);
+        check_invariants(&doc);
+        assert!(!doc.links.is_empty());
+    }
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        t.elapsed()
+    );
+}
+
 #[test]
 fn images_and_links() {
     let doc = Doc::parse(
@@ -974,6 +1074,32 @@ fn assert_same(name: &str, src: &str, budget: usize) -> usize {
     segment_count(src, budget)
 }
 
+/// Inline HTML and autolinks at the cuts: tight items and cells that open tags, paragraphs that
+/// begin with an address (whether it may start a link depends on what came before), and URLs
+/// that end a block.
+#[test]
+fn segmented_parse_keeps_inline_html_and_autolinks_at_the_cuts() {
+    let blocks = [
+        "- <b>bold</b> item\n- <a href=\"x\">l</a> y\n- [ ] <b>t</b> z\n- <i>open\n- plain",
+        "www.a.com first and https://b.c/d)",
+        "<b>unclosed\n\nwww.b.com",
+        "| <b>x | y |\n|---|---|\n| www.c.com | https://a.b/c |\n| <a href=u>l | a@b.co |",
+        "`c`www.d.com <b>www.e.com</b> (www.f.com)",
+        "1. <kbd>k</kbd> a\n   - <sup>2</sup> b\n2. http://localhost:3000",
+        "[a <a href=x>b](y) c</a> d\n\n<a href=x>foo [bar</a>](y)",
+        "https://github.com/a/__init__.py",
+    ];
+    let src: String = (0..12)
+        .flat_map(|i| (0..blocks.len()).map(move |j| (i + j) % blocks.len()))
+        .map(|j| format!("{}\n\n", blocks[j]))
+        .collect();
+    for budget in [1, 40, 150, 300] {
+        let n = assert_same_in_parallel("inline html", &src, budget);
+        assert_same("inline html", &src, budget);
+        assert!(n > 5, "@ {budget}: {n} segments");
+    }
+}
+
 #[test]
 fn segmented_parse_matches_fixtures() {
     for name in ["tiny", "readme", "spec", "cjk", "rtl", "emoji", "tables"] {
@@ -1429,6 +1555,11 @@ const FUZZ_BLOCKS: &[&str] = &[
     "---\ntitle: x\n\nkey: y\n---",
     "A line\nwith a hard break  \nand more",
     "Text with `code` and <b>inline</b> html &amp; entities.",
+    "- <b>bold</b> item\n- <a href=\"x\">link</a> y\n- [ ] <i>task</i>\n- <b>open\n- plain",
+    "| <b>x | y |\n|---|---|\n| www.a.com | <a href=u>l |",
+    "www.example.com/a_(b)) and `c`www.x.com and <b>www.y.com</b> and a@b.co",
+    "https://a.b/__init__.py, URL:ftp://x.y/z and http://localhost:3000.",
+    "[a <a href=x>b](y) c</a> and <a href=x>foo [bar</a>](y)",
     "1) paren list\n2) second",
     "* star\n\n* loose",
     // Fences in list items (closed or not) and other places the scan can't be sure about.

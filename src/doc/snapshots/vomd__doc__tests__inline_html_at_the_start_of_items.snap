@@ -1,0 +1,25 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"- <b>bold</b> item\\n\\\n         - <kbd>Ctrl</kbd>+C\\n\\\n         - <a href=\\\"x\\\">link</a> y\\n\\\n         - [ ] <b>task</b> done\\n\\\n         - [x] <a href=\\\"t\\\">task link</a> and <i>it</i>\\n\\\n         - <i>unclosed\\n\\\n         - plain after it\\n\\\n         - <b></b><b>\\n\\\n         - plain after a tag with no text\\n\\\n         - <a href=\\\"open\\\">\\n\\\n         - plain after a link with no text\\n\\n\\\n         - loose <b>one</b>\\n\\n\\\n         - <b>loose bold</b> two\\n\\n\\\n         1. <b>a</b> then\\n   \\\n            - <i>nested</i> item\\n   \\\n            - plain nested\\n\\\n         2. <sup>2</sup> end\\n\\n\\\n         Plain after the lists.\\n\")"
+---
+P list=1 Bullet | [B]"bold" " item"
+P list=1 Bullet | [C]"Ctrl" "+C"
+P list=1 Bullet | [L1]"link" " y"
+P list=1 Task(false) | [B]"task" " done"
+P list=1 Task(true) | [L2]"task link" " and " [I]"it"
+P list=1 Bullet | [I]"unclosed"
+P list=1 Bullet | "plain after it"
+P list=1 Bullet |
+P list=1 Bullet | "plain after a tag with no text"
+P list=1 Bullet |
+P list=1 Bullet | "plain after a link with no text"
+P list=1 Bullet | "loose " [B]"one"
+P list=1 Bullet | [B]"loose bold" " two"
+P list=1 Ordered(1) | [B]"a" " then"
+P list=2 Bullet | [I]"nested" " item"
+P list=2 Bullet | "plain nested"
+P list=1 Ordered(2) | [U]"2" " end"
+P | "Plain after the lists."
+link 1: x
+link 2: t
+link 3: open

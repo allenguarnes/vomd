@@ -1,0 +1,22 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"[a <a href=x>b](y) c</a> d\\n\\n\\\n         <a href=x>foo [bar</a>](y) baz\\n\\n\\\n         <a href=\\\"x\\\">foo [bar](y) baz</a> qux\\n\\n\\\n         [a <a name=n>b</a> c](y) d\\n\\n\\\n         <a href=x>one <a href=z>two</a> three</a> four\\n\\n\\\n         [md](y) then <a href=x>html</a> then [md2](z) end\\n\")"
+---
+P | [L1]"a " [L2]"b" " c d"
+P | [L3]"foo " [L4]"bar" " baz"
+P | [L5]"foo " [L6]"bar" " baz qux"
+P | [L7]"a " "b c d"
+P | [L8]"one " [L9]"two" " three four"
+P | [L10]"md" " then " [L11]"html" " then " [L12]"md2" " end"
+link 1: y
+link 2: x
+link 3: x
+link 4: y
+link 5: x
+link 6: y
+link 7: y
+link 8: x
+link 9: z
+link 10: y
+link 11: x
+link 12: z

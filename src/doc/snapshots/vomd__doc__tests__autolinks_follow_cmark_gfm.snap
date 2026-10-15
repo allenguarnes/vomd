@@ -1,0 +1,12 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"\\\"https://a.b/c\\\" and URL:https://a.b/d and http://localhost:3000 and ftp://x.y/z.\\n\\n\\\n         a@b.c1 and a@b.co and a@b.c1d.\\n\")"
+---
+P | "\"" [L1]"https://a.b/c" "\" and URL:" [L2]"https://a.b/d" " and " [L3]"http://localhost:3000" " and " [L4]"ftp://x.y/z" "."
+P | "a@b.c1 and " [L5]"a@b.co" " and " [L6]"a@b.c1d" "."
+link 1: https://a.b/c
+link 2: https://a.b/d
+link 3: http://localhost:3000
+link 4: ftp://x.y/z
+link 5: mailto:a@b.co
+link 6: mailto:a@b.c1d
