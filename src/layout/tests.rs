@@ -24,13 +24,18 @@ fn complete(doc: &Doc, fonts: &Fonts, p: Params) -> Layout {
 }
 
 fn check_geometry(l: &Layout) {
-    let mut y = 0.0;
-    for g in l.geoms() {
-        assert!((g.y - y).abs() < 1e-2, "blocks must be contiguous");
+    // Summed in f64: the f32 tops are roundings of the exact sums.
+    let mut y = 0.0f64;
+    for (i, g) in l.geoms().iter().enumerate() {
+        let tolerance = 1e-2 + y.abs() * 2e-7;
+        assert!(
+            (f64::from(l.y(i)) - y).abs() < tolerance,
+            "blocks must be contiguous"
+        );
         assert!(g.h >= 0.0 && g.h.is_finite());
-        y += g.h;
+        y += f64::from(g.h);
     }
-    assert!((l.total_height() - y).abs() < 1e-2);
+    assert!((f64::from(l.total_height()) - y).abs() < 1e-2 + y * 2e-7);
 }
 
 /// A stable fingerprint of all heights plus the content of blocks near the viewport.
@@ -475,7 +480,7 @@ fn decoration_text_is_not_hit_testable() {
     // The bullet's glyphs exist, but no hit or line maps to them (they aren't document text).
     let c = l.geoms()[0].content.as_ref().unwrap();
     assert!(c.glyphs.iter().any(|g| g.x < LIST_INDENT * 16.0 - 8.0));
-    let y = l.geoms()[0].y + c.lines[0].baseline - 4.0;
+    let y = l.y(0) + c.lines[0].baseline - 4.0;
     assert!(l.hit(col_x + LIST_INDENT * 16.0 - 12.0, y).is_none());
     // Real text still hits, at its own offset.
     let text = l.hit(col_x + LIST_INDENT * 16.0 + 2.0, y).unwrap();
@@ -557,7 +562,7 @@ fn quote_bars_follow_nesting_order() {
     assert_eq!(bars(2), vec![0.0]);
     let (col_x, _) = l.column();
     let c = l.geoms()[2].content.as_ref().unwrap();
-    let y = l.geoms()[2].y + c.lines[0].baseline - 4.0;
+    let y = l.y(2) + c.lines[0].baseline - 4.0;
     let hit = l
         .hit(col_x + (QUOTE_INDENT + LIST_INDENT) * em + 2.0, y)
         .unwrap();
@@ -799,7 +804,7 @@ fn chunked_code_is_one_continuous_background() {
         let bottom = g.h - c.lines.last().unwrap().bottom;
         assert_eq!(bottom, if i == n - 1 { pad } else { 0.0 }, "chunk {i}");
         if i > 0 {
-            assert_eq!(g.y, l.geoms()[i - 1].y + l.geoms()[i - 1].h);
+            assert!((l.y(i) - (l.y(i - 1) + l.geoms()[i - 1].h)).abs() < 1e-3);
         }
     }
     // A code block that fits in one block keeps its rounded corners and both pads.
@@ -849,7 +854,7 @@ fn chunked_quotes_and_headings_stay_whole() {
     // Chunks of a run have no gap between them.
     for &i in &heading[1..] {
         let prev = &l.geoms()[i - 1];
-        assert_eq!(l.geoms()[i].y, prev.y + prev.h);
+        assert!((l.y(i) - (l.y(i - 1) + prev.h)).abs() < 1e-3);
     }
 }
 
@@ -908,7 +913,7 @@ fn table_rows_with_over_65535_links_keep_them_across_fragments() {
         .unwrap();
     let (x, y) = (
         l.column().0 + (h.x0 + h.x1) / 2.0,
-        l.geoms()[last].y + (line.top + line.bottom) / 2.0,
+        l.y(last) + (line.top + line.bottom) / 2.0,
     );
     let hit = l.hit(x, y).expect("link under the cursor");
     assert_eq!(
@@ -1396,4 +1401,209 @@ fn footnote_ending_in_a_table_has_a_visible_backlink() {
         doc.blocks[last - 1].kind,
         BlockKind::TableRow { .. }
     ));
+}
+
+#[test]
+fn prefix_sums_match_a_plain_scan() {
+    use super::heights::Heights;
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    for n in [0usize, 1, 2, 3, 7, 8, 33, 100] {
+        // Quarter-pixel heights, zeros included, so sums are exact and ties happen.
+        let mut h: Vec<f32> = (0..n).map(|_| next(5) as f32 * 0.25).collect();
+        let mut tree = Heights::new(h.iter().copied());
+        for round in 0..200 {
+            if n > 0 && round > 0 {
+                let i = next(n as u64) as usize;
+                let new = next(9) as f32 * 0.25;
+                tree.add(i, f64::from(new) - f64::from(h[i]));
+                h[i] = new;
+            }
+            let mut sum = 0.0f64;
+            let mut tops = vec![0.0f64];
+            for &x in &h {
+                sum += f64::from(x);
+                tops.push(sum);
+            }
+            for (i, &top) in tops.iter().enumerate() {
+                assert_eq!(tree.prefix(i), top, "n={n} i={i}");
+            }
+            for _ in 0..8 {
+                let y = next(((sum + 2.0) * 4.0) as u64 + 1) as f64 * 0.125 - 0.25;
+                let ending = (0..n).filter(|&i| tops[i + 1] <= y).count();
+                assert_eq!(tree.blocks_within(y, false), ending, "n={n} y={y}");
+                // Blocks that start before `y`: the tops below it, but never the end of the text.
+                let before = (0..n).filter(|&i| tops[i] < y).count();
+                let strict = tree.blocks_within(y, true);
+                let counted = if y > 0.0 { (strict + 1).min(n) } else { 0 };
+                assert_eq!(counted, before, "n={n} y={y}");
+            }
+        }
+    }
+}
+
+/// Short paragraphs, one per block.
+fn many_paragraphs(n: usize) -> Doc {
+    let src: String = (0..n).map(|i| format!("para {i}\n\n")).collect();
+    Doc::parse(&src)
+}
+
+#[test]
+fn idle_measurement_maintains_positions_in_log_time() {
+    let fonts = Fonts::new().unwrap();
+    let mut prev = 0;
+    for n in [2000, 4000, 8000] {
+        let doc = many_paragraphs(n);
+        assert_eq!(doc.blocks.len(), n);
+        let mut l = Layout::new(&doc, params(900.0, 1.0));
+        let before = l.position_ops();
+        // One block per slice (the deadline has passed), the way a busy frame loop measures, and a
+        // scroll anchor kept in place after each slice.
+        let anchor = l.anchor_at(l.total_height() / 2.0);
+        let mut slices = 0;
+        while !l.idle(&doc, &fonts, Instant::now()) {
+            let y = l.y_of(anchor);
+            assert_eq!(l.block_at(y).min(n - 1), l.block_at(y));
+            slices += 1;
+        }
+        assert!(slices >= n / 2, "{n}: {slices} slices");
+        check_geometry(&l);
+        let ops = l.position_ops() - before;
+        // Each block: one tree update and a few queries, each O(log n), and nothing per slice that
+        // grows with the document.
+        let log = usize::BITS as usize - n.leading_zeros() as usize;
+        assert!(ops <= 40 * n * log, "{n} blocks: {ops} node visits");
+        if prev > 0 {
+            assert!(
+                ops < prev * 5 / 2,
+                "{n} blocks: {prev} -> {ops} node visits"
+            );
+        }
+        prev = ops;
+    }
+}
+
+#[test]
+fn missing_characters_queue_in_log_time() {
+    // Distinct characters in descending order, each reported on its own: every one of them used to
+    // shift all the larger ones in a sorted vector.
+    let chars = |n: usize| -> Vec<char> {
+        (0..n)
+            .map(|i| char::from_u32(0x2_0000 + (n - i) as u32).unwrap())
+            .collect()
+    };
+    let doc = Doc::parse("");
+    let mut prev = 0;
+    for n in [50_000, 100_000, 200_000] {
+        let mut l = Layout::new(&doc, params(900.0, 1.0));
+        for c in chars(n) {
+            l.report_missing(&[c]);
+        }
+        let batch = l.take_missing();
+        assert_eq!(batch.len(), n);
+        assert!(batch.windows(2).all(|w| w[0] < w[1]), "sorted batch");
+        // Reported once, never again.
+        l.report_missing(&chars(n));
+        assert!(l.take_missing().is_empty());
+        assert!(l.set_ops <= 4 * n, "{n}: {} set operations", l.set_ops);
+        if prev > 0 {
+            assert!(l.set_ops < prev * 5 / 2, "{n}: {prev} -> {}", l.set_ops);
+        }
+        prev = l.set_ops;
+    }
+    // The shifts of a sorted vector are cheap per element, so only a very long run shows them:
+    // 600,000 characters took over ten seconds that way.
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let t = Instant::now();
+    for c in chars(600_000) {
+        l.report_missing(&[c]);
+    }
+    assert_eq!(l.take_missing().len(), 600_000);
+    assert!(t.elapsed().as_secs_f64() < 4.0, "{:?}", t.elapsed());
+    // Through the layout: one distinct CJK character per paragraph, descending.
+    let src: String = (0..2000u32)
+        .map(|i| format!("{}\n\n", char::from_u32(0x4E00 + 1999 - i).unwrap()))
+        .collect();
+    let doc = Doc::parse(&src);
+    let l = complete(&doc, &Fonts::new().unwrap(), params(900.0, 1.0));
+    let mut l = l;
+    let missing = l.take_missing();
+    assert_eq!(missing.len(), 2000);
+    assert!(missing.windows(2).all(|w| w[0] < w[1]));
+    assert!(l.take_missing().is_empty());
+}
+
+#[test]
+fn sparse_row_fragments_cost_their_visible_columns_only() {
+    // Many short cells and one long one: the long cell splits the row into fragments, each of
+    // which used to lay out and draw every column of the table.
+    let fonts = Fonts::new().unwrap();
+    let work = |cols: usize| -> (usize, usize, usize) {
+        let head = format!("|{}\n", " h |".repeat(cols));
+        let delim = format!("|{}\n", "---|".repeat(cols));
+        let body = format!(
+            "|{} {} |\n",
+            " a |".repeat(cols - 1),
+            "word ".repeat(cols * 12)
+        );
+        let doc = Doc::parse(&format!("{head}{delim}{body}"));
+        let mut l = Layout::new(&doc, params(900.0, 1.0));
+        l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+        check_geometry(&l);
+        let rects: usize = l
+            .geoms()
+            .iter()
+            .map(|g| g.content.as_ref().map_or(0, |c| c.rects.len()))
+            .sum();
+        (doc.blocks.len(), rects, l.cells_laid)
+    };
+    let mut prev: Option<(usize, usize, usize)> = None;
+    for cols in [1000, 2000, 4000, 8000] {
+        let (blocks, rects, cells) = work(cols);
+        assert!(blocks >= 4, "{cols} columns: {blocks} blocks");
+        if let Some((_, p_rects, p_cells)) = prev {
+            assert!(
+                rects < p_rects * 5 / 2,
+                "{cols} columns: {p_rects} -> {rects} rects"
+            );
+            assert!(
+                cells < p_cells * 5 / 2,
+                "{cols} columns: {p_cells} -> {cells} cells"
+            );
+        }
+        prev = Some((blocks, rects, cells));
+    }
+}
+
+#[test]
+fn table_rows_clip_columns_past_the_document_width() {
+    let fonts = Fonts::new().unwrap();
+    let cols = 300;
+    let head = format!("|{}\n", " head |".repeat(cols));
+    let delim = format!("|{}\n", "---|".repeat(cols));
+    let row = format!("|{}\n", " cell |".repeat(cols));
+    let doc = Doc::parse(&format!("{head}{delim}{row}{row}"));
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    let reach = l.params().width - l.column().0;
+    for (i, g) in l.geoms().iter().enumerate() {
+        let c = g.content.as_ref().unwrap();
+        // Nothing starts past the right edge, and the rules and fills stop at it.
+        let wide = c
+            .rects
+            .iter()
+            .find(|r| r.x > reach || r.x + r.w > reach + 1.0);
+        assert!(wide.is_none(), "block {i}: {wide:?} (reach {reach})");
+        // Text only starts in columns that start inside it (the last one may run past).
+        assert!(c.hits.iter().all(|h| h.x0 <= reach + 150.0), "block {i}");
+        assert!(c.rects.len() < 40, "block {i}: {} rects", c.rects.len());
+    }
+    // The columns that are there still hold their text, in order.
+    let first = l.geoms()[0].content.as_ref().unwrap();
+    assert!(first.glyphs.len() >= 4 * 6, "{} glyphs", first.glyphs.len());
 }

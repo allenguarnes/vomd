@@ -9,14 +9,14 @@
 //! **Safe cuts.** A cut goes before a line that follows a blank line, starts in column 0 and
 //! can't continue a construct before it: nothing but a list marker, `>`, a footnote definition
 //! or indentation could continue a list, quote or footnote across the blank line. It must also
-//! not fall inside a block that spans blank lines: fenced code, an HTML block that only ends at
-//! its closing tag (CommonMark types 1–5), or a YAML metadata block (pulldown-cmark accepts
-//! those anywhere). Those are tracked line by line with the same rules as pulldown-cmark
-//! (case-sensitive end tags included, and its whitespace: tab, VT and FF blank a line too).
+//! not fall inside a block that spans blank lines: fenced code, or an HTML block that only ends
+//! at its closing tag (CommonMark types 1–5). Those are tracked line by line with the same rules
+//! as pulldown-cmark (case-sensitive end tags included, and its whitespace: tab, VT and FF blank
+//! a line too). (YAML front matter is not a block pulldown-cmark knows: `Doc` cuts it off the
+//! start of the text before parsing, so a `---` here is only ever a rule or a setext underline.)
 //!
 //! **Ambiguity.** Some lines open one of those blocks only in some contexts: a fence inside a
-//! list item or an HTML block, a `---` after a text line. The scan can't always tell, so it
-//! follows every reading at once (a handful of states) and cuts only where all of them agree
+//! list item or an HTML block. The scan can't always tell, so it follows every reading at once (a handful of states) and cuts only where all of them agree
 //! that nothing is open. A fence in a list item, for example, is either a real fence or part of
 //! the item (which ends at the next column-0 line); once its closing line is seen both readings
 //! agree again and cutting resumes. Only a pile-up of readings (more than [`MAX_STATES`]) makes
@@ -64,8 +64,6 @@ pub(super) struct Segment {
 
 pub(super) struct Plan {
     pub segments: Vec<Segment>,
-    /// Where leading YAML front matter ends (0 if none).
-    front_matter_end: usize,
 }
 
 /// The definitions of the whole text, from every segment, as pulldown-cmark reads them.
@@ -81,9 +79,8 @@ pub(super) struct Definitions {
 impl Plan {
     /// The text to parse for segment `n`: the segment itself, preceded by the header of the table
     /// it continues, and by the footnote `stubs` (labels defined in other segments, which this
-    /// one's parser needs to see footnote references where they are, not text). The stubs go
-    /// after front matter, which must stay first; the builder drops their events, which come
-    /// first. A reference definition ends the last stub (indented text after it would continue
+    /// one's parser needs to see footnote references where they are, not text). The builder
+    /// drops the events of the stubs, which come first. A reference definition ends the last stub (indented text after it would continue
     /// it) and defines nothing anyone refers to.
     pub fn text<'a>(&self, src: &'a str, n: usize, stubs: &[String]) -> Cow<'a, str> {
         let seg = &self.segments[n];
@@ -92,9 +89,7 @@ impl Plan {
             return Cow::Borrowed(body);
         }
         let head = seg.head.clone().map_or("", |h| &src[h]);
-        let (front, body) = body.split_at(if n == 0 { self.front_matter_end } else { 0 });
         let mut text = String::with_capacity(head.len() + body.len() + 16 * stubs.len());
-        text.push_str(front);
         for label in stubs {
             text.push_str("[^");
             text.push_str(label);
@@ -268,23 +263,19 @@ struct State {
     /// like an opener might be content of a block that is open or of a list item, so every
     /// opener counts until its end text shows up (always an over-estimate).
     html: Vec<&'static str>,
-    /// Inside a metadata block.
-    meta: bool,
-    /// That block began at the start of the text (front matter).
-    front: bool,
     /// A list, quote or footnote definition may be open.
     containers: bool,
     /// A line of the current run of non-blank lines began with `<` (maybe an HTML block).
     html_run: bool,
     /// A line of the current run has `]:` in it: it may hold a link reference definition.
     def_run: bool,
-    /// The previous line ended a fenced or metadata block, so this one starts a run.
+    /// The previous line ended a fenced block, so this one starts a run.
     fresh: bool,
     table: Option<TableScan>,
 }
 
 impl State {
-    /// A line inside a fence or metadata block ended the current run of plain lines.
+    /// A line inside a fence ended the current run of plain lines.
     fn leave_run(&mut self) {
         self.html_run = false;
         self.def_run = false;
@@ -331,8 +322,6 @@ struct Line<'l> {
     top: bool,
     /// The line without its indentation, if `top`.
     rest: &'l [u8],
-    /// A column-0 `---`, which may open a metadata block.
-    meta_open: bool,
     /// A table row: starts with `|` in column 0 and has a cell (a lone `|` ends a table).
     row: bool,
     /// A segment may start here: after a blank line, in column 0, with a line that can't
@@ -359,22 +348,12 @@ pub(super) fn plan(src: &str, budget: usize) -> Option<Plan> {
     scan.finish()
 }
 
-/// [`plan`], and how many lines the lookahead for metadata blocks examined.
-#[cfg(test)]
-pub(super) fn plan_with_work(src: &str, budget: usize) -> (Option<Plan>, usize) {
-    let mut scan = Scan::new(src, budget);
-    scan.run();
-    let work = scan.work;
-    (scan.finish(), work)
-}
-
 struct Scan<'a> {
     src: &'a str,
     budget: usize,
     segments: Vec<Segment>,
     start: usize,
     head: Option<Range<usize>>,
-    front_matter_end: usize,
     // Line state.
     /// Start of the line after the current one.
     next: usize,
@@ -382,12 +361,6 @@ struct Scan<'a> {
     /// Every reading of the text so far (never empty until the scan stops).
     states: Vec<State>,
     scratch: Vec<State>,
-    /// Start of the last line that could close a metadata block (checked on the first need), so
-    /// that whether one follows a line is a comparison and not a search.
-    last_meta_close: Option<Option<usize>>,
-    /// Lines the lookahead for metadata blocks has examined (for tests of its cost).
-    #[cfg(test)]
-    work: usize,
     /// Too many readings to follow: no more cuts.
     stopped: bool,
     /// Whether the header at this start offset is a table for pulldown-cmark (checked lazily).
@@ -402,14 +375,11 @@ impl<'a> Scan<'a> {
             segments: Vec::new(),
             start: 0,
             head: None,
-            front_matter_end: 0,
             next: 0,
             prev_blank: true,
             states: vec![State {
                 fence: None,
                 html: Vec::new(),
-                meta: false,
-                front: false,
                 containers: false,
                 html_run: false,
                 def_run: false,
@@ -417,9 +387,6 @@ impl<'a> Scan<'a> {
                 table: None,
             }],
             scratch: Vec::new(),
-            last_meta_close: None,
-            #[cfg(test)]
-            work: 0,
             stopped: false,
             valid_head: None,
         }
@@ -452,7 +419,6 @@ impl<'a> Scan<'a> {
             odd_blank: !blank && is_blank_ws(bytes),
             top,
             rest: if top { &bytes[indent..] } else { &bytes[..0] },
-            meta_open: !blank && indent == 0 && is_meta_open(bytes),
             row: bytes.first() == Some(&b'|') && !is_blank_ws(&bytes[1..]),
             l_start: !blank && was_blank && indent == 0 && cut_may_start(bytes),
             want_cut: pos - self.start >= self.budget,
@@ -495,15 +461,6 @@ impl<'a> Scan<'a> {
     /// Read `line` in one reading of the text, pushing the readings it leads to (several when
     /// the line is ambiguous) to `out` and what it says about cutting to `verdict`.
     fn step(&mut self, mut st: State, line: &Line, out: &mut Vec<State>, verdict: &mut Verdict) {
-        if st.meta {
-            st.meta = !is_meta_close(line.bytes);
-            if !st.meta && st.front {
-                self.front_matter_end = self.next;
-            }
-            verdict.block();
-            st.leave_run();
-            return out.push(st);
-        }
         if let Some(fence) = st.fence {
             match fence.container {
                 None => {
@@ -540,9 +497,8 @@ impl<'a> Scan<'a> {
             }
         }
         if line.odd_blank {
-            // Such a line is blank at the start of a block, in an HTML block of type 6 or 7 and
-            // before a metadata block's content, but text within a paragraph: no telling which,
-            // so no more cuts.
+            // Such a line is blank at the start of a block and in an HTML block of type 6 or 7,
+            // but text within a paragraph: no telling which, so no more cuts.
             self.stopped = true;
         }
         let in_html = !st.html.is_empty();
@@ -571,22 +527,6 @@ impl<'a> Scan<'a> {
         // An HTML block of type 6 or 7 can start wherever a block does (after a heading, a rule,
         // ...), and runs until the next blank line.
         st.html_run |= line.top && line.rest.first() == Some(&b'<');
-
-        // A YAML metadata block starts with `---` in column 0 (pulldown-cmark accepts it at any
-        // block start) and may contain anything, blank lines included. After a blank line, outside
-        // HTML blocks, that is certainly a block start; anywhere else the line may be a setext
-        // underline or HTML content, and either reading goes on.
-        if line.meta_open && self.meta_closes() {
-            let mut meta = st.clone();
-            meta.meta = true;
-            meta.front = line.pos == 0;
-            verdict.block();
-            meta.leave_run();
-            out.push(meta);
-            if line.was_blank && st.html.is_empty() {
-                return;
-            }
-        }
 
         if line.want_cut && line.row {
             let head = (!in_html).then(|| self.table_head(&st, line.pos)).flatten();
@@ -662,57 +602,6 @@ impl<'a> Scan<'a> {
         valid.then(|| table.head.clone())
     }
 
-    /// Whether the metadata block opened by the `---` line just read is closed somewhere:
-    /// pulldown-cmark ignores the opener otherwise, and when the first line after it is blank or
-    /// a closing line.
-    fn meta_closes(&mut self) -> bool {
-        let src = self.src;
-        if self.next >= src.len() {
-            return false;
-        }
-        let first = src[self.next..].split('\n').next().unwrap_or("");
-        let first = first.strip_suffix('\r').unwrap_or(first).as_bytes();
-        #[cfg(test)]
-        {
-            self.work += 1;
-        }
-        if is_meta_close(first) || is_blank_ws(first) {
-            return false;
-        }
-        // Closing lines are found once, from the end: opener after opener asks about the same
-        // last one, and a search from each would read the rest of the text again and again.
-        let last = match self.last_meta_close {
-            Some(last) => last,
-            None => {
-                let last = self.find_last_meta_close();
-                self.last_meta_close = Some(last);
-                last
-            }
-        };
-        last.is_some_and(|at| at >= self.next)
-    }
-
-    fn find_last_meta_close(&mut self) -> Option<usize> {
-        let src = self.src;
-        let mut end = src.len();
-        loop {
-            let start = src[..end].rfind('\n').map_or(0, |i| i + 1);
-            let line = &src[start..end];
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            #[cfg(test)]
-            {
-                self.work += 1;
-            }
-            if is_meta_close(line.as_bytes()) {
-                return Some(start);
-            }
-            if start == 0 {
-                return None;
-            }
-            end = start - 1;
-        }
-    }
-
     /// Track a table whose rows all start with `|` in column 0 (so it is not inside a list
     /// item): the header must follow a blank line and be followed by a delimiter row.
     fn table_line(&mut self, st: &mut State, line: &Line) {
@@ -748,7 +637,6 @@ impl<'a> Scan<'a> {
         });
         Some(Plan {
             segments: self.segments,
-            front_matter_end: self.front_matter_end,
         })
     }
 }
@@ -961,17 +849,6 @@ fn fence_open(rest: &[u8]) -> Option<(u8, usize)> {
 fn fence_close(rest: &[u8], c: u8, len: usize) -> bool {
     let n = rest.iter().take_while(|&&b| b == c).count();
     n >= len && rest[n..].iter().all(|&b| b == b' ')
-}
-
-/// `---` and nothing else but whitespace (as `u8::is_ascii_whitespace` has it: pulldown-cmark
-/// accepts a form feed there, not a vertical tab).
-fn is_meta_open(line: &[u8]) -> bool {
-    line.starts_with(b"---") && line[3..].iter().all(u8::is_ascii_whitespace)
-}
-
-/// `---` or `...` in column 0, then only spaces.
-fn is_meta_close(line: &[u8]) -> bool {
-    (line.starts_with(b"---") || line.starts_with(b"...")) && line[3..].iter().all(|&b| b == b' ')
 }
 
 /// A table delimiter row in column 0: pipes, dashes, colons and spaces, with at least one dash.

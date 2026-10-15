@@ -1143,7 +1143,7 @@ fn segmented_parse_never_cuts_inside_blocks_that_span_blank_lines() {
         "<![CDATA[\ndata\n\ntext\n]]>",
         "<?php\necho 1;\n\ntext\n?>",
         "<!DOCTYPE html\n\ntext\n>",
-        // A metadata block in the middle of the text.
+        // Lines that look like a metadata block in the middle of the text.
         "---\ntitle: x\n\ntext\n---",
         // Lists and quotes with blank lines between their parts.
         "- a\n\n- b\n\n  nested para\n\n- c",
@@ -1868,29 +1868,130 @@ fn a_list_fence_does_not_stop_segmentation() {
     assert_same("fence after the item", &src, 4096);
 }
 
+/// Kinds of the blocks, one letter each: P(aragraph), H(eading), R(ule).
+fn kinds(doc: &Doc) -> String {
+    doc.blocks
+        .iter()
+        .map(|b| match b.kind {
+            BlockKind::Paragraph => 'P',
+            BlockKind::Heading(_) => 'H',
+            BlockKind::Rule => 'R',
+            _ => '?',
+        })
+        .collect()
+}
+
 #[test]
-fn metadata_lookahead_is_linear_in_the_text() {
-    // Every `---\t` may open a metadata block (it can't close one), and the only closing line
-    // is the last: a search from each opener would read the rest of the text each time.
-    let doc = |n: usize| "text\n---\t\nx\n".repeat(n) + "...\n";
-    let mut prev = 0;
-    for n in [1000, 2000, 4000, 8000] {
-        let src = doc(n);
-        let (_, work) = segment::plan_with_work(&src, 400);
-        let lines = 3 * n + 1;
-        assert!(work <= 4 * lines, "{n} reps: {work} lines examined");
-        if prev > 0 {
-            assert!(
-                work < prev * 5 / 2,
-                "{n} reps: {prev} -> {work} lines examined"
-            );
+fn unclosed_metadata_candidates_parse_in_linear_time() {
+    // pulldown-cmark's metadata option reads forward for a closing line at every `---` it sees
+    // (quadratic when there is none), so front matter is only looked for at the start of the text
+    // and the option is off. Every `---\t` after the intro is a rule, and each `x` a paragraph.
+    for kb in [64, 128, 256] {
+        let n = kb * 1024 / 8;
+        let src = format!("intro\n\n{}", "---\t\nx\n\n".repeat(n));
+        let t = std::time::Instant::now();
+        let doc = Doc::parse(&src);
+        assert_eq!(doc.blocks.len(), 1 + 2 * n, "{kb} KB");
+        assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(n)), "{kb} KB");
+        assert!(
+            t.elapsed().as_secs_f64() < 3.0,
+            "{kb} KB: {:?}",
+            t.elapsed()
+        );
+    }
+    // At the very start the first `---\t` opens front matter that the second closes.
+    let doc = Doc::parse(&"---\t\nx\n\n".repeat(1000));
+    assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(998)));
+    // With a closing line at the end the metadata option would swallow all of it as one block.
+    let src = format!("intro\n\n{}...\n", "---\t\nx\n\n".repeat(1000));
+    let doc = Doc::parse(&src);
+    assert_eq!(doc.blocks.len(), 1 + 2000 + 1);
+    assert_eq!(doc.text.matches('x').count(), 1000);
+}
+
+#[test]
+fn front_matter_is_found_only_at_the_start() {
+    let hidden = [
+        "---\ntitle: x\n---\n# T\n",
+        "---  \t\ntitle: x\n---\t \n# T\n",
+        "---\ntitle: x\n...\n# T\n",
+        "---\r\ntitle: x\r\n\r\nk: v\r\n---\r\n# T\r\n",
+        "\u{feff}---\ntitle: x\n---\n# T\n",
+        "---\ntitle: x\n---\n\n# T\n",
+    ];
+    for src in hidden {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        assert_eq!(kinds(&doc), "H", "{src:?}");
+        assert_eq!(doc.text, "T", "{src:?}");
+        assert!(front_matter_len(src) > 0, "{src:?}");
+        assert!(
+            src[front_matter_len(src)..].trim_start().starts_with('#'),
+            "{src:?}"
+        );
+    }
+    // Front matter that runs to the end of the text, with and without a final newline.
+    for src in ["---\na: b\n---", "---\na: b\n---\n", "---\na: b\n...\n"] {
+        assert_eq!(front_matter_len(src), src.len(), "{src:?}");
+        assert!(Doc::parse(src).blocks.is_empty());
+    }
+    // Not front matter: no closing line, a blank or closing line right after the opener, text on
+    // the opener's line, indentation, a BOM-less lookalike after other text, or a longer rule.
+    let shown = [
+        ("---\ntitle: x\n", "RP"),
+        ("---\n\ntitle: x\n---\n", "RH"),
+        ("---\n---\ntext\n", "RRP"),
+        ("--- x\ntitle: x\n---\n", "H"),
+        (" ---\ntitle: x\n---\n", "RH"),
+        ("----\ntitle: x\n---\n", "RH"),
+        ("\n---\ntitle: x\n---\n", "RH"),
+        ("text\n\n---\ntitle: x\n\nmore\n---\n", "PRPH"),
+        ("text\n\n---\ntitle: x\n...\n", "PRP"),
+    ];
+    for (src, expected) in shown {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        assert_eq!(front_matter_len(src), 0, "{src:?}");
+        assert_eq!(kinds(&doc), expected, "{src:?}");
+        assert!(
+            doc.text.contains("title") || expected == "RRP" || expected == "H",
+            "{src:?}"
+        );
+    }
+}
+
+#[test]
+fn segmented_parse_keeps_metadata_lookalikes_visible() {
+    // `---` and `...` lines in quotes and lists, with distant lines that could close them: none
+    // of it is metadata, so one parser and segments both show it all.
+    let filler = filler(20);
+    let regions = [
+        "> ---\n> secret: value\n>\n> ---",
+        "> ---\n> secret: value\n> ...",
+        "- ---\n  secret: value\n\n  ---",
+        "1. ---\n   secret: value\n   ...",
+        "text\n---\nsecret: value\n\n---",
+    ];
+    for (i, region) in regions.iter().enumerate() {
+        let src = format!("{filler}{region}\n\n{filler}---\nclose: me\n...\n\n{filler}---\n");
+        for budget in [1, 90, 700] {
+            assert_same(&format!("region {i} @ {budget}"), &src, budget);
         }
-        prev = work;
+        let doc = Doc::parse_whole(&src);
+        assert!(doc.text.contains("secret"), "region {i}");
+        assert!(doc.text.contains("close"), "region {i}");
     }
-    for n in [3, 50, 400] {
-        let src = format!("{}{}\n{}", filler(20), doc(n), filler(20));
-        assert!(assert_same("metadata lookahead", &src, 400) > 1);
-    }
+    // As a text over the production threshold, where `Doc::parse` really segments it.
+    let src = format!(
+        "{}> ---\n> secret: value\n>\n> ---\n\n{}---\nclose: me\n...\n",
+        "filler paragraph\n\n".repeat(60_000),
+        "filler paragraph\n\n".repeat(60_000)
+    );
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    let doc = Doc::parse(&src);
+    assert!(doc == Doc::parse_whole(&src));
+    assert!(doc.text.contains("secret"));
+    assert!(segment_count(&src, SEGMENT_BYTES) > 3);
 }
 
 #[test]
@@ -2090,8 +2191,8 @@ fn footnotes_are_numbered_by_reference_not_by_definition() {
 
 #[test]
 fn form_feed_and_vertical_tab_lines_are_not_cut_inside_html_blocks() {
-    // A form feed line is blank to the metadata scan: `---` is no metadata opener here, and the
-    // `<pre>` block that follows holds a heading and bold text as plain content.
+    // A form feed line after `---` can't be told from text: the `<pre>` block that follows holds
+    // a heading and bold text as plain content.
     let region = "---\n\u{c}\n<pre>\n---\n\n# Heading\n**bold**\n</pre>\n\n";
     for blank in ["\u{c}", "\u{b}", "\t", " \u{c} ", "\u{c}\u{c}"] {
         let region = region.replace('\u{c}', blank);

@@ -19,10 +19,50 @@ fn options() -> Options {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_GFM
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+        | Options::ENABLE_GFM;
     opts.remove(Options::ENABLE_SMART_PUNCTUATION);
     opts
+}
+
+/// Length of the YAML front matter at the very start of `src`, BOM included (0 if there is
+/// none): a line `---` (trailing spaces and tabs allowed) with text on the next line, up to the
+/// first line that is `---` or `...`, which is part of it. Like GitHub, only the start of the
+/// document counts, so one forward scan settles it; a `---` anywhere else (or one that is never
+/// closed) is an ordinary thematic break or setext underline for pulldown-cmark.
+fn front_matter_len(src: &str) -> usize {
+    fn line_at(src: &str, pos: usize) -> (&str, usize) {
+        let end = src[pos..].find('\n').map_or(src.len(), |i| pos + i);
+        let line = &src[pos..end];
+        (
+            line.strip_suffix('\r').unwrap_or(line),
+            (end + 1).min(src.len()),
+        )
+    }
+    fn is_fence(line: &str, c: &str) -> bool {
+        line.strip_prefix(c)
+            .is_some_and(|rest| rest.bytes().all(|b| b == b' ' || b == b'\t'))
+    }
+    let bom = if src.starts_with('\u{feff}') { 3 } else { 0 };
+    let (open, mut pos) = line_at(src, bom);
+    if !is_fence(open, "---") || pos >= src.len() {
+        return 0;
+    }
+    // An empty first line or an immediate closer: a rule, not front matter.
+    let first = line_at(src, pos).0;
+    if first.bytes().all(|b| b == b' ' || b == b'\t')
+        || is_fence(first, "---")
+        || is_fence(first, "...")
+    {
+        return 0;
+    }
+    while pos < src.len() {
+        let (line, next) = line_at(src, pos);
+        if is_fence(line, "---") || is_fence(line, "...") {
+            return next;
+        }
+        pos = next;
+    }
+    0
 }
 
 /// Inline style bits carried by each [`Span`].
@@ -195,6 +235,7 @@ impl Doc {
 
     /// One parser for the whole text.
     fn parse_whole(src: &str) -> Doc {
+        let src = &src[front_matter_len(src)..];
         let mut b = Builder::new(src.len());
         for event in Parser::new_ext(src, options()) {
             b.event(event);
@@ -212,6 +253,7 @@ impl Doc {
     /// found: the link definitions through the broken-link callback, the footnote definitions as
     /// stubs in front of the segment's text.
     fn parse_segments(src: &str, budget: usize) -> Option<Doc> {
+        let src = &src[front_matter_len(src)..];
         let plan = segment::plan(src, budget)?;
         let opts = options();
         let defs = plan.definitions(src, opts)?;
@@ -380,7 +422,6 @@ struct Builder {
     marker: Marker,
     image: Option<ImageAlt>,
     html_block: Option<String>,
-    metadata: bool,
     row: Option<(bool, u32)>,
     /// The next table continues the previous segment's (its header is a repeat, see
     /// `Doc::parse_segments`).
@@ -424,7 +465,6 @@ impl Builder {
             marker: Marker::None,
             image: None,
             html_block: None,
-            metadata: false,
             row: None,
             continue_table: false,
             skip_head: false,
@@ -478,12 +518,6 @@ impl Builder {
                 }
                 _ => return,
             }
-        }
-        if self.metadata {
-            if let Event::End(TagEnd::MetadataBlock(_)) = event {
-                self.metadata = false;
-            }
-            return;
         }
         if let Some(html) = &mut self.html_block {
             match event {
@@ -677,9 +711,9 @@ impl Builder {
                     depth: 0,
                 });
             }
-            Tag::MetadataBlock(_) => self.metadata = true,
             // Not enabled (GitHub doesn't support them); content flows as plain text.
-            Tag::DefinitionList
+            Tag::MetadataBlock(_)
+            | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
             | Tag::Superscript

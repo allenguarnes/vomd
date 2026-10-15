@@ -269,18 +269,21 @@ fn find_with<'a>(
                 read(path, &chars)
             }
         });
-        // The face covering the most of what is still missing.
-        let mut best: Option<(u32, usize)> = None;
-        for (index, covered) in faces.iter() {
-            let n = covered.iter().filter(|c| remaining.contains(c)).count();
-            if n > 0 && best.is_none_or(|(_, b)| n > b) {
-                best = Some((*index, n));
+        // The face covering the most of what is still missing, and then the next, until no
+        // face of the file helps: the file is not read again, so this is its only chance.
+        loop {
+            let mut best: Option<(u32, usize)> = None;
+            for (index, covered) in faces.iter() {
+                let n = covered.iter().filter(|c| remaining.contains(c)).count();
+                if n > 0
+                    && best.is_none_or(|(_, b)| n > b)
+                    && !skip(path, *index)
+                    && !found.iter().any(|f| f.path == path && f.index == *index)
+                {
+                    best = Some((*index, n));
+                }
             }
-        }
-        if let Some((index, _)) = best
-            && !skip(path, index)
-            && !found.iter().any(|f| f.path == path && f.index == index)
-        {
+            let Some((index, _)) = best else { break };
             for c in faces
                 .iter()
                 .filter(|(i, _)| *i == index)
@@ -427,6 +430,11 @@ mod tests {
         // finds, which pick up the odd characters it left.
         let at = |name: &str| found.iter().position(|f| f.path.ends_with(name));
         assert_eq!(found[at("NotoSansCJK-Regular.ttc").unwrap()].index, 1);
+        // The collection's first face still covers characters the second doesn't: both come.
+        let cjk = found
+            .iter()
+            .filter(|f| f.path.ends_with("NotoSansCJK-Regular.ttc"));
+        assert_eq!(cjk.map(|f| f.index).collect::<Vec<_>>(), [1, 0]);
         assert!(at("NotoSansCJK-Regular.ttc") < at("Other0.ttf"));
         assert!(found.iter().any(|f| f.path.ends_with("DejaVuSans.ttf")));
         assert!(
@@ -448,5 +456,70 @@ mod tests {
         );
         assert!(reads.borrow().values().all(|&n| n == 1));
         assert!(!found.iter().any(|f| f.path.ends_with("DejaVuSans.ttf")));
+    }
+
+    /// A collection whose faces each cover part of what is missing gives all of them, in one
+    /// read: a preferred file and one found by the scan alike, skipping the faces already loaded.
+    #[test]
+    fn every_useful_face_of_a_collection_is_taken() {
+        let files = vec![
+            PathBuf::from("/fonts/NotoSansCJK-Regular.ttc"),
+            PathBuf::from("/fonts/extra/Collection.ttc"),
+        ];
+        let reads: RefCell<HashMap<PathBuf, usize>> = RefCell::default();
+        let mut read = |path: &Path, chars: &[char]| -> Coverage {
+            *reads.borrow_mut().entry(path.to_owned()).or_default() += 1;
+            let covers = |list: &[char]| -> Vec<char> {
+                chars.iter().copied().filter(|c| list.contains(c)).collect()
+            };
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let faces = match name {
+                // Three faces each covering one character, the first two also the same one.
+                "NotoSansCJK-Regular.ttc" => vec![
+                    (0, covers(&['中'])),
+                    (1, covers(&['文'])),
+                    (2, covers(&['字'])),
+                ],
+                _ => vec![
+                    (0, covers(&['\u{20000}', '\u{20001}'])),
+                    (1, covers(&['\u{20001}'])),
+                    (2, covers(&['\u{20002}'])),
+                    (3, covers(&['\u{20003}'])),
+                ],
+            };
+            faces.into_iter().filter(|(_, c)| !c.is_empty()).collect()
+        };
+        let indexes = |found: &[Found], name: &str| -> Vec<u32> {
+            let mut v: Vec<u32> = found
+                .iter()
+                .filter(|f| f.path.ends_with(name))
+                .map(|f| f.index)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let missing = [
+            '中',
+            '文',
+            '字',
+            '\u{20000}',
+            '\u{20001}',
+            '\u{20002}',
+            '\u{20003}',
+        ];
+        let found = find_with(&files, &missing, &|_, _| false, &mut read);
+        assert_eq!(indexes(&found, "NotoSansCJK-Regular.ttc"), [0, 1, 2]);
+        // Faces 0, 2 and 3 cover everything; face 1 adds nothing the others don't.
+        assert_eq!(indexes(&found, "Collection.ttc"), [0, 2, 3]);
+        assert!(reads.borrow().values().all(|&n| n == 1), "{reads:?}");
+        // A face that is loaded already is passed over, and the rest of the file still counts.
+        reads.borrow_mut().clear();
+        let skip = |p: &Path, i: u32| p.ends_with("NotoSansCJK-Regular.ttc") && i == 1;
+        let found = find_with(&files, &missing, &skip, &mut read);
+        assert_eq!(indexes(&found, "NotoSansCJK-Regular.ttc"), [0, 2]);
+        assert!(reads.borrow().values().all(|&n| n == 1), "{reads:?}");
+        // Faces that add nothing new are not taken, whatever the order.
+        let found = find_with(&files, &['中'], &|_, _| false, &mut read);
+        assert_eq!(indexes(&found, "NotoSansCJK-Regular.ttc"), [0]);
     }
 }

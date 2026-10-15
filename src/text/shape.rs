@@ -1,5 +1,8 @@
-//! Itemization and shaping. Runs split on item, face (per-character fallback), script, and
-//! bidi level; each run is shaped by swash in logical order. RTL reordering happens per line
+//! Itemization and shaping. Runs split on face (per-character fallback), font size, script and
+//! bidi level, and at inline boxes; each run is shaped by swash in logical order. Neighboring
+//! items that differ only in color, link or decoration share one run, so shaping sees the text
+//! whole (Arabic letters keep joining across a link boundary, say) and each cluster takes the
+//! style of the item it starts in. RTL reordering happens per line
 //! in `lines.rs`, at cluster granularity, as swash requires.
 
 use std::ops::Range;
@@ -52,12 +55,19 @@ pub struct Shaped {
     pub base_level: u8,
     /// Characters no face covers (sorted, deduplicated).
     pub missing: Vec<char>,
+    /// Shaping runs, boxes included.
+    #[cfg(test)]
+    pub runs: usize,
 }
 
 struct Run {
     range: Range<usize>,
+    /// The item the run starts in; a text run covers every item up to the one holding its end.
     item: usize,
+    /// An inline box.
+    boxed: bool,
     face: FaceId,
+    size: f32,
     script: Script,
     level: u8,
 }
@@ -191,7 +201,9 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
             runs.push(Run {
                 range,
                 item: item_idx,
+                boxed: true,
                 face: FaceId(0),
+                size: 0.0,
                 script: Script::Common,
                 level: level_at(item.range.start as usize),
             });
@@ -205,7 +217,8 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
         for (off, c) in text[range.clone()].char_indices() {
             let at = range.start + off;
             let level = level_at(at);
-            let last = runs.last().filter(|r| r.item == item_idx);
+            // The run holding the character before this one, within the item.
+            let last = runs.last().filter(|_| off > 0);
             let inherit = prev.is_some()
                 && (attaches_to_previous(c)
                     || prev.is_some_and(|p| is_regional_indicator(p) && is_regional_indicator(c)));
@@ -259,16 +272,24 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                     })
                 }
             };
+            // Characters with no script of their own go with the text before them, across items.
             let script = match c.script() {
-                Script::Common | Script::Inherited | Script::Unknown => {
-                    last.map_or(Script::Latin, |r| r.script)
-                }
+                Script::Common | Script::Inherited | Script::Unknown => runs
+                    .last()
+                    .filter(|r| !r.boxed)
+                    .map_or(Script::Latin, |r| r.script),
                 s => s,
             };
+            // A run goes on over an item boundary unless something that shapes differs (face,
+            // size, script, level) or the text is synthesized (it maps to the document apart).
+            let across =
+                off > 0 || item_idx == 0 || !(item.fixed_doc || para.items[item_idx - 1].fixed_doc);
             match runs.last_mut() {
                 Some(r)
-                    if r.item == item_idx
+                    if !r.boxed
+                        && across
                         && r.face == face
+                        && r.size.to_bits() == style.size.to_bits()
                         && r.level == level
                         && r.script == script =>
                 {
@@ -277,7 +298,9 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 _ => runs.push(Run {
                     range: at..at + c.len_utf8(),
                     item: item_idx,
+                    boxed: false,
                     face,
+                    size: style.size,
                     script,
                     level,
                 }),
@@ -289,6 +312,10 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
     out.missing.dedup();
 
     // Shape.
+    #[cfg(test)]
+    {
+        out.runs = runs.len();
+    }
     for run in &runs {
         let item = &para.items[run.item];
         if let Some(b) = item.inline_box {
@@ -304,7 +331,8 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
             });
             continue;
         }
-        let style = &para.styles[item.style as usize];
+        // The items the run covers, to find each cluster's style in.
+        let items = &para.items[run.item..];
         let font = fonts.face(run.face).font();
         let dir = if run.level % 2 == 1 {
             Direction::RightToLeft
@@ -313,7 +341,7 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
         };
         let mut shaper = ctx
             .builder(font)
-            .size(style.size)
+            .size(run.size)
             .script(run.script)
             .direction(dir)
             .build();
@@ -325,6 +353,7 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
             let start = base + c.source.start;
             let end = base + c.source.end;
             let src = &text[start as usize..end as usize];
+            let style = items[items.partition_point(|it| it.range.end <= start)].style;
             // Invisible formatting characters render nothing, even when the face lacks them:
             // a cluster that is all of them drops every `.notdef`, one that carries them next
             // to a base (`e` + variation selector + mark) drops one per such character.
@@ -362,7 +391,7 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
                 glyphs: g0..glyphs.len() as u32,
                 advance,
                 face: run.face,
-                style: item.style,
+                style,
                 level: run.level,
                 flags: f,
             });

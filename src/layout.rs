@@ -1,12 +1,16 @@
 //! Block layout: Doc IR + width + scale → positioned primitives.
 //!
-//! Every block has a cached `y` and `h`. Heights start as estimates and become exact when a
-//! block is measured: blocks near the viewport first ([`Layout::ensure`], the first-frame
-//! path), the rest in time-boxed idle slices ([`Layout::idle`]). Shaped content is kept only
+//! Every block has a cached height `h`, and its top `y` comes from prefix sums over the heights
+//! (see `heights.rs`), so measuring a block never moves the whole tail. Heights start as
+//! estimates and become exact when a block is measured: blocks near the viewport first
+//! ([`Layout::ensure`], the first-frame path), the rest in time-boxed idle slices
+//! ([`Layout::idle`]). Shaped content is kept only
 //! near the viewport, so memory stays flat on huge documents. Positions are relative to the
 //! document area: x from its left edge, y from the document top.
 
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::doc::{self, Alert, Block, BlockKind, Doc, Marker, Span, style};
@@ -15,6 +19,10 @@ use crate::text::{
     Align, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, TextCtx, TextStyle, deco,
 };
 use crate::theme::Role;
+
+mod heights;
+
+use heights::Heights;
 
 /// Average advance per character used to size the content column, in em. 80 characters at
 /// 16 px ≈ 720 px.
@@ -146,7 +154,7 @@ impl BlockBox {
 
 #[derive(Clone, Debug, Default)]
 pub struct BlockGeom {
-    pub y: f32,
+    /// Height, spacing above included. Only [`Layout`] changes it, which keeps the tops in step.
     pub h: f32,
     /// `h` is exact (otherwise an estimate).
     pub measured: bool,
@@ -198,20 +206,29 @@ pub struct Layout {
     col_x: f32,
     col_w: f32,
     geoms: Vec<BlockGeom>,
+    /// The heights of `geoms` with their prefix sums: where each block starts.
+    heights: Heights,
     meta: Vec<Meta>,
     /// Block range of each table.
     table_rows: Vec<Range<u32>>,
-    table_cols: Vec<Option<Vec<f32>>>,
+    /// Each table's column widths, shared with the rows being laid out.
+    table_cols: Vec<Option<Arc<[f32]>>>,
     /// Some character in a table's sampled rows had no face when its columns were measured.
     table_missing: Vec<bool>,
-    total: f32,
     /// Next block for idle measurement.
     cursor: usize,
     /// Blocks currently holding content.
     live: Vec<u32>,
-    missing: Vec<char>,
-    /// Characters already returned by `take_missing` (sorted).
-    tried: Vec<char>,
+    /// Characters waiting for `take_missing`.
+    missing: BTreeSet<char>,
+    /// Characters already returned by `take_missing`.
+    tried: HashSet<char>,
+    /// Set operations on `missing` and `tried` so far (for tests of the cost).
+    #[cfg(test)]
+    set_ops: usize,
+    /// Table cells laid out so far (for tests of the cost).
+    #[cfg(test)]
+    cells_laid: usize,
     ctx: TextCtx,
     para: Para,
 }
@@ -224,15 +241,19 @@ impl Layout {
             col_x: 0.0,
             col_w: 0.0,
             geoms: vec![BlockGeom::default(); doc.blocks.len()],
+            heights: Heights::new(std::iter::empty()),
             meta: Vec::new(),
             table_rows: vec![0..0; doc.tables.len()],
             table_cols: vec![None; doc.tables.len()],
             table_missing: vec![false; doc.tables.len()],
-            total: 0.0,
             cursor: 0,
             live: Vec::new(),
-            missing: Vec::new(),
-            tried: Vec::new(),
+            missing: BTreeSet::new(),
+            tried: HashSet::new(),
+            #[cfg(test)]
+            set_ops: 0,
+            #[cfg(test)]
+            cells_laid: 0,
             ctx: TextCtx::default(),
             para: Para::default(),
         };
@@ -241,7 +262,7 @@ impl Layout {
         for i in 0..doc.blocks.len() {
             layout.geoms[i].h = layout.estimate(doc, i);
         }
-        layout.recompute_ys();
+        layout.rebuild_heights();
         layout
     }
 
@@ -250,7 +271,12 @@ impl Layout {
     }
 
     pub fn total_height(&self) -> f32 {
-        self.total
+        self.heights.prefix(self.geoms.len()) as f32
+    }
+
+    /// Top of block `i` (the total height for one past the last).
+    pub fn y(&self, i: usize) -> f32 {
+        self.heights.prefix(i) as f32
     }
 
     /// Left edge and width of the content column.
@@ -273,12 +299,12 @@ impl Layout {
     /// runs, so `invalidate_missing` covers every block that was laid out without a face.
     pub fn take_missing(&mut self) -> Vec<char> {
         let missing = std::mem::take(&mut self.missing);
-        for &c in &missing {
-            if let Err(at) = self.tried.binary_search(&c) {
-                self.tried.insert(at, c);
-            }
+        #[cfg(test)]
+        {
+            self.set_ops += missing.len();
         }
-        missing
+        self.tried.extend(&missing);
+        missing.into_iter().collect()
     }
 
     /// New width, scale, or font settings: everything is remeasured (old heights remain as
@@ -300,7 +326,7 @@ impl Layout {
         self.table_cols.iter_mut().for_each(|c| *c = None);
         self.table_missing.iter_mut().for_each(|m| *m = false);
         self.cursor = 0;
-        self.recompute_ys();
+        self.rebuild_heights();
     }
 
     /// Fallback faces were added: remeasure blocks that had uncovered characters (even ones
@@ -346,12 +372,13 @@ impl Layout {
 
     /// Queue characters no face covered for `take_missing`, unless already reported.
     fn report_missing(&mut self, chars: &[char]) {
+        #[cfg(test)]
+        {
+            self.set_ops += chars.len();
+        }
         for &c in chars {
-            if self.tried.binary_search(&c).is_ok() {
-                continue;
-            }
-            if let Err(at) = self.missing.binary_search(&c) {
-                self.missing.insert(at, c);
+            if !self.tried.contains(&c) {
+                self.missing.insert(c);
             }
         }
     }
@@ -411,20 +438,58 @@ impl Layout {
         meta
     }
 
-    fn recompute_ys(&mut self) {
-        let mut y = 0.0;
-        for g in &mut self.geoms {
-            g.y = y;
-            y += g.h;
+    /// Prefix sums over all heights again, after they were all set at once.
+    fn rebuild_heights(&mut self) {
+        self.heights = Heights::new(self.geoms.iter().map(|g| g.h));
+    }
+
+    /// Give block `i` the height `h`.
+    fn set_height(&mut self, i: usize, h: f32) {
+        let delta = f64::from(h) - f64::from(self.geoms[i].h);
+        if delta != 0.0 {
+            self.heights.add(i, delta);
         }
-        self.total = y;
+        self.geoms[i].h = h;
+    }
+
+    /// Prefix-sum nodes visited so far (for tests of the cost).
+    #[cfg(test)]
+    fn position_ops(&self) -> usize {
+        self.heights.ops.get()
+    }
+
+    /// How many blocks end at or before `y` (strict: start before `y`), by the f32 tops
+    /// [`Layout::y`] hands out, so a top maps back to its own block.
+    fn blocks_before(&self, y: f32, strict: bool) -> usize {
+        let n = self.geoms.len();
+        let counted = |i: usize| {
+            if strict {
+                self.y(i) < y
+            } else {
+                self.y(i + 1) <= y
+            }
+        };
+        // The tree searches in f64; the rounding to f32 can move the answer by a block or two.
+        let within = self.heights.blocks_within(f64::from(y), strict);
+        let mut count = if strict {
+            if y > 0.0 { (within + 1).min(n) } else { 0 }
+        } else {
+            within
+        };
+        while count < n && counted(count) {
+            count += 1;
+        }
+        while count > 0 && !counted(count - 1) {
+            count -= 1;
+        }
+        count
     }
 
     // ---- Queries ----------------------------------------------------------------------
 
     /// Index of the block containing `y` (clamped to the document).
     pub fn block_at(&self, y: f32) -> usize {
-        let i = self.geoms.partition_point(|g| g.y + g.h <= y);
+        let i = self.blocks_before(y, false);
         i.min(self.geoms.len().saturating_sub(1))
     }
 
@@ -433,8 +498,8 @@ impl Layout {
         if self.geoms.is_empty() {
             return 0..0;
         }
-        let start = self.geoms.partition_point(|g| g.y + g.h <= y0);
-        let end = self.geoms.partition_point(|g| g.y < y1);
+        let start = self.blocks_before(y0, false);
+        let end = self.blocks_before(y1, true);
         start..end.max(start)
     }
 
@@ -445,7 +510,7 @@ impl Layout {
         let i = self.block_at(y.max(0.0));
         let g = &self.geoms[i];
         let frac = if g.h > 0.0 {
-            ((y - g.y) / g.h).clamp(0.0, 1.0)
+            ((y - self.y(i)) / g.h).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -457,8 +522,8 @@ impl Layout {
 
     pub fn y_of(&self, a: Anchor) -> f32 {
         match self.geoms.get(a.block as usize) {
-            Some(g) => g.y + a.frac * g.h,
-            None => self.total,
+            Some(g) => self.y(a.block as usize) + a.frac * g.h,
+            None => self.total_height(),
         }
     }
 
@@ -468,7 +533,7 @@ impl Layout {
         let i = self.range(y, y + f32::EPSILON).start;
         let g = self.geoms.get(i)?;
         let content = g.content.as_ref()?;
-        let (lx, ly) = (x - self.col_x, y - g.y);
+        let (lx, ly) = (x - self.col_x, y - self.y(i));
         for line in content
             .lines
             .iter()
@@ -508,15 +573,14 @@ impl Layout {
                 let (content, h) = self.build(doc, fonts, i);
                 let g = &mut self.geoms[i];
                 changed |= !g.measured || (g.h - h).abs() > 1e-3;
-                g.h = h;
                 g.measured = true;
                 g.content = Some(Box::new(content));
+                self.set_height(i, h);
                 self.live.push(i as u32);
             }
             if !changed {
                 break;
             }
-            self.recompute_ys();
         }
         let y = self.y_of(top);
         let keep = self.range(y - KEEP_SCREENS * view_h, y + (1.0 + KEEP_SCREENS) * view_h);
@@ -534,22 +598,17 @@ impl Layout {
     /// Measure unmeasured blocks until `deadline`. Returns true when the whole document has
     /// exact heights. Callers keep their scroll position with an [`Anchor`].
     pub fn idle(&mut self, doc: &Doc, fonts: &Fonts, deadline: Instant) -> bool {
-        let mut any = false;
         while self.cursor < self.geoms.len() {
             let i = self.cursor;
             if !self.geoms[i].measured {
                 let (_, h) = self.build(doc, fonts, i);
-                self.geoms[i].h = h;
+                self.set_height(i, h);
                 self.geoms[i].measured = true;
-                any = true;
             }
             self.cursor += 1;
             if Instant::now() >= deadline {
                 break;
             }
-        }
-        if any {
-            self.recompute_ys();
         }
         self.cursor >= self.geoms.len()
     }
@@ -923,10 +982,19 @@ impl Layout {
             ..self.body_style(block, meta)
         };
         let aligns = &doc.tables[table].aligns;
-        let mut cells = Vec::with_capacity(cols.len());
+        // There is no horizontal scrolling: columns that start past the document's right edge
+        // can't be seen, so a row costs its visible columns (and the populated cells among them),
+        // however many columns the table has. A column's cell and rules count from its left edge.
+        let reach = (self.params.width - self.col_x - indent).max(0.0);
+        let (mut visible, mut edge) = (0, 0.0f32);
+        while visible < cols.len() && edge < reach {
+            edge += cols[visible];
+            visible += 1;
+        }
+        let mut cells = Vec::new();
         let mut row_h: f32 = 0.0;
         // A fragment of a split row only stores the cells that still have text.
-        let stored = doc.row_cells(block).take_while(|&(c, _)| c < cols.len());
+        let stored = doc.row_cells(block).take_while(|&(c, _)| c < visible);
         for (c, spans) in stored {
             fill_para(&mut self.para, doc, spans, body);
             let align = match aligns.get(c) {
@@ -941,6 +1009,10 @@ impl Layout {
                 align,
                 BODY_LH,
             );
+            #[cfg(test)]
+            {
+                self.cells_laid += 1;
+            }
             missing.extend_from_slice(&pl.missing);
             row_h = row_h.max(pl.height);
             cells.push((c, pl, std::mem::take(&mut self.para.styles)));
@@ -954,7 +1026,7 @@ impl Layout {
             row_h = pl.height;
         }
         let h = row_h + top + bottom;
-        let width: f32 = cols.iter().sum();
+        let width = edge.min(reach);
         let line = self.hairline();
         if meta.stripe {
             out.rect(indent, gap, width, h, Role::TableStripe);
@@ -965,15 +1037,18 @@ impl Layout {
         if last {
             out.rect(indent, gap + h - line, width, line, Role::Border);
         }
+        out.rect(indent, gap, line, h, Role::Border);
         let mut x = indent;
-        out.rect(x, gap, line, h, Role::Border);
         let mut cells = cells.into_iter().peekable();
-        for (c, w) in cols.iter().enumerate() {
+        for (c, w) in cols[..visible].iter().enumerate() {
             if let Some((_, pl, styles)) = cells.next_if(|(col, ..)| *col == c) {
                 out.append(pl, &styles, x + px, gap + top);
             }
             x += w;
-            out.rect(x - line, gap, line, h, Role::Border);
+            // A rule on the far side of the visible width can't be seen.
+            if x - indent <= reach {
+                out.rect(x - line, gap, line, h, Role::Border);
+            }
         }
         h
     }
@@ -1002,9 +1077,9 @@ impl Layout {
     /// auto-layout, simplified). Rows past the sample never influence the columns; their text
     /// wraps within them (a table that fits and has such rows is stretched to the full width,
     /// leaving them room).
-    fn table_cols(&mut self, doc: &Doc, fonts: &Fonts, table: usize, indent: f32) -> Vec<f32> {
+    fn table_cols(&mut self, doc: &Doc, fonts: &Fonts, table: usize, indent: f32) -> Arc<[f32]> {
         if let Some(cols) = &self.table_cols[table] {
-            return cols.clone();
+            return Arc::clone(cols);
         }
         let em = self.em;
         let px = CELL_PAD_X * em;
@@ -1055,8 +1130,8 @@ impl Layout {
                 .map(|(lo, hi)| lo + (hi - lo) * t)
                 .collect()
         };
-        let cols: Vec<f32> = widths.into_iter().map(|w| w.ceil() + 2.0 * px).collect();
-        self.table_cols[table] = Some(cols.clone());
+        let cols: Arc<[f32]> = widths.into_iter().map(|w| w.ceil() + 2.0 * px).collect();
+        self.table_cols[table] = Some(Arc::clone(&cols));
         cols
     }
 

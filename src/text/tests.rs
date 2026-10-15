@@ -517,3 +517,119 @@ fn marks_after_joiners_and_selectors_use_a_fallback() {
         );
     }
 }
+
+/// Makes an item's style from the base style.
+type Restyle<'a> = &'a dyn Fn(&mut TextStyle);
+
+/// A paragraph of text items, each with the style `f` makes from the base style.
+fn items_para(items: &[(&str, Restyle)]) -> Para {
+    let mut p = Para::default();
+    let mut doc = 0;
+    for (text, f) in items {
+        let mut s = style(16.0);
+        f(&mut s);
+        p.push_text(text, doc, s);
+        doc += text.len() as u32;
+    }
+    p
+}
+
+#[test]
+fn items_that_differ_only_in_color_link_or_decoration_share_a_run() {
+    let fonts = Fonts::new().unwrap();
+    let mut ctx = TextCtx::default();
+    let link = |s: &mut TextStyle| {
+        s.link = 1;
+        s.role = Role::Link;
+    };
+    let strike = |s: &mut TextStyle| s.deco = deco::STRIKE;
+    let plain = |_: &mut TextStyle| {};
+    let p = items_para(&[("ab", &plain), ("cd", &link), ("ef", &strike)]);
+    let whole = ctx.shape(&fonts, &para("abcdef"));
+    let shaped = ctx.shape(&fonts, &p);
+    assert_eq!(shaped.runs, 1);
+    assert_eq!(whole.runs, 1);
+    // Same glyphs, and every cluster has the style of its own item.
+    let ids = |s: &Shaped| s.glyphs.iter().map(|g| g.id).collect::<Vec<_>>();
+    assert_eq!(ids(&shaped), ids(&whole));
+    let styles: Vec<u32> = shaped.clusters.iter().map(|c| c.style).collect();
+    let items: Vec<u32> = (0..6).map(|i| p.items[i / 2].style).collect();
+    assert_eq!(styles, items);
+    assert_eq!(p.styles[styles[2] as usize].link, 1);
+    // A different size, face (bold), an inline box or synthesized text each end the run.
+    let big = |s: &mut TextStyle| s.size = 24.0;
+    let bold = |s: &mut TextStyle| s.bold = true;
+    for f in [&big as &dyn Fn(&mut TextStyle), &bold] {
+        let p = items_para(&[("ab", &plain), ("cd", f), ("ef", &plain)]);
+        assert_eq!(ctx.shape(&fonts, &p).runs, 3);
+    }
+    let mut p = items_para(&[("ab", &plain)]);
+    p.push_box(
+        InlineBox {
+            width: 8.0,
+            ascent: 8.0,
+            descent: 0.0,
+            id: 0,
+        },
+        2,
+        style(16.0),
+    );
+    p.push_text("cd", 3, style(16.0));
+    assert_eq!(ctx.shape(&fonts, &p).runs, 3);
+    let mut p = items_para(&[("ab", &plain)]);
+    p.push_synthetic("    ", 2, style(16.0));
+    p.push_text("cd", 3, style(16.0));
+    assert_eq!(ctx.shape(&fonts, &p).runs, 3);
+}
+
+#[test]
+fn arabic_keeps_joining_across_style_boundaries() {
+    let word = "سلام";
+    let base = Fonts::new().unwrap();
+    let chars: Vec<char> = word.chars().collect();
+    let found = fallback::find_fallbacks(&chars, &|p, i| base.has_source(p, i));
+    let mut fonts = Fonts::new().unwrap();
+    for f in &found {
+        fonts.add_fallback(&f.path, f.index);
+    }
+    let mut ctx = TextCtx::default();
+    let plain = ctx.shape(&fonts, &para(word));
+    // Needs an installed face that draws all of it.
+    if !plain.missing.is_empty() || plain.glyphs.iter().any(|g| g.id == 0) {
+        return;
+    }
+    let ids = |s: &Shaped| s.glyphs.iter().map(|g| g.id).collect::<Vec<_>>();
+    let nolink = |_: &mut TextStyle| {};
+    let link = |s: &mut TextStyle| {
+        s.link = 1;
+        s.role = Role::Link;
+    };
+    let colored = |s: &mut TextStyle| s.role = Role::Link;
+    for split in [2, 4, 6] {
+        let p = items_para(&[
+            (&word[..split], &nolink as &dyn Fn(&mut TextStyle)),
+            (&word[split..], &link),
+        ]);
+        let shaped = ctx.shape(&fonts, &p);
+        assert_eq!(ids(&shaped), ids(&plain), "split at {split}");
+        assert_eq!(shaped.runs, 1, "split at {split}");
+        // Each cluster has the style of the item it starts in: the link covers the tail only.
+        for c in &shaped.clusters {
+            let linked = p.styles[c.style as usize].link;
+            assert_eq!(linked == 1, c.start as usize >= split, "{c:?}");
+        }
+        assert!(shaped.clusters.iter().all(|c| c.level == 1));
+    }
+    // Three items, the middle one differently colored.
+    let p = items_para(&[
+        (&word[..2], &nolink as &dyn Fn(&mut TextStyle)),
+        (&word[2..6], &colored),
+        (&word[6..], &nolink),
+    ]);
+    assert_eq!(ids(&ctx.shape(&fonts, &p)), ids(&plain));
+    // The hit map still resolves each cluster to the right document offset.
+    let l = ctx.layout(&fonts, &p, 1000.0, Align::Start, 1.5);
+    let mut docs = visual_docs(&l, 0);
+    docs.sort_unstable();
+    assert_eq!(docs, [0, 2, 4, 6]);
+}
