@@ -3,6 +3,7 @@
 //! and written back line by line so comments, ordering and unknown keys survive.
 
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -11,6 +12,9 @@ use crate::view::ThemeMode;
 
 /// Saves wait this long after the last change.
 pub const SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// A save that failed is tried again after this long.
+pub const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// One line of the file, kept verbatim. `kv` locates the key and value in `raw`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,20 +33,27 @@ impl Line {
         self.kv.as_ref().map(|(k, _)| &self.raw[k.clone()])
     }
 
+    /// Keys match regardless of ASCII case (`Theme = dark` is `theme`).
+    fn is_key(&self, key: &str) -> bool {
+        self.key().is_some_and(|k| k.eq_ignore_ascii_case(key))
+    }
+
     fn value(&self) -> Option<&str> {
         self.kv.as_ref().map(|(_, v)| &self.raw[v.clone()])
     }
 }
 
 /// Key and value spans of a `key = value` line; `None` for blanks, comments and garbage. A `#`
-/// only starts a comment at the start of a line, so values (paths) may contain one.
+/// only starts a comment at the start of a line, so values (paths) may contain one. A byte order
+/// mark in front of the line is skipped (editors add one to the file's first line).
 fn split(raw: &str) -> Option<(Range<usize>, Range<usize>)> {
-    let trimmed = raw.trim_start();
+    let start = if raw.starts_with('\u{feff}') { 3 } else { 0 };
+    let trimmed = raw[start..].trim_start();
     if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
         return None;
     }
     let eq = raw.find('=')?;
-    let key = trim_span(raw, 0..eq);
+    let key = trim_span(raw, start..eq);
     let value = trim_span(raw, eq + 1..raw.len());
     let k = &raw[key.clone()];
     if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -63,12 +74,17 @@ fn trim_span(s: &str, range: Range<usize>) -> Range<usize> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     lines: Vec<Line>,
+    /// The file used CRLF line ends (kept when it is written back).
+    crlf: bool,
 }
 
 impl Settings {
     pub fn parse(text: &str) -> Settings {
         Settings {
             lines: text.lines().map(|l| Line::parse(l.to_owned())).collect(),
+            crlf: text
+                .split_once('\n')
+                .is_some_and(|(first, _)| first.ends_with('\r')),
         }
     }
 
@@ -76,17 +92,18 @@ impl Settings {
         self.lines
             .iter()
             .rev()
-            .find(|l| l.key() == Some(key))
+            .find(|l| l.is_key(key))
             .and_then(Line::value)
     }
 
-    /// Set `key` to `value`: rewrite the value on its (last) line, keeping the rest of the line,
+    /// Set `key` to `value`: rewrite the value on its (last) line, keeping the rest of the line
+    /// (and the key's spelling), or replace the template's commented default (`# key = value`),
     /// or append a line. Returns false if the value was already `value`.
     pub fn set(&mut self, key: &str, value: &str) -> bool {
         // Values are ours (numbers, words, paths checked by `FontPaths::value`): one line, no
         // surrounding blanks, so they read back exactly.
         debug_assert!(!value.contains(['\n', '\r']) && value.trim() == value);
-        if let Some(line) = self.lines.iter_mut().rev().find(|l| l.key() == Some(key)) {
+        if let Some(line) = self.lines.iter_mut().rev().find(|l| l.is_key(key)) {
             if line.value() == Some(value) {
                 return false;
             }
@@ -101,7 +118,19 @@ impl Settings {
             *line = Line::parse(raw);
             return true;
         }
-        self.lines.push(Line::parse(format!("{key} = {value}")));
+        let new = Line::parse(format!("{key} = {value}"));
+        // Only the template's own lines: a comment of the user's stays where it is.
+        let commented = self.lines.iter_mut().find(|l| {
+            let Some(rest) = l.raw.strip_prefix("# ") else {
+                return false;
+            };
+            split(rest).is_some_and(|(k, _)| rest[k].eq_ignore_ascii_case(key))
+                && TEMPLATE.lines().any(|t| t == l.raw)
+        });
+        match commented {
+            Some(line) => *line = new,
+            None => self.lines.push(new),
+        }
         true
     }
 
@@ -116,10 +145,11 @@ impl Settings {
 
     /// The file's text: every line as read (or rewritten), newline-terminated.
     pub fn text(&self) -> String {
+        let eol = if self.crlf { "\r\n" } else { "\n" };
         let mut out = String::new();
         for l in &self.lines {
             out.push_str(&l.raw);
-            out.push('\n');
+            out.push_str(eol);
         }
         out
     }
@@ -222,12 +252,10 @@ impl Prefs {
             });
         let font_size = s
             .get("font_size")
-            .and_then(|v| parse_in::<f32>(v, FONT_SIZE_RANGE))
-            .filter(|n| n.is_finite());
+            .and_then(|v| parse_in::<f32>(v, FONT_SIZE_RANGE));
         let line_width = s
             .get("line_width")
-            .and_then(|v| parse_in::<f32>(v, LINE_WIDTH_RANGE))
-            .filter(|n| n.is_finite());
+            .and_then(|v| parse_in::<f32>(v, LINE_WIDTH_RANGE));
         let font_sans = s.get("font_sans").and_then(parse_family).unwrap_or(None);
         let font_mono = s.get("font_mono").and_then(parse_family).unwrap_or(None);
         Prefs {
@@ -372,27 +400,64 @@ pub fn stamp(path: &Path) -> Option<Stamp> {
 /// Settings files beyond this are not ours (or not settings); ignore them.
 const MAX_FILE: u64 = 256 * 1024;
 
-/// Read the file: missing, unreadable or oversized files read as empty (all defaults).
-pub fn load(path: &Path) -> (Settings, Option<Stamp>) {
-    let st = stamp(path);
-    if st.is_none_or(|(_, len)| len > MAX_FILE) {
-        return (Settings::default(), st);
-    }
-    let text = std::fs::read(path)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
-    (Settings::parse(&text), st)
+/// The file as read.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Loaded {
+    pub settings: Settings,
+    pub stamp: Option<Stamp>,
+    /// False if the file exists but couldn't be read as it is (unreadable, oversized, not UTF-8):
+    /// what could be parsed still applies, but writing it back would destroy the rest.
+    pub faithful: bool,
 }
 
-/// Write atomically: a temporary file next to it, then rename over it. Returns the new stamp.
-pub fn save(path: &Path, settings: &Settings) -> std::io::Result<Option<Stamp>> {
-    let dir = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+/// Read the file; a missing one reads as empty (all defaults).
+pub fn load(path: &Path) -> Loaded {
+    let stamp = stamp(path);
+    let (text, faithful) = match std::fs::metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (String::new(), true),
+        Ok(m) if m.len() <= MAX_FILE => match std::fs::read(path).map(String::from_utf8) {
+            Ok(Ok(text)) => (text, true),
+            Ok(Err(e)) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
+            Err(_) => (String::new(), false),
+        },
+        _ => (String::new(), false),
+    };
+    Loaded {
+        settings: Settings::parse(&text),
+        stamp,
+        faithful,
+    }
+}
+
+/// The file a settings path really is: a symlink (a dotfiles setup) is followed, also when it
+/// dangles, so saving replaces the target and not the link.
+fn resolve(path: &Path) -> PathBuf {
+    let mut p = path.to_owned();
+    for _ in 0..8 {
+        let Ok(link) = std::fs::read_link(&p) else {
+            break;
+        };
+        p = p.parent().map_or(link.clone(), |d| d.join(&link));
+    }
+    p
+}
+
+/// Write atomically: a temporary file next to the (resolved) file, with its permissions, then
+/// rename over it. Returns the new stamp.
+pub fn save(path: &Path, settings: &Settings) -> io::Result<Option<Stamp>> {
+    let target = resolve(path);
+    let dir = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
     std::fs::create_dir_all(dir)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    let mut tmp = target.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, settings.text())?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        if let Ok(m) = std::fs::metadata(&target) {
+            f.set_permissions(m.permissions())?;
+        }
+        f.write_all(settings.text().as_bytes())
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &target)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -432,17 +497,36 @@ impl Saver {
     pub fn take(&mut self) -> bool {
         self.due.take().is_some()
     }
+
+    /// A save failed: try again after [`RETRY_DELAY`] (or sooner, with the next change).
+    pub fn retry(&mut self, now: Instant) {
+        self.due = Some(now + RETRY_DELAY);
+    }
 }
 
 /// The settings as the app uses them: the file (if any), what was last applied from it, and
 /// changes waiting to be saved. Without a path (`--no-settings`, or no config directory) it
 /// gives the defaults and never touches the disk.
+///
+/// Saving never overwrites the file with a stale copy: changes are kept as `(key, value)`
+/// pending writes, and a save first looks at the file again; if it changed since it was read
+/// (another window, a hand edit) its lines are taken as they are and the pending keys go on
+/// top, so for each key the last write wins and nothing else is lost.
 #[derive(Debug, Default)]
 pub struct Store {
     path: Option<PathBuf>,
     settings: Settings,
     stamp: Option<Stamp>,
     saver: Saver,
+    /// Changes not written yet, one per key.
+    pending: Vec<(String, String)>,
+    /// The file couldn't be read faithfully: used as far as it parsed, never written.
+    read_only: bool,
+    /// A save found changes from outside and merged them in; the next [`Store::refresh`] reports
+    /// them though the file's stamp is ours.
+    foreign: bool,
+    /// The last save failed (and was reported); retries stay quiet until one works.
+    failing: bool,
     /// Theme and zoom as last read from or written to the file: only a change from these is
     /// written, so a bad value in the file isn't overwritten just because the view shows the
     /// default.
@@ -451,14 +535,14 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: Option<PathBuf>) -> Store {
-        let (settings, stamp) = path.as_deref().map(load).unwrap_or_default();
         let mut store = Store {
             path,
-            settings,
-            stamp,
             ..Store::default()
         };
-        store.resync();
+        if let Some(path) = &store.path {
+            let loaded = load(path);
+            store.adopt(loaded);
+        }
         store
     }
 
@@ -474,9 +558,43 @@ impl Store {
         &self.settings
     }
 
-    fn resync(&mut self) {
+    /// Take `loaded` as the file's state, with the pending changes still on top (those the file
+    /// already has are dropped).
+    fn adopt(&mut self, loaded: Loaded) {
+        self.settings = loaded.settings;
+        self.stamp = loaded.stamp;
+        self.read_only = !loaded.faithful;
+        let settings = &mut self.settings;
+        if self.read_only {
+            self.pending.clear();
+        }
+        self.pending.retain(|(k, v)| settings.get(k) != Some(v));
+        for (k, v) in &self.pending {
+            settings.set(k, v);
+        }
+        if self.pending.is_empty() {
+            self.saver = Saver::default();
+        }
         let p = self.prefs();
         self.synced = (p.theme, p.zoom);
+    }
+
+    /// Set `key` to `value` (not theme and zoom: [`Store::record`]); a change is saved after
+    /// [`SAVE_DELAY`]. For the toolbar and panel toggles.
+    pub fn set(&mut self, key: &str, value: &str, now: Instant) {
+        if self.settings.set(key, value) {
+            self.track(key, value, now);
+        }
+    }
+
+    /// Queue a change for saving.
+    fn track(&mut self, key: &str, value: &str, now: Instant) {
+        if self.path.is_none() || self.read_only {
+            return;
+        }
+        self.pending.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
+        self.pending.push((key.to_owned(), value.to_owned()));
+        self.saver.mark(now);
     }
 
     /// The view's theme and zoom now; a change is saved after [`SAVE_DELAY`].
@@ -485,13 +603,12 @@ impl Store {
             return;
         }
         if theme != self.synced.0 {
-            self.settings.set("theme", theme_value(theme));
+            self.set("theme", theme_value(theme), now);
         }
         if zoom != self.synced.1 {
-            self.settings.set("zoom", &zoom.to_string());
+            self.set("zoom", &zoom.to_string(), now);
         }
         self.synced = (theme, zoom);
-        self.mark(now);
     }
 
     /// The window's size in logical pixels at close: recorded if it differs from what the file
@@ -505,14 +622,14 @@ impl Store {
             return;
         }
         let d = DEFAULT_WINDOW;
-        let a = self
-            .settings
-            .set_unless_default("window_width", &w.to_string(), &d.0.to_string());
-        let b = self
-            .settings
-            .set_unless_default("window_height", &h.to_string(), &d.1.to_string());
-        if a || b {
-            self.mark(now);
+        for (key, v, default) in [("window_width", w, d.0), ("window_height", h, d.1)] {
+            let v = v.to_string();
+            if self
+                .settings
+                .set_unless_default(key, &v, &default.to_string())
+            {
+                self.track(key, &v, now);
+            }
         }
     }
 
@@ -523,16 +640,8 @@ impl Store {
         } else {
             "font_sans_path"
         };
-        if let Some(v) = paths.value()
-            && self.settings.set(key, &v)
-        {
-            self.mark(now);
-        }
-    }
-
-    fn mark(&mut self, now: Instant) {
-        if self.path.is_some() {
-            self.saver.mark(now);
+        if let Some(v) = paths.value() {
+            self.set(key, &v, now);
         }
     }
 
@@ -542,58 +651,92 @@ impl Store {
     }
 
     /// Save if a save is due at `now`.
-    pub fn poll(&mut self, now: Instant) -> std::io::Result<()> {
+    pub fn poll(&mut self, now: Instant) -> io::Result<()> {
         if self.saver.take_due(now) {
-            return self.write();
+            return self.write(now);
         }
         Ok(())
     }
 
-    /// Save now if anything is waiting (on close).
-    pub fn flush(&mut self) -> std::io::Result<()> {
+    /// Save now if anything is waiting (on close, and when the window loses focus).
+    pub fn flush(&mut self) -> io::Result<()> {
         if self.saver.take() {
-            return self.write();
+            return self.write(Instant::now());
         }
         Ok(())
     }
 
-    fn write(&mut self) -> std::io::Result<()> {
-        let Some(path) = &self.path else {
+    /// Write the pending changes. A failure keeps them pending and schedules a retry; only the
+    /// first of a run of failures is returned.
+    fn write(&mut self, now: Instant) -> io::Result<()> {
+        let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        self.stamp = save(path, &self.settings)?;
-        Ok(())
+        if stamp(&path) != self.stamp {
+            self.adopt(load(&path));
+            self.foreign = true;
+        }
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        match save(&path, &self.settings) {
+            Ok(stamp) => {
+                self.stamp = stamp;
+                self.pending.clear();
+                self.failing = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.saver.retry(now);
+                if std::mem::replace(&mut self.failing, true) {
+                    return Ok(());
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Re-read the file if it changed on disk since it was last read or written (on focus;
-    /// live apply). Returns the new preferences then. The file wins over changes not
-    /// saved yet (last write wins, as with two windows).
+    /// live apply). Returns the new preferences then. Changes not saved yet stay on
+    /// top of what the file says (last write wins, as with two windows, and a failed save isn't
+    /// lost); they are saved as usual.
     pub fn refresh(&mut self) -> Option<Prefs> {
-        let path = self.path.as_deref()?;
-        if stamp(path) == self.stamp {
-            return None;
+        let path = self.path.clone()?;
+        let foreign = std::mem::take(&mut self.foreign);
+        if stamp(&path) == self.stamp {
+            return foreign.then(|| self.prefs());
         }
-        let (settings, st) = load(path);
-        self.settings = settings;
-        self.stamp = st;
-        self.saver = Saver::default();
-        self.resync();
+        self.adopt(load(&path));
         Some(self.prefs())
     }
-}
 
-/// The ⚙ action: write the commented template if there is no file, then open the
-/// file in the default editor.
-pub fn open_in_editor(path: &Path) -> std::io::Result<()> {
-    ensure_template(path)?;
-    crate::platform::open(path.as_os_str())
+    /// The ⚙ action: save what is pending, write the commented template if there is
+    /// no file, then open the file in the default editor. `Unsupported` without a settings file
+    /// (`--no-settings`, no config directory: `path()` is `None`, which P9 uses to disable the
+    /// button).
+    pub fn open_in_editor(&mut self) -> io::Result<()> {
+        self.prepare_file()?;
+        let path = self.path.as_deref().ok_or(io::ErrorKind::Unsupported)?;
+        crate::platform::open(path.as_os_str())
+    }
+
+    /// The file part of [`Store::open_in_editor`]: a file made here is the template with the
+    /// pending changes on top (not a file of just those), and what is pending is written.
+    fn prepare_file(&mut self) -> io::Result<()> {
+        let path = self.path.clone().ok_or(io::ErrorKind::Unsupported)?;
+        if !self.read_only && ensure_template(&path)? {
+            self.adopt(load(&path));
+        }
+        self.flush()
+    }
 }
 
 /// The file written by the ⚙ action when there is none: every key commented out at its
 /// default, with a line of explanation.
 pub const TEMPLATE: &str = "\
 # VOMD settings. Remove the # in front of a line to change it; delete a line to go back to
-# the default. VOMD re-reads this file when its window gets focus.
+# the default. VOMD re-reads this file when its window gets focus. Comments go on a line of
+# their own: after a value, a # is part of the value.
 
 # Color theme: system, light or dark (T cycles it).
 # theme = system
@@ -621,15 +764,19 @@ pub const TEMPLATE: &str = "\
 # line_width = 80
 
 # Fonts: default (built in) or the name of an installed family, e.g. Noto Sans. VOMD finds
-# the files once and remembers them below as font_sans_path / font_mono_path.
+# the files once and remembers them below as font_sans_path / font_mono_path. A family that
+# isn't installed falls back to the built-in font.
 # font_sans = default
 # font_mono = default
 ";
 
-/// Create the file from [`TEMPLATE`] if it doesn't exist. Returns true if it was created.
-pub fn ensure_template(path: &Path) -> std::io::Result<bool> {
-    if path.exists() {
-        return Ok(false);
+/// Create the file from [`TEMPLATE`] if it doesn't exist (a dangling symlink gets the file at
+/// its target). Returns true if it was created.
+pub fn ensure_template(path: &Path) -> io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        Err(_) => {}
     }
     save(path, &Settings::parse(TEMPLATE))?;
     Ok(true)

@@ -412,6 +412,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
             }
+            // Changes made here are in the file before another window (or an editor) is used.
+            WindowEvent::Focused(false) => self.save(|s| s.flush()),
             WindowEvent::Focused(true) => {
                 if let Input::File(path) = &self.input
                     && view::stamp(path) != self.stamp
@@ -481,8 +483,11 @@ impl ApplicationHandler<UserEvent> for App {
     /// However the window goes (close button, quit keys), save its size and anything else
     /// waiting.
     fn exiting(&mut self, _: &ActiveEventLoop) {
+        // A maximized or fullscreen window's size isn't the one to come back to.
         if let Some(g) = &self.gfx
             && self.shown
+            && !g.window.is_maximized()
+            && g.window.fullscreen().is_none()
         {
             let size = g
                 .window
@@ -583,5 +588,26 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
         (None, None) => true,
         (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_family;
+
+    /// A family lookup in flight when the setting changes is ignored when it comes back: its
+    /// result only counts while the family is still the wanted one (`Families` event).
+    #[test]
+    fn lookups_for_a_family_no_longer_wanted_are_ignored() {
+        assert!(same_family(Some("Noto Sans"), Some(" noto sans ")));
+        assert!(
+            !same_family(Some("Noto Sans"), Some("Inter")),
+            "changed meanwhile"
+        );
+        assert!(
+            !same_family(Some("Noto Sans"), None),
+            "back to the default meanwhile"
+        );
+        assert!(same_family(None, None));
     }
 }

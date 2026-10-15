@@ -206,27 +206,36 @@ fn save_is_atomic_and_load_reads_it_back() {
     let path = dir.join("vomd/settings.ini");
     assert_eq!(
         load(&path),
-        (Settings::default(), None),
+        Loaded {
+            settings: Settings::default(),
+            stamp: None,
+            faithful: true
+        },
         "missing: defaults"
     );
     let mut s = Settings::parse("# keep\ntheme = dark\n");
     s.set("zoom", "130");
     let st = save(&path, &s).unwrap();
     assert!(st.is_some());
-    assert!(!dir.join("vomd/settings.ini.tmp").exists());
-    let (back, st2) = load(&path);
-    assert_eq!(back, s);
-    assert_eq!(st2, st);
+    let left: Vec<_> = std::fs::read_dir(dir.join("vomd")).unwrap().collect();
+    assert_eq!(left.len(), 1, "no temporary file left");
+    let back = load(&path);
+    assert_eq!((back.settings, back.stamp, back.faithful), (s, st, true));
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         "# keep\ntheme = dark\nzoom = 130\n"
     );
     // Oversized files are ignored, not parsed.
     std::fs::write(&path, "zoom = 150\n".repeat(30_000)).unwrap();
-    assert_eq!(load(&path).0, Settings::default());
+    let big = load(&path);
+    assert_eq!((big.settings, big.faithful), (Settings::default(), false));
     // Invalid UTF-8 is replaced, never fatal.
     std::fs::write(&path, b"zoom = 150\n\xff\xfe = x\n").unwrap();
-    assert_eq!(load(&path).0.get("zoom"), Some("150"));
+    let odd = load(&path);
+    assert_eq!(
+        (odd.settings.get("zoom"), odd.faithful),
+        (Some("150"), false)
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -350,7 +359,8 @@ fn fuzz_round_trip() {
         let keep = |l: &&str| {
             !keys
                 .iter()
-                .any(|k| split(l).is_some_and(|(kr, _)| &l[kr] == *k))
+                .any(|k| split(l).is_some_and(|(kr, _)| l[kr].eq_ignore_ascii_case(k)))
+                && !TEMPLATE.lines().any(|t| t == *l)
         };
         let old: Vec<&str> = before.lines().filter(keep).collect();
         let new_text = s.text();
@@ -407,13 +417,12 @@ fn store_records_saves_and_refreshes() {
     st.record_window((800, 600), t0);
     st.flush().unwrap();
     assert_eq!(st.prefs().window, (800, 600));
-    // An edit by hand is picked up on refresh, and wins over unsaved changes.
+    // An edit by hand is picked up on refresh.
     std::thread::sleep(Duration::from_millis(20));
     std::fs::write(&path, "# mine\ntheme = light\nzoom = 999\n").unwrap();
-    st.record(ThemeMode::Dark, 130, t0);
     let p = st.refresh().expect("changed on disk");
     assert_eq!((p.theme, p.zoom), (ThemeMode::Light, 100));
-    assert_eq!(st.deadline(), None, "pending changes dropped");
+    assert_eq!(st.deadline(), None);
     // The view now shows zoom 100 (the default for the bad value): that isn't a change.
     st.record(ThemeMode::Light, 100, t0);
     assert_eq!(st.deadline(), None);
@@ -452,4 +461,415 @@ fn store_records_font_paths() {
     );
     assert_eq!(st.prefs().font_sans_path, Some(fp));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- Parser details ---------------------------------------------------------------------------
+
+#[test]
+fn bom_keeps_the_first_key_findable() {
+    let mut s = Settings::parse("\u{feff}theme = dark\nzoom = 120\n");
+    assert_eq!(s.get("theme"), Some("dark"));
+    assert!(s.set("theme", "light"));
+    assert_eq!(
+        s.text(),
+        "\u{feff}theme = light\nzoom = 120\n",
+        "no duplicate"
+    );
+}
+
+#[test]
+fn keys_match_in_any_ascii_case() {
+    let mut s = Settings::parse("Theme = dark\nZOOM=120\n");
+    assert_eq!(s.get("theme"), Some("dark"));
+    assert_eq!(Prefs::from_settings(&s).zoom, 120);
+    assert!(s.set("theme", "light"));
+    assert!(!s.set("zoom", "120"));
+    assert!(s.set("zoom", "130"));
+    assert_eq!(
+        s.text(),
+        "Theme = light\nZOOM=130\n",
+        "spelling kept, no duplicate"
+    );
+}
+
+#[test]
+fn crlf_files_stay_crlf() {
+    let text = "# mine\r\ntheme = dark\r\nzoom = 120\r\n";
+    let mut s = Settings::parse(text);
+    assert_eq!(s.get("theme"), Some("dark"), "no \\r in values");
+    assert_eq!(s.text(), text);
+    s.set("zoom", "130");
+    s.set("toc", "true");
+    assert_eq!(
+        s.text(),
+        "# mine\r\ntheme = dark\r\nzoom = 130\r\ntoc = true\r\n"
+    );
+    assert_eq!(Settings::parse("a = 1\nb = 2\n").text(), "a = 1\nb = 2\n");
+}
+
+#[test]
+fn inline_comments_are_part_of_the_value() {
+    let s = Settings::parse("theme = dark # night\n");
+    assert_eq!(s.get("theme"), Some("dark # night"));
+    assert_eq!(
+        Prefs::from_settings(&s).theme,
+        ThemeMode::System,
+        "so it isn't a theme"
+    );
+    assert!(TEMPLATE.contains("Comments go on a line of"));
+}
+
+#[test]
+fn a_commented_default_is_replaced_in_place() {
+    let mut s = Settings::parse(TEMPLATE);
+    s.set("theme", "dark");
+    s.set("ZOOM", "120");
+    let text = s.text();
+    assert!(text.contains("\ntheme = dark\n") && !text.contains("# theme = system"));
+    assert!(text.contains("\nZOOM = 120\n") && !text.contains("# zoom = 100"));
+    assert_eq!(
+        text.lines().count(),
+        TEMPLATE.lines().count(),
+        "nothing appended"
+    );
+    let p = Prefs::from_settings(&Settings::parse(&text));
+    assert_eq!((p.theme, p.zoom), (ThemeMode::Dark, 120));
+    // Only the template's own lines: other comments stay, the value goes at the end.
+    let mut s = Settings::parse("# theme = system or so\n#theme = system\n");
+    s.set("theme", "dark");
+    assert_eq!(
+        s.text(),
+        "# theme = system or so\n#theme = system\ntheme = dark\n"
+    );
+    // Once set, later writes use that line.
+    let mut s = Settings::parse(TEMPLATE);
+    s.set("zoom", "120");
+    s.set("zoom", "130");
+    assert_eq!(s.get("zoom"), Some("130"));
+    assert_eq!(s.text().matches("zoom = ").count(), 1);
+}
+
+#[test]
+fn non_finite_numbers_are_rejected_by_the_range() {
+    for v in ["NaN", "nan", "inf", "-inf", "infinity", "1e999"] {
+        let p = Prefs::from_settings(&Settings::parse(&format!(
+            "font_size = {v}\nline_width = {v}\n"
+        )));
+        assert_eq!((p.font_size, p.line_width), (16.0, 80.0), "{v}");
+    }
+}
+
+// ---- Saving against a file that changed -------------------------------------------------------
+
+fn write_file(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// Let the file's modification time move on (the stamp also has the length, but not always).
+fn tick() {
+    std::thread::sleep(Duration::from_millis(20));
+}
+
+#[test]
+fn saving_keeps_edits_made_since_the_file_was_read() {
+    let dir = temp_dir("external");
+    let path = dir.join("settings.ini");
+    write_file(&path, "zoom = 110\n");
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    tick();
+    // A hand edit while this window is open and unfocused: a key and a comment.
+    write_file(&path, "# note to self\nzoom = 110\ntoc = true\n");
+    st.record_window((800, 600), t0);
+    st.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# note to self\nzoom = 110\ntoc = true\nwindow_width = 800\nwindow_height = 600\n"
+    );
+    // The merged-in edit reaches the view on the next focus although the stamp is ours.
+    let p = st.refresh().expect("external changes were merged");
+    assert!(p.toc);
+    assert!(st.refresh().is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn two_stores_on_one_file_keep_each_others_keys() {
+    let dir = temp_dir("two");
+    let path = dir.join("settings.ini");
+    write_file(&path, "# shared\n");
+    let t0 = Instant::now();
+    let mut a = Store::open(Some(path.clone()));
+    let mut b = Store::open(Some(path.clone()));
+    a.record(ThemeMode::Dark, 100, t0);
+    b.record(ThemeMode::System, 130, t0);
+    tick();
+    a.flush().unwrap();
+    tick();
+    b.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# shared\ntheme = dark\nzoom = 130\n",
+        "different keys: both survive"
+    );
+    // The same key: the last write wins, and a stale store doesn't write back old values.
+    a.set("toc", "true", t0);
+    b.set("toc", "false", t0);
+    tick();
+    a.flush().unwrap();
+    tick();
+    b.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# shared\ntheme = dark\nzoom = 130\ntoc = false\n"
+    );
+    // `a` still shows theme dark, zoom 100 internally: its next write doesn't revert zoom.
+    a.set("toolbar", "false", t0);
+    tick();
+    a.flush().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("zoom = 130") && text.contains("toolbar = false"),
+        "{text}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn pending_changes_stay_on_top_when_the_file_is_refreshed() {
+    let dir = temp_dir("pending-refresh");
+    let path = dir.join("settings.ini");
+    write_file(&path, "theme = light\n");
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    st.record(ThemeMode::Light, 130, t0);
+    tick();
+    write_file(&path, "# mine\ntheme = dark\nzoom = 999\ntoc = true\n");
+    let p = st.refresh().expect("changed on disk");
+    assert_eq!((p.theme, p.zoom, p.toc), (ThemeMode::Dark, 130, true));
+    assert!(
+        st.deadline().is_some(),
+        "the unsaved zoom is still to be saved"
+    );
+    st.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# mine\ntheme = dark\nzoom = 130\ntoc = true\n"
+    );
+    // A pending value the file now has is no change at all.
+    st.set("toc", "false", t0);
+    tick();
+    write_file(&path, "toc = false\n");
+    st.refresh().unwrap();
+    assert_eq!(st.deadline(), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- Files that can't be read faithfully ------------------------------------------------------
+
+/// A store on `bytes` writes nothing: not on a change, nor when the file is replaced (then it
+/// reads fine and writing works again).
+fn assert_read_only(name: &str, bytes: &[u8]) {
+    let dir = temp_dir(name);
+    let path = dir.join("settings.ini");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    st.record(ThemeMode::Dark, 130, t0);
+    st.record_window((640, 480), t0);
+    st.set("toc", "true", t0);
+    assert_eq!(st.deadline(), None, "{name}: nothing to save");
+    st.flush().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}: untouched");
+    assert_eq!(
+        st.prefs().theme,
+        ThemeMode::Dark,
+        "{name}: still applies in memory"
+    );
+    tick();
+    write_file(&path, "zoom = 90\n");
+    assert_eq!(st.refresh().unwrap().zoom, 90);
+    st.set("toc", "true", t0);
+    st.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "zoom = 90\ntoc = true\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_oversized_file_is_never_overwritten() {
+    assert_read_only("big", "zoom = 150\n".repeat(30_000).as_bytes());
+}
+
+#[test]
+fn a_non_utf8_file_is_never_overwritten() {
+    assert_read_only("latin1", b"# caf\xe9\nzoom = 150\n");
+    let dir = temp_dir("latin1-prefs");
+    let path = dir.join("settings.ini");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&path, b"zoom = 150\n# caf\xe9\n").unwrap();
+    assert_eq!(
+        Store::open(Some(path)).prefs().zoom,
+        150,
+        "what parsed applies"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_is_never_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("unreadable");
+    let path = dir.join("settings.ini");
+    write_file(&path, "theme = dark\nzoom = 150\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    if std::fs::read(&path).is_ok() {
+        eprintln!("skipped: permissions don't apply (root)");
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let mut st = Store::open(Some(path.clone()));
+    assert_eq!(st.prefs(), Prefs::default());
+    st.record(ThemeMode::Light, 130, Instant::now());
+    st.flush().unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "theme = dark\nzoom = 150\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- Symlinks and permissions -----------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn saving_follows_a_symlink_and_keeps_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = temp_dir("symlink");
+    let real = dir.join("dotfiles/vomd.ini");
+    let link = dir.join("config/settings.ini");
+    write_file(&real, "# mine\nzoom = 110\n");
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    symlink("../dotfiles/vomd.ini", &link).unwrap();
+    let mut st = Store::open(Some(link.clone()));
+    assert_eq!(st.prefs().zoom, 110);
+    st.record(ThemeMode::Dark, 110, Instant::now());
+    st.flush().unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+        "link kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "# mine\nzoom = 110\ntheme = dark\n",
+        "target updated"
+    );
+    let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "permissions kept");
+    assert!(st.refresh().is_none(), "own write through the link");
+    let names = |d: &Path| std::fs::read_dir(d).unwrap().count();
+    assert_eq!(
+        (names(real.parent().unwrap()), names(link.parent().unwrap())),
+        (1, 1)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_gets_the_template_at_its_target() {
+    use std::os::unix::fs::symlink;
+    let dir = temp_dir("dangling");
+    std::fs::create_dir_all(&dir).unwrap();
+    let link = dir.join("settings.ini");
+    symlink(dir.join("later/vomd.ini"), &link).unwrap();
+    assert!(ensure_template(&link).unwrap());
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("later/vomd.ini")).unwrap(),
+        TEMPLATE
+    );
+    assert!(!ensure_template(&link).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- Failed saves -----------------------------------------------------------------------------
+
+#[test]
+fn a_failed_save_is_kept_and_retried() {
+    let dir = temp_dir("retry");
+    let path = dir.join("blocker/settings.ini");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    // A file where the directory must go: every save fails.
+    std::fs::write(dir.join("blocker"), "in the way").unwrap();
+    st.record(ThemeMode::Dark, 100, t0);
+    let due = t0 + SAVE_DELAY;
+    assert!(st.poll(due).is_err(), "the first failure is reported");
+    assert_eq!(st.deadline(), Some(due + RETRY_DELAY), "retry later");
+    assert!(st.poll(due + RETRY_DELAY).is_ok(), "repeats are quiet");
+    assert!(st.deadline().is_some(), "but still retried");
+    assert!(st.flush().is_ok() && st.deadline().is_some());
+    std::fs::remove_file(dir.join("blocker")).unwrap();
+    st.poll(due + 2 * RETRY_DELAY).unwrap();
+    assert_eq!(st.deadline(), None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "theme = dark\n");
+    // Closing tries once more.
+    std::fs::remove_file(&path).unwrap();
+    st.set("toc", "true", t0);
+    st.flush().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "toc = true\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- The gear action --------------------------------------------------------------------------
+
+#[test]
+fn the_template_gets_pending_changes_on_top() {
+    let dir = temp_dir("gear");
+    let path = dir.join("vomd/settings.ini");
+    let t0 = Instant::now();
+    let mut st = Store::open(Some(path.clone()));
+    st.record(ThemeMode::Dark, 100, t0);
+    st.set("toc", "true", t0);
+    st.prepare_file().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut expect = Settings::parse(TEMPLATE);
+    expect.set("theme", "dark");
+    expect.set("toc", "true");
+    assert_eq!(
+        text,
+        expect.text(),
+        "the template with the changes in place"
+    );
+    assert!(text.contains("# Color theme"), "comments there");
+    assert_eq!(st.deadline(), None, "saved");
+    assert!(st.refresh().is_none());
+    // With a file already: pending changes are merged into it, not into a template.
+    let mut st = Store::open(Some(path.clone()));
+    st.record(ThemeMode::Light, 100, t0);
+    tick();
+    write_file(&path, "# hand\ntoc = true\n");
+    st.prepare_file().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# hand\ntoc = true\ntheme = light\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_gear_needs_a_settings_file() {
+    let mut st = Store::open(None);
+    assert!(st.path().is_none());
+    let e = st.open_in_editor().unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
 }
