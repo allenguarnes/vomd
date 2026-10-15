@@ -380,8 +380,9 @@ fn span(v: f32, len: f32) -> (i32, i32) {
     if len > 0.0 { (a, b.max(a + 1)) } else { (a, b) }
 }
 
-/// Paint one block's content with its origin at (`ox`, `oy`) in frame pixels.
-fn paint_block(
+/// Paint one block's content with its origin at (`ox`, `oy`) in frame pixels (within the
+/// frame's clip). [`paint`] uses it for document blocks; the app shell for its own text.
+pub fn paint_block(
     frame: &mut Frame,
     content: &BlockBox,
     ox: f32,

@@ -62,6 +62,9 @@ pub struct Params {
     pub font_size: f32,
     /// Maximum characters per line (`line_width` setting).
     pub line_width: f32,
+    /// Space above the first block and below the last, in em. The app pads the page like
+    /// GitHub (about 2 em); 0 by default, so block 0 starts at y = 0.
+    pub page_pad: f32,
 }
 
 impl Default for Params {
@@ -71,6 +74,7 @@ impl Default for Params {
             scale: 1.0,
             font_size: 16.0,
             line_width: 80.0,
+            page_pad: 0.0,
         }
     }
 }
@@ -88,6 +92,14 @@ pub struct BlockBox {
 }
 
 impl BlockBox {
+    /// A paragraph laid out on its own (text outside the document, such as a message screen),
+    /// with `styles` the paragraph's style table.
+    pub fn from_para(pl: ParaLayout, styles: &[TextStyle]) -> BlockBox {
+        let mut out = BlockBox::default();
+        out.append(pl, styles, 0.0, 0.0);
+        out
+    }
+
     /// Append a paragraph layout at (`dx`, `dy`).
     fn append(&mut self, pl: ParaLayout, para_styles: &[TextStyle], dx: f32, dy: f32) {
         let style_base = self.styles.len() as u32;
@@ -547,6 +559,36 @@ impl Layout {
         }
     }
 
+    /// [`Layout::anchor_at`] for an f64 `y`, without rounding through f32: scrolling by a pixel
+    /// must move the anchor however far down a tall document it is.
+    pub fn anchor_exact(&self, y: f64) -> Anchor {
+        if self.geoms.is_empty() {
+            return Anchor::TOP;
+        }
+        let y = y.max(0.0);
+        let i = self
+            .blocks_before_by(y, false, |i| self.top(i))
+            .min(self.geoms.len() - 1);
+        let h = f64::from(self.geoms[i].h);
+        let frac = if h > 0.0 {
+            ((y - self.top(i)) / h).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Anchor {
+            block: i as u32,
+            frac: frac as f32,
+        }
+    }
+
+    /// [`Layout::y_of`] in f64.
+    pub fn y_exact(&self, a: Anchor) -> f64 {
+        match self.geoms.get(a.block as usize) {
+            Some(g) => self.top(a.block as usize) + f64::from(a.frac) * f64::from(g.h),
+            None => self.top(self.geoms.len()),
+        }
+    }
+
     /// Link and document position under (`x`, `y`), document-area coordinates. Only blocks
     /// with content (near the viewport) can be hit.
     pub fn hit(&self, x: f32, y: f32) -> Option<Hit> {
@@ -740,7 +782,7 @@ impl Layout {
         // Always flag the block: a fallback scan may still be running for these characters.
         self.geoms[i].missing |= !missing.is_empty();
         self.report_missing(&missing);
-        (out, gap + content_h)
+        (out, gap + content_h + self.page_end(doc, i))
     }
 
     /// Physical width of a 1-logical-pixel line.
@@ -750,7 +792,10 @@ impl Layout {
 
     /// Spacing above block `i`, in em.
     fn gap_before(&self, doc: &Doc, i: usize) -> f32 {
-        if i == 0 || doc.blocks[i].joined {
+        if i == 0 {
+            return self.params.page_pad;
+        }
+        if doc.blocks[i].joined {
             return 0.0;
         }
         let (prev, cur) = (&doc.blocks[i - 1], &doc.blocks[i]);
@@ -1207,6 +1252,15 @@ impl Layout {
         }
     }
 
+    /// Padding below the last block (part of its height, so scrolling reaches it).
+    fn page_end(&self, doc: &Doc, i: usize) -> f32 {
+        if i + 1 == doc.blocks.len() {
+            self.params.page_pad * self.em
+        } else {
+            0.0
+        }
+    }
+
     /// Height estimate for an unmeasured block.
     fn estimate(&self, doc: &Doc, i: usize) -> f32 {
         let block = &doc.blocks[i];
@@ -1215,34 +1269,35 @@ impl Layout {
         let avail = (self.col_w - self.indent(doc, block, self.meta[i])).max(em);
         let chars = text_bytes(doc, block);
         let lines = |size: f32| ((chars as f32 * CHAR_EM * size) / avail).ceil().max(1.0);
-        gap + match block.kind {
-            BlockKind::Paragraph | BlockKind::AlertTitle(_) => lines(em) * BODY_LH * em,
-            BlockKind::Heading(level) => {
-                let size = HEADING_SIZES[(level.clamp(1, 6) - 1) as usize] * em;
-                lines(size) * HEADING_LH * size
+        gap + self.page_end(doc, i)
+            + match block.kind {
+                BlockKind::Paragraph | BlockKind::AlertTitle(_) => lines(em) * BODY_LH * em,
+                BlockKind::Heading(level) => {
+                    let size = HEADING_SIZES[(level.clamp(1, 6) - 1) as usize] * em;
+                    lines(size) * HEADING_LH * size
+                }
+                BlockKind::Code => {
+                    // A chunk ending in a newline has no empty line after it.
+                    let spans = doc.block_spans(block);
+                    let newlines: usize = spans
+                        .iter()
+                        .map(|s| doc.span_text(s).matches('\n').count())
+                        .sum();
+                    let ends_line = spans
+                        .last()
+                        .is_some_and(|s| doc.span_text(s).ends_with('\n'));
+                    let text_lines = newlines + !ends_line as usize;
+                    let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
+                    (text_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em
+                        + pads as f32 * em
+                }
+                BlockKind::Rule => 0.25 * em,
+                // The cells share the width: a row is about as tall as its text set on one line.
+                BlockKind::TableRow { .. } => {
+                    let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
+                    lines(em) * BODY_LH * em + pads as f32 * CELL_PAD_Y * em
+                }
             }
-            BlockKind::Code => {
-                // A chunk ending in a newline has no empty line after it.
-                let spans = doc.block_spans(block);
-                let newlines: usize = spans
-                    .iter()
-                    .map(|s| doc.span_text(s).matches('\n').count())
-                    .sum();
-                let ends_line = spans
-                    .last()
-                    .is_some_and(|s| doc.span_text(s).ends_with('\n'));
-                let text_lines = newlines + !ends_line as usize;
-                let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
-                (text_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em
-                    + pads as f32 * em
-            }
-            BlockKind::Rule => 0.25 * em,
-            // The cells share the width: a row is about as tall as its text set on one line.
-            BlockKind::TableRow { .. } => {
-                let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
-                lines(em) * BODY_LH * em + pads as f32 * CELL_PAD_Y * em
-            }
-        }
     }
 }
 

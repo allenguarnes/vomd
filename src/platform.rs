@@ -1,0 +1,75 @@
+//! Everything OS-specific. Other modules use only portable std. Non-Linux branches
+//! compile but are untested until P14.
+
+/// The system theme when winit can't tell (`Window::theme()` is `None`). On Linux, dark if
+/// `GTK_THEME` names a dark variant (`Adwaita:dark`), otherwise light.
+pub fn fallback_dark() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        gtk_theme_dark(std::env::var("GTK_THEME").ok().as_deref())
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        // TODO(P14): winit reports the theme on Windows and macOS; nothing to fall back to.
+        false
+    }
+}
+
+/// `GTK_THEME` is `name[:variant]`; the variant decides.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn gtk_theme_dark(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().ends_with(":dark"))
+}
+
+/// Let `--help` and `--version` print when started from a terminal. A no-op except on Windows,
+/// where the GUI subsystem detaches the console.
+pub fn attach_console() {
+    // TODO(P14): AttachConsole(ATTACH_PARENT_PROCESS) on Windows.
+}
+
+/// Errors go to stderr only when someone can see them.
+pub fn stderr_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+}
+
+/// Peak resident set size in KB, for `VOMD_BENCH` (0 where unknown).
+pub fn peak_rss_kb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("VmHWM:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // TODO(P14): GetProcessMemoryInfo / task_info.
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gtk_theme_variants() {
+        assert!(gtk_theme_dark(Some("Adwaita:dark")));
+        assert!(gtk_theme_dark(Some("Breeze:dark\n")));
+        assert!(!gtk_theme_dark(Some("Adwaita")));
+        assert!(!gtk_theme_dark(Some("Adwaita:light")));
+        assert!(!gtk_theme_dark(Some("dark")));
+        assert!(!gtk_theme_dark(None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_peak_rss() {
+        assert!(peak_rss_kb() > 0);
+    }
+}

@@ -302,6 +302,12 @@ impl Fonts {
         })
     }
 
+    /// Files and collection indexes of the faces loaded from disk, for a fallback scan running
+    /// on another thread to skip.
+    pub fn sources(&self) -> Vec<(PathBuf, u32)> {
+        self.faces.iter().filter_map(|f| f.source.clone()).collect()
+    }
+
     /// Memory-map a font file and add one of its faces as a fallback.
     pub fn add_fallback(&mut self, path: &Path, index: u32) -> Option<FaceId> {
         if self.has_source(path, index) {
