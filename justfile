@@ -8,6 +8,8 @@ fmt:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy --no-default-features -- -D warnings
+    cargo clippy --all-targets --no-default-features --features images -- -D warnings
+    cargo clippy --all-targets --no-default-features --features images,embed-fonts -- -D warnings
 
 test:
     cargo test --workspace

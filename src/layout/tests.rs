@@ -1778,13 +1778,12 @@ fn images_are_boxes_of_their_size() {
         alt.rects.iter().any(|r| r.role == Role::Border),
         "outlined alt text"
     );
-    // A very tall image is shown smaller than one that would take hundreds of MB.
+    // A very tall image is shown smaller than one that would take hundreds of MB, and no
+    // taller than the decoder makes it.
     let t = boxes(&l, 3)[0].b;
     assert!(t.width * t.ascent <= MAX_BOX_PIXELS * 1.01, "{t:?}");
-    assert!(
-        (t.ascent / t.width - 10_000.0).abs() < 100.0,
-        "keeps its shape: {t:?}"
-    );
+    assert_eq!(t.ascent, MAX_SIDE as f32, "{t:?}");
+    assert!(t.width >= 1.0 && t.width <= 3.0, "keeps its shape: {t:?}");
 
     // Twice the scale (HiDPI or zoom): twice the pixels.
     l.set_params(params(900.0, 2.0));
@@ -1838,4 +1837,85 @@ fn an_image_in_a_table_fits_its_cell() {
     let (_, col_w) = l.column();
     assert!(b.width < col_w, "{} < {col_w}", b.width);
     assert!((b.ascent - b.width / 2.0).abs() <= 1.0);
+}
+
+/// No box has a side the decoder wouldn't make (`image::MAX_SIDE`) or more pixels than
+/// [`MAX_BOX_PIXELS`], however long and narrow the image or large the scale: a box that can't be
+/// decoded at its size would be asked for again and again.
+#[test]
+fn image_boxes_stay_within_what_can_be_decoded() {
+    let side = MAX_SIDE as f32;
+    for (w, h) in [
+        (1, 64_000_000),
+        (500, 20_000),
+        (4, 20_000),
+        (64_000_000, 1),
+        (20_000, 700),
+        (100, 100),
+        (8000, 8000),
+        (1, 1),
+    ] {
+        for scale in [0.5, 1.0, 2.0, 3.0] {
+            let sizes = [Some(ImageSize::Pixels(w, h))];
+            let boxes = Boxes {
+                sizes: &sizes,
+                scale,
+                em: 16.0 * scale,
+                max_w: 900.0 * scale,
+            };
+            let (bw, bh) = boxes.size(1).unwrap();
+            let what = format!("{w}×{h} at {scale}: {bw}×{bh}");
+            assert!(bw >= 1.0 && bh >= 1.0, "{what}");
+            assert!(bw <= side && bh <= side, "{what}");
+            assert!(bw <= 900.0 * scale, "{what}");
+            assert!(bw * bh <= MAX_BOX_PIXELS * 1.01, "{what}");
+        }
+    }
+    // A width that rounds down to nothing stays one pixel; the height keeps what fits.
+    let sizes = [Some(ImageSize::Pixels(1, 64_000_000))];
+    let b = Boxes {
+        sizes: &sizes,
+        scale: 1.0,
+        em: 16.0,
+        max_w: 900.0,
+    };
+    assert_eq!(b.size(1), Some((1.0, side)));
+}
+
+/// A long alt text is cut into chunk blocks; the image is one box, in the chunk its text starts
+/// in, and every chunk follows its size when it changes.
+#[test]
+fn an_image_with_a_long_alt_text_is_one_box() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&format!("Before ![{}](a.png) after", "x".repeat(40_000)));
+    assert!(doc.blocks.len() >= 3, "{} chunks", doc.blocks.len());
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.set_image_probe(&doc, Some(test_probe()));
+    let count = |l: &Layout| {
+        (0..doc.blocks.len())
+            .map(|i| boxes(l, i).len())
+            .sum::<usize>()
+    };
+    l.ensure(&doc, &fonts, Anchor::TOP, 100_000.0);
+    assert_eq!(count(&l), 1, "one box for the whole alt text");
+    // In the first chunk with a piece of the alt text, not the ones after it.
+    let with_alt = |i: usize| doc.block_spans(&doc.blocks[i]).iter().any(|s| s.image == 1);
+    let alt_chunks: Vec<usize> = (0..doc.blocks.len()).filter(|&i| with_alt(i)).collect();
+    assert!(alt_chunks.len() >= 2, "{alt_chunks:?}");
+    assert_eq!(boxes(&l, alt_chunks[0]).len(), 1);
+    assert_eq!(boxes(&l, alt_chunks[0])[0].b.width, 100.0);
+    // Its alt text instead: shown in every chunk.
+    l.set_image(&doc, 1, ImageSize::Alt);
+    assert!(
+        alt_chunks.iter().all(|&i| !l.geoms()[i].measured),
+        "every chunk of it lays out again"
+    );
+    l.ensure(&doc, &fonts, Anchor::TOP, 100_000.0);
+    assert_eq!(count(&l), 0);
+    assert!(l.geoms().iter().all(|g| g.content.is_some()));
+    // A box again: the chunks after the first show nothing of it.
+    l.set_image(&doc, 1, ImageSize::Pixels(10, 10));
+    l.ensure(&doc, &fonts, Anchor::TOP, 100_000.0);
+    assert_eq!(count(&l), 1);
+    assert_eq!(boxes(&l, alt_chunks[0])[0].b.width, 10.0);
 }

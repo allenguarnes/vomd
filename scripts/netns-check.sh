@@ -6,8 +6,8 @@
 # Opens a document full of remote images in the real binary, inside a network namespace with no
 # interfaces (`unshare -rn`) and with a fake `curl` first on PATH that logs every call. With the
 # default policy (`ask`) and nobody pressing I, curl must never run. A second run with
-# `remote_images = always` is the control: there curl must run, with `-q` first and the URL
-# after `--`. Needs a display (Wayland or X11) and unprivileged user namespaces.
+# `remote_images = always` is the control: there curl must run, with `-q --globoff` first and the
+# URL after `--`. Needs a display (Wayland or X11) and unprivileged user namespaces.
 set -euo pipefail
 bin=$(realpath "${1:-target/release/vomd}")
 tmp=$(mktemp -d)
@@ -47,9 +47,9 @@ if ! [ -s "$tmp/curl.log" ]; then
   echo "FAIL (control): curl never ran with remote_images = always" >&2
   exit 1
 fi
-if grep -qv '^-q .* -- http' "$tmp/curl.log"; then
-  echo "FAIL: curl called without -q first or the URL after --:" >&2
+if grep -qv '^-q --globoff .* -- http' "$tmp/curl.log"; then
+  echo "FAIL: curl called without -q --globoff first or the URL after --:" >&2
   cat "$tmp/curl.log" >&2
   exit 1
 fi
-echo "PASS always (control): curl ran $(wc -l < "$tmp/curl.log") times, -q first, URL after --"
+echo "PASS always (control): curl ran $(wc -l < "$tmp/curl.log") times, -q --globoff first, URL after --"

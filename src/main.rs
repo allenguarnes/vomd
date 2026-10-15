@@ -286,8 +286,7 @@ impl App {
         self.input = input;
         self.stamp = loaded.stamp;
         if let Some(view) = self.view.as_mut() {
-            view.open(loaded.doc, loaded.message);
-            view.set_image_base(nav::base_dir(&self.input));
+            view.open_in(loaded.doc, loaded.message, nav::base_dir(&self.input));
         }
         if let Some(g) = &self.gfx {
             g.window.set_title(&view::title(&self.input));

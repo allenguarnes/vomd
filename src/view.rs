@@ -1438,9 +1438,10 @@ impl View {
         }
         // Stable: on screen first, then the rest in document order.
         near.sort_by_key(|n| n.0);
+        let on_screen = near.iter().take_while(|n| !n.0).count();
         let boxes: Vec<(u32, u32, u32)> =
             near.into_iter().map(|(_, id, w, h)| (id, w, h)).collect();
-        self.images.request(&boxes);
+        self.images.request(&boxes, on_screen);
     }
 
     /// Take what the image threads finished: decoded images show, fetched ones get their size
@@ -1481,6 +1482,17 @@ impl View {
 
     /// Show a different document (or a message), from the top.
     pub fn open(&mut self, doc: Doc, message: Option<String>) {
+        self.open_doc(doc, message);
+    }
+
+    /// [`View::open`] for a document in directory `base` (see [`View::set_image_base`]), which
+    /// its images are attached to in one go.
+    pub fn open_in(&mut self, doc: Doc, message: Option<String>, base: Option<PathBuf>) {
+        self.images.set_base(base);
+        self.open_doc(doc, message);
+    }
+
+    fn open_doc(&mut self, doc: Doc, message: Option<String>) {
         self.doc = doc;
         self.message = message;
         self.layout = Layout::new(

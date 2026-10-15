@@ -66,7 +66,7 @@ fn main() {
             (b.b.id, size(b.b.width), size(b.b.ascent + b.b.descent))
         })
         .collect();
-    images.request(&boxes);
+    images.request(&boxes, boxes.len());
     let mut quiet = Instant::now();
     while quiet.elapsed() < Duration::from_millis(500) {
         if images.poll(&doc, &mut layout) {

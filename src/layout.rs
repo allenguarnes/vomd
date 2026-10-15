@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use crate::doc::{self, Alert, Block, BlockKind, Doc, ImageRef, Marker, Span, style};
 use crate::fonts::Fonts;
+use crate::image::MAX_SIDE;
 use crate::text::{
     Align, InlineBox, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, TextCtx,
     TextStyle, deco,
@@ -486,6 +487,19 @@ impl Layout {
             && (b as usize) < self.geoms.len()
         {
             self.invalidate_block(doc, b as usize);
+            // The chunks its alt text goes on in (a long block is cut) show it, or not, too.
+            for k in b as usize + 1..self.geoms.len() {
+                let block = &doc.blocks[k];
+                let cells = doc.row_cells(block).map(|(_, spans)| spans);
+                let has = std::iter::once(doc.block_spans(block))
+                    .chain(cells)
+                    .flatten()
+                    .any(|s| s.image == id);
+                if !block.joined || !has {
+                    break;
+                }
+                self.invalidate_block(doc, k);
+            }
         }
     }
 
@@ -596,7 +610,7 @@ impl Layout {
     }
 
     /// Prefix-sum nodes visited so far (for tests of the cost).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "embed-fonts"))]
     fn position_ops(&self) -> usize {
         self.heights.ops.get()
     }
@@ -1620,25 +1634,35 @@ impl Boxes<'_> {
             }
             ImageSize::Pixels(w, h) => (w as f32 * self.scale, h as f32 * self.scale),
         };
-        let max_w = self.max_w.floor().max(1.0);
-        let fit = (max_w / w).min((MAX_BOX_PIXELS / (w * h)).sqrt()).min(1.0);
+        // No side beyond what `image::decode` makes, whatever the pixel count; a side that
+        // shrinks to less than a pixel stays one, and the other is what's left of the budget.
+        let side = MAX_SIDE as f32;
+        let max_w = self.max_w.floor().clamp(1.0, side);
+        let fit = (max_w / w)
+            .min((MAX_BOX_PIXELS / (w * h)).sqrt())
+            .min(side / h)
+            .min(1.0);
         Some((
             (w * fit).round().clamp(1.0, max_w),
-            (h * fit).round().max(1.0),
+            (h * fit).round().clamp(1.0, side),
         ))
     }
 }
 
 fn fill_para(para: &mut Para, doc: &Doc, spans: &[Span], body: TextStyle, boxes: &Boxes) {
     para.clear();
-    let mut last_image = 0;
     for span in spans {
         let style = span_style(span, body);
         if span.image != 0
             && let Some((w, h)) = boxes.size(span.image)
         {
-            // An alt text split over two spans (a long block cut in chunks) is one box.
-            if span.image != last_image {
+            // An alt text split over two spans (a long block cut in chunks) is one box, in the
+            // chunk its text starts in; the rest of it shows nothing.
+            let first = doc
+                .images
+                .get(span.image as usize - 1)
+                .is_none_or(|img| img.start == span.start);
+            if first {
                 let b = InlineBox {
                     width: w,
                     ascent: h,
@@ -1652,10 +1676,8 @@ fn fill_para(para: &mut Para, doc: &Doc, spans: &[Span], body: TextStyle, boxes:
                 };
                 para.push_box(b, span.start, style);
             }
-            last_image = span.image;
             continue;
         }
-        last_image = span.image;
         para.push_text(doc.span_text(span), span.start, style);
     }
     if para.styles.is_empty() {

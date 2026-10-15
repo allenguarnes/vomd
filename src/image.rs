@@ -11,7 +11,7 @@
 #![cfg_attr(not(feature = "images"), allow(dead_code))]
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -26,8 +26,9 @@ pub const CACHE_BYTES: usize = 32 << 20;
 pub const MAX_FILE: u64 = 64 << 20;
 /// Images with more pixels than this aren't decoded: a few KB of PNG can claim gigapixels.
 pub const MAX_PIXELS: u64 = 64_000_000;
-/// Largest side of a decoded (resampled) image.
-const MAX_SIDE: u32 = 16_384;
+/// Largest side of an image box, and so of a decoded (resampled) image: layout never makes a
+/// box bigger, so what it asks for is what `decode` makes.
+pub const MAX_SIDE: u32 = 16_384;
 /// Bytes of a JPEG looked through for its size, at most (segments before the frame header are
 /// metadata: EXIF, color profiles, thumbnails).
 const MAX_HEADER_SCAN: u64 = 4 << 20;
@@ -77,7 +78,7 @@ pub fn header(r: &mut impl Read) -> Option<(Format, u32, u32)> {
 }
 
 /// The size in a JPEG's frame header, the segments after the start-of-image marker walked
-/// (and skipped) until it.
+/// (and skipped) until it. Every marker is taken to have a length, as the decoder does.
 fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32)> {
     let mut byte = || {
         let mut b = [0u8; 1];
@@ -97,12 +98,11 @@ fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32)> {
                 return None;
             }
         }
-        match marker {
-            // Markers without a segment.
-            0x01 | 0xD0..=0xD8 => continue,
-            // The image ended, or its data began, before any frame header.
-            0xD9 | 0xDA => return None,
-            _ => {}
+        // The image ended, or its data began, before any frame header. (TEM and RSTn have no
+        // segment in the standard, but the decoder skips a length for them like for any marker
+        // it doesn't know: the two must agree on where the frame header is, see `decode`.)
+        if matches!(marker, 0xD9 | 0xDA) {
+            return None;
         }
         let len = u16::from_be_bytes([byte()?, byte()?]);
         if len < 2 {
@@ -134,11 +134,11 @@ fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32)> {
 
 /// The local file an image's `src` names: a path, absolute or relative to `base` (the
 /// document's directory), percent-decoded, without its `?query` or `#fragment`. `None` for URLs
-/// (anything with a scheme, and `//host/...`) and for a relative path without a base (a
-/// document read from stdin).
+/// (anything with a scheme), for network paths (see [`is_network`]) and for a relative path
+/// without a base (a document read from stdin).
 pub fn local_path(src: &str, base: Option<&Path>) -> Option<PathBuf> {
     let src = src.trim();
-    if src.is_empty() || src.starts_with("//") || src.chars().any(char::is_control) {
+    if src.is_empty() || src.chars().any(char::is_control) {
         return None;
     }
     // A scheme is two characters or more: `C:\x.png` is a Windows path.
@@ -152,7 +152,13 @@ pub fn local_path(src: &str, base: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     let path = src.split(['?', '#']).next().unwrap_or_default();
-    let path = PathBuf::from(crate::nav::percent_decode(path));
+    let path = crate::nav::percent_decode(path);
+    // Windows connects to a server just to look at its path (and sends credentials): no image
+    // may name one, written as is or percent-encoded.
+    if is_network(src) || is_network(&path) {
+        return None;
+    }
+    let path = PathBuf::from(path);
     if path.as_os_str().is_empty() {
         None
     } else if path.is_absolute() || path.has_root() {
@@ -160,6 +166,21 @@ pub fn local_path(src: &str, base: Option<&Path>) -> Option<PathBuf> {
     } else {
         Some(base?.join(path))
     }
+}
+
+/// Whether `path` names a file on another machine, or a device, for Windows: two separators
+/// in a row at its start, in any mix of `/` and `\` (`\\host\share`, `//host/share`, the
+/// `\\?\` and `\\.\` forms), or any prefix but a plain drive letter. Plain drive-letter and
+/// rooted paths are the only absolute ones allowed. (Elsewhere a mount like autofs's `/net/host`
+/// can reach a server the same way: a path is only as local as the system makes it.)
+fn is_network(path: &str) -> bool {
+    let mut c = path.chars();
+    let sep = |c: char| matches!(c, '/' | '\\');
+    (c.next().is_some_and(sep) && c.next().is_some_and(sep))
+        || matches!(
+            Path::new(path).components().next(),
+            Some(Component::Prefix(p)) if !matches!(p.kind(), Prefix::Disk(_))
+        )
 }
 
 /// `path` opened for reading if it's a regular file of at most [`MAX_FILE`] bytes. An image
@@ -203,15 +224,22 @@ fn read_file(path: &Path) -> Option<Vec<u8>> {
 
 // ---- Decoding ---------------------------------------------------------------------------
 
-/// Decode a PNG or JPEG and resample it to `w` × `h`. `None` for anything else, broken data,
-/// or more than [`MAX_PIXELS`].
+/// The size [`decode`] makes an image of box size `w` × `h`: each side at least 1 and at most
+/// [`MAX_SIDE`]. What the cache is asked for and told it has goes through this, so a size that
+/// had to be clamped is still found.
+pub fn clamp_box(w: u32, h: u32) -> (u32, u32) {
+    (w.clamp(1, MAX_SIDE), h.clamp(1, MAX_SIDE))
+}
+
+/// Decode a PNG or JPEG and resample it to `w` × `h` (see [`clamp_box`]). `None` for anything
+/// else, broken data, or more than [`MAX_PIXELS`].
 #[cfg(feature = "images")]
 pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
     let (format, sw, sh) = header(&mut &bytes[..])?;
     if u64::from(sw) * u64::from(sh) > MAX_PIXELS {
         return None;
     }
-    let (w, h) = (w.clamp(1, MAX_SIDE), h.clamp(1, MAX_SIDE));
+    let (w, h) = clamp_box(w, h);
     match format {
         Format::Png => {
             let limits = png::Limits {
@@ -242,14 +270,20 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
             use zune_jpeg::zune_core::{
                 bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions,
             };
+            // The decoder may find a frame header other than the one `header` did (they read
+            // odd markers differently): it gets the size we checked as its limit, and what it
+            // reads must be that size, before it allocates anything.
             let options = DecoderOptions::default()
                 .jpeg_set_out_colorspace(ColorSpace::RGB)
-                .set_max_width(usize::from(u16::MAX))
-                .set_max_height(usize::from(u16::MAX));
+                .set_max_width(sw as usize)
+                .set_max_height(sh as usize);
             let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-            let data = d.decode().ok()?;
+            d.decode_headers().ok()?;
             let info = d.info()?;
-            let (sw, sh) = (u32::from(info.width), u32::from(info.height));
+            if (u32::from(info.width), u32::from(info.height)) != (sw, sh) {
+                return None;
+            }
+            let data = d.decode().ok()?;
             let stride = sw as usize * 3;
             if data.len() < stride * sh as usize {
                 return None;
@@ -409,6 +443,16 @@ impl Cache {
             .any(|s| s.key == *key && s.pixels().is_some_and(|b| (b.width, b.height) == (w, h)))
     }
 
+    /// Mark the pixels for `key` at exactly `w` × `h`, if cached, as painted this frame.
+    fn touch(&mut self, key: &Key, w: u32, h: u32) {
+        let frame = self.frame;
+        for s in &mut self.slots {
+            if s.key == *key && s.pixels().is_some_and(|b| (b.width, b.height) == (w, h)) {
+                s.used = frame;
+            }
+        }
+    }
+
     /// The pixels for `key` at `w` × `h`, or at another size while that one is decoded (a zoom
     /// step); marked as painted this frame.
     fn pixels(&mut self, key: &Key, w: u32, h: u32) -> Option<&Bitmap> {
@@ -521,7 +565,7 @@ pub(crate) enum Done {
     #[cfg(feature = "remote-images")]
     Fetched {
         url: Arc<str>,
-        result: Result<(Arc<[u8]>, u32, u32), crate::remote::Error>,
+        result: crate::remote::Fetched,
     },
 }
 
@@ -655,11 +699,11 @@ impl Default for Images {
 
 impl Images {
     pub fn set_wake(&mut self, wake: Wake) {
-        self.wake = wake;
-        // Threads already running keep the old one: start them again with the new one.
+        // The decoder thread keeps the old one: it is started again with the new one.
         self.worker = None;
         #[cfg(feature = "remote-images")]
-        self.remote.stop();
+        self.remote.set_wake(wake.clone());
+        self.wake = wake;
     }
 
     pub fn set_base(&mut self, base: Option<PathBuf>) {
@@ -698,6 +742,12 @@ impl Images {
         self.sync_remote(doc, layout);
     }
 
+    /// How many documents were attached (tests).
+    #[cfg(all(test, feature = "embed-fonts"))]
+    pub(crate) fn generation(&self) -> u64 {
+        self.doc_gen
+    }
+
     /// The source of image `id` (1-based).
     fn src(&self, id: u32) -> &Src {
         id.checked_sub(1)
@@ -719,10 +769,16 @@ impl Images {
     }
 
     /// Ask for the boxes near the viewport, most wanted first: (image id, width, height) in
-    /// physical pixels. Images not decoded at that size are queued for the worker, replacing
-    /// what it hadn't started. With remote images on, URLs not fetched yet are queued for the
-    /// fetchers: these boxes first, then the rest of the document's in order.
-    pub fn request(&mut self, boxes: &[(u32, u32, u32)]) {
+    /// physical pixels, the first `on_screen` of them in view. Images not decoded at that size
+    /// are queued for the worker, replacing what it hadn't started. With remote images on, URLs
+    /// not fetched yet are queued for the fetchers: these boxes first, then the rest of the
+    /// document's in order.
+    ///
+    /// The ones in view are always wanted; of the rest only as many as fit the cache beside
+    /// them are, and those already decoded are kept (as if painted) while they are. Otherwise
+    /// a screen of images bigger than the cache would evict each other, decoded again and
+    /// again.
+    pub fn request(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) {
         // Without decoders there's nothing to ask for (and the worker isn't built in).
         if !cfg!(feature = "images") {
             return;
@@ -730,14 +786,24 @@ impl Images {
         let mut jobs = Vec::new();
         #[cfg(feature = "remote-images")]
         let mut fetch: Vec<Arc<str>> = Vec::new();
-        for &(id, w, h) in boxes {
+        let mut wanted = 0usize;
+        for (n, &(id, w, h)) in boxes.iter().enumerate() {
             let Some(key) = self.key(id) else {
                 continue;
             };
-            if self.cache.has(&key, w, h)
-                || jobs
-                    .iter()
-                    .any(|j: &Job| (&j.key, j.w, j.h) == (&key, w, h))
+            let (w, h) = clamp_box(w, h);
+            let over = n >= on_screen && wanted >= self.cache.cap;
+            wanted = wanted.saturating_add(w as usize * h as usize * 4);
+            if over {
+                continue;
+            }
+            if self.cache.has(&key, w, h) {
+                self.cache.touch(&key, w, h);
+                continue;
+            }
+            if jobs
+                .iter()
+                .any(|j: &Job| (&j.key, j.w, j.h) == (&key, w, h))
             {
                 continue;
             }
@@ -852,6 +918,7 @@ impl Images {
         matches!(self.src(id), Src::Remote(_))
             && !self.remote_on()
             && self.policy() != RemoteImages::Never
+            && !self.no_curl()
     }
 
     pub fn remote_on(&self) -> bool {
@@ -914,6 +981,7 @@ impl Images {
 impl crate::render::Pixels for Images {
     fn pixels(&mut self, id: u32, w: u32, h: u32) -> Option<&Bitmap> {
         let key = self.key(id)?;
+        let (w, h) = clamp_box(w, h);
         self.cache.pixels(&key, w, h)
     }
 }

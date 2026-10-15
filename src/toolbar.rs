@@ -497,9 +497,15 @@ impl Toolbar {
         let slots = slots(ctx);
         let scroll = self.menu.filter(|_| !slots.overflow.is_empty());
         let open = scroll.is_some();
+        // The pulse is on `⋯` while the button is inside its dropdown.
+        let pulse_on = if slots.overflow.contains(&Item::Images) {
+            Item::More
+        } else {
+            Item::Images
+        };
         for &(item, rect) in &slots.items {
             let on = (item == Item::More && open) || (item == Item::Images && ctx.remote_on);
-            if cfg!(feature = "remote-images") && item == Item::Images && ctx.pulse {
+            if cfg!(feature = "remote-images") && item == pulse_on && ctx.pulse {
                 let inset = 3.0 * s;
                 let r = Rect {
                     x0: rect.x0 + inset,

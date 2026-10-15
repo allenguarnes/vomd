@@ -2,6 +2,7 @@ use super::*;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 fn have_curl() -> bool {
@@ -28,6 +29,9 @@ fn respond(mut s: TcpStream, status: &str, headers: &str, body: &[u8]) {
     let _ = write!(s, "HTTP/1.1 {status}\r\n{headers}Connection: close\r\n\r\n");
     let _ = s.write_all(body);
 }
+
+/// Requests for the glob test's paths.
+static GLOB_HITS: AtomicUsize = AtomicUsize::new(0);
 
 /// Serve one request on `s`.
 fn serve(s: TcpStream, port: u16) {
@@ -75,6 +79,10 @@ fn serve(s: TcpStream, port: u16) {
         "/slow" => {
             std::thread::sleep(Duration::from_secs(4));
             respond(s, "200 OK", &len(png.len()), &png);
+        }
+        p if p.starts_with("/glob") => {
+            GLOB_HITS.fetch_add(1, Ordering::SeqCst);
+            respond(s, "404 Not Found", &len(0), b"");
         }
         "/page.html" => respond(s, "200 OK", &len(6), b"<html>"),
         _ => respond(s, "404 Not Found", &len(0), b""),
@@ -211,4 +219,166 @@ fn what_fetching_found_decides_the_layout() {
     let mut r = Remote::default();
     r.fetch(vec![url.clone()], tx, Arc::new(|| {}));
     assert!(!r.started());
+}
+
+/// A URL with `[1-N]` or `{a,b}` is one URL (no `--globoff`, and one image would make `curl`
+/// request a million).
+#[test]
+fn glob_urls_are_fetched_literally() {
+    if !have_curl() {
+        eprintln!("curl not installed: skipped");
+        return;
+    }
+    let port = server();
+    let before = GLOB_HITS.load(Ordering::SeqCst);
+    for path in ["/glob[1-5].png", "/glob{a,b,c}.png"] {
+        let _ = fetch(&format!("http://127.0.0.1:{port}{path}"), SMALL);
+    }
+    // (The server answers them all 404: what counts is how many it saw.)
+    let hits = GLOB_HITS.load(Ordering::SeqCst) - before;
+    assert_eq!(hits, 2, "requests for 2 URLs");
+}
+
+/// A `curl` still running well past its `--max-time` is killed, so a fetcher is never stuck.
+#[cfg(unix)]
+#[test]
+fn a_curl_that_overstays_is_killed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("vomd-remote-stuck-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("curl");
+    // Ignores its arguments, writes nothing and doesn't stop.
+    std::fs::write(&fake, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let limits = Limits { secs: 1, ..SMALL };
+    let t = Instant::now();
+    let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", limits);
+    assert_eq!(got, Err(Error::Failed));
+    let took = t.elapsed();
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_secs(8),
+        "{took:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fetcher standing in for `curl`: records how many run at once and which URLs it was asked
+/// for, and holds each until the gate is opened.
+#[derive(Default)]
+struct Probe {
+    open: Mutex<bool>,
+    cv: Condvar,
+    now: AtomicUsize,
+    peak: AtomicUsize,
+    log: Mutex<Vec<String>>,
+}
+
+impl Probe {
+    fn fetcher(self: &Arc<Self>) -> Fetcher {
+        let p = self.clone();
+        Arc::new(move |url: &str| {
+            p.log.lock().unwrap().push(url.to_owned());
+            let now = p.now.fetch_add(1, Ordering::SeqCst) + 1;
+            p.peak.fetch_max(now, Ordering::SeqCst);
+            let mut open = p.open.lock().unwrap();
+            while !*open {
+                open = p.cv.wait(open).unwrap();
+            }
+            p.now.fetch_sub(1, Ordering::SeqCst);
+            Ok((png().into(), 2, 1))
+        })
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    fn started(&self) -> usize {
+        self.log.lock().unwrap().len()
+    }
+}
+
+fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !cond() {
+        assert!(t.elapsed() < Duration::from_secs(10), "timed out: {what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn urls(n: usize) -> Vec<Arc<str>> {
+    (0..n)
+        .map(|i| format!("https://x.y/{i}.png").into())
+        .collect()
+}
+
+/// At most [`FETCHERS`] fetches run at once and none runs twice, however the queue is replaced
+/// and however often fetching is stopped and started again meanwhile; what finished is told
+/// apart from what is still being fetched until the main thread takes it.
+#[test]
+fn the_fetchers_never_exceed_their_number_or_repeat_a_url() {
+    let probe = Arc::new(Probe::default());
+    let woken = Arc::new(AtomicUsize::new(0));
+    let wake: Wake = {
+        let woken = woken.clone();
+        Arc::new(move || {
+            woken.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut r = Remote {
+        on: true,
+        fetcher: probe.fetcher(),
+        ..Remote::default()
+    };
+    let all = urls(10);
+    r.fetch(all.clone(), tx.clone(), wake.clone());
+    until("4 fetches started", || probe.started() == FETCHERS);
+    // The queue is replaced: what was waiting is gone, what is running is not asked for again.
+    let later = urls(14)[10..].to_vec();
+    r.fetch([&all[..2], &later[..]].concat(), tx.clone(), wake.clone());
+    // Off and on again, three times, with the same URLs.
+    for _ in 0..3 {
+        r.stop();
+        r.fetch(all.clone(), tx.clone(), wake.clone());
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(probe.started(), FETCHERS, "{:?}", probe.log.lock().unwrap());
+    assert_eq!(probe.peak.load(Ordering::SeqCst), FETCHERS);
+    // Stopped for good: what is queued is dropped, the running four finish and are kept.
+    r.stop();
+    probe.release();
+    let mut got: Vec<Arc<str>> = Vec::new();
+    while got.len() < FETCHERS {
+        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a fetch result");
+        };
+        assert!(result.is_ok());
+        // Finished but not taken: asking for it again doesn't fetch it again.
+        r.fetch(vec![url.clone()], tx.clone(), wake.clone());
+        got.push(url);
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(probe.started(), FETCHERS, "nothing fetched twice");
+    assert_eq!(woken.load(Ordering::SeqCst), FETCHERS);
+    // Taken, they can be fetched again (an evicted image); the rest of the queue goes on.
+    for url in &got {
+        assert!(r.fetched(url, Ok((png().into(), 2, 1))).is_some());
+    }
+    r.fetch(all[FETCHERS..].to_vec(), tx.clone(), wake.clone());
+    let mut seen = got.len();
+    while seen < 10 {
+        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(10)) else {
+            panic!("a fetch result");
+        };
+        r.fetched(&url, result);
+        seen += 1;
+    }
+    let mut log = probe.log.lock().unwrap().clone();
+    log.sort();
+    log.dedup();
+    assert_eq!(log.len(), probe.started(), "no URL twice");
+    assert_eq!(probe.started(), 10);
+    assert_eq!(probe.peak.load(Ordering::SeqCst), FETCHERS);
 }

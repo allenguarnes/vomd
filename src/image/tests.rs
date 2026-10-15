@@ -83,6 +83,60 @@ fn jpeg_size_after_metadata_segments() {
     assert_eq!(header(&mut &j[..]), None);
 }
 
+/// A JPEG that says 16×16 to a reader taking `FF 01` for a marker without a segment, and
+/// 60000×60000 to one that gives it a length (the decoder does): `FF D8 FF 01`, whose "length"
+/// is the first two bytes of a decoy frame header, so the real one comes after the padding.
+fn crafted_jpeg() -> Vec<u8> {
+    let sof = |w: u16, h: u16| {
+        let mut s = vec![0xFF, 0xC0, 0x00, 0x0B, 0x08];
+        s.extend(h.to_be_bytes());
+        s.extend(w.to_be_bytes());
+        s.extend([0x01, 0x01, 0x11, 0x00]);
+        s
+    };
+    let mut j = vec![0xFF, 0xD8, 0xFF, 0x01];
+    j.extend(sof(16, 16));
+    // 0xFFC0 bytes from the start of the decoy, the length included.
+    j.resize(4 + 0xFFC0, 0);
+    j.extend(sof(60_000, 60_000));
+    j.extend([0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+    j
+}
+
+/// The size the JPEG decoder reads from the headers (without decoding anything).
+fn zune_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    use zune_jpeg::zune_core::{bytestream::ZCursor, options::DecoderOptions};
+    let options = DecoderOptions::default()
+        .set_max_width(usize::from(u16::MAX))
+        .set_max_height(usize::from(u16::MAX));
+    let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+    d.decode_headers().ok()?;
+    let info = d.info()?;
+    Some((u32::from(info.width), u32::from(info.height)))
+}
+
+/// Our JPEG header and the decoder agree on the size (they once read `FF 01` differently, and
+/// the decoder allocated what a 16×16 header had promised it wouldn't), and an image that
+/// is too big isn't decoded either way.
+#[test]
+fn the_jpeg_header_agrees_with_the_decoder() {
+    for name in ["gradient.jpg", "progressive.jpg", "gray.jpg", "wide.jpg"] {
+        let j = fixture(name);
+        let (_, w, h) = header(&mut &j[..]).unwrap();
+        assert_eq!(zune_size(&j), Some((w, h)), "{name}");
+    }
+    let j = crafted_jpeg();
+    assert_eq!(header(&mut &j[..]), Some((Format::Jpeg, 60_000, 60_000)));
+    assert_eq!(zune_size(&j), Some((60_000, 60_000)));
+    // 3.6 gigapixels: never decoded (this used to try to allocate 10.8 GB).
+    assert_eq!(decode(&j, 10, 10), None);
+    let dir = scratch("crafted");
+    let path = dir.join("c.jpg");
+    std::fs::write(&path, &j).unwrap();
+    assert_eq!(probe_file(&path), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn local_paths_resolve_against_the_document() {
     let base = Path::new("/docs/proj");
@@ -108,6 +162,26 @@ fn local_paths_resolve_against_the_document() {
     ] {
         assert_eq!(p(url), None, "{url:?}");
     }
+    // Neither are paths that make Windows connect to a server, however written or encoded.
+    for net in [
+        r"\\attacker\share\x.png",
+        "//attacker/share/x.png",
+        r"/\attacker\share\x.png",
+        r"\/attacker/share/x.png",
+        "%2F%2Fattacker/share/x.png",
+        "%5C%5Cattacker%5Cshare%5Cx.png",
+        "%2f%5cattacker/share/x.png",
+        r"\\?\UNC\attacker\share\x.png",
+        r"\\.\pipe\x",
+        "//?/C:/x.png",
+        "///x.png",
+    ] {
+        assert_eq!(p(net), None, "{net:?}");
+        assert_eq!(local_path(net, None), None, "{net:?}");
+    }
+    // A single root, and what only looks like one, are paths.
+    assert_eq!(p("%2Fabs/a.png"), Some(PathBuf::from("/abs/a.png")));
+    assert_eq!(p("a//b.png"), Some(PathBuf::from("/docs/proj/a//b.png")));
     // A relative path needs a base (stdin); an absolute one doesn't.
     assert_eq!(local_path("a.png", None), None);
     assert_eq!(
@@ -298,7 +372,7 @@ fn a_documents_local_images_load() {
         Some(ImageSize::Alt),
         "remote images are off"
     );
-    images.request(&[(1, 30, 20), (2, 10, 10), (3, 5, 5), (4, 5, 5)]);
+    images.request(&[(1, 30, 20), (2, 10, 10), (3, 5, 5), (4, 5, 5)], 4);
     wait(&mut images, &doc, &mut layout, |i| {
         i.pixels(1, 30, 20).is_some()
     });
@@ -314,4 +388,125 @@ fn a_documents_local_images_load() {
     images.attach(&doc, &mut layout);
     assert!(images.pixels(1, 30, 20).is_none());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The boxes layout makes for the image at `src` of `doc`, as `View` asks for them:
+/// (id, width, height).
+fn boxes_of(layout: &Layout) -> Vec<(u32, u32, u32)> {
+    layout
+        .geoms()
+        .iter()
+        .filter_map(|g| g.content.as_deref())
+        .flat_map(|c| c.boxes.iter())
+        .map(|b| {
+            let size = |v: f32| v.round().max(1.0) as u32;
+            (b.b.id, size(b.b.width), size(b.b.ascent + b.b.descent))
+        })
+        .collect()
+}
+
+/// How many results arrive over `rounds` polls, 20 ms apart.
+fn arrivals(images: &mut Images, doc: &Doc, layout: &mut Layout, rounds: u32) -> u32 {
+    let mut n = 0;
+    for _ in 0..rounds {
+        std::thread::sleep(Duration::from_millis(20));
+        n += u32::from(images.poll(doc, layout));
+    }
+    n
+}
+
+/// A tall, narrow image's box is decoded at exactly its size, so what was decoded is what is
+/// asked for next time: nothing is decoded again and again (this used to keep the viewer
+/// busy forever).
+#[test]
+fn a_tall_images_box_is_found_once_decoded() {
+    let dir = scratch("tall");
+    // 4 × 20000: its box can't be as tall as the image.
+    std::fs::write(
+        dir.join("t.png"),
+        png_bytes(4, 20_000, |_, y| [y as u8, 0, 0, 255]),
+    )
+    .unwrap();
+    let doc = Doc::parse("![t](t.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
+    let boxes = boxes_of(&layout);
+    assert_eq!(boxes.len(), 1);
+    let (id, w, h) = boxes[0];
+    assert!(w >= 1 && h == MAX_SIDE, "{w}×{h}");
+    images.request(&boxes, 1);
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.cache.has(&Key::Local(1), w, h)
+    });
+    // Asked for again, as every frame does: nothing is queued, nothing arrives.
+    images.begin_frame();
+    images.request(&boxes, 1);
+    assert_eq!(arrivals(&mut images, &doc, &mut layout, 5), 0);
+    use crate::render::Pixels;
+    assert!(images.pixels(id, w, h).is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A window of images bigger than the cache keeps what it has: the ones in view are never
+/// evicted, and of the rest only as many as fit beside them are decoded, so no image evicts
+/// another to be decoded again by the next request.
+#[test]
+fn images_beyond_the_cache_are_not_decoded_over_and_over() {
+    use crate::render::Pixels;
+    let dir = scratch("thrash");
+    for i in 1..=4 {
+        std::fs::write(
+            dir.join(format!("{i}.png")),
+            png_bytes(100, 100, |_, _| [i as u8, 0, 0, 255]),
+        )
+        .unwrap();
+    }
+    let doc = Doc::parse("![1](1.png) ![2](2.png) ![3](3.png) ![4](4.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    // Room for two and a half of them (40 000 bytes each).
+    images.cache.cap = 100_000;
+    // Image 1 in view, the others a screen away.
+    let boxes = [(1, 100, 100), (2, 100, 100), (3, 100, 100), (4, 100, 100)];
+    // A frame per result: results straddle frames, as the decodes of big images do.
+    let mut settled = 0;
+    for frame in 0..60 {
+        images.begin_frame();
+        let _ = images.pixels(1, 100, 100);
+        images.request(&boxes, 1);
+        let t = Instant::now();
+        let mut arrived = false;
+        while !arrived && t.elapsed() < Duration::from_millis(40) {
+            std::thread::sleep(Duration::from_millis(1));
+            arrived = images.poll(&doc, &mut layout);
+        }
+        settled = if arrived { 0 } else { settled + 1 };
+        if settled >= 5 {
+            break;
+        }
+        assert!(frame < 59, "still decoding after {frame} frames");
+    }
+    let has = |i, images: &Images| images.cache.has(&Key::Local(i), 100, 100);
+    assert!(has(1, &images) && has(2, &images) && has(3, &images));
+    assert!(!has(4, &images), "the fourth doesn't fit");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without `curl` a blocked image isn't offered to load (the note would say to press `I`).
+#[cfg(feature = "remote-images")]
+#[test]
+fn blocked_images_are_not_offered_without_curl() {
+    let doc = Doc::parse("![r](https://x.y/r.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.attach(&doc, &mut layout);
+    assert!(images.blocked(1));
+    images.remote.no_curl = true;
+    assert!(!images.blocked(1));
 }

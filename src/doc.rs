@@ -210,6 +210,9 @@ pub struct Heading {
 pub struct ImageRef {
     pub src: String,
     pub remote: bool,
+    /// Where its alt text starts in [`Doc::text`]: a long block is cut into chunks, and the one
+    /// that has this offset is the one that holds the image.
+    pub start: u32,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1026,6 +1029,12 @@ impl Builder {
         let style = self.style() | extra_style;
         let link = self.link();
         let start = self.doc.text.len() as u32;
+        if let Some(img) = (image as usize)
+            .checked_sub(1)
+            .and_then(|i| self.doc.images.get_mut(i))
+        {
+            img.start = start;
+        }
         self.doc.text.push_str(s);
         let end = self.doc.text.len() as u32;
         if image == 0
@@ -1342,7 +1351,8 @@ impl Builder {
         // Schemes are case-insensitive (`HTTPS://`).
         let scheme = src.get(..8).unwrap_or(&src).to_ascii_lowercase();
         let remote = scheme.starts_with("http://") || scheme.starts_with("https://");
-        push_id(&mut self.doc.images, ImageRef { src, remote })
+        let start = self.doc.text.len() as u32;
+        push_id(&mut self.doc.images, ImageRef { src, remote, start })
     }
 
     fn end_image(&mut self) {

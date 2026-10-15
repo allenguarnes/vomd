@@ -557,3 +557,39 @@ fn the_badge_and_pulse_are_painted() {
     let plain = paint(&c, &mut cache, &mut text);
     assert_ne!(pulse, plain, "the pulse shows");
 }
+
+/// With the button inside the dropdown, `⋯` pulses in its place.
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_pulse_moves_to_the_more_button_with_the_images_button() {
+    let fonts = Fonts::new().unwrap();
+    let (mut cache, mut text) = (GlyphCache::default(), TextCtx::default());
+    let c = Ctx {
+        remote: 3,
+        ..ctx(200)
+    };
+    let s = slots(&c);
+    assert!(s.overflow.contains(&Item::Images));
+    let r = s.items.iter().find(|(i, _)| *i == Item::More).unwrap().1;
+    let mut paint = |pulse: bool| {
+        let mut buf = vec![0u32; 200 * 40];
+        let mut frame = Frame::new(&mut buf, 200, 40, 200);
+        let c = Ctx { pulse, ..c };
+        Toolbar::default().paint(
+            &mut frame,
+            &c,
+            &fonts,
+            &mut cache,
+            &mut text,
+            &crate::theme::LIGHT,
+        );
+        buf
+    };
+    let (plain, pulse) = (paint(false), paint(true));
+    let changed = |x: usize, y: usize| plain[y * 200 + x] != pulse[y * 200 + x];
+    let on_more = (r.x0 as usize..r.x1 as usize)
+        .flat_map(|x| (0..32).map(move |y| (x, y)))
+        .filter(|&(x, y)| changed(x, y))
+        .count();
+    assert!(on_more > 20, "`⋯` pulses: {on_more}");
+}

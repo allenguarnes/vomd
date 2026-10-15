@@ -1,5 +1,6 @@
 use super::*;
-#[cfg(feature = "images")]
+// Only the tests that need the embedded fonts use it.
+#[cfg(all(feature = "images", feature = "embed-fonts"))]
 use crate::layout::ImageSize;
 use winit::keyboard::SmolStr;
 
@@ -1916,6 +1917,7 @@ mod with_fonts {
     }
 
     /// Poll the image threads until `done` holds (fails after a while).
+    #[cfg(feature = "remote-images")]
     fn wait_images(v: &mut View, done: impl Fn(&View) -> bool) {
         let t = Instant::now();
         while !done(v) {
@@ -1960,6 +1962,18 @@ mod with_fonts {
         }
         assert_eq!(buf.iter().filter(|&&p| p == 0x119933).count(), 40 * 20);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A document's images are attached once when it is opened, base directory included.
+    #[cfg(feature = "images")]
+    #[test]
+    fn opening_a_document_attaches_its_images_once() {
+        let mut v = view("![a](a.png)", 600, 400);
+        let before = v.images.generation();
+        v.open_in(Doc::parse("![b](b.png)"), None, Some(std::env::temp_dir()));
+        assert_eq!(v.images.generation(), before + 1);
+        v.open(Doc::parse("![c](c.png)"), None);
+        assert_eq!(v.images.generation(), before + 2);
     }
 
     #[cfg(feature = "remote-images")]
