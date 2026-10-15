@@ -5,10 +5,43 @@
 
 use std::ops::Range;
 
+/// Byte ranges of text that came from character references (`&copy;`, `&#35;`): pulldown-cmark
+/// decodes them, and cmark-gfm looks for links in the source, where `&` and `;` are there. See
+/// [`find`].
+#[derive(Clone, Copy)]
+pub struct Entities<'a>(pub &'a [Range<usize>]);
+
+impl Entities<'_> {
+    /// Whether the character at `i` is part of an entity.
+    fn contains(self, i: usize) -> bool {
+        let k = self.0.partition_point(|r| r.end <= i);
+        self.0.get(k).is_some_and(|r| r.start <= i)
+    }
+
+    /// Whether an entity ends at `i`.
+    fn ends_at(self, i: usize) -> bool {
+        let k = self.0.partition_point(|r| r.end < i);
+        self.0.get(k).is_some_and(|r| r.end == i)
+    }
+
+    /// Where the first entity starting at or after `i` starts.
+    fn next_start(self, i: usize) -> Option<usize> {
+        let k = self.0.partition_point(|r| r.start < i);
+        self.0.get(k).map(|r| r.start)
+    }
+}
+
 /// The autolinks in `s`: byte range of the link text and the link target. `prev` is the
 /// character before `s` in the source (a space at the start of a block); whether a link may
 /// start depends on the character before it.
-pub fn find(s: &str, prev: char) -> Vec<(Range<usize>, String)> {
+///
+/// `ents` are the entities in `s`, in order. cmark-gfm sees them as written (`;` after the
+/// name), we only see what they decode to, so they are treated as the written text would be
+/// where it is cheap to: a link doesn't start in one or after one (`;` is not a boundary), a
+/// domain ends at one, and one at the end of a link is trimmed (`&copy;`, `&amp;`). An entity
+/// inside the path stays in the link, decoded, unless it decodes to whitespace or `<`, which end
+/// it (cmark-gfm links the written text, spaces and all).
+pub fn find(s: &str, prev: char, ents: Entities) -> Vec<(Range<usize>, String)> {
     let mut out = Vec::new();
     let b = s.as_bytes();
     // Every link needs one of these; most text has none, and the parser runs this on all of it.
@@ -21,21 +54,24 @@ pub fn find(s: &str, prev: char) -> Vec<(Range<usize>, String)> {
         // Links start with `w`, `h`, `f` or (for emails) contain `@`; only ASCII bytes are
         // tested, so `i` is on a character boundary whenever it is sliced at.
         match b[i] {
-            b'w' | b'W' | b'h' | b'H' | b'f' | b'F' => {
+            b'w' | b'W' | b'h' | b'H' | b'f' | b'F' if !ents.contains(i) => {
                 let before = if i == 0 {
                     prev
+                } else if ents.ends_at(i) {
+                    ';'
                 } else {
                     s[..i].chars().next_back().unwrap_or(' ')
                 };
-                if let Some((end, href)) = at(s, i, before, &mut bad) {
+                if let Some((end, href)) = at(s, i, before, &mut bad, ents) {
                     out.push((i..end, href));
                     i = end;
                     continue;
                 }
             }
             // Emails can start mid-word (`a.b@c.d`): back up over the local part.
-            b'@' => {
-                if let Some((start, end)) = email(s, i)
+            b'@' if !ents.contains(i) => {
+                let hi = ents.next_start(i + 1).unwrap_or(s.len());
+                if let Some((start, end)) = email(&s[..hi], i)
                     && out.last().is_none_or(|(r, _)| r.end <= start)
                 {
                     out.push((start..end, format!("mailto:{}", &s[start..end])));
@@ -70,7 +106,7 @@ fn candidate(s: &str) -> bool {
 ///
 /// `bad` is the last failed domain scan; a `www.` inside it may fail without a scan of its own
 /// (after `_`, say), which keeps `www._www._www._…` linear.
-fn at(s: &str, i: usize, before: char, bad: &mut Scan) -> Option<(usize, String)> {
+fn at(s: &str, i: usize, before: char, bad: &mut Scan, ents: Entities) -> Option<(usize, String)> {
     let rest = &s[i..];
     let lower = |p: &str| {
         rest.as_bytes()
@@ -88,6 +124,10 @@ fn at(s: &str, i: usize, before: char, bad: &mut Scan) -> Option<(usize, String)
     } else {
         return None;
     };
+    // The prefix is written out, not decoded from entities.
+    if ents.next_start(i).is_some_and(|e| e < i + prefix.max(4)) {
+        return None;
+    }
     let boundary = if prefix > 0 {
         !before.is_ascii_alphabetic()
     } else {
@@ -99,14 +139,16 @@ fn at(s: &str, i: usize, before: char, bad: &mut Scan) -> Option<(usize, String)
     if prefix == 0 && bad.fails_www_at(i) {
         return None;
     }
-    let domain_end = match domain(s, i + prefix, prefix > 0) {
+    // The domain ends where an entity starts.
+    let cap = ents.next_start(i + prefix).unwrap_or(s.len());
+    let domain_end = match domain(&s[..cap], i + prefix, prefix > 0) {
         Ok(end) => end,
         Err(scan) => {
             *bad = scan;
             return None;
         }
     };
-    let end = trim_end(s, i, path_end(s, domain_end));
+    let end = trim_end(s, i, path_end(s, domain_end), ents);
     Some((end, format!("{scheme}{}", &s[i..end])))
 }
 
@@ -185,13 +227,32 @@ fn path_end(s: &str, from: usize) -> usize {
 }
 
 /// Trailing punctuation isn't part of a link (GFM "extended autolink path validation"):
-/// `?!.,:*_~'"`, an unbalanced `)`, and an entity-like `&name;` at the end.
-fn trim_end(s: &str, start: usize, mut end: usize) -> usize {
-    // Counted once: only a trimmed `)` changes them (the other trimmed characters, entity-like
-    // runs included, hold no parentheses), so the loop is linear.
-    let open = s[start..end].matches('(').count();
+/// `?!.,:*_~'"`, an unbalanced `)`, and an entity-like `&name;` at the end, all as cmark-gfm's
+/// `autolink_delim` has it. A trailing entity is dropped whole, whatever its name.
+fn trim_end(s: &str, start: usize, mut end: usize, ents: Entities) -> usize {
+    // Counted once: only a trimmed `)` (or an entity holding one) changes them, so the loop is
+    // linear.
+    let mut open = s[start..end].matches('(').count();
     let mut close = s[start..end].matches(')').count();
+    // The entities in the link, last first: `k` entities start before `end`.
+    let mut k = ents.0.partition_point(|r| r.start < end);
     loop {
+        while k > 0 && ents.0[k - 1].start >= end {
+            k -= 1;
+        }
+        if k > 0 && ents.0[k - 1].end == end && ents.0[k - 1].start > start {
+            let entity = ents.0[k - 1].clone();
+            for c in s[entity.clone()].chars() {
+                match c {
+                    '(' => open = open.saturating_sub(1),
+                    ')' => close = close.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            end = entity.start;
+            k -= 1;
+            continue;
+        }
         let link = &s[start..end];
         let Some(last) = link.chars().next_back() else {
             return end;
@@ -207,17 +268,19 @@ fn trim_end(s: &str, start: usize, mut end: usize) -> usize {
                 }
             }
             ';' => {
-                // `&hl;` at the end: drop the whole entity-like run.
-                let body = &link[..link.len() - 1];
-                match body.rfind('&') {
-                    Some(amp)
-                        if amp + 1 < body.len()
-                            && body[amp + 1..].bytes().all(|c| c.is_ascii_alphanumeric()) =>
-                    {
-                        end = start + amp;
-                    }
-                    _ => return end,
+                // `&hl;` at the end (`&` and letters): drop the whole run, else just the `;`.
+                // The letters are scanned once: when there is no `&`, the next character is
+                // the last of them and ends the loop.
+                let b = s.as_bytes();
+                let mut name = end - 2;
+                while name > start && b[name].is_ascii_alphabetic() {
+                    name -= 1;
                 }
+                end = if name < end - 2 && b[name] == b'&' && !ents.contains(name) {
+                    name
+                } else {
+                    end - 1
+                };
             }
             _ => return end,
         }
@@ -257,7 +320,31 @@ mod tests {
     use super::*;
 
     fn links(s: &str) -> Vec<(&str, String)> {
-        find(s, ' ').into_iter().map(|(r, h)| (&s[r], h)).collect()
+        find(s, ' ', Entities(&[]))
+            .into_iter()
+            .map(|(r, h)| (&s[r], h))
+            .collect()
+    }
+
+    /// `src` with the entities in `{}` (the braces go): the text and the entities' ranges, as the
+    /// builder would hand them over (`{&}` is what `&amp;` decodes to).
+    fn with_ents(src: &str) -> (String, Vec<Range<usize>>) {
+        let (mut text, mut ents, mut start) = (String::new(), Vec::new(), 0);
+        for c in src.chars() {
+            match c {
+                '{' => start = text.len(),
+                '}' => ents.push(start..text.len()),
+                _ => text.push(c),
+            }
+        }
+        (text, ents)
+    }
+
+    /// The link texts of `src` with entities (see `with_ents`), for a source that starts a block.
+    fn ent_links(src: &str) -> Vec<String> {
+        let (text, ents) = with_ents(src);
+        let found = find(&text, ' ', Entities(&ents));
+        found.into_iter().map(|(r, _)| text[r].to_owned()).collect()
     }
 
     #[test]
@@ -333,6 +420,99 @@ mod tests {
         );
     }
 
+    /// cmark-gfm's `;` rule, checked against its output: the `;` goes, and with it a `&` and the
+    /// letters before it, nothing else (no digits: `&x1;` is not an entity reference).
+    #[test]
+    fn trailing_semicolons_follow_cmark_gfm() {
+        for (src, link) in [
+            ("https://example.com/path;", "https://example.com/path"),
+            ("www.example.com/path;", "www.example.com/path"),
+            ("www.example.com/path&x1;", "www.example.com/path&x1"),
+            ("www.example.com/path&hl;", "www.example.com/path"),
+            ("www.example.com/path&hl;;", "www.example.com/path"),
+            ("www.example.com/path;;;", "www.example.com/path"),
+            ("www.example.com/path&;", "www.example.com/path&"),
+            ("www.example.com/path1;", "www.example.com/path1"),
+            ("www.example.com/path;?;", "www.example.com/path"),
+            ("www.example.com/&ab;cd;", "www.example.com/&ab;cd"),
+            ("www.example.com/ab;", "www.example.com/ab"),
+            ("www.example.com/a&amp&b;", "www.example.com/a&amp"),
+            ("www.example.com/&é;", "www.example.com/&é"),
+            ("https://a.b&c;", "https://a.b"),
+        ] {
+            assert_eq!(links(src)[0].0, link, "{src}");
+        }
+    }
+
+    /// The text of an entity (`{&}` for `&amp;`), as cmark-gfm's links see it written.
+    #[test]
+    fn entities_end_and_stay_in_links_like_cmark_gfm() {
+        // At the end of a link an entity is trimmed, whatever it decodes to.
+        for src in [
+            "https://example.com/path{©}",
+            "https://example.com/path{&}",
+            "https://example.com/path{;}",
+            "https://example.com/path{.}",
+            "https://example.com/path{&}{&}",
+            "https://example.com/path{&};",
+            "https://example.com/path{&}.",
+            "https://example.com/path.{&}?",
+            "https://example.com/path{&}{.}",
+            "https://example.com/path{ }x",
+            "https://example.com/path{<}x",
+        ] {
+            assert_eq!(ent_links(src), ["https://example.com/path"], "{src}");
+        }
+        assert_eq!(ent_links("www.a.com/{&};"), ["www.a.com/"]);
+        // Parentheses in an entity count as the written ones.
+        assert_eq!(ent_links("https://a.b/({)}"), ["https://a.b/("]);
+        assert_eq!(ent_links("https://a.b/(x{)}"), ["https://a.b/(x"]);
+        // In the middle of a path one stays, decoded, except whitespace and `<`.
+        assert_eq!(
+            ent_links("https://x.y/?a=1{&}b=2"),
+            ["https://x.y/?a=1&b=2"]
+        );
+        assert_eq!(ent_links("www.a.com/{é}x"), ["www.a.com/éx"]);
+        assert_eq!(ent_links("https://x.y/a{ }b"), ["https://x.y/a"]);
+        // The `&` of `&amp;copy;` isn't the start of `&copy;`.
+        assert_eq!(ent_links("https://a.b/x{&}copy;"), ["https://a.b/x&copy"]);
+        // A domain ends at an entity, the path goes on.
+        assert_eq!(ent_links("www.caf{é}.com/x"), ["www.café.com/x"]);
+        assert_eq!(ent_links("https://caf{é}.com/x"), ["https://café.com/x"]);
+        assert!(ent_links("www.{é}.com").is_empty());
+        assert_eq!(ent_links("http://a{é}b_c"), ["http://aéb_c"]);
+        // A link can't be written with entities or follow one the way text follows text.
+        for src in [
+            "{h}ttp://a.b",
+            "ht{t}p://a.b",
+            "http{:}//a.b",
+            "http:{/}/a.b",
+            "{w}ww.a.com",
+            "ww{w}.a.com",
+            "www{.}a.com",
+            "{ }www.a.com",
+            "x{&}www.a.com",
+            "{@}a.b@c.com",
+        ] {
+            let found = ent_links(src);
+            assert!(
+                found
+                    .iter()
+                    .all(|l| !l.starts_with("www") && !l.contains("://")),
+                "{src}: {found:?}"
+            );
+        }
+        assert_eq!(ent_links("{x}https://a.b"), ["https://a.b"]);
+        // Emails: the domain ends at an entity, the local part may hold one.
+        assert_eq!(ent_links("a@b.co{é}x"), ["a@b.co"]);
+        assert_eq!(ent_links("a{.}b@c.com"), ["a.b@c.com"]);
+        assert_eq!(ent_links("a@b.com{&}"), ["a@b.com"]);
+        // The entity before a link doesn't hide it.
+        assert_eq!(ent_links("x{&} https://a.b/c{&}"), ["https://a.b/c"]);
+        // Plain text is as before.
+        assert_eq!(ent_links("see https://a.b/c, ok"), ["https://a.b/c"]);
+    }
+
     #[test]
     fn invalid_domains_and_boundaries() {
         assert!(links("www.").is_empty());
@@ -377,8 +557,8 @@ mod tests {
             assert!(links(none).is_empty(), "{none}");
         }
         // The text before the URL is the caller's `prev` for the first character.
-        assert!(find("https://a.b", 'x').is_empty());
-        assert_eq!(find("https://a.b", '`').len(), 1);
+        assert!(find("https://a.b", 'x', Entities(&[])).is_empty());
+        assert_eq!(find("https://a.b", '`', Entities(&[])).len(), 1);
     }
 
     /// `www.` addresses need whitespace, `*`, `_`, `~` or `(` before them, also across the
@@ -399,14 +579,14 @@ mod tests {
             ('a', false),
         ] {
             assert_eq!(
-                find("www.a.com", prev).len(),
+                find("www.a.com", prev, Entities(&[])).len(),
                 usize::from(linked),
                 "{prev:?}"
             );
         }
         // Later positions look at the text itself.
-        assert_eq!(find("`c` www.a.com", '>').len(), 1);
-        assert!(find("c`www.a.com", ' ').is_empty());
+        assert_eq!(find("`c` www.a.com", '>', Entities(&[])).len(), 1);
+        assert!(find("c`www.a.com", ' ', Entities(&[])).is_empty());
     }
 
     #[test]
@@ -426,6 +606,28 @@ mod tests {
             // And entity-like endings and long runs of other trailing punctuation.
             let entities = format!("{url}{}", "&a;".repeat(50_000));
             assert_eq!(links(&entities)[0].0, url);
+            let semicolons = format!("{url}{}", ";".repeat(200_000));
+            assert_eq!(links(&semicolons)[0].0, url);
+            let doubled = format!("{url}{}", "&a;;".repeat(50_000));
+            assert_eq!(links(&doubled)[0].0, url);
+            // A long run of letters before a `;` is read once, whether or not an `&` starts it.
+            let name = format!("{url}&{};", "a".repeat(200_000));
+            assert_eq!(links(&name)[0].0, url);
+            let letters = format!("{url}{};", "a".repeat(200_000));
+            assert_eq!(links(&letters)[0].0, &letters[..letters.len() - 1]);
+            let each = format!("{url}{}", "a;".repeat(100_000));
+            assert_eq!(links(&each)[0].0, &each[..each.len() - 1]);
+            // Entities from the parser: a long run of them at the end, or one after another
+            // with a link between.
+            let amps = format!("{url}{}", "{&}".repeat(100_000));
+            assert_eq!(ent_links(&amps), [url]);
+            let parens = format!("{url}{}", "{)}".repeat(100_000));
+            assert_eq!(ent_links(&parens), [url]);
+            let paired = format!("{url}{}", "({)}".repeat(50_000));
+            let kept = format!("{url}{}{}", "()".repeat(49_999), "(");
+            assert_eq!(ent_links(&paired), [kept]);
+            let between = format!("{url}{{&}} ").repeat(50_000);
+            assert_eq!(ent_links(&between).len(), 50_000);
             let punct = format!("{url}{}", "?!.,:*_~'\"".repeat(20_000));
             assert_eq!(links(&punct)[0].0, url);
         }
@@ -482,13 +684,19 @@ mod tests {
             ("semicolons", format!("http://a.b/{}", ";".repeat(mb))),
             ("amps", format!("http://a.b/{}", "&;".repeat(mb / 2))),
             ("trimmed links", "www.a.bc?! ".repeat(mb / 11)),
+            ("alphabetic runs", format!("www.a.bc/&{}", "a".repeat(mb))),
+            (
+                "alphabetic runs and semicolons",
+                "www.a.bc/aaaa;".repeat(mb / 14),
+            ),
+            ("entity-like runs", "www.a.bc/&aa;;;".repeat(mb / 15)),
             ("unicode", "é@é.é www.é_é.é_é ".repeat(mb / 28)),
         ];
         for (name, src) in cases {
             assert!(src.len() >= mb / 2, "{name}: {}", src.len());
             let t = std::time::Instant::now();
             for prev in [' ', 'a'] {
-                let _ = find(&src, prev);
+                let _ = find(&src, prev, Entities(&[]));
             }
             assert!(
                 t.elapsed() < std::time::Duration::from_secs(2),
@@ -551,7 +759,7 @@ mod tests {
         // Never panics on arbitrary slices around multi-byte text.
         for i in 0..s.len() {
             if s.is_char_boundary(i) {
-                let _ = find(&s[i..], ' ');
+                let _ = find(&s[i..], ' ', Entities(&[]));
             }
         }
     }

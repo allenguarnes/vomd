@@ -246,8 +246,8 @@ impl Doc {
     fn parse_whole(src: &str) -> Doc {
         let src = &src[front_matter_len(src)..];
         let mut b = Builder::new(src.len());
-        for event in Parser::new_ext(src, options()) {
-            b.event(event);
+        for (event, decoded) in marked(src, Parser::new_ext(src, options())) {
+            b.event_marked(event, decoded);
         }
         b.finish()
     }
@@ -288,13 +288,14 @@ impl Doc {
             // Each segment's parser is dropped before the next one starts.
             (0..total).all(|n| {
                 let (stubs, text) = stubs_and_text(n);
-                let events = segment_events(&text, &defs.links, opts);
+                let events = marked(&text, segment_events(&text, &defs.links, opts));
                 feed.segment(n, stubs, text.len(), events).is_some()
             })
         } else {
             let (fed, done) = pipeline::ordered(total, pipeline, feed, |n, turn| {
                 let (stubs, text) = stubs_and_text(n);
-                let events: Vec<Event<'_>> = segment_events(&text, &defs.links, opts).collect();
+                let events: Vec<_> =
+                    marked(&text, segment_events(&text, &defs.links, opts)).collect();
                 let text_len = text.len();
                 // The events are gone (consumed) by the end of the turn.
                 turn.take(
@@ -438,6 +439,11 @@ struct Builder {
     /// Plain text waiting for autolink detection: pulldown-cmark splits a run of text into
     /// several events (at entities, escapes, unmatched delimiters), and a URL can span them.
     pending: String,
+    /// Ranges of `pending` that are not slices of the source but decoded character references,
+    /// which autolinks treat the way the written text would be (see `autolink::find`).
+    pending_ents: Vec<Range<usize>>,
+    /// The event being handled is text that isn't a slice of the source (see `marked`).
+    decoded: bool,
     /// The source character before `pending`, for autolink boundaries (see `boundary_after`).
     prev: char,
     /// Next number for each open list (`None` = bullet list).
@@ -510,6 +516,8 @@ impl Builder {
             links: Vec::new(),
             html_inline: HtmlInline::default(),
             pending: String::new(),
+            pending_ents: Vec::new(),
+            decoded: false,
             prev: ' ',
             lists: Vec::new(),
             quote: 0,
@@ -573,6 +581,13 @@ impl Builder {
             self.misfit |= !self.broken;
         }
         self.broken = true;
+    }
+
+    /// [`Builder::event`] for an event that comes with whether it is decoded text (see `marked`).
+    fn event_marked(&mut self, event: Event, decoded: bool) {
+        self.decoded = decoded;
+        self.event(event);
+        self.decoded = false;
     }
 
     fn event(&mut self, event: Event) {
@@ -642,6 +657,19 @@ impl Builder {
             return;
         }
         match event {
+            // Inside `<script>`/`<style>` nothing is content: not text, code, math, breaks, images
+            // (which would be registered), links (the end of one still closes the open link) or
+            // footnote references (which would number a note), only HTML, to find the end tag, and
+            // the structure around it.
+            Event::Start(Tag::Link { .. } | Tag::Image { .. })
+            | Event::Text(_)
+            | Event::Code(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::FootnoteReference(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+                if self.html_inline.skip.is_some() => {}
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => {
                 let def = matches!(tag, TagEnd::FootnoteDefinition);
@@ -657,10 +685,15 @@ impl Builder {
                     self.fn_depth -= 1;
                 }
             }
-            Event::Text(_) if self.html_inline.skip.is_some() => {}
             Event::Text(s) if self.code_block() => self.text(&s, style::CODE, 0),
             Event::Text(s) if self.link() != 0 => self.text(&s, 0, 0),
-            Event::Text(s) => self.pending.push_str(&s),
+            Event::Text(s) => {
+                let start = self.pending.len();
+                self.pending.push_str(&s);
+                if self.decoded {
+                    self.pending_ents.push(start..self.pending.len());
+                }
+            }
             Event::Code(s) => self.text(&s, style::CODE, 0),
             Event::InlineMath(s) | Event::DisplayMath(s) => self.text(&s, 0, 0),
             Event::Html(s) | Event::InlineHtml(s) => self.html(&s, false),
@@ -946,8 +979,9 @@ impl Builder {
             return;
         }
         let text = std::mem::take(&mut self.pending);
+        let ents = std::mem::take(&mut self.pending_ents);
         let mut at = 0;
-        for (range, href) in autolink::find(&text, self.prev) {
+        for (range, href) in autolink::find(&text, self.prev, autolink::Entities(&ents)) {
             self.text(&text[at..range.start], 0, 0);
             let id = push_id(&mut self.doc.links, href);
             self.links.push(id);
@@ -959,6 +993,8 @@ impl Builder {
         // Keep the buffer's allocation for the next run.
         self.pending = text;
         self.pending.clear();
+        self.pending_ents = ents;
+        self.pending_ents.clear();
     }
 
     /// Append text to the open block, opening an implicit paragraph if needed (tight list
@@ -1386,6 +1422,16 @@ impl Builder {
     fn html(&mut self, html: &str, block: bool) {
         let mut rest = html;
         while !rest.is_empty() {
+            if let Some(skip) = self.html_inline.skip {
+                // Inside <script> or <style>: everything up to its end tag is dropped, whatever
+                // it looks like (`a < b`, a tag with a `</script>` in a quote).
+                let Some(after) = end_of_raw_text(rest, skip) else {
+                    break;
+                };
+                self.html_inline.skip = None;
+                rest = &rest[after..];
+                continue;
+            }
             let Some(lt) = rest.find('<') else {
                 self.html_text(rest, block);
                 break;
@@ -1409,13 +1455,6 @@ impl Builder {
                 .map(|c| c.to_ascii_lowercase())
                 .collect();
             let closing = tag.starts_with('/');
-            if let Some(skip) = self.html_inline.skip {
-                // Inside <script> or <style>: everything up to its closing tag is dropped.
-                if closing && name == skip {
-                    self.html_inline.skip = None;
-                }
-                continue;
-            }
             if self.inline_tag(&name, tag, closing) {
                 continue;
             }
@@ -1486,9 +1525,6 @@ impl Builder {
     }
 
     fn html_text(&mut self, s: &str, block: bool) {
-        if self.html_inline.skip.is_some() {
-            return;
-        }
         if !block {
             self.text(&decode_entities(s), 0, 0);
             return;
@@ -1641,6 +1677,26 @@ fn boundary_after(event: &Event) -> char {
     }
 }
 
+/// The parser's events over `src`, each with whether it is text that isn't a slice of it: a
+/// decoded character reference (autolinks need to know, see `autolink::find`). Text from `src`
+/// borrows from it; a numeric reference is built (an owned string), a named one comes from the
+/// parser's table (a static string outside `src`).
+fn marked<'a>(
+    src: &'a str,
+    events: impl Iterator<Item = Event<'a>>,
+) -> impl Iterator<Item = (Event<'a>, bool)> {
+    let start = src.as_ptr() as usize;
+    let source = start..start + src.len();
+    events.map(move |event| {
+        let decoded = match &event {
+            Event::Text(CowStr::Borrowed(s)) => !source.contains(&(s.as_ptr() as usize)),
+            Event::Text(_) => true,
+            _ => false,
+        };
+        (event, decoded)
+    })
+}
+
 /// The events of one segment's text, with the document's link definitions (by label) behind the
 /// parser's broken-link callback.
 fn segment_events<'a>(
@@ -1674,7 +1730,7 @@ impl SegmentFeed<'_> {
         n: usize,
         stubs: usize,
         text_len: usize,
-        events: impl Iterator<Item = Event<'t>>,
+        events: impl Iterator<Item = (Event<'t>, bool)>,
     ) -> Option<()> {
         let (plan, b) = (self.plan, &mut self.b);
         let seg = &plan.segments[n];
@@ -1685,7 +1741,7 @@ impl SegmentFeed<'_> {
         let held = plan.segments.get(n + 1).is_some_and(|next| next.list);
         let mut open = 0i64;
         let mut expanded = 0usize;
-        while let Some(event) = events.next() {
+        while let Some((event, decoded)) = events.next() {
             match &event {
                 Event::Start(tag) => {
                     open += 1;
@@ -1700,7 +1756,7 @@ impl SegmentFeed<'_> {
                 }
                 break;
             }
-            b.event(event);
+            b.event_marked(event, decoded);
         }
         // pulldown-cmark ends its events early on some malformed input (a link definition
         // in a list item followed by a line of whitespace, say), losing the rest of the
@@ -1750,6 +1806,30 @@ fn expansion(tag: &Tag) -> usize {
         }
         _ => 0,
     }
+}
+
+/// Where the raw text of a `<script>` or `<style>` (`name`) ends in `s`: after the first end tag,
+/// a `</` and the name (any case) followed by whitespace, `/` or `>`, and then everything up to
+/// its `>`, as an HTML parser has it. `Some(s.len())` if that tag is cut off, `None` if there is
+/// none.
+fn end_of_raw_text(s: &str, name: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut from = 0;
+    while let Some(lt) = s[from..].find("</") {
+        let at = from + lt;
+        let tail = &b[at + 2..];
+        if tail.len() > name.len()
+            && tail[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+            && matches!(
+                tail[name.len()],
+                b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'/' | b'>'
+            )
+        {
+            return Some(s[at..].find('>').map_or(s.len(), |gt| at + gt + 1));
+        }
+        from = at + 2;
+    }
+    None
 }
 
 /// Index of the `>` closing the tag at the start of `s`, skipping quoted attribute values.
