@@ -6,6 +6,7 @@
 //! offset: block heights change as idle layout measures them, and on resize, zoom and reload,
 //! and the anchor keeps the same text at the top of the window through all of it.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -58,6 +59,25 @@ pub enum Outcome {
     /// Re-read the document ([`read_input`]) and pass it to [`View::replace`].
     Reload,
     Quit,
+}
+
+/// When the event loop should run again after [`View::tick`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// Straight away: idle layout has more to measure.
+    Poll,
+    /// At this instant, to hide the scrollbar.
+    At(Instant),
+    /// Only on the next event.
+    Event,
+}
+
+/// The result of [`View::tick`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tick {
+    /// The window needs a repaint.
+    pub redraw: bool,
+    pub wake: Wake,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,12 +133,14 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             _ => None,
         },
         Key::Character(c) => match c.as_str() {
-            "j" => Some(Action::Lines(1)),
-            "k" => Some(Action::Lines(-1)),
+            "j" | "J" => Some(Action::Lines(1)),
+            "k" | "K" => Some(Action::Lines(-1)),
             " " if mods.shift_key() => Some(Action::Pages(-1)),
             " " => Some(Action::Pages(1)),
-            "g" => Some(Action::Top),
-            "G" => Some(Action::Bottom),
+            // Shift decides, not the case of the character: CapsLock turns `g` into "G", and
+            // some layouts report Shift+g as "g" (or as "G" with Shift set).
+            "g" | "G" if mods.shift_key() => Some(Action::Bottom),
+            "g" | "G" => Some(Action::Top),
             "r" | "R" => Some(Action::Reload),
             "t" | "T" => Some(Action::CycleTheme),
             "q" | "Q" => Some(Action::Quit),
@@ -192,6 +214,8 @@ pub struct View {
     msg_ctx: TextCtx,
     width: u32,
     height: u32,
+    /// Height of the strip above the document area (the toolbar of P9), in physical pixels.
+    top_inset: u32,
     /// Physical pixels per logical pixel from the window system.
     hidpi: f64,
     zoom: u16,
@@ -199,6 +223,9 @@ pub struct View {
     system_dark: bool,
     fade: ScrollbarFade,
     drag: Option<Drag>,
+    /// Characters already handed to a fallback scan, over all documents shown (the
+    /// system fonts are scanned once per character, not once per reload).
+    tried: HashSet<char>,
 }
 
 impl View {
@@ -222,12 +249,14 @@ impl View {
             msg_ctx: TextCtx::default(),
             width,
             height,
+            top_inset: 0,
             hidpi,
             zoom: 100,
             theme: ThemeMode::System,
             system_dark: false,
             fade: ScrollbarFade::default(),
             drag: None,
+            tried: HashSet::new(),
         }
     }
 
@@ -288,10 +317,32 @@ impl View {
         self.relayout();
     }
 
+    /// The window size the view lays out and paints for (physical pixels).
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Reserve `px` pixels at the top of the window for something else (the toolbar, P9): the
+    /// document area, its scrolling, pages and scrollbar start below it.
+    pub fn set_top_inset(&mut self, px: u32) {
+        self.top_inset = px.min(self.height);
+        self.clamp_scroll();
+    }
+
+    pub fn top_inset(&self) -> u32 {
+        self.top_inset
+    }
+
+    /// The document area's height.
+    fn area_height(&self) -> u32 {
+        self.height.saturating_sub(self.top_inset)
+    }
+
     /// The window was resized (physical pixels).
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
+        self.top_inset = self.top_inset.min(height);
         self.relayout();
         self.clamp_scroll();
     }
@@ -315,7 +366,7 @@ impl View {
     }
 
     pub fn max_scroll(&self) -> f64 {
-        (self.layout.top(self.doc.blocks.len()) - f64::from(self.height)).max(0.0)
+        (self.layout.top(self.doc.blocks.len()) - f64::from(self.area_height())).max(0.0)
     }
 
     pub fn set_scroll(&mut self, y: f64) {
@@ -342,7 +393,7 @@ impl View {
 
     /// One page: the window less a line, so the last line stays in view.
     fn page(&self) -> f64 {
-        (f64::from(self.height) - self.line()).max(self.line())
+        (f64::from(self.area_height()) - self.line()).max(self.line())
     }
 
     /// Wheel notches (line deltas, positive = down).
@@ -391,7 +442,7 @@ impl View {
         Viewport {
             area: Clip {
                 x0: 0,
-                y0: 0,
+                y0: self.top_inset.min(i32::MAX as u32) as i32,
                 x1: self.width.min(i32::MAX as u32) as i32,
                 y1: self.height.min(i32::MAX as u32) as i32,
             },
@@ -408,8 +459,10 @@ impl View {
         render::thumb(vp, self.layout.total_height(), self.scale())
     }
 
-    /// Mouse button pressed at (`x`, `y`). On the thumb it starts a drag; elsewhere in the
-    /// scrollbar's column it centers the thumb there first. Returns true if it took the press.
+    /// Mouse button pressed at (`x`, `y`). On the thumb it starts a drag, visible or not; on the
+    /// rest of the scrollbar's track it centers the thumb there first, but only while the
+    /// scrollbar is showing, so links and other things under a hidden one stay clickable.
+    /// Returns true if it took the press.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
         let Some(t) = self.thumb_at(self.scroll()) else {
             return false;
@@ -417,15 +470,15 @@ impl View {
         // The column is the thumb and its margin to the right edge, a few pixels wider to the
         // left so the thin thumb is easy to hit.
         let slack = f64::from(t.x1 - t.x0);
-        if x < f64::from(t.x0) - slack {
+        if x < f64::from(t.x0) - slack || y < f64::from(self.top_inset) {
             return false;
         }
         let (y0, y1) = (f64::from(t.y0), f64::from(t.y1));
-        let grab = if (y0..y1).contains(&y) {
-            y - y0
-        } else {
-            (y1 - y0) / 2.0
-        };
+        let on_thumb = (y0..y1).contains(&y);
+        if !on_thumb && !self.fade.visible(now) {
+            return false;
+        }
+        let grab = if on_thumb { y - y0 } else { (y1 - y0) / 2.0 };
         self.drag = Some(Drag { grab });
         self.drag_to(y, now);
         true
@@ -469,7 +522,7 @@ impl View {
 
     /// Lay out the blocks around the reading position, keeping it inside the document.
     pub fn ensure(&mut self) {
-        let h = self.height as f32;
+        let h = self.area_height() as f32;
         self.layout.ensure(&self.doc, &self.fonts, self.anchor, h);
         if self.scroll() > self.max_scroll() + 0.5 {
             // Exact heights made the document shorter than the position: settle at the end.
@@ -494,6 +547,8 @@ impl View {
         }
         self.ensure();
         let vp = self.viewport();
+        // Whatever uses the inset paints over this.
+        frame.fill_rect(0, 0, w as i32, vp.area.y0, theme.bg);
         render::paint(
             &mut frame,
             vp,
@@ -550,11 +605,31 @@ impl View {
         self.drag.is_none() && self.fade.expire(now)
     }
 
+    /// What the event loop does each time it runs out of events: hide the scrollbar if its
+    /// time is up (whatever woke the loop, and however busy measuring keeps it), then measure
+    /// until `measure_until` (`None`: not yet), and say when to run again.
+    pub fn tick(&mut self, now: Instant, measure_until: Option<Instant>) -> Tick {
+        let redraw = self.expire(now);
+        let measured = measure_until.is_none_or(|t| self.idle(t));
+        // No timers when there's nothing to do.
+        let wake = match (measured, self.deadline()) {
+            (false, _) => Wake::Poll,
+            (true, Some(t)) => Wake::At(t),
+            (true, None) => Wake::Event,
+        };
+        Tick { redraw, wake }
+    }
+
     // ---- Fonts ----------------------------------------------------------------------------
 
-    /// Characters no loaded face covers that the shell hasn't looked for yet.
+    /// Characters no loaded face covers that the shell hasn't looked for yet. Each is returned
+    /// once per process, however often the document is reloaded: a character that no
+    /// installed font has would otherwise rescan them all on every reload. (A character
+    /// first seen in a later edit does get a scan of its own.)
     pub fn take_missing(&mut self) -> Vec<char> {
-        self.layout.take_missing()
+        let mut missing = self.layout.take_missing();
+        missing.retain(|&c| self.tried.insert(c));
+        missing
     }
 
     /// Faces already loaded from disk, for a fallback scan to skip.
@@ -588,9 +663,9 @@ impl View {
 
     /// Show a new version of the document (reload) or a message in its place. The position
     /// follows the nearest heading at or above it, so edits above it don't move the text being
-    /// read; without one it keeps the block index.
+    /// read; without one (or if the heading is gone) it keeps the block index.
     pub fn replace(&mut self, doc: Doc, message: Option<String>) {
-        let heading = self.heading_above();
+        let place = self.place();
         let old = self.anchor;
         self.doc = doc;
         self.message = message;
@@ -600,29 +675,27 @@ impl View {
         if n == 0 {
             return;
         }
-        let target = heading.and_then(|(slug, dy)| {
-            let h = self.doc.headings.iter().find(|h| h.slug == slug)?;
-            Some((h.block, dy))
+        let found = place.and_then(|p| {
+            let h = self.doc.headings.iter().find(|h| h.slug == p.slug)?;
+            // The same block offset below the heading, not the same pixels: the blocks in
+            // between are only estimates until measured, so a pixel offset lands elsewhere
+            // even when nothing changed. A section that got shorter clamps to its last block.
+            let last = section_end(&self.doc, h.block) - 1;
+            Some(Anchor {
+                block: (h.block + p.offset).min(last),
+                frac: p.frac,
+            })
         });
-        match target {
-            Some((block, dy)) => {
-                self.anchor = Anchor { block, frac: 0.0 };
-                self.ensure();
-                self.set_scroll(self.layout.top(block as usize) + dy);
-            }
-            None => {
-                self.anchor = Anchor {
-                    block: old.block.min(n as u32 - 1),
-                    frac: old.frac,
-                };
-            }
-        }
-        self.clamp_scroll();
+        self.anchor = found.unwrap_or(Anchor {
+            block: old.block.min(n as u32 - 1),
+            frac: old.frac,
+        });
+        // Measures around the position, and settles at the end if the new text is shorter.
+        self.ensure();
     }
 
-    /// The heading at or above the reading position, by slug, and how far below its top the
-    /// position is.
-    fn heading_above(&self) -> Option<(String, f64)> {
+    /// Where the reading position is relative to the heading at or above it.
+    fn place(&self) -> Option<Place> {
         if self.message.is_some() {
             return None;
         }
@@ -633,11 +706,30 @@ impl View {
             .iter()
             .filter(|h| h.block <= at)
             .max_by_key(|h| h.block)?;
-        Some((
-            h.slug.clone(),
-            self.scroll() - self.layout.top(h.block as usize),
-        ))
+        Some(Place {
+            slug: h.slug.clone(),
+            offset: at - h.block,
+            frac: self.anchor.frac,
+        })
     }
+}
+
+/// The reading position as a heading (by slug), blocks below it, and a fraction of that block.
+struct Place {
+    slug: String,
+    offset: u32,
+    frac: f32,
+}
+
+/// The block after the section that starts at heading block `from`: the next heading's, or the
+/// end of the document.
+fn section_end(doc: &Doc, from: u32) -> u32 {
+    doc.headings
+        .iter()
+        .map(|h| h.block)
+        .filter(|&b| b > from)
+        .min()
+        .unwrap_or(doc.blocks.len() as u32)
 }
 
 /// Layout parameters for a window `width` wide at `hidpi` and `zoom` percent.

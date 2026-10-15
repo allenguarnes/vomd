@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Theme, Window, WindowId};
@@ -20,7 +20,7 @@ use vomd::doc::Doc;
 use vomd::fonts::Fonts;
 use vomd::platform;
 use vomd::text::fallback::{self, Found};
-use vomd::view::{self, Outcome, Stamp, View};
+use vomd::view::{self, Outcome, Stamp, View, Wake};
 
 /// Default window size in logical pixels (P6 makes it the last-used size).
 const WINDOW_SIZE: (f64, f64) = (900.0, 1000.0);
@@ -107,7 +107,11 @@ impl App {
         let Ok(mut buf) = gfx.surface.buffer_mut() else {
             return;
         };
-        view.resize(w.get(), h.get());
+        // The Resized and ScaleFactorChanged handlers keep the view's size; this only covers a
+        // frame painted before their event arrives (the buffer must match what is painted).
+        if view.size() != (w.get(), h.get()) {
+            view.resize(w.get(), h.get());
+        }
         view.paint(&mut buf, w.get() as usize, Instant::now());
         if buf.present().is_err() {
             return;
@@ -259,14 +263,6 @@ impl ApplicationHandler<UserEvent> for App {
         self.redraw();
     }
 
-    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
-        if let (StartCause::ResumeTimeReached { .. }, Some(view)) = (cause, self.view.as_mut())
-            && view.expire(Instant::now())
-        {
-            self.redraw();
-        }
-    }
-
     fn user_event(&mut self, _: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Fonts(found) => {
@@ -377,19 +373,17 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         let now = Instant::now();
-        let done = !self.shown || view.idle(now + IDLE_SLICE);
+        // Idle layout starts once the first frame is out. The scrollbar's deadline is checked
+        // on every turn, so it hides on time while measuring keeps the loop polling.
+        let tick = view.tick(now, self.shown.then(|| now + IDLE_SLICE));
+        if tick.redraw {
+            self.redraw();
+        }
         self.scan_fonts();
-        let Some(view) = self.view.as_ref() else {
-            return;
-        };
-        // Idle layout keeps the loop turning until the document is measured; then sleep, waking
-        // only to hide the scrollbar (no timers when idle).
-        event_loop.set_control_flow(if !done {
-            ControlFlow::Poll
-        } else if let Some(t) = view.deadline() {
-            ControlFlow::WaitUntil(t)
-        } else {
-            ControlFlow::Wait
+        event_loop.set_control_flow(match tick.wake {
+            Wake::Poll => ControlFlow::Poll,
+            Wake::At(t) => ControlFlow::WaitUntil(t),
+            Wake::Event => ControlFlow::Wait,
         });
     }
 }
