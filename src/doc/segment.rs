@@ -30,6 +30,17 @@
 //! empty cells) is not cut: segments would count afresh and go on. Nor is a table cut before
 //! the segment is [`TABLE_HEAD_RATIO`] times its header, so repeating a huge header stays linear.
 //!
+//! **Lists.** A list has no blank line to cut at when it is tight, and a giant one (a generated
+//! file index) must not be one parser's tree. So a segment may also end between two items of a
+//! top-level list: before a column-0 line that starts another item with the same marker (the
+//! same bullet, or the same `.` / `)` of an ordered list), provided the scan knows the list is
+//! top-level and its last item hasn't ended: it started at column 0 after a blank line (or the
+//! start of the text), and every line since has been blank or indented at least to the item's
+//! content (a line indented less might end the list, or only continue a paragraph lazily, and
+//! the scan doesn't try to tell which). The next segment's list is the same list: the builder
+//! keeps the list state across the cut ([`Segment::list`]; see `Builder::hold_list`), so item
+//! numbers go on and whether blank lines make the list loose makes no difference to the IR.
+//!
 //! **Definitions.** Link reference definitions and footnote definitions may come after their
 //! use, in another segment. They are not guessed from the text: [`Plan::definitions`] parses
 //! each segment that could hold one (it has `]:` in it) and takes the definitions from the
@@ -66,6 +77,8 @@ pub(super) struct Segment {
     pub range: Range<usize>,
     /// The header and delimiter rows of the table this segment continues, to parse before it.
     pub head: Option<Range<usize>>,
+    /// The segment starts with another item of the top-level list the previous one ends in.
+    pub list: bool,
 }
 
 pub(super) struct Plan {
@@ -250,6 +263,17 @@ struct TableScan {
     cuttable: bool,
 }
 
+/// A list item that starts in column 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ListItem {
+    /// What makes a list: the bullet character, or the delimiter (`.` or `)`) of an ordered
+    /// list.
+    mark: u8,
+    /// The column its content starts in: what a later line is indented at least as much as to
+    /// belong to the item.
+    offset: usize,
+}
+
 /// A fenced code block the scan believes may be open.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fence {
@@ -278,6 +302,9 @@ struct State {
     /// The previous line ended a fenced block, so this one starts a run.
     fresh: bool,
     table: Option<TableScan>,
+    /// The text so far ends in a top-level list, whose last item started in column 0 and goes on
+    /// (see the module docs).
+    list: Option<ListItem>,
 }
 
 impl State {
@@ -287,6 +314,7 @@ impl State {
         self.def_run = false;
         self.fresh = true;
         self.table = None;
+        self.list = None;
     }
 }
 
@@ -297,9 +325,16 @@ struct Verdict {
     /// Every reading is in the same table, which pulldown-cmark can start from its header.
     table: Option<Range<usize>>,
     table_ok: bool,
+    /// For a line that starts a list item: whether every reading that got that far is in a list
+    /// this item belongs to (`None` while no reading has said).
+    sibling: Option<bool>,
 }
 
 impl Verdict {
+    fn sibling(&mut self, yes: bool) {
+        self.sibling = Some(self.sibling.unwrap_or(true) && yes);
+    }
+
     fn block(&mut self) {
         self.plain = false;
         self.table_ok = false;
@@ -330,6 +365,8 @@ struct Line<'l> {
     rest: &'l [u8],
     /// A table row: starts with `|` in column 0 and has a cell (a lone `|` ends a table).
     row: bool,
+    /// A list item that starts in column 0.
+    item: Option<ListItem>,
     /// A segment may start here: after a blank line, in column 0, with a line that can't
     /// continue a construct before it.
     l_start: bool,
@@ -360,6 +397,8 @@ struct Scan<'a> {
     segments: Vec<Segment>,
     start: usize,
     head: Option<Range<usize>>,
+    /// The segment being read starts in the middle of a list.
+    list: bool,
     // Line state.
     /// Start of the line after the current one.
     next: usize,
@@ -381,6 +420,7 @@ impl<'a> Scan<'a> {
             segments: Vec::new(),
             start: 0,
             head: None,
+            list: false,
             next: 0,
             prev_blank: true,
             states: vec![State {
@@ -391,6 +431,7 @@ impl<'a> Scan<'a> {
                 def_run: false,
                 fresh: false,
                 table: None,
+                list: None,
             }],
             scratch: Vec::new(),
             stopped: false,
@@ -426,6 +467,11 @@ impl<'a> Scan<'a> {
             top,
             rest: if top { &bytes[indent..] } else { &bytes[..0] },
             row: bytes.first() == Some(&b'|') && !is_blank_ws(&bytes[1..]),
+            item: if indent == 0 && !blank {
+                list_item(bytes)
+            } else {
+                None
+            },
             l_start: !blank && was_blank && indent == 0 && cut_may_start(bytes),
             want_cut: pos - self.start >= self.budget,
         };
@@ -433,6 +479,7 @@ impl<'a> Scan<'a> {
             plain: true,
             table: None,
             table_ok: true,
+            sibling: None,
         };
         let mut states = std::mem::take(&mut self.states);
         let mut next = std::mem::take(&mut self.scratch);
@@ -458,12 +505,14 @@ impl<'a> Scan<'a> {
             return;
         }
         if line.l_start && verdict.plain {
-            self.cut(pos, None);
+            self.cut(pos, None, false);
+        } else if line.item.is_some() && verdict.plain && verdict.sibling == Some(true) {
+            self.cut(pos, None, true);
         } else if let Some(head) = verdict
             .table
             .filter(|h| verdict.table_ok && pos - self.start >= TABLE_HEAD_RATIO * h.len())
         {
-            self.cut(pos, Some(head));
+            self.cut(pos, Some(head), false);
         }
     }
 
@@ -528,6 +577,23 @@ impl<'a> Scan<'a> {
         if in_html {
             verdict.block();
         }
+        // A list goes on with an item that has its marker, and ends with a line that is not
+        // indented into its last item (or may do: a lazy continuation line is no different).
+        // After a blank line a column-0 item is the start of a top-level list.
+        match line.item {
+            Some(item) if line.was_blank || st.list.is_some_and(|run| run.mark == item.mark) => {
+                verdict.sibling(st.list.is_some_and(|run| run.mark == item.mark));
+                st.list = Some(item);
+            }
+            _ => {
+                if st
+                    .list
+                    .is_some_and(|run| indent_width(line.bytes) < run.offset)
+                {
+                    st.list = None;
+                }
+            }
+        }
         // The first line of a run of plain lines: after a blank line, or a block that ended.
         let first = line.was_blank || std::mem::take(&mut st.fresh);
         if first {
@@ -584,11 +650,12 @@ impl<'a> Scan<'a> {
         out.push(st);
     }
 
-    fn cut(&mut self, at: usize, head: Option<Range<usize>>) {
+    fn cut(&mut self, at: usize, head: Option<Range<usize>>, list: bool) {
         let head = std::mem::replace(&mut self.head, head);
         self.segments.push(Segment {
             range: self.start..at,
             head,
+            list: std::mem::replace(&mut self.list, list),
         });
         self.start = at;
     }
@@ -643,6 +710,7 @@ impl<'a> Scan<'a> {
         self.segments.push(Segment {
             range: self.start..self.src.len(),
             head: self.head.take(),
+            list: self.list,
         });
         Some(Plan {
             segments: self.segments,
@@ -797,7 +865,9 @@ fn may_define(text: &str) -> (bool, bool) {
 
 /// Whether the line has `]:` in it (the fast check for `]` first).
 fn has_ref_end(line: &[u8]) -> bool {
-    line.contains(&b']') && contains(line, b"]:")
+    line.iter()
+        .enumerate()
+        .any(|(i, &b)| b == b']' && line.get(i + 1) == Some(&b':'))
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -807,6 +877,42 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 /// Whitespace as pulldown-cmark's HTML scanners see it.
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// The list item that a line (starting in column 0, not blank) begins, if it certainly does: a
+/// bullet or an ordered number of at most 9 digits, then a space or tab and some text (an empty
+/// item can't be told from a line of a paragraph or the end of a list), and not a thematic break.
+fn list_item(line: &[u8]) -> Option<ListItem> {
+    let (mark, len) = match *line.first()? {
+        c @ (b'-' | b'*' | b'+') => (c, 1),
+        b'0'..=b'9' => {
+            let digits = line.iter().take_while(|b| b.is_ascii_digit()).count();
+            match line.get(digits) {
+                Some(&c @ (b'.' | b')')) if digits <= 9 => (c, digits + 1),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    // The whitespace after the marker, in columns.
+    let mut col = len;
+    let mut rest = &line[len..];
+    while let Some((&b @ (b' ' | b'\t'), tail)) = rest.split_first() {
+        col += if b == b' ' { 1 } else { 4 - col % 4 };
+        rest = tail;
+    }
+    if col == len || is_blank_ws(rest) {
+        return None;
+    }
+    if matches!(mark, b'-' | b'*')
+        && line.iter().all(|&b| b == mark || b == b' ' || b == b'\t')
+        && line.iter().filter(|&&b| b == mark).count() >= 3
+    {
+        return None;
+    }
+    // Five columns or more after the marker are an indented code block in the item.
+    let offset = if col - len > 4 { len + 1 } else { col };
+    Some(ListItem { mark, offset })
 }
 
 /// A line starting at column 0 that no list, quote, footnote or indented block before the blank

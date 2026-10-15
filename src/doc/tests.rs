@@ -923,6 +923,11 @@ fn segment_count(src: &str, budget: usize) -> usize {
     segment::plan(src, budget).map_or(1, |p| p.segments.len())
 }
 
+/// How many of the cuts at `budget` are between two items of a list.
+fn list_joins(src: &str, budget: usize) -> usize {
+    segment::plan(src, budget).map_or(0, |p| p.segments.iter().filter(|s| s.list).count())
+}
+
 /// Segmented parsing at `budget` bytes gives exactly the document one parser gives. Returns the
 /// number of segments, so callers can check that the text really was cut.
 fn assert_same(name: &str, src: &str, budget: usize) -> usize {
@@ -1342,6 +1347,21 @@ const FUZZ_LINES: &[&str] = &[
     "     ```",
     "   1. item",
     "  - [ ] task",
+    // List items of every shape, at the top level and below it.
+    "* star",
+    "2. two",
+    "3) three",
+    "- [x] done",
+    " - indented marker",
+    "  continuation",
+    "* * *",
+    "- - -",
+    "- ---",
+    "10) ten",
+    "-\titem after a tab",
+    "1234567890. too long",
+    "-",
+    "- ",
 ];
 
 fn fuzz_doc(rng: &mut Rng) -> String {
@@ -1425,6 +1445,12 @@ const FUZZ_BLOCKS: &[&str] = &[
     // Whitespace the scan has to see as pulldown-cmark does.
     "| a |\n|---|\n| 1 |\n\u{c}\n| 2 |\n| 3 |",
     "| a |\n|---|\n| 1 |\n\u{b}\n| 2 |\n| 3 |",
+    // Lists that other lists, text and blocks follow without a gap.
+    "- a\n- b\ntext right after\n- c",
+    "1. a\n2. b\n> quote after\n3. c",
+    "- a\n  - b\n- c\n\n  - d\n- e",
+    "* a\n* b\n\n+ c\n+ d\n\n- e\n- f",
+    "1. a\n2. b\n\n1) c\n2) d",
 ];
 
 /// A document of blocks, usually separated by a blank line (sometimes by none), maybe with front
@@ -1469,6 +1495,107 @@ fn mutated_doc(rng: &mut Rng) -> String {
         .collect()
 }
 
+/// Items of the lists of [`list_doc`], after their marker; the lines after the first are indented
+/// to the item's content.
+const LIST_ITEMS: &[&str] = &[
+    "item",
+    "item with `code`, *emphasis* and [a link](/u)",
+    "[ ] task",
+    "[x] done",
+    "[foo] and [baz][foo]",
+    "text\ncontinued",
+    "item\n- nested\n  - deeper",
+    "item\n1. nested ordered\n2. second",
+    "item\n\npara in item",
+    "item\n\n> quote\n>\n> more",
+    "> quote in item",
+    "item\n```\ncode\n```",
+    "item\n\n```\ncode\n\nwith a blank\n```",
+    "~~~\ntilde fence\n\n~~~",
+    "    code after the marker",
+    "# heading in item",
+    "item\n---",
+    "<div>\nhtml\n</div>",
+    "<!-- comment\n\nacross a gap -->",
+    "| a |\n|---|\n| 1 |",
+    "[^a] a note reference",
+    "[^n]: a note in an item\n\nnote text",
+    "[d]: /dest \"title\"",
+    "[e]: /dest2\n\"title on the next line\"",
+    "[q]: /q \"title\nover a blank\n\nline\"",
+    "![img](a.png)",
+    "",
+];
+
+/// Lines that end or interrupt a list, or only look like they continue it.
+const LIST_BREAKS: &[&str] = &[
+    "text",
+    "lazy",
+    " one space",
+    "> quote",
+    "# Heading",
+    "---",
+    "***",
+    "<div>",
+    "<!-- c -->",
+    "```",
+    "~~~",
+    "    indented code",
+    "| a |\n|---|\n| 1 |",
+    "[foo]: /url",
+    "[^a]: note",
+    "1234567890. not a marker",
+];
+
+/// Documents with long lists: bullets of each kind and ordered lists (starting anywhere, numbers
+/// that repeat, count up or are arbitrary, either delimiter) of items of every shape, tight and
+/// loose, with other lists, text and blocks in between.
+fn list_doc(rng: &mut Rng) -> String {
+    let mut src = String::new();
+    for _ in 0..rng.below(5) + 1 {
+        if rng.below(4) == 0 {
+            src.push_str(FUZZ_BLOCKS[rng.below(FUZZ_BLOCKS.len())]);
+            src.push_str("\n\n");
+            continue;
+        }
+        let kind = rng.below(5);
+        let bullet = ["-", "*", "+"][kind.min(2)];
+        let (ordered, delim) = (kind >= 3, if kind == 3 { '.' } else { ')' });
+        let (mut number, step) = (rng.below(12), rng.below(3));
+        // How often a blank line separates two items (0 = never: a tight list).
+        let gap = [0, 0, 1, 2, 3, 5][rng.below(6)];
+        for item in 0..rng.below(40) + 3 {
+            // Now and then an item of another list: another bullet, another delimiter.
+            let other = rng.below(25) == 0;
+            let mark = if ordered {
+                let delim = if other == (delim == ')') { '.' } else { ')' };
+                format!("{number}{delim}")
+            } else if other {
+                ["-", "*", "+"][rng.below(3)].to_owned()
+            } else {
+                bullet.to_owned()
+            };
+            number = [number + step, rng.below(100)][usize::from(rng.below(8) == 0)];
+            // Spaces after the marker; five or more make the content an indented code block.
+            let pad = [1, 1, 1, 1, 2, 3, 4, 5][rng.below(8)];
+            let indent = " ".repeat(mark.len() + if pad > 4 { 1 } else { pad });
+            let text = LIST_ITEMS[rng.below(LIST_ITEMS.len())];
+            let body = text.replace('\n', &format!("\n{indent}"));
+            let tab = if rng.below(30) == 0 { "\t" } else { "" };
+            src.push_str(&format!("{mark}{}{tab}{body}\n", " ".repeat(pad)));
+            if gap > 0 && item % gap == gap - 1 {
+                src.push('\n');
+            }
+            if rng.below(40) == 0 {
+                src.push_str(LIST_BREAKS[rng.below(LIST_BREAKS.len())]);
+                src.push('\n');
+            }
+        }
+        src.push_str(["\n", "\n\nAfter the list.\n\n", "\n"][rng.below(3)]);
+    }
+    src
+}
+
 /// `VOMD_FUZZ=<n>` runs `n` random documents of each kind instead of the default.
 fn fuzz_runs() -> usize {
     std::env::var("VOMD_FUZZ")
@@ -1501,6 +1628,22 @@ fn segmented_parse_matches_on_random_documents() {
             assert_same(&format!("mutated doc {i}\n{src}"), &src, budget);
         }
     }
+    // Long lists are cut between items, and every such cut joins up again.
+    LIST_MISFITS.with(|n| n.set(0));
+    let mut joins = 0;
+    for i in 0..fuzz_runs() {
+        let src = list_doc(&mut rng);
+        for budget in [1, 60, 400] {
+            assert_same(&format!("list doc {i}\n{src}"), &src, budget);
+            assert_eq!(
+                LIST_MISFITS.with(|n| n.get()),
+                0,
+                "list doc {i}\n{src}\n@ {budget}: the builder couldn't join the cuts in a list"
+            );
+            joins += list_joins(&src, budget);
+        }
+    }
+    assert!(joins > fuzz_runs() * 3, "only {joins} list cuts");
 }
 
 #[test]
@@ -2374,4 +2517,387 @@ fn heading_slugs_keep_marks_and_connectors_like_github() {
     for t in targets {
         assert!(doc.anchors.iter().any(|(s, _)| s == t), "dangling #{t}");
     }
+}
+
+/// Heading slugs with their block (into the final block list), anchors that way too.
+fn heading_blocks(doc: &Doc) -> Vec<(String, u32)> {
+    doc.headings
+        .iter()
+        .map(|h| (h.slug.clone(), h.block))
+        .collect()
+}
+
+#[test]
+fn headings_inside_footnotes_have_anchors() {
+    let src = "[go](#note-title) [^n]\n\n[^n]:\n    # Note title\n\n    text\n";
+    let doc = Doc::parse(src);
+    check_invariants(&doc);
+    check_anchors(&doc);
+    let at = doc
+        .anchors
+        .iter()
+        .find(|(id, _)| id == "note-title")
+        .expect("the link resolves")
+        .1;
+    assert!(matches!(
+        doc.blocks[at as usize].kind,
+        BlockKind::Heading(1)
+    ));
+    assert_eq!(block_text(&doc, &doc.blocks[at as usize]), "Note title");
+    // It is a heading of the document too, after the ones of the main flow.
+    assert_eq!(heading_blocks(&doc), [("note-title".to_owned(), at)]);
+    assert_eq!(Doc::parse_whole(src), doc);
+
+    // Definitions are listed by reference number: the headings and anchors follow them there, not
+    // where the definitions were written. A heading in a nested definition counts too.
+    let src = "# Top\n\nsee [x](#second) [y](#first) [z](#inner)\n\nb[^b] a[^a]\n\n\
+               [^a]:\n    # First\n\n    one\n\n\
+               [^b]:\n    ## Second\n\n    two\n    - [^c]:\n      ### Inner\n\n      deep\n";
+    let doc = Doc::parse(src);
+    check_invariants(&doc);
+    check_anchors(&doc);
+    let slugs: Vec<_> = doc.headings.iter().map(|h| h.slug.as_str()).collect();
+    assert_eq!(slugs, ["top", "second", "inner", "first"]);
+    for h in &doc.headings {
+        let anchor = doc.anchors.iter().find(|(id, _)| *id == h.slug).unwrap();
+        assert_eq!(anchor.1, h.block);
+        let want = match h.slug.as_str() {
+            "top" => "Top",
+            "second" => "Second",
+            "inner" => "Inner",
+            _ => "First",
+        };
+        assert!(
+            block_text(&doc, &doc.blocks[h.block as usize]).starts_with(want),
+            "{h:?}"
+        );
+    }
+    assert!(doc.headings.windows(2).all(|w| w[0].block < w[1].block));
+    assert_eq!(Doc::parse_whole(src), doc);
+}
+
+#[test]
+fn heading_slugs_stay_unique_across_the_text_and_its_footnotes() {
+    let src = "# Same\n\nx[^a][^b]\n\n# Same\n\n[^a]:\n    # Same\n\n    text\n\n\
+               [^b]:\n    # Same\n    # Same-1\n\n    text\n\n# Same\n\n[^b]: dropped\n    # Same\n";
+    let doc = Doc::parse(src);
+    check_invariants(&doc);
+    check_anchors(&doc);
+    // Slugs are handed out in text order, the unused suffixes first; a repeated definition (its
+    // text is dropped) takes none.
+    let slugs: Vec<_> = doc.headings.iter().map(|h| h.slug.as_str()).collect();
+    assert_eq!(
+        slugs,
+        ["same", "same-1", "same-4", "same-2", "same-3", "same-1-1"]
+    );
+    let links: Vec<_> = (0..slugs.len())
+        .map(|i| format!("[{i}](#{})", slugs[i]))
+        .collect();
+    let linked = Doc::parse(&format!("{}\n\n{src}", links.join(" ")));
+    check_anchors(&linked);
+    assert_eq!(linked.headings.len(), slugs.len());
+    assert_eq!(Doc::parse_whole(src), doc);
+}
+
+#[test]
+fn headings_inside_footnotes_segment_like_one_parser() {
+    let note = |i: usize| {
+        format!(
+            "Ref[^n{i}] and [x](#note-{i}).\n\n[^n{i}]:\n    # Note {i}\n\n    text\n\n# Note {i}\n\n"
+        )
+    };
+    let src: String = (0..12).map(note).collect();
+    for budget in [1, 100, 300] {
+        assert!(assert_same("footnote headings", &src, budget) > 1);
+    }
+    let doc = Doc::parse_whole(&src);
+    check_anchors(&doc);
+    assert_eq!(doc.headings.len(), 24);
+}
+
+/// `n` lines made by `line`, each with its line break.
+fn lines(n: usize, line: impl Fn(usize) -> String) -> String {
+    (0..n).map(|i| line(i) + "\n").collect()
+}
+
+/// The ordered markers of the blocks, in order (the number each item that has one is shown with).
+fn numbers(doc: &Doc) -> Vec<u32> {
+    doc.blocks
+        .iter()
+        .filter_map(|b| match b.marker {
+            Marker::Ordered(n) => Some(n),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Segmented parsing at `budget` equals one parser, cuts lists between items (more than `joins`
+/// of them), and the builder joins them up without falling back to one parser.
+fn assert_list_joins(name: &str, src: &str, budget: usize, joins: usize) {
+    LIST_MISFITS.with(|n| n.set(0));
+    assert_same(name, src, budget);
+    let at = list_joins(src, budget);
+    assert!(at > joins, "{name} @ {budget}: {at} list cuts");
+    assert!(
+        Doc::parse_segments(src, budget).is_some(),
+        "{name} @ {budget}: fell back to one parser"
+    );
+    assert_eq!(LIST_MISFITS.with(|n| n.get()), 0, "{name} @ {budget}");
+}
+
+#[test]
+fn segmented_parse_cuts_lists_between_items() {
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for marker in ["-", "*", "+", "1.", "1)", "7.", "0.", "5)", "999999999."] {
+        cases.push((
+            format!("tight {marker}"),
+            lines(40, |i| {
+                format!("{marker} item {i} with `code` and [a link](/u{i})")
+            }),
+        ));
+        // Blank lines make a list loose wherever they are: between every item, only after the
+        // first, only before the last, or only in some segment far from the cut.
+        for (gap, name) in [(1, "every"), (7, "7th"), (40, "last")] {
+            let src: String = (0..40)
+                .map(|i| {
+                    let blank = if i % gap == gap - 1 && i < 39 {
+                        "\n"
+                    } else {
+                        ""
+                    };
+                    format!("{marker} item {i}\n{blank}")
+                })
+                .collect();
+            cases.push((format!("loose {marker} ({name})"), src));
+        }
+    }
+    // Ordered numbers: repeated, written any way at all.
+    let any = [5, 9, 2, 100, 0, 3, 3, 3, 14, 1];
+    for delim in ['.', ')'] {
+        cases.push((
+            format!("any numbers {delim}"),
+            lines(40, |i| format!("{}{delim} item {i}", any[i % any.len()])),
+        ));
+        cases.push((
+            format!("counting {delim}"),
+            lines(40, |i| format!("{}{delim} item {i}", i + 3)),
+        ));
+    }
+    // Items that hold other blocks, tight and loose; the text of an item after a code block
+    // or a quote, tasks.
+    let rich = [
+        "- [ ] task {i}",
+        "- [x] done {i}",
+        "- item {i}\n  - nested\n    - deeper",
+        "- item {i}\n\n  ```rust\n  fn f() {{}}\n\n  ```\n",
+        "- item {i}\n  > quote\n  > more",
+        "- > quote {i}\n  >\n  > - in it",
+        "- item {i}\n\n  | a |\n  |---|\n  | 1 |",
+        "- # heading {i}\n  text",
+        "- item {i}\n\n      indented code\n\n  after",
+        "- <div>{i}</div>",
+        "-   spaced {i}",
+        "-\ttabbed {i}",
+    ];
+    cases.push((
+        "rich bullets".into(),
+        lines(48, |i| rich[i % rich.len()].replace("{i}", &i.to_string())),
+    ));
+    cases.push((
+        "rich ordered".into(),
+        lines(48, |i| {
+            let item = rich[i % rich.len()].replace("{i}", &i.to_string());
+            let indented = item.replace("\n  ", "\n   ");
+            format!("{}. {}", i % 7, &indented[2..])
+        }),
+    ));
+    // A list followed by text, with more list after it.
+    cases.push((
+        "list, text, list".into(),
+        lines(60, |i| format!("1. a{i}")) + "\nText.\n\n" + &lines(60, |i| format!("1. b{i}")),
+    ));
+    for (name, src) in &cases {
+        for budget in [1, 40, 200] {
+            let joins = if budget == 200 { 0 } else { 2 };
+            assert_list_joins(name, src, budget, joins);
+        }
+    }
+}
+
+#[test]
+fn joined_lists_keep_their_numbers_and_depth() {
+    // One list, numbered from its first number whatever later items say.
+    let src = lines(30, |i| format!("{}. item {i}", [7, 1, 9][i % 3]));
+    assert_list_joins("numbers", &src, 30, 5);
+    let doc = Doc::parse_segments(&src, 30).unwrap();
+    assert_eq!(numbers(&doc), (7..37).collect::<Vec<_>>());
+    assert!(doc.blocks.iter().all(|b| b.list == 1));
+    // `1.` repeated.
+    let src = lines(30, |i| format!("1. item {i}"));
+    assert_list_joins("ones", &src, 30, 5);
+    assert_eq!(
+        numbers(&Doc::parse_segments(&src, 30).unwrap()),
+        (1..=30).collect::<Vec<_>>()
+    );
+    // A list that ends is not continued: the next one starts again at its own number. The
+    // delimiter makes a list of its own, so does the text between.
+    for src in [
+        lines(12, |i| format!("1. a{i}")) + &lines(12, |i| format!("1) b{i}")),
+        lines(12, |i| format!("1. a{i}\n")) + &lines(12, |i| format!("5) b{i}\n")),
+        lines(12, |i| format!("1. a{i}")) + "\ntext\n\n" + &lines(12, |i| format!("1. b{i}")),
+        lines(12, |i| format!("1. a{i}")) + "\n---\n\n" + &lines(12, |i| format!("3. b{i}")),
+        lines(12, |i| format!("3. a{i}")) + "\n<!-- x -->\n\n" + &lines(12, |i| format!("9. b{i}")),
+        "> 3. quoted\n> 4. items\n\n".to_owned() + &lines(12, |i| format!("1. b{i}")),
+        "- a\n  - b\n\n".to_owned() + &lines(12, |i| format!("1. b{i}")),
+    ] {
+        for budget in [1, 20, 60] {
+            assert_same("two lists", &src, budget);
+            let n = |doc: &Doc| numbers(doc);
+            let (whole, parts) = (Doc::parse_whole(&src), Doc::parse(&src));
+            assert_eq!(n(&whole), n(&parts));
+            if let Some(parts) = Doc::parse_segments(&src, budget) {
+                // Neither list's numbers go on in the other.
+                assert_eq!(n(&whole), n(&parts), "{src:?}");
+            }
+        }
+    }
+    let src = lines(12, |i| format!("1. a{i}")) + &lines(12, |i| format!("1) b{i}"));
+    let doc = Doc::parse_segments(&src, 20).unwrap();
+    let want: Vec<u32> = (1..=12).chain(1..=12).collect();
+    assert_eq!(numbers(&doc), want);
+}
+
+#[test]
+fn lists_are_not_cut_where_they_may_end_or_be_another_list() {
+    // After ten items a line that ends the list, or may (lazy text, a quote, a rule, HTML, ...),
+    // with or without blank lines, then ten more items of the same kind (a new list), which are
+    // not joined to the first.
+    let breaks = [
+        "text",
+        "lazy continuation",
+        " one space",
+        "> quote",
+        " > quote",
+        "# Heading",
+        "---",
+        "***",
+        "- - -",
+        "* * *",
+        "<div>",
+        "<!-- c -->",
+        "```\ncode\n```",
+        "~~~",
+        "[foo]: /url",
+        "[^a]: note",
+        "| a |\n|---|\n| 1 |",
+        "1234567890. not a marker",
+        "-",
+        "- ",
+        "-\t",
+        "10.",
+        "* other bullet",
+        "+ another bullet",
+    ];
+    for brk in breaks {
+        for gaps in [("", ""), ("\n", "\n"), ("", "\n"), ("\n", "")] {
+            for marker in ["-", "1."] {
+                let first = lines(10, |i| format!("{marker} a{i}"));
+                let second = lines(10, |i| format!("{marker} b{i}"));
+                let src = format!("{first}{}{brk}\n{}{second}", gaps.0, gaps.1);
+                let at = first.len() + gaps.0.len() + brk.len() + 1 + gaps.1.len();
+                for budget in [1, 25] {
+                    assert_same(brk, &src, budget);
+                    let plan = segment::plan(&src, budget).unwrap();
+                    // The first item after the break may start a segment only if it isn't one
+                    // that goes on with the list before it.
+                    assert!(
+                        plan.segments
+                            .iter()
+                            .all(|s| !(s.range.start == at && s.list)),
+                        "{brk:?} {gaps:?} {marker}: joined to the list before it"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_list_start_is_certain_before_it_is_cut() {
+    // A list inside a quote or a footnote, or one that only looks like one, is not top-level.
+    for head in [
+        "> - a\n> - b\n",
+        "> 1. a\n> 2. b\n",
+        "[^n]: note\n    - a\n    - b\n",
+        "    - a\n    - b\n",
+        "text\n2. a\n3. b\n",
+        "<div>\n- a\n- b\n",
+        "```\n- a\n- b\n```\n",
+        "1234567890. a\n1234567890. b\n",
+        "-a\n-b\n",
+        "- - -\n- - -\n",
+        "-\n-\n",
+    ] {
+        let src = head.repeat(30) + "- x\n- y\n";
+        for budget in [1, 20, 100] {
+            assert_same(head, &src, budget);
+            let src = format!("{head}\n{}", lines(12, |i| format!("1. n{i}")));
+            assert_same(head, &src, budget);
+        }
+    }
+}
+
+#[test]
+fn a_giant_list_is_cut_between_its_items() {
+    // A generated file index: one list of 116,280 items, 5.0 MB.
+    let src = lines(116_280, |i| {
+        format!("- [module_{i:06}.rs](src/module_{i:06}.rs)")
+    });
+    assert!(src.len() > 5_000_000);
+    let plan = segment::plan(&src, SEGMENT_BYTES).expect("a list is cut");
+    let longest = plan.segments.iter().map(|s| s.range.len()).max().unwrap();
+    assert!(
+        plan.segments.len() >= src.len() / SEGMENT_BYTES,
+        "{} segments",
+        plan.segments.len()
+    );
+    assert!(longest < SEGMENT_BYTES + 100, "{longest} bytes");
+    assert!(plan.segments[1..].iter().all(|s| s.list));
+    assert!(!plan.segments[0].list);
+    // It parses to the same document either way (a smaller one, which keeps the test quick, with
+    // the real thresholds).
+    let src = lines(26_000, |i| {
+        format!("{}. [module_{i:06}.rs](src/module_{i:06}.rs)", i % 3 + 1)
+    });
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    let doc = Doc::parse(&src);
+    check_invariants(&doc);
+    assert!(doc == Doc::parse_whole(&src));
+    assert_eq!(doc.blocks.len(), 26_000);
+    assert_eq!(numbers(&doc).last(), Some(&26_000));
+}
+
+#[test]
+fn segments_that_do_not_fit_a_list_are_refused() {
+    // The planner said the next segment goes on with the list: if it doesn't start with one (or
+    // the list that ends isn't a top-level one), the builder says so instead of guessing.
+    LIST_MISFITS.with(|n| n.set(0));
+    let mut b = Builder::new(0);
+    b.begin_segment(0, false, true);
+    for event in Parser::new_ext("text\n", options()) {
+        b.event(event);
+    }
+    assert!(b.broken);
+    let mut b = Builder::new(0);
+    b.begin_segment(0, false, true);
+    for event in Parser::new_ext("1. a\n", options()) {
+        b.event(event);
+    }
+    assert!(b.broken, "an ordered list can't continue nothing");
+    let mut b = Builder::new(0);
+    let mut events = Parser::new_ext("> - a\n", options()).collect::<Vec<_>>();
+    let end = events.pop().unwrap();
+    assert!(matches!(end, Event::End(TagEnd::BlockQuote(_))));
+    assert!(!b.hold_list(&end));
+    assert_eq!(LIST_MISFITS.with(|n| n.replace(0)), 3);
 }

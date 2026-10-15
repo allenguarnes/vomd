@@ -192,6 +192,8 @@ pub struct Table {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heading {
     pub level: u8,
+    /// Index into [`Doc::blocks`]. Headings inside footnote definitions come after the others,
+    /// in the order the definitions are listed.
     pub block: u32,
     /// GitHub-compatible anchor slug (also present in [`Doc::anchors`]).
     pub slug: String,
@@ -262,7 +264,7 @@ impl Doc {
         for (n, seg) in plan.segments.iter().enumerate() {
             let stubs = defs.footnote_stubs(&src[seg.range.clone()]);
             let text = plan.text(src, n, &stubs);
-            b.begin_segment(stubs.len(), seg.head.is_some());
+            b.begin_segment(stubs.len(), seg.head.is_some(), seg.list);
             let links = &defs.links;
             let resolve = move |link: BrokenLink<'_>| {
                 let (dest, title) = links.get(&UniCase::new(link.reference.into_string()))?;
@@ -270,10 +272,13 @@ impl Doc {
             };
             // Without definitions there is nothing to look up (and no callback to make).
             let resolve = (!links.is_empty()).then_some(resolve);
-            let parser = Parser::new_with_broken_link_callback(&text, opts, resolve);
+            let mut events = Parser::new_with_broken_link_callback(&text, opts, resolve).peekable();
+            // The list this segment ends in goes on in the next one: the end of the list is held
+            // back, the next segment's start of its list is dropped (see `Builder::hold_list`).
+            let held = plan.segments.get(n + 1).is_some_and(|next| next.list);
             let mut open = 0i64;
             let mut expanded = 0usize;
-            for event in parser {
+            while let Some(event) = events.next() {
                 match &event {
                     Event::Start(tag) => {
                         open += 1;
@@ -282,13 +287,19 @@ impl Doc {
                     Event::End(_) => open -= 1,
                     _ => {}
                 }
+                if held && events.peek().is_none() {
+                    if !b.hold_list(&event) {
+                        return None;
+                    }
+                    break;
+                }
                 b.event(event);
             }
             // pulldown-cmark ends its events early on some malformed input (a link definition
             // in a list item followed by a line of whitespace, say), losing the rest of the
             // text. Whatever one parser makes of that, segments can't repeat it. (Nor if a stub
             // didn't come out as a definition.)
-            if open != 0 || b.footnotes.stubs != 0 {
+            if open != 0 || b.footnotes.stubs != 0 || b.broken {
                 return None;
             }
             // A parser stops resolving references once their destinations and titles add up to
@@ -366,9 +377,12 @@ struct Footnotes {
     active: bool,
     /// Main-flow `quote_start` set aside while a definition is open.
     quote_start: u8,
-    /// Anchors that point into `blocks` (references inside definitions) until `finish` moves
-    /// the definitions into the document.
+    /// Anchors that point into `blocks` (references and headings inside definitions) until
+    /// `finish` moves the definitions into the document.
     local: Vec<usize>,
+    /// Headings inside definitions, as (index into `blocks`, level, slug): they follow the
+    /// headings of the main flow, in the order the definitions end up in (see `finish`).
+    headings: Vec<(usize, u8, String)>,
     /// Anchor and link targets that name a footnote by number. Their ids are allocated in
     /// `finish`, after every heading, so a heading's slug is never taken from it.
     ref_anchors: Vec<(usize, u32)>,
@@ -428,6 +442,12 @@ struct Builder {
     continue_table: bool,
     /// Skipping the repeated header rows of a continued table.
     skip_head: bool,
+    /// The segment's first block is another part of the list the previous segment ended in (see
+    /// `hold_list`): its list start is dropped.
+    continue_list: bool,
+    /// The segments didn't fit together as the planner said (a list that wasn't one, say): the
+    /// parse can't go on in segments.
+    broken: bool,
     /// Skipping a footnote definition (a stub, or a repeat of a label): its depth (see
     /// `fn_depth`), 0 when not skipping. Definitions of new labels inside it are not skipped.
     skip_def: usize,
@@ -468,6 +488,8 @@ impl Builder {
             row: None,
             continue_table: false,
             skip_head: false,
+            continue_list: false,
+            broken: false,
             skip_def: 0,
             fn_depth: 0,
             suspended: Vec::new(),
@@ -479,11 +501,43 @@ impl Builder {
     }
 
     /// Start a segment of a segmented parse. It begins with `stubs` footnote definitions that
-    /// only declare labels; `continued` means it starts with a repeat of the previous segment's
-    /// last table header.
-    fn begin_segment(&mut self, stubs: usize, continued: bool) {
+    /// only declare labels; `table` means it starts with a repeat of the previous segment's last
+    /// table header, `list` that it goes on with the list the previous segment ended in.
+    fn begin_segment(&mut self, stubs: usize, table: bool, list: bool) {
         self.footnotes.stubs = stubs;
-        self.continue_table = continued;
+        self.continue_table = table;
+        self.continue_list = list;
+    }
+
+    /// The last event of a segment that the next one continues, which is the end of the
+    /// top-level list it ends in. Instead of ending the list the builder keeps it open (its
+    /// nesting, and the number of the next item if it is ordered), and the next segment's list
+    /// start is dropped: a cut between two items doesn't change what is built (a tight list's
+    /// text has no paragraph events, a loose list's has, and both make the same paragraph).
+    /// Whether this is so is checked: `false` if the event is anything else.
+    fn hold_list(&mut self, event: &Event) -> bool {
+        let held = matches!(event, Event::End(TagEnd::List(_)))
+            && self.lists.len() == 1
+            && self.open.is_none()
+            && self.quote == 0
+            && self.fn_depth == 0
+            && self.skip_def == 0
+            && self.html_block.is_none()
+            && self.image.is_none()
+            && !self.continue_list;
+        if !held {
+            self.misfit();
+        }
+        held
+    }
+
+    /// The segments don't fit together the way the planner said they would.
+    fn misfit(&mut self) {
+        #[cfg(test)]
+        if !self.broken {
+            LIST_MISFITS.with(|n| n.set(n.get() + 1));
+        }
+        self.broken = true;
     }
 
     fn event(&mut self, event: Event) {
@@ -518,6 +572,13 @@ impl Builder {
                 }
                 _ => return,
             }
+        }
+        if self.continue_list
+            && !matches!(&event, Event::Start(Tag::List(_)))
+            && !(self.footnotes.stubs > 0
+                && matches!(event, Event::Start(Tag::FootnoteDefinition(_))))
+        {
+            self.misfit();
         }
         if let Some(html) = &mut self.html_block {
             match event {
@@ -609,6 +670,12 @@ impl Builder {
                         BlockQuoteKind::Caution => Alert::Caution,
                     };
                     self.push_block(BlockKind::AlertTitle(alert), 0..0);
+                }
+            }
+            Tag::List(start) if std::mem::take(&mut self.continue_list) => {
+                // Items go on in the held list, if it is of the same kind.
+                if self.lists.len() != 1 || self.lists[0].is_some() != start.is_some() {
+                    self.misfit();
                 }
             }
             Tag::List(start) => {
@@ -870,16 +937,26 @@ impl Builder {
         if kind == BlockKind::Paragraph && spans.is_empty() && self.marker == Marker::None {
             return;
         }
+        let first_block = self.block_count();
         if let BlockKind::Heading(level) = kind
-            && !self.footnotes.active
             && let Some(slug) = self.slug(spans.clone())
         {
             // Anchors point at the first chunk of a split heading.
-            let block = self.doc.blocks.len() as u32;
-            self.doc.anchors.push((slug.clone(), block));
-            self.doc.headings.push(Heading { level, block, slug });
+            let block = first_block as u32;
+            if self.footnotes.active {
+                // A heading in a footnote has its id like any other (GitHub renders one), but the
+                // block index is into the definitions' blocks for now: `finish` moves the
+                // definitions and the anchor and heading with them.
+                self.footnotes.local.push(self.doc.anchors.len());
+                self.footnotes
+                    .headings
+                    .push((first_block, level, slug.clone()));
+                self.doc.anchors.push((slug, block));
+            } else {
+                self.doc.anchors.push((slug.clone(), block));
+                self.doc.headings.push(Heading { level, block, slug });
+            }
         }
-        let first_block = self.block_count();
         let block_spans = &self.doc.spans[spans.start as usize..];
         let bytes = match (block_spans.first(), block_spans.last()) {
             (Some(first), Some(last)) => last.end as usize - first.start as usize,
@@ -1393,6 +1470,16 @@ impl Builder {
                 let at = self.doc.anchors[anchor].1 as usize;
                 self.doc.anchors[anchor].1 = moved[at];
             }
+            let mut noted: Vec<Heading> = std::mem::take(&mut self.footnotes.headings)
+                .into_iter()
+                .map(|(at, level, slug)| Heading {
+                    level,
+                    block: moved[at],
+                    slug,
+                })
+                .collect();
+            noted.sort_by_key(|h| h.block);
+            self.doc.headings.append(&mut noted);
         }
         self.doc
     }
@@ -1533,6 +1620,9 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 thread_local! {
     static ROW_CELL_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Cuts in lists that the builder couldn't join up again, on this thread: the planner and the
+    /// builder disagree about a list (tests expect none).
+    static LIST_MISFITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A table cell whose text is being cut into pieces: `spans` are its spans, `at..end` the text
