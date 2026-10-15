@@ -48,6 +48,18 @@ fn keys() {
         (ch("q"), ModifiersState::ALT, None),
         (ch("="), none, None),
         (ch("x"), none, None),
+        (ch("["), none, Some(Action::PrevHeading)),
+        (ch("]"), none, Some(Action::NextHeading)),
+        (Key::Named(NamedKey::Backspace), none, Some(Action::Back)),
+        (
+            Key::Named(NamedKey::ArrowLeft),
+            ModifiersState::ALT,
+            Some(Action::Back),
+        ),
+        (ch("["), ModifiersState::SUPER, Some(Action::Back)),
+        (ch("["), ctrl, Some(Action::Back)),
+        (Key::Named(NamedKey::ArrowLeft), none, None),
+        (ch("]"), ModifiersState::ALT, None),
     ];
     for (key, mods, want) in cases {
         assert_eq!(key_action(&key, mods), want, "{key:?} {mods:?}");
@@ -1148,5 +1160,166 @@ mod with_fonts {
         assert!(covered(&v, BOX));
         assert_eq!(v.font_sources().len(), 1);
         assert!(!v.add_fallbacks(&found), "once");
+    }
+
+    /// A window point over the first glyph of `needle` in block `block` (laid out).
+    fn point_at(v: &View, block: usize, needle: &str) -> (f64, f64) {
+        let doc = v.doc();
+        let b = &doc.blocks[block];
+        let span = doc
+            .block_spans(b)
+            .iter()
+            .find(|s| doc.span_text(s).contains(needle))
+            .expect("needle in block");
+        let offset = span.start + doc.span_text(span).find(needle).unwrap() as u32;
+        let content = v.layout().geoms()[block]
+            .content
+            .as_ref()
+            .expect("laid out");
+        let line = content
+            .lines
+            .iter()
+            .find(|l| {
+                content.hits[l.hits.start as usize..l.hits.end as usize]
+                    .iter()
+                    .any(|h| h.doc >= offset)
+            })
+            .unwrap();
+        let hit = content.hits[line.hits.start as usize..line.hits.end as usize]
+            .iter()
+            .find(|h| h.doc >= offset)
+            .unwrap();
+        let (col_x, _) = v.layout().column();
+        let x = f64::from(col_x + (hit.x0 + hit.x1) / 2.0);
+        let y = v.layout().top(block) - v.scroll() + f64::from((line.top + line.bottom) / 2.0);
+        (x, y)
+    }
+
+    #[test]
+    fn links_hover_and_click() {
+        let now = Instant::now();
+        let mut v = view(
+            "Intro with [a link](https://example.com/x) and plain words here.\n\n# Target\n",
+            600,
+            400,
+        );
+        settle(&mut v);
+        let (lx, ly) = point_at(&v, 0, "a link");
+        let (px, py) = point_at(&v, 0, "plain");
+        assert_eq!(
+            v.doc().links[v.link_at(lx, ly).unwrap() as usize - 1],
+            "https://example.com/x"
+        );
+        assert_eq!(v.link_at(px, py), None);
+        assert!(v.hover(lx, ly), "entering a link changes the hover");
+        assert_eq!(v.hovered(), Some("https://example.com/x"));
+        assert!(!v.hover(lx + 1.0, ly), "same link");
+        assert!(v.hover(px, py));
+        assert_eq!(v.hovered(), None);
+        v.hover(lx, ly);
+        assert!(v.hover_end());
+        assert_eq!(v.hovered(), None);
+        // A click is press and release on the same link.
+        assert!(!v.press(lx, ly, now), "the scrollbar doesn't take it");
+        assert_eq!(v.click(lx, ly).as_deref(), Some("https://example.com/x"));
+        assert_eq!(v.click(lx, ly), None, "one click per press");
+        v.press(lx, ly, now);
+        assert_eq!(v.click(px, py), None, "released elsewhere");
+        v.press(px, py, now);
+        assert_eq!(v.click(lx, ly), None, "pressed elsewhere");
+        // The preview is painted at the bottom left while hovering.
+        let mut buf = vec![0; 600 * 400];
+        v.paint(&mut buf, 600, now);
+        let corner =
+            |buf: &[u32]| (390..396).any(|y| (6..40).any(|x| buf[y * 600 + x] != LIGHT.bg));
+        assert!(!corner(&buf));
+        v.hover(lx, ly);
+        v.paint(&mut buf, 600, now);
+        assert!(corner(&buf), "preview box drawn");
+        // A new document forgets the link under the pointer.
+        v.replace(Doc::parse("Other."), None);
+        assert_eq!(v.hovered(), None);
+    }
+
+    #[test]
+    fn anchors_and_footnotes_jump() {
+        let now = Instant::now();
+        let src = format!(
+            "# Top\n\nSee [below](#far-section) and a note[^n].\n\n{}## Far Section\n\n{}[^n]: The note.\n",
+            paras(80),
+            paras(30)
+        );
+        let mut v = view(&src, 600, 400);
+        settle(&mut v);
+        let far = v
+            .doc()
+            .headings
+            .iter()
+            .find(|h| h.slug == "far-section")
+            .unwrap()
+            .block;
+        assert!(v.jump_to_anchor("far-section", now));
+        assert_eq!(
+            v.anchor(),
+            Anchor {
+                block: far,
+                frac: 0.0
+            }
+        );
+        assert!(
+            v.jump_to_anchor("FAR-SECTION", now),
+            "case-insensitive fallback"
+        );
+        assert!(!v.jump_to_anchor("missing", now));
+        assert_eq!(v.anchor().block, far, "a missing anchor doesn't move");
+        // Footnote reference → note.
+        let note = v.doc().anchors.iter().find(|(s, _)| s == "fn-n").unwrap().1;
+        assert!(v.jump_to_anchor("fn-n", now));
+        // The note is at the end: the view settles at the bottom with the note on screen.
+        let shown = v.layout().range_exact(v.scroll(), v.scroll() + 400.0);
+        assert!(shown.contains(&(note as usize)), "{shown:?} {note}");
+        assert!(v.jump_to_anchor("", now));
+        assert_eq!(v.scroll(), 0.0);
+        // Back-stack positions are clamped into the document.
+        v.set_anchor(Anchor {
+            block: 1_000_000,
+            frac: 3.0,
+        });
+        assert!(v.anchor().block < v.doc().blocks.len() as u32);
+    }
+
+    #[test]
+    fn heading_navigation() {
+        let now = Instant::now();
+        let src = format!(
+            "# One\n\n{}## Two\n\n{}## Three\n\n{}",
+            paras(20),
+            paras(20),
+            paras(20)
+        );
+        let mut v = view(&src, 600, 400);
+        settle(&mut v);
+        let blocks: Vec<u32> = v.doc().headings.iter().map(|h| h.block).collect();
+        assert_eq!(blocks.len(), 3);
+        assert!(v.heading(1, now));
+        assert_eq!(v.anchor().block, blocks[1]);
+        assert!(v.heading(1, now));
+        assert_eq!(v.anchor().block, blocks[2]);
+        assert!(!v.heading(1, now), "no heading after the last");
+        assert!(v.heading(-1, now));
+        assert_eq!(v.anchor().block, blocks[1]);
+        // From the middle of a section, back goes to its own heading first.
+        v.scroll_by(200.0, now);
+        assert!(v.heading(-1, now));
+        assert_eq!(v.anchor().block, blocks[1]);
+        assert!(v.heading(-1, now));
+        assert_eq!(v.anchor().block, blocks[0]);
+        assert!(
+            !v.heading(-1, now),
+            "already at the first heading (at the top)"
+        );
+        assert_eq!(v.apply(Action::NextHeading, now), Outcome::Redraw);
+        assert_eq!(v.anchor().block, blocks[1]);
+        assert_eq!(v.apply(Action::Back, now), Outcome::Back);
     }
 }

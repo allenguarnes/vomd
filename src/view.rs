@@ -26,6 +26,8 @@ use crate::theme::{DARK, LIGHT, Role, Theme};
 pub const ZOOM_MIN: u16 = 50;
 pub const ZOOM_MAX: u16 = 300;
 pub const ZOOM_STEP: u16 = 10;
+/// Font size of the link preview, in logical pixels.
+const PREVIEW_SIZE: f32 = 12.0;
 /// Space above and below the document, in em (GitHub pads its pages about this much).
 const PAGE_PAD: f32 = 2.0;
 /// Ctrl + trackpad scroll zooms one step per this many pixels.
@@ -50,6 +52,11 @@ pub enum Action {
     ZoomReset,
     Reload,
     CycleTheme,
+    /// Jump to the previous / next heading (`[` / `]`).
+    PrevHeading,
+    NextHeading,
+    /// Go back after following a link.
+    Back,
     Quit,
 }
 
@@ -60,6 +67,8 @@ pub enum Outcome {
     Redraw,
     /// Re-read the document ([`read_input`]) and pass it to [`View::replace`].
     Reload,
+    /// Return to the last place on the back stack (the shell owns it: it may be another file).
+    Back,
     Quit,
 }
 
@@ -113,13 +122,18 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
                 "-" | "_" => Some(Action::ZoomOut),
                 "0" => Some(Action::ZoomReset),
                 "w" | "W" => Some(Action::Quit),
+                // Cmd+[ is the macOS back key; Ctrl+[ goes back on Linux too.
+                "[" => Some(Action::Back),
                 _ => None,
             },
             _ => None,
         };
     }
     if mods.alt_key() {
-        return None;
+        return match key {
+            Key::Named(NamedKey::ArrowLeft) => Some(Action::Back),
+            _ => None,
+        };
     }
     match key {
         Key::Named(named) => match named {
@@ -132,6 +146,7 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             NamedKey::Home => Some(Action::Top),
             NamedKey::End => Some(Action::Bottom),
             NamedKey::F5 => Some(Action::Reload),
+            NamedKey::Backspace => Some(Action::Back),
             NamedKey::Escape => Some(Action::Quit),
             _ => None,
         },
@@ -147,6 +162,8 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             "r" | "R" => Some(Action::Reload),
             "t" | "T" => Some(Action::CycleTheme),
             "q" | "Q" => Some(Action::Quit),
+            "[" => Some(Action::PrevHeading),
+            "]" => Some(Action::NextHeading),
             _ => None,
         },
         _ => None,
@@ -235,6 +252,10 @@ pub struct View {
     msg_missing: BTreeSet<char>,
     /// Ctrl + trackpad scroll not yet turned into zoom steps.
     zoom_pixels: f64,
+    /// The link under the pointer (1-based id into `Doc::links`): pointer cursor and URL preview.
+    hover: Option<u32>,
+    /// The link the mouse button went down on; a click is a release on the same link.
+    pressed: Option<u32>,
     /// While a message replaces a reloaded document: the reading position of the last good
     /// one, for the next successful reload (a file that is briefly missing, as editors and
     /// branch switches make it, doesn't cost the position).
@@ -275,6 +296,8 @@ impl View {
             tried: HashSet::new(),
             msg_missing: BTreeSet::new(),
             zoom_pixels: 0.0,
+            hover: None,
+            pressed: None,
             kept: None,
         }
     }
@@ -480,6 +503,13 @@ impl View {
             Action::ZoomOut => self.set_zoom(self.zoom.saturating_sub(ZOOM_STEP)),
             Action::ZoomReset => self.set_zoom(100),
             Action::CycleTheme => self.theme = self.theme.next(),
+            Action::PrevHeading => {
+                self.heading(-1, now);
+            }
+            Action::NextHeading => {
+                self.heading(1, now);
+            }
+            Action::Back => return Outcome::Back,
             Action::Reload => return Outcome::Reload,
             Action::Quit => return Outcome::Quit,
         }
@@ -514,6 +544,13 @@ impl View {
     /// scrollbar is showing, so links and other things under a hidden one stay clickable.
     /// Returns true if it took the press.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        let taken = self.press_scrollbar(x, y, now);
+        // Not the scrollbar's: remember the link under it, for a click on release.
+        self.pressed = if taken { None } else { self.link_at(x, y) };
+        taken
+    }
+
+    fn press_scrollbar(&mut self, x: f64, y: f64, now: Instant) -> bool {
         let Some(t) = self.thumb_at(self.scroll()) else {
             return false;
         };
@@ -568,6 +605,96 @@ impl View {
         self.drag.is_some()
     }
 
+    // ---- Links and headings ---------------------------------------------------------------
+
+    /// The link (1-based id into `Doc::links`) under window point (`x`, `y`), if any. Only
+    /// blocks near the viewport have content to hit, which covers everything on screen.
+    pub fn link_at(&self, x: f64, y: f64) -> Option<u32> {
+        if self.message.is_some() || y < f64::from(self.top_inset) {
+            return None;
+        }
+        let doc_y = self.scroll() + (y - f64::from(self.top_inset));
+        let hit = self.layout.hit(x as f32, doc_y as f32)?;
+        (hit.link != 0).then_some(hit.link)
+    }
+
+    /// The pointer moved to (`x`, `y`). Returns true if the link under it changed: repaint
+    /// for the URL preview (and switch the pointer cursor, see [`View::hovered`]).
+    pub fn hover(&mut self, x: f64, y: f64) -> bool {
+        let link = if self.drag.is_some() {
+            None
+        } else {
+            self.link_at(x, y)
+        };
+        std::mem::replace(&mut self.hover, link) != link
+    }
+
+    /// The pointer left the window. Returns true if a link was hovered.
+    pub fn hover_end(&mut self) -> bool {
+        self.hover.take().is_some()
+    }
+
+    /// The target of the hovered link, as written in the document.
+    pub fn hovered(&self) -> Option<&str> {
+        let id = self.hover? as usize;
+        self.doc.links.get(id.checked_sub(1)?).map(String::as_str)
+    }
+
+    /// The mouse button came up at (`x`, `y`): the target of the link clicked (pressed and
+    /// released on the same link), if any.
+    pub fn click(&mut self, x: f64, y: f64) -> Option<String> {
+        let pressed = self.pressed.take()?;
+        if self.link_at(x, y) != Some(pressed) {
+            return None;
+        }
+        self.doc.links.get(pressed as usize - 1).cloned()
+    }
+
+    /// Scroll to the heading or footnote a `#fragment` names. Returns false if there's none.
+    pub fn jump_to_anchor(&mut self, fragment: &str, now: Instant) -> bool {
+        let Some(block) = crate::nav::find_anchor(&self.doc, fragment) else {
+            return false;
+        };
+        self.set_anchor(Anchor { block, frac: 0.0 });
+        self.fade.poke(now);
+        true
+    }
+
+    /// Go to a reading position (from the back stack), kept inside the document.
+    pub fn set_anchor(&mut self, anchor: Anchor) {
+        let n = self.doc.blocks.len() as u32;
+        self.anchor = if n == 0 {
+            Anchor::TOP
+        } else {
+            Anchor {
+                block: anchor.block.min(n - 1),
+                frac: anchor.frac.clamp(0.0, 1.0),
+            }
+        };
+        self.ensure();
+    }
+
+    /// Jump to the next (`dir` > 0) or previous heading from the reading position. Returns
+    /// false if there's none that way.
+    pub fn heading(&mut self, dir: i32, now: Instant) -> bool {
+        let at = self.scroll();
+        let mut blocks: Vec<u32> = self.doc.headings.iter().map(|h| h.block).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        let top = |b: u32| self.layout.top(b as usize);
+        let target = if dir > 0 {
+            blocks.iter().copied().find(|&b| top(b) > at + 0.5)
+        } else {
+            blocks.iter().rev().copied().find(|&b| top(b) < at - 0.5)
+        };
+        let Some(block) = target else {
+            return false;
+        };
+        self.set_anchor(Anchor { block, frac: 0.0 });
+        self.fade.poke(now);
+        true
+    }
+
     // ---- Layout and painting --------------------------------------------------------------
 
     /// Lay out the blocks around the reading position, keeping it inside the document.
@@ -611,6 +738,69 @@ impl View {
             let total = self.layout.total_height();
             render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
         }
+        if let Some(url) = self.hovered().map(str::to_owned) {
+            self.paint_preview(&mut frame, &url, theme);
+        }
+    }
+
+    /// The hovered link's target in a small box at the bottom left, cut short with
+    /// an ellipsis when it doesn't fit.
+    fn paint_preview(&mut self, frame: &mut Frame, url: &str, theme: &Theme) {
+        let (w, h) = (frame.width() as f32, frame.height() as f32);
+        let scale = self.scale();
+        let size = PREVIEW_SIZE * scale;
+        let style = TextStyle {
+            bold: false,
+            italic: false,
+            mono: false,
+            size,
+            role: Role::Muted,
+            deco: 0,
+            shift: 0.0,
+            link: 0,
+        };
+        let (pad_x, pad_y, margin) = (0.5 * size, 0.3 * size, (4.0 * scale).round());
+        let max_w = (w * 0.6).min(w - 2.0 * (margin + pad_x)).max(size);
+        // About 0.55 em per character; the layout below is the real check.
+        let budget = ((max_w / (0.55 * size)) as usize).max(4);
+        let text: String = if url.chars().count() > budget {
+            url.chars().take(budget - 1).chain(['…']).collect()
+        } else {
+            url.to_owned()
+        };
+        let mut para = Para::default();
+        para.push_text(&text, 0, style);
+        let pl = self
+            .msg_ctx
+            .layout(&self.fonts, &para, 1.0e6, Align::Start, 1.4);
+        self.msg_missing
+            .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
+        let box_w = pl.width.min(max_w) + 2.0 * pad_x;
+        let box_h = pl.height + 2.0 * pad_y;
+        let (x0, y1) = (margin, h - margin);
+        let y0 = y1 - box_h;
+        let px = |v: f32| v.round() as i32;
+        let r = (0.3 * size).round();
+        let rect = (px(x0), px(y0), px(x0 + box_w), px(y1));
+        frame.rounded_rect(rect, r, None, theme.code_bg, 255);
+        frame.rounded_rect(rect, r, Some(scale.round().max(1.0)), theme.border, 255);
+        let content = BlockBox::from_para(pl, &para.styles);
+        let prev = frame.set_clip(render::Clip {
+            x0: rect.0,
+            y0: rect.1,
+            x1: rect.2 - px(pad_x) / 2,
+            y1: rect.3,
+        });
+        render::paint_block(
+            frame,
+            &content,
+            x0 + pad_x,
+            y0 + pad_y,
+            &self.fonts,
+            &mut self.cache,
+            theme,
+        );
+        frame.set_clip(prev);
     }
 
     /// One centered paragraph of muted text.
@@ -721,6 +911,8 @@ impl View {
         self.anchor = Anchor::TOP;
         self.drag = None;
         self.kept = None;
+        self.hover = None;
+        self.pressed = None;
     }
 
     /// Show a new version of the document (reload) or a message in its place. The position
@@ -733,6 +925,9 @@ impl View {
             .kept
             .take()
             .unwrap_or_else(|| (self.place(), self.anchor));
+        // Link ids belong to the old document.
+        self.hover = None;
+        self.pressed = None;
         self.doc = doc;
         self.message = message;
         self.layout = Layout::new(

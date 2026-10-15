@@ -4,6 +4,7 @@ pub mod cli;
 pub mod doc;
 pub mod fonts;
 pub mod layout;
+pub mod nav;
 pub mod platform;
 pub mod render;
 pub mod settings;

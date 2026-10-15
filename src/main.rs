@@ -13,11 +13,12 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Theme, Window, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use vomd::cli::{self, Cli, Input};
 use vomd::doc::Doc;
 use vomd::fonts::Fonts;
+use vomd::nav::{self, BackStack, Target};
 use vomd::platform;
 use vomd::settings::{self, FontPaths, Prefs, Store};
 use vomd::text::fallback::{self, Family, Found};
@@ -85,6 +86,11 @@ struct App {
     resolving: bool,
     mods: ModifiersState,
     cursor: PhysicalPosition<f64>,
+    /// The pointer is over the window (hover tracking).
+    cursor_in: bool,
+    /// The pointer cursor shows a hand (over a link).
+    pointer: bool,
+    back: BackStack,
     shown: bool,
     exit_code: i32,
 }
@@ -257,6 +263,85 @@ impl App {
         self.redraw();
     }
 
+    /// Follow a clicked link: `#anchor` scrolls, a relative Markdown file opens in
+    /// this window, `http(s)`/`mailto` go to the desktop, anything else does nothing. Places
+    /// left are pushed on the back stack.
+    fn follow(&mut self, href: &str, now: Instant) {
+        let base = nav::base_dir(&self.input);
+        let here = self.view.as_ref().map(|v| nav::Entry {
+            input: self.input.clone(),
+            anchor: v.anchor(),
+        });
+        match nav::classify(href, base.as_deref()) {
+            Target::Anchor(fragment) => {
+                if let Some(view) = self.view.as_mut()
+                    && view.jump_to_anchor(&fragment, now)
+                {
+                    if let Some(here) = here.clone() {
+                        self.back.push(here);
+                    }
+                    self.redraw();
+                }
+            }
+            Target::Doc { path, fragment } => {
+                if let Some(here) = here {
+                    self.back.push(here);
+                }
+                self.open(Input::File(path));
+                if let (Some(view), Some(fragment)) = (self.view.as_mut(), fragment) {
+                    view.jump_to_anchor(&fragment, now);
+                }
+            }
+            Target::External(url) => {
+                if let Err(e) = platform::open(std::ffi::OsStr::new(&url))
+                    && platform::stderr_is_tty()
+                {
+                    eprintln!("vomd: cannot open {url}: {e}");
+                }
+            }
+            Target::Ignore => {}
+        }
+    }
+
+    /// Return to the last place on the back stack, reopening its file if it's another one.
+    fn go_back(&mut self) {
+        let Some(entry) = self.back.pop() else {
+            return;
+        };
+        if entry.input != self.input {
+            self.open(entry.input);
+        }
+        if let Some(view) = self.view.as_mut() {
+            view.set_anchor(entry.anchor);
+        }
+        self.redraw();
+    }
+
+    /// Track the link under the pointer: the hand cursor and the URL preview follow it.
+    fn update_hover(&mut self) {
+        let (Some(view), Some(gfx)) = (self.view.as_mut(), self.gfx.as_ref()) else {
+            return;
+        };
+        let changed = if self.cursor_in {
+            view.hover(self.cursor.x, self.cursor.y)
+        } else {
+            view.hover_end()
+        };
+        if !changed {
+            return;
+        }
+        let pointer = view.hovered().is_some();
+        if pointer != self.pointer {
+            self.pointer = pointer;
+            gfx.window.set_cursor(if pointer {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
+        }
+        gfx.window.request_redraw();
+    }
+
     /// Run a settings save; a failure is reported (on a terminal) and otherwise ignored, since
     /// preferences are not worth interrupting reading for. Changes from outside that the save
     /// merged into the file are applied at once.
@@ -277,6 +362,7 @@ impl App {
             Outcome::Nothing => {}
             Outcome::Redraw => self.redraw(),
             Outcome::Reload => self.reload(),
+            Outcome::Back => self.go_back(),
             Outcome::Quit => event_loop.exit(),
         }
     }
@@ -463,25 +549,33 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
+                self.cursor_in = true;
                 if view.drag_to(position.y, now) {
                     self.redraw();
                 }
             }
+            WindowEvent::CursorLeft { .. } => self.cursor_in = false,
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
             } => {
-                let changed = match state {
-                    ElementState::Pressed => view.press(self.cursor.x, self.cursor.y, now),
-                    ElementState::Released => view.release(now),
+                let (x, y) = (self.cursor.x, self.cursor.y);
+                let (changed, clicked) = match state {
+                    ElementState::Pressed => (view.press(x, y, now), None),
+                    ElementState::Released => (view.release(now), view.click(x, y)),
                 };
                 if changed {
                     self.redraw();
                 }
+                if let Some(href) = clicked {
+                    self.follow(&href, now);
+                }
             }
             _ => {}
         }
+        // Scrolling, zooming, resizing or a new document move what's under the pointer.
+        self.update_hover();
     }
 
     /// However the window goes (close button, quit keys), save its size and anything else
@@ -576,6 +670,9 @@ fn main() {
         resolving: false,
         mods: ModifiersState::empty(),
         cursor: PhysicalPosition::new(0.0, 0.0),
+        cursor_in: false,
+        pointer: false,
+        back: BackStack::default(),
         shown: false,
         exit_code: 0,
     };

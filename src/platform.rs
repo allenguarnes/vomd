@@ -31,6 +31,11 @@ pub fn attach_console() {
 /// one argument, never part of a command line). Doesn't wait for the application.
 pub fn open(target: &std::ffi::OsStr) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
+    // Defense in depth: callers only pass URLs with a scheme or absolute paths, but a target
+    // starting with `-` must never reach a launcher as an option.
+    if target.to_string_lossy().starts_with('-') {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = Command::new("xdg-open");
     #[cfg(target_os = "macos")]
@@ -83,6 +88,13 @@ pub fn peak_rss_kb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_refuses_option_like_targets() {
+        let err = open(std::ffi::OsStr::new("--help")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(open(std::ffi::OsStr::new("-x")).is_err());
+    }
 
     #[test]
     fn gtk_theme_variants() {
