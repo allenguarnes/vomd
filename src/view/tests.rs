@@ -48,6 +48,8 @@ fn keys() {
         (ch("q"), ModifiersState::ALT, None),
         (ch("="), none, None),
         (ch("x"), none, None),
+        (ch("b"), none, Some(Action::ToggleToolbar)),
+        (ch("B"), none, Some(Action::ToggleToolbar)),
         (ch("["), none, Some(Action::PrevHeading)),
         (ch("]"), none, Some(Action::NextHeading)),
         (Key::Named(NamedKey::Backspace), none, Some(Action::Back)),
@@ -1716,5 +1718,82 @@ mod with_fonts {
         assert_eq!(v.apply(Action::NextHeading, now), Outcome::Redraw);
         assert_eq!(v.anchor().block, blocks[1]);
         assert_eq!(v.apply(Action::Back, now), Outcome::Back);
+    }
+
+    #[test]
+    fn toolbar_takes_its_strip_and_its_clicks() {
+        let now = Instant::now();
+        let mut v = view(
+            &format!("[top link](https://a.example/)\n\n{}", paras(200)),
+            600,
+            400,
+        );
+        settle(&mut v);
+        assert_eq!(
+            (v.top_inset(), v.toolbar_visible()),
+            (0, false),
+            "a bare view has no bar"
+        );
+        v.set_scroll(v.layout().top(100) + 5.0);
+        let anchor = v.anchor();
+        v.set_toolbar(true);
+        assert_eq!(v.top_inset(), 32);
+        assert_eq!(
+            v.anchor(),
+            anchor,
+            "showing the bar keeps the reading position"
+        );
+        assert_eq!(v.apply(Action::ToggleToolbar, now), Outcome::Redraw);
+        assert_eq!((v.top_inset(), v.toolbar_visible()), (0, false));
+        assert_eq!(v.anchor(), anchor);
+        v.apply(Action::ToggleToolbar, now);
+        assert_eq!(v.top_inset(), 32);
+        // HiDPI scales the bar, not the zoom.
+        v.set_hidpi(2.0);
+        assert_eq!(v.top_inset(), 64);
+        v.set_hidpi(1.0);
+        v.apply(Action::ZoomIn, now);
+        assert_eq!(v.top_inset(), 32);
+        v.apply(Action::ZoomReset, now);
+        // A click on the bar is a toolbar command, never a link under it.
+        v.apply(Action::Top, now);
+        v.set_can_back(true);
+        assert!(v.press(20.0, 16.0, now), "Back button");
+        assert!(!v.release(now));
+        assert!(v.release_toolbar(20.0, 16.0));
+        assert_eq!(v.click(20.0, 16.0), None);
+        assert_eq!(
+            v.take_command(),
+            Some(toolbar::Command::Action(Action::Back))
+        );
+        assert_eq!(v.take_command(), None);
+        // Hovering the bar shows no link, and starts the tooltip timer.
+        assert!(v.hover_at(20.0, 16.0, now));
+        assert_eq!(v.hovered(), None);
+        assert_eq!(v.deadline(), Some(now + toolbar::TOOLTIP_DELAY));
+        assert!(v.expire(now + toolbar::TOOLTIP_DELAY));
+        assert!(v.hover_end());
+        // Only the scrollbar's own timer (from the jump to the top) may remain.
+        assert!(
+            v.deadline()
+                .is_none_or(|t| t != now + toolbar::TOOLTIP_DELAY)
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_toolbar_menu_first() {
+        let now = Instant::now();
+        let mut v = view(&paras(20), 200, 300);
+        v.set_toolbar(true);
+        // At 200 px the zoom and theme buttons live in the `⋯` menu, next to Reload.
+        let (mx, my) = (200.0 - 4.0 - 3.0 * 32.0 + 16.0, 16.0);
+        assert!(v.press(mx, my, now));
+        v.release_toolbar(mx, my);
+        assert_eq!(
+            v.apply(Action::Quit, now),
+            Outcome::Redraw,
+            "closes the menu"
+        );
+        assert_eq!(v.apply(Action::Quit, now), Outcome::Quit);
     }
 }

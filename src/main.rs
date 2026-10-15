@@ -22,6 +22,7 @@ use vomd::nav::{self, BackStack, Target};
 use vomd::platform;
 use vomd::settings::{self, FontPaths, Prefs, Store};
 use vomd::text::fallback::{self, Family, Found};
+use vomd::toolbar::Command;
 use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
 
 /// Idle layout runs in slices this long between events.
@@ -91,6 +92,8 @@ struct App {
     /// The pointer cursor shows a hand (over a link).
     pointer: bool,
     back: BackStack,
+    /// The toolbar's visibility as last applied from or saved to the settings.
+    toolbar_shown: bool,
     shown: bool,
     exit_code: i32,
 }
@@ -150,6 +153,10 @@ impl App {
         };
         view.set_theme_mode(prefs.theme);
         view.set_zoom(prefs.zoom);
+        if view.toolbar_visible() != prefs.toolbar {
+            view.set_toolbar(prefs.toolbar);
+        }
+        self.toolbar_shown = prefs.toolbar;
         view.set_text(prefs.font_size, prefs.line_width);
         for mono in [false, true] {
             let (family, cached) = if mono {
@@ -209,6 +216,26 @@ impl App {
     fn record(&mut self, now: Instant) {
         if let Some(view) = &self.view {
             self.store.record(view.theme_mode(), view.zoom(), now);
+            let shown = view.toolbar_visible();
+            if shown != self.toolbar_shown {
+                self.toolbar_shown = shown;
+                self.store
+                    .set("toolbar", if shown { "true" } else { "false" }, now);
+            }
+        }
+    }
+
+    /// Run what a toolbar button asked for: the same actions as the keys.
+    fn command(&mut self, command: Command, event_loop: &ActiveEventLoop, now: Instant) {
+        match command {
+            Command::Action(action) => {
+                if let Some(view) = self.view.as_mut() {
+                    let outcome = view.apply(action, now);
+                    self.outcome(outcome, event_loop);
+                }
+                self.record(now);
+            }
+            Command::Settings => self.save(|s| s.open_in_editor()),
         }
     }
 
@@ -441,6 +468,7 @@ impl ApplicationHandler<UserEvent> for App {
             (px.width, px.height),
             window.scale_factor(),
         );
+        view.set_settings_available(self.store.path().is_some());
         view.set_system_dark(match window.theme() {
             Some(t) => t == Theme::Dark,
             None => platform::fallback_dark(),
@@ -574,9 +602,16 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 let (x, y) = (self.cursor.x, self.cursor.y);
-                let (changed, clicked) = match state {
-                    ElementState::Pressed => (view.press(x, y, now), None),
-                    ElementState::Released => (view.release(now), view.click(x, y)),
+                let (changed, clicked, command) = match state {
+                    ElementState::Pressed => (view.press(x, y, now), None, None),
+                    ElementState::Released => {
+                        let bar = view.release_toolbar(x, y);
+                        (
+                            view.release(now) | bar,
+                            view.click(x, y),
+                            view.take_command(),
+                        )
+                    }
                 };
                 if changed {
                     self.redraw();
@@ -584,8 +619,17 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(href) = clicked {
                     self.follow(&href, now);
                 }
+                if let Some(command) = command {
+                    self.command(command, event_loop, now);
+                }
             }
             _ => {}
+        }
+        // The toolbar's Back follows the back stack.
+        if let Some(view) = self.view.as_mut()
+            && view.set_can_back(!self.back.is_empty())
+        {
+            self.redraw();
         }
         // Scrolling, zooming, resizing or a new document move what's under the pointer.
         self.update_hover();
@@ -686,6 +730,7 @@ fn main() {
         cursor_in: false,
         pointer: false,
         back: BackStack::default(),
+        toolbar_shown: true,
         shown: false,
         exit_code: 0,
     };

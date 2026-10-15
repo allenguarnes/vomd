@@ -23,6 +23,7 @@ use crate::text::cache::GlyphCache;
 use crate::text::fallback::Found;
 use crate::text::{Align, Para, ParaLayout, TextCtx, TextStyle};
 use crate::theme::{DARK, LIGHT, Role, Theme};
+use crate::toolbar::{self, Toolbar};
 
 /// Zoom limits and step, in percent.
 pub const ZOOM_MIN: u16 = 50;
@@ -59,6 +60,8 @@ pub enum Action {
     NextHeading,
     /// Go back after following a link.
     Back,
+    /// Show or hide the toolbar (`B`).
+    ToggleToolbar,
     Quit,
 }
 
@@ -166,6 +169,7 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             "q" | "Q" => Some(Action::Quit),
             "[" => Some(Action::PrevHeading),
             "]" => Some(Action::NextHeading),
+            "b" | "B" => Some(Action::ToggleToolbar),
             _ => None,
         },
         _ => None,
@@ -337,6 +341,13 @@ pub struct View {
     /// Shown centered instead of the document (read errors, the empty window).
     message: Option<String>,
     msg_ctx: TextCtx,
+    toolbar: Toolbar,
+    /// The shell's back stack isn't empty (the toolbar's Back button).
+    can_back: bool,
+    /// There's a settings file for the toolbar's ⚙ to open.
+    settings: bool,
+    /// What a toolbar click asked for, waiting for [`View::take_command`].
+    command: Option<toolbar::Command>,
     width: u32,
     height: u32,
     /// Height of the strip above the document area (the toolbar of P9), in physical pixels.
@@ -388,6 +399,16 @@ impl View {
             anchor: Anchor::TOP,
             message,
             msg_ctx: TextCtx::default(),
+            // Hidden until the shell shows it (the `toolbar` setting), so a bare view (tests,
+            // the bench) has the whole window as its document area.
+            toolbar: {
+                let mut t = Toolbar::default();
+                t.set_visible(false);
+                t
+            },
+            can_back: false,
+            settings: false,
+            command: None,
             width,
             height,
             top_inset: 0,
@@ -498,6 +519,46 @@ impl View {
         self.top_inset
     }
 
+    // ---- Toolbar --------------------------------------------------------------------------
+
+    /// Show or hide the toolbar; the document area gives up or reclaims its height,
+    /// keeping the reading position.
+    pub fn set_toolbar(&mut self, visible: bool) {
+        self.toolbar.set_visible(visible);
+        self.set_top_inset(self.toolbar.height(self.hidpi as f32));
+    }
+
+    pub fn toolbar_visible(&self) -> bool {
+        self.toolbar.visible()
+    }
+
+    /// Whether the toolbar's Back is enabled (the shell owns the back stack).
+    pub fn set_can_back(&mut self, can_back: bool) -> bool {
+        std::mem::replace(&mut self.can_back, can_back) != can_back
+    }
+
+    /// Whether the toolbar shows ⚙ (there is a settings file to open).
+    pub fn set_settings_available(&mut self, available: bool) {
+        self.settings = available;
+    }
+
+    /// What a toolbar click asked for, if anything since the last call.
+    pub fn take_command(&mut self) -> Option<toolbar::Command> {
+        self.command.take()
+    }
+
+    fn toolbar_ctx(&self) -> toolbar::Ctx {
+        toolbar::Ctx {
+            width: self.width,
+            height: self.height,
+            scale: self.hidpi as f32,
+            can_back: self.can_back,
+            zoom: self.zoom,
+            theme: self.theme,
+            settings: self.settings,
+        }
+    }
+
     /// The document area's height.
     fn area_height(&self) -> u32 {
         self.height.saturating_sub(self.top_inset)
@@ -513,6 +574,8 @@ impl View {
 
     pub fn set_hidpi(&mut self, hidpi: f64) {
         self.hidpi = sane_scale(hidpi);
+        // The toolbar scales with the window, not the zoom.
+        self.top_inset = self.toolbar.height(self.hidpi as f32).min(self.height);
         self.relayout();
     }
 
@@ -615,7 +678,13 @@ impl View {
                 self.heading(1, now);
             }
             Action::Back => return Outcome::Back,
+            Action::ToggleToolbar => {
+                let visible = !self.toolbar.visible();
+                self.set_toolbar(visible);
+            }
             Action::Reload => return Outcome::Reload,
+            // Escape closes the toolbar's dropdown before it quits.
+            Action::Quit if self.toolbar.close_menu() => {}
             Action::Quit => return Outcome::Quit,
         }
         Outcome::Redraw
@@ -649,6 +718,11 @@ impl View {
     /// scrollbar is showing, so links and other things under a hidden one stay clickable.
     /// Returns true if it took the press.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        let ctx = self.toolbar_ctx();
+        if self.toolbar.press(&ctx, x, y) {
+            self.pressed = None;
+            return true;
+        }
         self.ensure_content();
         let taken = self.press_scrollbar(x, y, now);
         // Not the scrollbar's: remember the link under it, for a click on release.
@@ -707,6 +781,17 @@ impl View {
         false
     }
 
+    /// The mouse button came up at (`x`, `y`) after a press the toolbar took. Returns true if
+    /// it needs a repaint; a click's command waits for [`View::take_command`].
+    pub fn release_toolbar(&mut self, x: f64, y: f64) -> bool {
+        let ctx = self.toolbar_ctx();
+        let (handled, command) = self.toolbar.release(&ctx, x, y);
+        if command.is_some() {
+            self.command = command;
+        }
+        handled
+    }
+
     pub fn dragging(&self) -> bool {
         self.drag.is_some()
     }
@@ -739,18 +824,26 @@ impl View {
     /// The pointer moved to (`x`, `y`). Returns true if the link under it changed: repaint
     /// for the URL preview (and switch the pointer cursor, see [`View::hovered`]).
     pub fn hover(&mut self, x: f64, y: f64) -> bool {
+        self.hover_at(x, y, Instant::now())
+    }
+
+    /// [`View::hover`] at a given time (the toolbar's tooltip timer starts then).
+    pub fn hover_at(&mut self, x: f64, y: f64, now: Instant) -> bool {
         self.ensure_content();
-        let link = if self.drag.is_some() {
+        let ctx = self.toolbar_ctx();
+        let bar = self.toolbar.pointer(&ctx, x, y, now);
+        let link = if self.drag.is_some() || self.toolbar.covers(&ctx, x, y) {
             None
         } else {
             self.link_at(x, y)
         };
-        std::mem::replace(&mut self.hover, link) != link
+        (std::mem::replace(&mut self.hover, link) != link) | bar
     }
 
-    /// The pointer left the window. Returns true if a link was hovered.
+    /// The pointer left the window. Returns true if a link was hovered (or the toolbar needs a
+    /// repaint).
     pub fn hover_end(&mut self) -> bool {
-        self.hover.take().is_some()
+        self.hover.take().is_some() | self.toolbar.leave()
     }
 
     /// The target of the hovered link, as written in the document.
@@ -861,6 +954,15 @@ impl View {
         if let Some(url) = self.hovered().map(str::to_owned) {
             self.paint_preview(&mut frame, &url, theme);
         }
+        let ctx = self.toolbar_ctx();
+        self.toolbar.paint(
+            &mut frame,
+            &ctx,
+            &self.fonts,
+            &mut self.cache,
+            &mut self.msg_ctx,
+            theme,
+        );
     }
 
     /// The hovered link's target in a small box at the bottom left, cut short with
@@ -1006,15 +1108,22 @@ impl View {
 
     /// When the event loop must wake for the scrollbar (`None`: never).
     pub fn deadline(&self) -> Option<Instant> {
-        if self.drag.is_some() {
-            return None;
+        let fade = if self.drag.is_some() {
+            None
+        } else {
+            self.fade.deadline()
+        };
+        match (fade, self.toolbar.deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
-        self.fade.deadline()
     }
 
-    /// Hide the scrollbar if its time is up. Returns true if the window needs a repaint.
+    /// Hide the scrollbar or show the toolbar's tooltip if its time is up. Returns true if the
+    /// window needs a repaint.
     pub fn expire(&mut self, now: Instant) -> bool {
-        self.drag.is_none() && self.fade.expire(now)
+        let fade = self.drag.is_none() && self.fade.expire(now);
+        fade | self.toolbar.expire(now)
     }
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its

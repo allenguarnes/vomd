@@ -10,4 +10,5 @@ pub mod render;
 pub mod settings;
 pub mod text;
 pub mod theme;
+pub mod toolbar;
 pub mod view;

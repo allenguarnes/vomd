@@ -21,7 +21,6 @@ pub mod synth {
 }
 
 enum Data {
-    #[cfg_attr(not(feature = "embed-fonts"), allow(dead_code))]
     Static(&'static [u8]),
     Mapped(Arc<memmap2::Mmap>),
 }
@@ -120,9 +119,15 @@ pub struct Fonts {
     slots: [FaceId; 6],
     /// The slots as [`Fonts::new`] set them, for going back from a chosen family.
     defaults: [FaceId; 6],
+    /// The toolbar's icon face (Lucide subset), embedded in every build.
+    icons: FaceId,
     /// Fallback faces in the order they were added.
     fallbacks: Vec<FaceId>,
 }
+
+/// Toolbar icons (`scripts/subset-icons.sh`): 7 Lucide glyphs, 3 KB, so they are embedded
+/// even without `embed-fonts` (no system font has them).
+static ICONS: &[u8] = include_bytes!("../assets/fonts/icons.ttf");
 
 #[cfg(feature = "embed-fonts")]
 static EMBEDDED: [(Slot, &[u8]); 6] = [
@@ -153,7 +158,7 @@ impl Fonts {
     /// The embedded faces. Infallible: the data is compiled in.
     #[cfg(feature = "embed-fonts")]
     pub fn new() -> Result<Fonts, String> {
-        let faces: Vec<Face> = EMBEDDED
+        let mut faces: Vec<Face> = EMBEDDED
             .iter()
             .map(|(_, data)| Face::new(Data::Static(data), 0, None).expect("embedded font"))
             .collect();
@@ -161,7 +166,9 @@ impl Fonts {
         for (i, (slot, _)) in EMBEDDED.iter().enumerate() {
             slots[*slot as usize] = FaceId(i as u16);
         }
+        faces.push(Face::new(Data::Static(ICONS), 0, None).expect("embedded icons"));
         Ok(Fonts {
+            icons: FaceId(faces.len() as u16 - 1),
             faces,
             slots,
             defaults: slots,
@@ -218,6 +225,7 @@ impl Fonts {
             faces: Vec::new(),
             slots: [FaceId(0); 6],
             defaults: [FaceId(0); 6],
+            icons: FaceId(0),
             fallbacks: Vec::new(),
         };
         let mut loaded: [Option<FaceId>; 6] = [None; 6];
@@ -240,7 +248,16 @@ impl Fonts {
         ];
         fonts.defaults = fonts.slots;
         fonts.fallbacks.clear();
+        fonts
+            .faces
+            .push(Face::new(Data::Static(ICONS), 0, None).expect("embedded icons"));
+        fonts.icons = FaceId(fonts.faces.len() as u16 - 1);
         Ok(fonts)
+    }
+
+    /// The toolbar's icon face.
+    pub fn icons(&self) -> FaceId {
+        self.icons
     }
 
     pub fn face(&self, id: FaceId) -> &Face {
