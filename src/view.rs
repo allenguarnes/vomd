@@ -62,6 +62,8 @@ pub enum Action {
     Back,
     /// Show or hide the toolbar (`B`).
     ToggleToolbar,
+    /// Escape: closes the toolbar's dropdown if it's open, else quits.
+    Escape,
     Quit,
 }
 
@@ -152,7 +154,7 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             NamedKey::End => Some(Action::Bottom),
             NamedKey::F5 => Some(Action::Reload),
             NamedKey::Backspace => Some(Action::Back),
-            NamedKey::Escape => Some(Action::Quit),
+            NamedKey::Escape => Some(Action::Escape),
             _ => None,
         },
         Key::Character(c) => match c.as_str() {
@@ -352,6 +354,8 @@ pub struct View {
     height: u32,
     /// Height of the strip above the document area (the toolbar of P9), in physical pixels.
     top_inset: u32,
+    /// What the strip was asked to be: `top_inset` is this, cut to the window's height.
+    top_inset_wanted: u32,
     /// Physical pixels per logical pixel from the window system.
     hidpi: f64,
     zoom: u16,
@@ -412,6 +416,7 @@ impl View {
             width,
             height,
             top_inset: 0,
+            top_inset_wanted: 0,
             hidpi,
             zoom: 100,
             text,
@@ -511,6 +516,7 @@ impl View {
     /// Reserve `px` pixels at the top of the window for something else (the toolbar, P9): the
     /// document area, its scrolling, pages and scrollbar start below it.
     pub fn set_top_inset(&mut self, px: u32) {
+        self.top_inset_wanted = px;
         self.top_inset = px.min(self.height);
         self.ensure();
     }
@@ -539,7 +545,15 @@ impl View {
 
     /// Whether the toolbar shows ⚙ (there is a settings file to open).
     pub fn set_settings_available(&mut self, available: bool) {
-        self.settings = available;
+        if std::mem::replace(&mut self.settings, available) != available {
+            self.close_menu();
+        }
+    }
+
+    /// Close the toolbar's dropdown, if open (a changed window or bar changes what it holds).
+    fn close_menu(&mut self) -> bool {
+        let ctx = self.toolbar_ctx();
+        self.toolbar.close_menu(&ctx)
     }
 
     /// What a toolbar click asked for, if anything since the last call.
@@ -566,16 +580,23 @@ impl View {
 
     /// The window was resized (physical pixels).
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.width = width;
-        self.height = height;
-        self.top_inset = self.top_inset.min(height);
+        if (width, height) != (self.width, self.height) {
+            self.width = width;
+            self.height = height;
+            self.close_menu();
+        }
+        self.top_inset = self.top_inset_wanted.min(height);
         self.relayout();
     }
 
     pub fn set_hidpi(&mut self, hidpi: f64) {
-        self.hidpi = sane_scale(hidpi);
+        let hidpi = sane_scale(hidpi);
+        if std::mem::replace(&mut self.hidpi, hidpi) != hidpi {
+            self.close_menu();
+        }
         // The toolbar scales with the window, not the zoom.
-        self.top_inset = self.toolbar.height(self.hidpi as f32).min(self.height);
+        self.top_inset_wanted = self.toolbar.height(self.hidpi as f32);
+        self.top_inset = self.top_inset_wanted.min(self.height);
         self.relayout();
     }
 
@@ -683,9 +704,8 @@ impl View {
                 self.set_toolbar(visible);
             }
             Action::Reload => return Outcome::Reload,
-            // Escape closes the toolbar's dropdown before it quits.
-            Action::Quit if self.toolbar.close_menu() => {}
-            Action::Quit => return Outcome::Quit,
+            Action::Escape if self.close_menu() => {}
+            Action::Escape | Action::Quit => return Outcome::Quit,
         }
         Outcome::Redraw
     }
@@ -933,26 +953,26 @@ impl View {
         let theme = self.palette();
         if let Some(text) = self.message.clone() {
             self.paint_message(&mut frame, &text, theme);
-            return;
-        }
-        self.ensure();
-        let vp = self.viewport();
-        // Whatever uses the inset paints over this.
-        frame.fill_rect(0, 0, w as i32, vp.area.y0, theme.bg);
-        render::paint(
-            &mut frame,
-            vp,
-            &self.layout,
-            &self.fonts,
-            &mut self.cache,
-            theme,
-        );
-        if self.fade.visible(now) || self.drag.is_some() {
-            let total = self.layout.total_height();
-            render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
-        }
-        if let Some(url) = self.hovered().map(str::to_owned) {
-            self.paint_preview(&mut frame, &url, theme);
+        } else {
+            self.ensure();
+            let vp = self.viewport();
+            // Whatever uses the inset paints over this.
+            frame.fill_rect(0, 0, w as i32, vp.area.y0, theme.bg);
+            render::paint(
+                &mut frame,
+                vp,
+                &self.layout,
+                &self.fonts,
+                &mut self.cache,
+                theme,
+            );
+            if self.fade.visible(now) || self.drag.is_some() {
+                let total = self.layout.total_height();
+                render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
+            }
+            if let Some(url) = self.hovered().map(str::to_owned) {
+                self.paint_preview(&mut frame, &url, theme);
+            }
         }
         let ctx = self.toolbar_ctx();
         self.toolbar.paint(
@@ -1074,7 +1094,7 @@ impl View {
         lay(self, &prefix(lo))
     }
 
-    /// One centered paragraph of muted text.
+    /// One paragraph of muted text, centered in the area below the toolbar.
     fn paint_message(&mut self, frame: &mut Frame, text: &str, theme: &Theme) {
         let (w, h) = (frame.width() as f32, frame.height() as f32);
         frame.fill_rect(0, 0, w as i32, h as i32, theme.bg);
@@ -1098,7 +1118,8 @@ impl View {
         // The message is laid out on every paint, so a face found later covers it then.
         self.msg_missing
             .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
-        let oy = ((h - pl.height) / 2.0).max(0.0);
+        let top = self.top_inset as f32;
+        let oy = top + ((h - top - pl.height) / 2.0).max(0.0);
         let content = BlockBox::from_para(pl, &para.styles);
         let ox = (w - max_w) / 2.0;
         render::paint_block(frame, &content, ox, oy, &self.fonts, &mut self.cache, theme);
@@ -1113,7 +1134,7 @@ impl View {
         } else {
             self.fade.deadline()
         };
-        match (fade, self.toolbar.deadline()) {
+        match (fade, self.toolbar.deadline(&self.toolbar_ctx())) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
@@ -1123,7 +1144,7 @@ impl View {
     /// window needs a repaint.
     pub fn expire(&mut self, now: Instant) -> bool {
         let fade = self.drag.is_none() && self.fade.expire(now);
-        fade | self.toolbar.expire(now)
+        fade | self.toolbar.expire(&self.toolbar_ctx(), now)
     }
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its

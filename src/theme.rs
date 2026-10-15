@@ -23,6 +23,7 @@ pub enum Role {
 /// `0x00RRGGBB`, the softbuffer pixel format.
 pub type Rgb = u32;
 
+#[derive(Clone, Copy)]
 pub struct Theme {
     pub bg: Rgb,
     pub text: Rgb,

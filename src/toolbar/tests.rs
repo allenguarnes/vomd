@@ -146,7 +146,7 @@ fn dropdown_opens_selects_and_closes() {
     let (mx, my) = center(&s, Item::More);
     t.press(&c, mx, my);
     assert_eq!(t.release(&c, mx, my), (true, None));
-    assert!(t.menu_open());
+    assert!(t.menu_open(&c));
     let rows = menu_rows(&c, &s);
     assert_eq!(rows.len(), s.overflow.len());
     assert!(
@@ -159,19 +159,97 @@ fn dropdown_opens_selects_and_closes() {
     assert!(t.covers(&c, rx, ry));
     t.press(&c, rx, ry);
     assert_eq!(t.release(&c, rx, ry), (true, item.command()));
-    assert!(!t.menu_open(), "closes on selection");
+    assert!(!t.menu_open(&c), "closes on selection");
     // An outside press closes it and is swallowed.
     t.press(&c, mx, my);
     t.release(&c, mx, my);
-    assert!(t.menu_open());
+    assert!(t.menu_open(&c));
     assert!(t.press(&c, 100.0, 500.0));
-    assert!(!t.menu_open());
+    assert!(!t.menu_open(&c));
     assert_eq!(t.release(&c, 100.0, 500.0), (false, None));
     // Escape-style close.
     t.press(&c, mx, my);
     t.release(&c, mx, my);
-    assert!(t.close_menu());
-    assert!(!t.close_menu());
+    assert!(t.close_menu(&c));
+    assert!(!t.close_menu(&c));
+}
+
+/// A press on another bar button closes the dropdown and still acts.
+#[test]
+fn another_button_closes_the_dropdown() {
+    let c = ctx(200);
+    let s = slots(&c);
+    let mut t = Toolbar::default();
+    let (mx, my) = center(&s, Item::More);
+    t.press(&c, mx, my);
+    t.release(&c, mx, my);
+    assert!(t.menu_open(&c));
+    let (rx, ry) = center(&s, Item::Reload);
+    assert!(t.press(&c, rx, ry));
+    assert!(!t.menu_open(&c), "closed by the press");
+    assert_eq!(
+        t.release(&c, rx, ry),
+        (true, Item::Reload.command()),
+        "the click still acts"
+    );
+    // `⋯` itself toggles.
+    t.press(&c, mx, my);
+    t.release(&c, mx, my);
+    t.press(&c, mx, my);
+    assert!(t.menu_open(&c), "open until released");
+    t.release(&c, mx, my);
+    assert!(!t.menu_open(&c));
+}
+
+/// A dropdown whose `⋯` is gone (the window got wide) is closed for every purpose, and stays
+/// closed when the window narrows again.
+#[test]
+fn dropdown_without_overflow_is_closed() {
+    let (narrow, wide) = (ctx(200), ctx(900));
+    let s = slots(&narrow);
+    let mut t = Toolbar::default();
+    let (mx, my) = center(&s, Item::More);
+    t.press(&narrow, mx, my);
+    t.release(&narrow, mx, my);
+    assert!(t.menu_open(&narrow));
+    assert!(!t.menu_open(&wide));
+    // A hover timer isn't held back by a menu nobody can see.
+    let now = Instant::now();
+    let (x, y) = center(&slots(&wide), Item::Theme);
+    assert!(t.pointer(&wide, x, y, now));
+    assert_eq!(t.deadline(&wide), Some(now + TOOLTIP_DELAY));
+    assert!(t.expire(&wide, now + TOOLTIP_DELAY));
+    // The next press is the document's, not swallowed.
+    assert!(!t.press(&wide, 100.0, 500.0));
+    assert!(!t.menu_open(&narrow), "not open again at the narrow width");
+    // Escape has nothing to close.
+    t.press(&narrow, mx, my);
+    t.release(&narrow, mx, my);
+    assert!(!t.close_menu(&wide));
+    assert!(!t.close_menu(&narrow));
+}
+
+/// A tooltip isn't due the moment the dropdown closes: the timer only runs while it's shut.
+#[test]
+fn no_tooltip_timer_under_the_dropdown() {
+    let c = ctx(200);
+    let s = slots(&c);
+    let mut t = Toolbar::default();
+    let (mx, my) = center(&s, Item::More);
+    t.press(&c, mx, my);
+    t.release(&c, mx, my);
+    let t0 = Instant::now();
+    let (rx, ry) = center(&s, Item::Reload);
+    assert!(t.pointer(&c, rx, ry, t0));
+    assert_eq!(t.deadline(&c), None);
+    assert!(t.close_menu(&c));
+    assert_eq!(t.deadline(&c), None, "not due at once");
+    assert!(!t.expire(&c, t0 + 10 * TOOLTIP_DELAY));
+    // Moving on to a button arms it from then on.
+    let t1 = t0 + Duration::from_secs(5);
+    let (sx, sy) = center(&s, Item::Settings);
+    assert!(t.pointer(&c, sx, sy, t1));
+    assert_eq!(t.deadline(&c), Some(t1 + TOOLTIP_DELAY));
 }
 
 #[test]
@@ -180,27 +258,27 @@ fn tooltip_after_500ms_with_one_timer() {
     let s = slots(&c);
     let t0 = Instant::now();
     let mut t = Toolbar::default();
-    assert_eq!(t.deadline(), None);
+    assert_eq!(t.deadline(&c), None);
     let (x, y) = center(&s, Item::Theme);
     assert!(t.pointer(&c, x, y, t0));
     assert!(
         !t.pointer(&c, x + 1.0, y, t0 + Duration::from_millis(100)),
         "same button"
     );
-    assert_eq!(t.deadline(), Some(t0 + TOOLTIP_DELAY));
-    assert!(!t.expire(t0 + Duration::from_millis(499)));
-    assert!(t.expire(t0 + TOOLTIP_DELAY));
-    assert_eq!(t.deadline(), None, "shown: no more timer");
+    assert_eq!(t.deadline(&c), Some(t0 + TOOLTIP_DELAY));
+    assert!(!t.expire(&c, t0 + Duration::from_millis(499)));
+    assert!(t.expire(&c, t0 + TOOLTIP_DELAY));
+    assert_eq!(t.deadline(&c), None, "shown: no more timer");
     // Moving to another button restarts it; leaving clears it.
     let (x2, y2) = center(&s, Item::Reload);
     let t1 = t0 + Duration::from_secs(2);
     assert!(t.pointer(&c, x2, y2, t1));
-    assert_eq!(t.deadline(), Some(t1 + TOOLTIP_DELAY));
+    assert_eq!(t.deadline(&c), Some(t1 + TOOLTIP_DELAY));
     assert!(t.leave());
-    assert_eq!(t.deadline(), None);
+    assert_eq!(t.deadline(&c), None);
     // Off the bar: no timer.
     assert!(!t.pointer(&c, 400.0, 300.0, t1));
-    assert_eq!(t.deadline(), None);
+    assert_eq!(t.deadline(&c), None);
 }
 
 #[test]
@@ -265,11 +343,11 @@ fn paints_bar_icons_menu_and_tooltip() {
     paint(&t, &mut buf, &mut cache, &mut text);
     assert!(ink(&buf, 36, 200), "menu rows drawn");
     // Tooltip.
-    t.close_menu();
+    t.close_menu(&c);
     let (x, y) = center(&s, Item::Back);
     let t0 = Instant::now();
     t.pointer(&c, x, y, t0);
-    t.expire(t0 + TOOLTIP_DELAY);
+    t.expire(&c, t0 + TOOLTIP_DELAY);
     paint(&t, &mut buf, &mut cache, &mut text);
     assert!(ink(&buf, 33, 70), "tooltip drawn under the bar");
 }

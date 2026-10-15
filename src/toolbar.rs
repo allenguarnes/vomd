@@ -326,6 +326,12 @@ impl Toolbar {
         }
     }
 
+    /// The dropdown is open and has something to show: one that lost its `⋯` (a window widened
+    /// until nothing overflows) counts as closed.
+    fn open(&self, ctx: &Ctx) -> bool {
+        self.menu && !slots(ctx).overflow.is_empty()
+    }
+
     fn spot_at(&self, ctx: &Ctx, x: f64, y: f64) -> Option<Spot> {
         if self.hidden {
             return None;
@@ -365,7 +371,8 @@ impl Toolbar {
         }
         self.hover = spot;
         self.tooltip = false;
-        self.hover_since = matches!(spot, Some(Spot::Bar(_))).then_some(now);
+        // No timer under an open dropdown: it would be due the moment the dropdown closes.
+        self.hover_since = (matches!(spot, Some(Spot::Bar(_))) && !self.open(ctx)).then_some(now);
         true
     }
 
@@ -381,11 +388,18 @@ impl Toolbar {
     /// Mouse button down at (`x`, `y`). Returns true if the toolbar took it: on one of its
     /// items, or anywhere while the dropdown is open (an outside press closes it).
     pub fn press(&mut self, ctx: &Ctx, x: f64, y: f64) -> bool {
+        self.menu = self.open(ctx);
         let spot = self.spot_at(ctx, x, y);
         self.tooltip = false;
         self.hover_since = None;
         match spot {
             Some(spot) => {
+                // Another button closes the dropdown (and still acts); `⋯` toggles on release.
+                if let Spot::Bar(item) = spot
+                    && item != Item::More
+                {
+                    self.menu = false;
+                }
                 self.pressed = Some(spot);
                 true
             }
@@ -424,27 +438,28 @@ impl Toolbar {
         (true, command)
     }
 
-    /// Close the dropdown (Escape, a resize that changes what overflows). Returns true if it
-    /// was open.
-    pub fn close_menu(&mut self) -> bool {
-        std::mem::take(&mut self.menu)
+    /// Close the dropdown (Escape, a resize). Returns true if it was open.
+    pub fn close_menu(&mut self, ctx: &Ctx) -> bool {
+        let was = self.open(ctx);
+        self.menu = false;
+        was
     }
 
-    pub fn menu_open(&self) -> bool {
-        self.menu
+    pub fn menu_open(&self, ctx: &Ctx) -> bool {
+        self.open(ctx)
     }
 
     /// When the loop must wake to show the tooltip (`None`: no timer).
-    pub fn deadline(&self) -> Option<Instant> {
-        if self.tooltip || self.menu {
+    pub fn deadline(&self, ctx: &Ctx) -> Option<Instant> {
+        if self.tooltip || self.open(ctx) {
             return None;
         }
         self.hover_since.map(|t| t + TOOLTIP_DELAY)
     }
 
     /// Show the tooltip if its time has come. Returns true if the window needs a repaint.
-    pub fn expire(&mut self, now: Instant) -> bool {
-        match self.deadline() {
+    pub fn expire(&mut self, ctx: &Ctx, now: Instant) -> bool {
+        match self.deadline(ctx) {
             Some(t) if now >= t => {
                 self.tooltip = true;
                 true
@@ -473,12 +488,13 @@ impl Toolbar {
         frame.fill_rect(0, 0, w, h, theme.code_bg);
         frame.fill_rect(0, h - line, w, h, theme.border);
         let slots = slots(ctx);
+        let open = self.menu && !slots.overflow.is_empty();
         for &(item, rect) in &slots.items {
             let spot = Spot::Bar(item);
-            let on = item == Item::More && self.menu;
+            let on = item == Item::More && open;
             self.paint_item(frame, ctx, item, rect, spot, on, fonts, cache, text, theme);
         }
-        if self.menu {
+        if open {
             let rows = menu_rows(ctx, &slots);
             if let Some(b) = menu_box(ctx, &rows) {
                 let r = (4.0 * s).round();
@@ -670,7 +686,7 @@ fn paint_label(
     theme: &Theme,
 ) {
     // UI text takes the given color whatever role its style names.
-    let mut t = Theme { ..*theme };
+    let mut t = *theme;
     t.text = color;
     render::paint_block(frame, &placed.content, placed.x, placed.y, fonts, cache, &t);
 }

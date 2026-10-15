@@ -37,7 +37,7 @@ fn keys() {
         (Key::Named(NamedKey::F5), none, Some(Action::Reload)),
         (ch("t"), none, Some(Action::CycleTheme)),
         (ch("q"), none, Some(Action::Quit)),
-        (Key::Named(NamedKey::Escape), none, Some(Action::Quit)),
+        (Key::Named(NamedKey::Escape), none, Some(Action::Escape)),
         (ch("="), ctrl, Some(Action::ZoomIn)),
         (ch("+"), ctrl | shift, Some(Action::ZoomIn)),
         (ch("-"), ctrl, Some(Action::ZoomOut)),
@@ -1780,20 +1780,114 @@ mod with_fonts {
         );
     }
 
-    #[test]
-    fn escape_closes_the_toolbar_menu_first() {
-        let now = Instant::now();
+    /// The view at 200 px wide (`⋯` holds zoom and theme) with the dropdown open.
+    fn open_menu_view(now: Instant) -> View {
         let mut v = view(&paras(20), 200, 300);
         v.set_toolbar(true);
-        // At 200 px the zoom and theme buttons live in the `⋯` menu, next to Reload.
         let (mx, my) = (200.0 - 4.0 - 3.0 * 32.0 + 16.0, 16.0);
         assert!(v.press(mx, my, now));
         v.release_toolbar(mx, my);
+        v
+    }
+
+    #[test]
+    fn escape_closes_the_toolbar_menu_first() {
+        let now = Instant::now();
+        let mut v = open_menu_view(now);
         assert_eq!(
-            v.apply(Action::Quit, now),
+            v.apply(Action::Escape, now),
             Outcome::Redraw,
             "closes the menu"
         );
+        assert_eq!(v.apply(Action::Escape, now), Outcome::Quit);
+        // The quit keys always quit, whatever is open.
+        let mut v = open_menu_view(now);
         assert_eq!(v.apply(Action::Quit, now), Outcome::Quit);
+    }
+
+    /// Widening the window until nothing overflows closes the dropdown that went with the
+    /// `⋯`: the next press is the document's and Escape quits.
+    #[test]
+    fn widening_the_window_closes_the_dropdown() {
+        let now = Instant::now();
+        let mut v = open_menu_view(now);
+        v.resize(900, 300);
+        assert_eq!(v.apply(Action::Escape, now), Outcome::Quit);
+        let mut v = open_menu_view(now);
+        v.resize(900, 300);
+        // A press below the bar isn't swallowed (here it starts nothing, but isn't taken by
+        // the toolbar either: the shell sees `false` and goes on to the document).
+        assert!(!v.press(300.0, 200.0, now));
+        assert!(!v.release_toolbar(300.0, 200.0));
+        // And it doesn't reopen when the window narrows again.
+        v.resize(200, 300);
+        assert!(!v.press(100.0, 200.0, now));
+    }
+
+    #[test]
+    fn toolbar_grows_back_with_the_window() {
+        let mut v = view(&paras(200), 600, 400);
+        settle(&mut v);
+        v.set_toolbar(true);
+        v.set_scroll(v.layout().top(100) + 5.0);
+        let anchor = v.anchor();
+        v.resize(600, 20);
+        assert_eq!(v.top_inset(), 20, "cut to a short window");
+        v.resize(600, 400);
+        assert_eq!(v.top_inset(), 32, "the whole bar again");
+        v.ensure();
+        assert_eq!(v.anchor(), anchor);
+    }
+
+    fn message_view(w: u32, h: u32) -> View {
+        View::new(
+            Fonts::new().unwrap(),
+            Doc::default(),
+            Some("Drop a Markdown file here".into()),
+            (w, h),
+            1.0,
+        )
+    }
+
+    /// The message screen has its toolbar like the document: painted, and its buttons work.
+    #[test]
+    fn message_screen_paints_the_toolbar_and_takes_its_clicks() {
+        let now = Instant::now();
+        let mut v = message_view(600, 400);
+        v.set_toolbar(true);
+        let mut buf = vec![0; 600 * 400];
+        v.paint(&mut buf, 600, now);
+        assert_eq!(buf[2 * 600 + 300], LIGHT.code_bg, "bar background");
+        assert_eq!(buf[31 * 600 + 300], LIGHT.border, "divider");
+        assert!(
+            buf[..32 * 600]
+                .iter()
+                .any(|&p| ![LIGHT.code_bg, LIGHT.border].contains(&p)),
+            "icons"
+        );
+        // The message is centered in the area below the bar.
+        let ink: Vec<usize> = (33..400)
+            .filter(|&y| (0..600).any(|x| buf[y * 600 + x] != LIGHT.bg))
+            .collect();
+        let (y0, y1) = (*ink.first().unwrap(), *ink.last().unwrap());
+        assert!(
+            (y0 as i32 + y1 as i32 - (32 + 400)).abs() <= 12,
+            "{y0}..{y1}"
+        );
+        // Reload sits at the right edge (no settings file here).
+        let (x, y) = (600.0 - 4.0 - 16.0, 16.0);
+        assert!(v.hover_at(x, y, now));
+        assert_eq!(v.deadline(), Some(now + toolbar::TOOLTIP_DELAY));
+        assert!(v.press(x, y, now));
+        assert!(v.release_toolbar(x, y));
+        assert_eq!(
+            v.take_command(),
+            Some(toolbar::Command::Action(Action::Reload))
+        );
+        // Hidden: nothing is painted or clicked there.
+        v.set_toolbar(false);
+        v.paint(&mut buf, 600, now);
+        assert!(buf[..32 * 600].iter().all(|&p| p == LIGHT.bg));
+        assert!(!v.press(x, y, now));
     }
 }
