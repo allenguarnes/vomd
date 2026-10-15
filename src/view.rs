@@ -722,9 +722,13 @@ impl View {
     }
 
     /// The link (1-based id into `Doc::links`) under window point (`x`, `y`), if any. Only
-    /// blocks near the viewport have content to hit, which covers everything on screen.
+    /// blocks near the viewport have content to hit, which covers everything on screen; a point
+    /// outside the document area (a press-drag goes on reporting the pointer beyond the window)
+    /// hits nothing even where cached content continues, and neither does NaN.
     pub fn link_at(&self, x: f64, y: f64) -> Option<u32> {
-        if self.message.is_some() || y < f64::from(self.top_inset) {
+        let inside = (0.0..f64::from(self.width)).contains(&x)
+            && (f64::from(self.top_inset)..f64::from(self.height)).contains(&y);
+        if self.message.is_some() || !inside {
             return None;
         }
         let doc_y = self.scroll() + (y - f64::from(self.top_inset));

@@ -1463,6 +1463,48 @@ mod with_fonts {
         assert!(update.set_cursor && !update.pointer, "{update:?}");
     }
 
+    /// A press on a link that wraps on below the window, dragged out and released there (to
+    /// cancel) must not follow it: cached content extends past the viewport, but the pointer
+    /// outside the window is over nothing.
+    #[test]
+    fn pointer_outside_the_window_is_over_no_link() {
+        let now = Instant::now();
+        let words: String = (0..80).map(|i| format!("word{i} ")).collect();
+        let src = format!("Start [{words}zzend](https://example.com/x) done.\n");
+        let mut v = view(&src, 600, 120);
+        settle(&mut v);
+        let (lx, ly) = point_at(&v, 0, "word0");
+        let (ex, ey) = point_at(&v, 0, "zzend");
+        assert!(ey > 120.0, "the link goes on below the window: {ey}");
+        assert!(v.link_at(lx, ly).is_some());
+        assert!(v.link_at(ex, ey).is_none(), "below the window");
+        // Left and right of the window on the first line, above the document, NaN.
+        let outside = [
+            (lx, 125.0),
+            (lx, 1000.0),
+            (610.0, ly),
+            (-5.0, ly),
+            (lx, -5.0),
+            (f64::NAN, ly),
+            (lx, f64::NAN),
+        ];
+        for (x, y) in outside {
+            assert_eq!(v.link_at(x, y), None, "({x}, {y})");
+            assert!(v.hover(lx, ly) || v.hovered().is_some());
+            v.hover(x, y);
+            assert_eq!(v.hovered(), None, "hover at ({x}, {y})");
+            v.press(lx, ly, now);
+            assert_eq!(v.click(x, y), None, "released at ({x}, {y})");
+        }
+        // Inside still works.
+        assert!(v.hover(lx, ly));
+        assert_eq!(v.hovered(), Some("https://example.com/x"));
+        v.press(lx, ly, now);
+        assert_eq!(v.click(lx, ly).as_deref(), Some("https://example.com/x"));
+        v.set_top_inset(20);
+        assert_eq!(v.link_at(lx, 5.0), None, "inside the inset");
+    }
+
     /// Scrolling away evicts the blocks at the top, and scrolling back leaves them unbuilt
     /// until the next paint: the hover refresh that follows an input event (and comes first)
     /// must still find the link under a pointer that hasn't moved.
