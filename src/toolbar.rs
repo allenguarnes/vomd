@@ -1,8 +1,9 @@
 //! The toolbar: one slim bar docked at the top, never over the text.
 //!
-//! Left: Back. Right: zoom (− 100% +), theme, reload, settings. Buttons for features that
-//! aren't built yet are absent. On narrow windows the right group collapses from the left (zoom
-//! first, then theme, ...) into a `⋯` button with a small dropdown, the one popup in the app.
+//! Left: Back. Right: remote images (only when the document has any), zoom (− 100% +), theme,
+//! reload, settings. Buttons for features that aren't built yet are absent. On narrow windows
+//! the right group collapses into a `⋯` button with a small dropdown, the one popup in the app:
+//! zoom first, then remote images, theme, ...
 //! A tooltip with the name and shortcut appears after 500 ms. Icons are glyphs of an embedded
 //! Lucide subset, drawn through the glyph cache, so they're crisp at every scale.
 //!
@@ -44,11 +45,14 @@ mod icon {
     pub const RELOAD: char = '\u{e149}';
     pub const SETTINGS: char = '\u{e154}';
     pub const MORE: char = '\u{e0b6}';
+    pub const IMAGE: char = '\u{e0f6}';
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     Back,
+    /// Load or hide remote images, with a badge counting them.
+    Images,
     ZoomOut,
     /// The percentage between − and +; clicking it resets the zoom.
     ZoomReset,
@@ -82,6 +86,14 @@ pub struct Ctx {
     pub theme: ThemeMode,
     /// There is a settings file to open (not with `--no-settings`).
     pub settings: bool,
+    /// Remote images in the document (0: no remote-images button).
+    pub remote: u32,
+    /// Remote images are on for the document.
+    pub remote_on: bool,
+    /// `curl` couldn't be run: the button says so and does nothing.
+    pub no_curl: bool,
+    /// The remote-images button pulses (once, after the first frame).
+    pub pulse: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,6 +135,12 @@ impl Item {
     pub fn label(self, ctx: &Ctx) -> String {
         match self {
             Item::Back => "Back (Backspace)".into(),
+            Item::Images if ctx.no_curl => "Remote images: curl not found".into(),
+            Item::Images if ctx.remote_on => "Hide remote images (I)".into(),
+            Item::Images => {
+                let s = if ctx.remote == 1 { "" } else { "s" };
+                format!("Load {} remote image{s} (I)", ctx.remote)
+            }
             Item::ZoomOut => "Zoom out (Ctrl+−)".into(),
             Item::ZoomReset => format!("Reset zoom {}% (Ctrl+0)", ctx.zoom),
             Item::ZoomIn => "Zoom in (Ctrl+=)".into(),
@@ -141,6 +159,7 @@ impl Item {
     fn icon(self) -> Option<char> {
         Some(match self {
             Item::Back => icon::BACK,
+            Item::Images => icon::IMAGE,
             Item::ZoomOut => icon::MINUS,
             Item::ZoomIn => icon::PLUS,
             Item::Theme => icon::THEME,
@@ -154,6 +173,7 @@ impl Item {
     fn command(self) -> Option<Command> {
         Some(match self {
             Item::Back => Command::Action(Action::Back),
+            Item::Images => Command::Action(Action::ToggleRemote),
             Item::ZoomOut => Command::Action(Action::ZoomOut),
             Item::ZoomReset => Command::Action(Action::ZoomReset),
             Item::ZoomIn => Command::Action(Action::ZoomIn),
@@ -165,24 +185,31 @@ impl Item {
     }
 
     fn enabled(self, ctx: &Ctx) -> bool {
-        self != Item::Back || ctx.can_back
+        match self {
+            Item::Back => ctx.can_back,
+            Item::Images => !ctx.no_curl,
+            _ => true,
+        }
     }
 }
 
 /// The right group's items, left to right, with their logical widths and collapse groups: the
-/// lowest group collapses into `⋯` first. ⚙ is the last, and only there with a settings file.
-const RIGHT: [(Item, f32, u8); 6] = [
+/// lowest group collapses into `⋯` first. The remote-images button is the first, and only there
+/// when the document has remote images; it goes after the zoom (collapsed alone, `⋯` would take
+/// its place for nothing). ⚙ is the last, and only there with a settings file.
+const RIGHT: [(Item, f32, u8); 7] = [
+    (Item::Images, BUTTON, 1),
     (Item::ZoomOut, BUTTON, 0),
     (Item::ZoomReset, PERCENT, 0),
     (Item::ZoomIn, BUTTON, 0),
-    (Item::Theme, BUTTON, 1),
-    (Item::Reload, BUTTON, 2),
-    (Item::Settings, BUTTON, 3),
+    (Item::Theme, BUTTON, 2),
+    (Item::Reload, BUTTON, 3),
+    (Item::Settings, BUTTON, 4),
 ];
 
-/// The right group's items in this window: ⚙ only with a settings file.
+/// The right group's items in this window.
 fn right_items(ctx: &Ctx) -> &'static [(Item, f32, u8)] {
-    &RIGHT[..5 + usize::from(ctx.settings)]
+    &RIGHT[usize::from(ctx.remote == 0)..6 + usize::from(ctx.settings)]
 }
 
 /// How many of the right group's leading groups don't fit and collapse into `⋯`.
@@ -219,7 +246,7 @@ pub fn slots(ctx: &Ctx) -> Slots {
         x -= iw * s;
     }
     let overflow: Vec<Item> = right.iter().filter(|r| r.2 < first).map(|r| r.0).collect();
-    if first > 0 {
+    if !overflow.is_empty() {
         // Never over Back: in a window too narrow for both, `⋯` runs off the right edge.
         let x0 = (x - BUTTON * s).max((EDGE + BUTTON) * s);
         items.push((Item::More, bar(x0, x0 + BUTTON * s)));
@@ -471,7 +498,17 @@ impl Toolbar {
         let scroll = self.menu.filter(|_| !slots.overflow.is_empty());
         let open = scroll.is_some();
         for &(item, rect) in &slots.items {
-            let on = item == Item::More && open;
+            let on = (item == Item::More && open) || (item == Item::Images && ctx.remote_on);
+            if cfg!(feature = "remote-images") && item == Item::Images && ctx.pulse {
+                let inset = 3.0 * s;
+                let r = Rect {
+                    x0: rect.x0 + inset,
+                    y0: rect.y0 + inset,
+                    x1: rect.x1 - inset,
+                    y1: rect.y1 - inset,
+                };
+                frame.rounded_rect(r.px(), (4.0 * s).round(), None, theme.link, 90);
+            }
             self.paint_item(
                 frame,
                 ctx,
@@ -484,6 +521,13 @@ impl Toolbar {
                 text,
                 theme,
             );
+            if cfg!(feature = "remote-images")
+                && item == Item::Images
+                && !ctx.remote_on
+                && !ctx.no_curl
+            {
+                paint_badge(frame, ctx, fonts, cache, text, theme, rect);
+            }
         }
         if let Some(scroll) = scroll
             && let Some(b) = menu_box(ctx, &slots)
@@ -671,6 +715,56 @@ fn paint_label(
     let mut t = *theme;
     t.text = color;
     render::paint_block(frame, &placed.content, placed.x, placed.y, fonts, cache, &t);
+}
+
+/// The count of remote images in a small pill at the top right of their button.
+fn paint_badge(
+    frame: &mut Frame,
+    ctx: &Ctx,
+    fonts: &Fonts,
+    cache: &mut GlyphCache,
+    text: &mut TextCtx,
+    theme: &Theme,
+    button: Rect,
+) {
+    let s = ctx.scale;
+    let label = if ctx.remote > 99 {
+        "99+".to_owned()
+    } else {
+        ctx.remote.to_string()
+    };
+    let style = TextStyle {
+        bold: true,
+        italic: false,
+        mono: false,
+        size: 9.0 * s,
+        role: Role::Text,
+        deco: 0,
+        shift: 0.0,
+        link: 0,
+    };
+    let mut para = Para::default();
+    para.push_text(&label, 0, style);
+    let pl = text.layout(fonts, &para, 1.0e6, Align::Start, 1.2);
+    let (tw, th) = (pl.width, pl.height);
+    let h = th.max(12.0 * s);
+    let w = (tw + 6.0 * s).max(h);
+    let x1 = button.x1 - 2.0 * s;
+    let y0 = button.y0 + 3.0 * s;
+    let b = Rect {
+        x0: x1 - w,
+        y0,
+        x1,
+        y1: y0 + h,
+    };
+    frame.rounded_rect(b.px(), (h / 2.0).round(), None, theme.link, 255);
+    let placed = Placed {
+        content: BlockBox::from_para(pl, &para.styles),
+        x: b.x0 + (w - tw) / 2.0,
+        y: b.y0 + (h - th) / 2.0,
+        width: tw,
+    };
+    paint_label(frame, fonts, cache, &placed, theme.bg, theme);
 }
 
 /// The tooltip: a small box under the hovered button, kept inside the window.

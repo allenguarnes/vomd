@@ -1723,3 +1723,119 @@ fn ensure_builds_the_viewport_of_many_overestimated_rows() {
     let blocks = l.range(y, y + 1080.0).len();
     assert!(blocks > 20, "{blocks} blocks in the viewport");
 }
+
+/// Sizes for the image test documents: by file name.
+fn test_probe() -> ImageProbe {
+    Box::new(|img: &ImageRef| match img.src.as_str() {
+        "a.png" => ImageSize::Pixels(100, 50),
+        "wide.png" => ImageSize::Pixels(2000, 1000),
+        "tall.png" => ImageSize::Pixels(100, 1_000_000),
+        "loading.png" => ImageSize::Loading,
+        _ => ImageSize::Alt,
+    })
+}
+
+fn boxes(l: &Layout, block: usize) -> Vec<PBox> {
+    l.geoms()[block]
+        .content
+        .as_ref()
+        .map_or(Vec::new(), |c| c.boxes.clone())
+}
+
+/// Images with a size are boxes that size in logical pixels, no wider than the line; others
+/// keep their alt text in an outline. A box sits on the baseline and makes its line taller.
+#[test]
+fn images_are_boxes_of_their_size() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(
+        "Before ![a](a.png) after\n\n![w](wide.png)\n\n![l](loading.png) ![alt text](none.png)\n\n![t](tall.png)",
+    );
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.set_image_probe(&doc, Some(test_probe()));
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    let em = 16.0;
+    let (_, col_w) = l.column();
+    let b = boxes(&l, 0);
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        (b[0].b.width, b[0].b.ascent, b[0].b.descent),
+        (100.0, 50.0, 0.0)
+    );
+    assert!(l.geoms()[0].h >= 50.0, "the line holds the box");
+    let c = l.geoms()[0].content.as_ref().unwrap();
+    assert!(
+        c.glyphs.len() >= "Beforeafter".len(),
+        "the text around it stays"
+    );
+    let w = boxes(&l, 1);
+    assert_eq!(w[0].b.width, col_w.floor());
+    assert_eq!(w[0].b.ascent, (col_w.floor() / 2.0).round());
+    let lb = boxes(&l, 2);
+    assert_eq!(lb.len(), 1, "an image without a size keeps its alt text");
+    assert_eq!((lb[0].b.width, lb[0].b.ascent), (16.0 * em, 12.0 * em));
+    let alt = l.geoms()[2].content.as_ref().unwrap();
+    assert!(
+        alt.rects.iter().any(|r| r.role == Role::Border),
+        "outlined alt text"
+    );
+    // A very tall image is shown smaller than one that would take hundreds of MB.
+    let t = boxes(&l, 3)[0].b;
+    assert!(t.width * t.ascent <= MAX_BOX_PIXELS * 1.01, "{t:?}");
+    assert!(
+        (t.ascent / t.width - 10_000.0).abs() < 100.0,
+        "keeps its shape: {t:?}"
+    );
+
+    // Twice the scale (HiDPI or zoom): twice the pixels.
+    l.set_params(params(900.0, 2.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 4000.0);
+    assert_eq!(boxes(&l, 0)[0].b.width, 200.0);
+    assert_eq!(boxes(&l, 0)[0].b.ascent, 100.0);
+}
+
+/// A new size (fetched, failed, turned off) lays out only the image's block again, and
+/// clicking an image in a link hits the link.
+#[test]
+fn a_changed_image_lays_out_its_block_again() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("One\n\n[![a](a.png)](https://e.x/)\n\nThree");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.set_image_probe(&doc, Some(test_probe()));
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    let b = boxes(&l, 1)[0];
+    let hit = l
+        .hit(l.column().0 + b.x + 50.0, l.y(1) + b.y + 25.0)
+        .unwrap();
+    assert_eq!(hit.link, 1);
+    let tall = l.geoms()[1].h;
+    l.set_image(&doc, 1, ImageSize::Alt);
+    assert!(l.geoms()[1].content.is_none() && !l.geoms()[1].measured);
+    assert!(
+        l.geoms()[0].measured && l.geoms()[2].content.is_some(),
+        "only its block"
+    );
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    assert!(boxes(&l, 1).is_empty());
+    assert!(l.geoms()[1].h < tall);
+    assert_eq!(l.image_size(1), Some(ImageSize::Alt));
+    // The same size again changes nothing.
+    l.set_image(&doc, 1, ImageSize::Alt);
+    assert!(l.geoms()[1].content.is_some());
+}
+
+/// In a table, an image is no wider than its cell.
+#[test]
+fn an_image_in_a_table_fits_its_cell() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("| A | B |\n|---|---|\n| ![w](wide.png) | text |\n");
+    let mut l = Layout::new(&doc, params(600.0, 1.0));
+    l.set_image_probe(&doc, Some(test_probe()));
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    let row = (0..doc.blocks.len())
+        .find(|&i| !boxes(&l, i).is_empty())
+        .unwrap();
+    let b = boxes(&l, row)[0].b;
+    let (_, col_w) = l.column();
+    assert!(b.width < col_w, "{} < {col_w}", b.width);
+    assert!((b.ascent - b.width / 2.0).abs() <= 1.0);
+}

@@ -8,10 +8,11 @@
 use std::time::{Duration, Instant};
 
 use crate::fonts::Fonts;
+use crate::image::Bitmap;
 use crate::layout::{BlockBox, Layout};
 use crate::text::RectKind;
 use crate::text::cache::GlyphCache;
-use crate::theme::{Rgb, Role, Theme};
+use crate::theme::{Rgb, Theme};
 
 /// A pixel buffer: `height` rows of `width` pixels, `stride` pixels apart.
 pub struct Frame<'a> {
@@ -241,6 +242,45 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// Composite a premultiplied bitmap into the `w` × `h` box at (`x`, `y`), scaled (nearest
+    /// pixel) when it has another size.
+    pub fn blit_bitmap(&mut self, x: i32, y: i32, w: u32, h: u32, bm: &Bitmap) {
+        let Some((c, sx, sy)) = self.blit_area(x, y, w, h) else {
+            return;
+        };
+        if bm.width == 0 || bm.height == 0 {
+            return;
+        }
+        let same = (bm.width, bm.height) == (w, h);
+        let src_x = |dx: usize| {
+            if same {
+                dx
+            } else {
+                (dx as u64 * u64::from(bm.width) / u64::from(w)) as usize
+            }
+        };
+        let cols: Vec<usize> = (0..(c.x1 - c.x0) as usize).map(|i| src_x(sx + i)).collect();
+        for (row_i, y) in (c.y0..c.y1).enumerate() {
+            let dy = sy + row_i;
+            let src_y = if same {
+                dy
+            } else {
+                (dy as u64 * u64::from(bm.height) / u64::from(h)) as usize
+            };
+            let row = &bm.data[src_y * bm.width as usize..][..bm.width as usize];
+            let dst = &mut self.row(y)[c.x0 as usize..c.x1 as usize];
+            for (d, &sx) in dst.iter_mut().zip(&cols) {
+                let p = row[sx];
+                let a = p >> 24;
+                *d = match a {
+                    255 => p & 0xff_ffff,
+                    0 => *d,
+                    _ => over_premul(*d, (p >> 16) as u8, (p >> 8) as u8, p as u8, a as u8),
+                };
+            }
+        }
+    }
+
     /// Visible part of a `w` × `h` image at (`x`, `y`): the clipped rectangle and the source
     /// offset of its top-left pixel.
     fn blit_area(&self, x: i32, y: i32, w: u32, h: u32) -> Option<(Clip, usize, usize)> {
@@ -444,18 +484,53 @@ pub fn paint_block(
             );
         }
     }
-    // Inline boxes have no pixels of their own yet (images land in P10): outline the space.
-    for b in &content.boxes {
-        let (x0, x1) = span(ox + b.x, b.b.width);
-        let (y0, y1) = span(oy + b.y, b.b.ascent + b.b.descent);
-        frame.rounded_rect(
-            (x0, y0, x1, y1),
-            0.0,
-            Some(1.0),
-            theme.color(Role::Border),
-            255,
-        );
+}
+
+/// The pixels for inline image boxes (see `image.rs`).
+pub trait Pixels {
+    /// The bitmap to show in box `id`, `w` × `h` physical pixels: that size, another one
+    /// while it's decoded again (scaled to fit), or none yet.
+    fn pixels(&mut self, id: u32, w: u32, h: u32) -> Option<&Bitmap>;
+}
+
+/// Paint the image boxes of the blocks in the viewport, after [`paint`]: their pixels, or a
+/// tinted box with an outline while they load.
+pub fn paint_images(
+    frame: &mut Frame,
+    vp: Viewport,
+    layout: &Layout,
+    pixels: &mut dyn Pixels,
+    theme: &Theme,
+) {
+    let prev = frame.set_clip(vp.area);
+    let a = frame.clip;
+    let (col_x, _) = layout.column();
+    let ox = vp.area.x0 as f32 + col_x;
+    let scroll = if vp.scroll.is_nan() { 0.0 } else { vp.scroll };
+    let top = scroll + (i64::from(a.y0) - i64::from(vp.area.y0)) as f64;
+    let bottom = scroll + (i64::from(a.y1) - i64::from(vp.area.y0)) as f64;
+    for i in layout.range_exact(top, bottom) {
+        let Some(content) = layout.geoms()[i].content.as_deref() else {
+            continue;
+        };
+        let oy = (vp.area.y0 as f64 + layout.top(i) - scroll) as f32;
+        for b in &content.boxes {
+            let (x0, x1) = span(ox + b.x, b.b.width);
+            let (y0, y1) = span(oy + b.y, b.b.ascent + b.b.descent);
+            if y1 <= a.y0 || y0 >= a.y1 {
+                continue;
+            }
+            let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+            match pixels.pixels(b.b.id, w, h) {
+                Some(bm) => frame.blit_bitmap(x0, y0, w, h, bm),
+                None => {
+                    frame.fill_rect(x0, y0, x1, y1, theme.code_bg);
+                    frame.rounded_rect((x0, y0, x1, y1), 0.0, Some(1.0), theme.border, 255);
+                }
+            }
+        }
     }
+    frame.set_clip(prev);
 }
 
 // ---- Scrollbar ----------------------------------------------------------------------------

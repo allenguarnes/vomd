@@ -802,7 +802,8 @@ pub const TEMPLATE: &str = "\
 # window_width = 900
 # window_height = 1000
 
-# Remote (http/https) images: ask (load with I), never, or always.
+# Remote (http/https) images: ask (load with I), never, or always. With always, every
+# document you open contacts the servers its images are on.
 # remote_images = ask
 
 # Base font size in pixels at 100% zoom, 10 to 32.

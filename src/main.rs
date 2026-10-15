@@ -4,7 +4,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,8 @@ enum UserEvent {
     Fonts(Vec<Found>),
     /// `font_sans` / `font_mono` families were looked up: (mono, family, faces if found).
     Families(Vec<(bool, String, Option<Family>)>),
+    /// An image was decoded or fetched.
+    Images,
 }
 
 /// The document as read and parsed off the main thread.
@@ -153,6 +155,7 @@ impl App {
         };
         view.set_theme_mode(prefs.theme);
         view.set_zoom(prefs.zoom);
+        view.set_remote_policy(prefs.remote_images);
         if view.toolbar_visible() != prefs.toolbar {
             view.set_toolbar(prefs.toolbar);
         }
@@ -284,6 +287,7 @@ impl App {
         self.stamp = loaded.stamp;
         if let Some(view) = self.view.as_mut() {
             view.open(loaded.doc, loaded.message);
+            view.set_image_base(nav::base_dir(&self.input));
         }
         if let Some(g) = &self.gfx {
             g.window.set_title(&view::title(&self.input));
@@ -469,6 +473,13 @@ impl ApplicationHandler<UserEvent> for App {
             window.scale_factor(),
         );
         view.set_settings_available(self.store.path().is_some());
+        view.set_image_base(nav::base_dir(&self.input));
+        let proxy = Mutex::new(self.proxy.clone());
+        view.set_image_wake(Arc::new(move || {
+            if let Ok(p) = proxy.lock() {
+                let _ = p.send_event(UserEvent::Images);
+            }
+        }));
         view.set_system_dark(match window.theme() {
             Some(t) => t == Theme::Dark,
             None => platform::fallback_dark(),
@@ -509,6 +520,13 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
                 self.resolve_families();
+            }
+            UserEvent::Images => {
+                if let Some(view) = self.view.as_mut()
+                    && view.poll_images(Instant::now())
+                {
+                    self.redraw();
+                }
             }
         }
         // New faces change line breaks and heights, and so what's under the pointer.

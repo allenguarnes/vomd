@@ -9,6 +9,10 @@ fn ctx(width: u32) -> Ctx {
         zoom: 100,
         theme: ThemeMode::System,
         settings: true,
+        remote: 0,
+        remote_on: false,
+        no_curl: false,
+        pulse: false,
     }
 }
 
@@ -450,4 +454,106 @@ fn paints_bar_icons_menu_and_tooltip() {
     t.expire(&c, t0 + TOOLTIP_DELAY);
     paint(&t, &mut buf, &mut cache, &mut text);
     assert!(ink(&buf, 33, 70), "tooltip drawn under the bar");
+}
+
+/// With remote images in the document, their button leads the right group, collapses first,
+/// counts them in its label, toggles them, and says when `curl` is missing.
+#[test]
+fn the_remote_images_button() {
+    let c = Ctx {
+        remote: 3,
+        ..ctx(900)
+    };
+    let s = slots(&c);
+    assert_eq!(
+        items(&s).last(),
+        Some(&Item::Images),
+        "leftmost of the right group"
+    );
+    let r = |i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;
+    assert!(r(Item::Images).x1 <= r(Item::ZoomOut).x0 + 0.01);
+    assert_eq!(Item::Images.label(&c), "Load 3 remote images (I)");
+    assert_eq!(
+        Item::Images.label(&Ctx { remote: 1, ..c }),
+        "Load 1 remote image (I)"
+    );
+    assert_eq!(
+        Item::Images.label(&Ctx {
+            remote_on: true,
+            ..c
+        }),
+        "Hide remote images (I)"
+    );
+    let mut t = Toolbar::default();
+    let (x, y) = center(&s, Item::Images);
+    assert!(t.press(&c, x, y));
+    assert_eq!(
+        t.release(&c, x, y),
+        (true, Some(Command::Action(Action::ToggleRemote)))
+    );
+    // No curl: it says so and does nothing.
+    let none = Ctx { no_curl: true, ..c };
+    assert_eq!(Item::Images.label(&none), "Remote images: curl not found");
+    t.press(&none, x, y);
+    assert_eq!(t.release(&none, x, y), (true, None));
+    // Narrower: the zoom goes into `⋯` first, then it.
+    let full = (EDGE + BUTTON + GAP + 3.0 * BUTTON + PERCENT + 3.0 * BUTTON + EDGE) as u32;
+    assert!(slots(&Ctx { width: full, ..c }).overflow.is_empty());
+    let s = slots(&Ctx {
+        width: full - 1,
+        ..c
+    });
+    assert_eq!(s.overflow, [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]);
+    assert!(items(&s).contains(&Item::Images));
+    let s = slots(&Ctx { width: 200, ..c });
+    assert_eq!(
+        s.overflow[..4],
+        [Item::Images, Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]
+    );
+}
+
+/// The button's badge and pulse are painted in the link color.
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_badge_and_pulse_are_painted() {
+    let fonts = Fonts::new().unwrap();
+    let (mut cache, mut text) = (GlyphCache::default(), TextCtx::default());
+    let paint = |c: &Ctx, cache: &mut GlyphCache, text: &mut TextCtx| {
+        let mut buf = vec![0u32; 900 * 40];
+        let mut frame = Frame::new(&mut buf, 900, 40, 900);
+        Toolbar::default().paint(&mut frame, c, &fonts, cache, text, &crate::theme::LIGHT);
+        buf
+    };
+    let c = Ctx {
+        remote: 3,
+        ..ctx(900)
+    };
+    let r = slots(&c)
+        .items
+        .iter()
+        .find(|(i, _)| *i == Item::Images)
+        .unwrap()
+        .1;
+    let link = crate::theme::LIGHT.link;
+    let count = |buf: &[u32]| {
+        (r.x0 as usize..r.x1 as usize)
+            .flat_map(|x| (0..32).map(move |y| (x, y)))
+            .filter(|&(x, y)| buf[y * 900 + x] == link)
+            .count()
+    };
+    let badge = count(&paint(&c, &mut cache, &mut text));
+    assert!(badge > 20, "a badge: {badge}");
+    let on = count(&paint(
+        &Ctx {
+            remote_on: true,
+            ..c
+        },
+        &mut cache,
+        &mut text,
+    ));
+    assert_eq!(on, 0, "no badge once they're on");
+    assert!(count(&paint(&ctx(900), &mut cache, &mut text)) == 0);
+    let pulse = paint(&Ctx { pulse: true, ..c }, &mut cache, &mut text);
+    let plain = paint(&c, &mut cache, &mut text);
+    assert_ne!(pulse, plain, "the pulse shows");
 }

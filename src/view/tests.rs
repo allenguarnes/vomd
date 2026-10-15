@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "images")]
+use crate::layout::ImageSize;
 use winit::keyboard::SmolStr;
 
 fn ch(s: &str) -> Key {
@@ -1903,5 +1905,175 @@ mod with_fonts {
         v.paint(&mut buf, 600, now);
         assert!(buf[..32 * 600].iter().all(|&p| p == LIGHT.bg));
         assert!(!v.press(x, y, now));
+    }
+
+    /// Paint, then let the loop run after the first frame (images are asked for).
+    fn frame(v: &mut View, now: Instant) {
+        let (w, h) = v.size();
+        let mut buf = vec![0u32; (w * h) as usize];
+        v.paint(&mut buf, w as usize, now);
+        v.tick(now, Some(now));
+    }
+
+    /// Poll the image threads until `done` holds (fails after a while).
+    fn wait_images(v: &mut View, done: impl Fn(&View) -> bool) {
+        let t = Instant::now();
+        while !done(v) {
+            assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+            if v.poll_images(Instant::now()) {
+                frame(v, Instant::now());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A local image is decoded after the first frame and painted in its box.
+    #[cfg(feature = "images")]
+    #[test]
+    fn local_images_are_painted() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = Vec::new();
+        let mut enc = ::png::Encoder::new(&mut png, 40, 20);
+        enc.set_color(::png::ColorType::Rgb);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&[0x11, 0x99, 0x33].repeat(800))
+            .unwrap();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        let mut v = view("![a](a.png)", 600, 400);
+        v.set_image_base(Some(dir.clone()));
+        let now = Instant::now();
+        frame(&mut v, now);
+        assert_eq!(v.layout().image_size(1), Some(ImageSize::Pixels(40, 20)));
+        let t = Instant::now();
+        let mut buf = vec![0u32; 600 * 400];
+        loop {
+            v.poll_images(Instant::now());
+            v.paint(&mut buf, 600, Instant::now());
+            if buf.contains(&0x119933) {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "never painted");
+            v.tick(Instant::now(), Some(Instant::now()));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(buf.iter().filter(|&&p| p == 0x119933).count(), 40 * 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "remote-images")]
+    mod remote {
+        use super::*;
+
+        /// Nothing listens on the discard port: a fetch fails at once, without the network.
+        const DOC: &str = "Text ![r](http://127.0.0.1:9/a.png) and ![s](HTTPS://127.0.0.1:9/b.png)";
+
+        fn shown(src: &str) -> View {
+            let mut v = view(src, 600, 400);
+            v.set_toolbar(true);
+            v
+        }
+
+        #[test]
+        fn remote_images_wait_for_the_reader() {
+            assert_eq!(
+                key_action(&ch("i"), ModifiersState::empty()),
+                Some(Action::ToggleRemote)
+            );
+            let mut v = shown(DOC);
+            let now = Instant::now();
+            for i in 0..3 {
+                frame(&mut v, now + Duration::from_millis(i));
+            }
+            // Blocked: alt text, nothing fetched, the button counts them and pulses once.
+            assert!(!v.images.remote.started());
+            assert_eq!(v.layout().image_size(1), Some(ImageSize::Alt));
+            assert_eq!(v.toolbar_ctx().remote, 2);
+            assert!(!v.toolbar_ctx().remote_on);
+            assert_eq!(v.deadline(), Some(now + PULSE));
+            assert!(v.tick(now + PULSE, Some(now)).redraw);
+            assert!(v.pulse.is_none());
+            // Hovering a placeholder says how to load it.
+            let hit = (0..600)
+                .flat_map(|x| (0..80).map(move |y| (f64::from(x), f64::from(y))))
+                .find(|&(x, y)| v.image_at(x, y) == Some(1))
+                .expect("a placeholder on screen");
+            assert!(v.hover(hit.0, hit.1));
+            assert!(v.hover_blocked);
+            assert_eq!(v.hovered(), None, "not a link: no hand cursor");
+            // `I`: they load (a box while fetching), and fail here, back to alt text.
+            assert_eq!(v.apply(Action::ToggleRemote, now), Outcome::Redraw);
+            assert!(v.remote_on());
+            v.ensure();
+            assert_eq!(v.layout().image_size(1), Some(ImageSize::Loading));
+            assert_eq!(
+                v.layout().image_size(2),
+                Some(ImageSize::Loading),
+                "any case of https"
+            );
+            frame(&mut v, now);
+            assert!(v.images.remote.started());
+            wait_images(&mut v, |v| {
+                v.layout().image_size(1) == Some(ImageSize::Alt)
+                    && v.layout().image_size(2) == Some(ImageSize::Alt)
+            });
+            v.hover(hit.0, hit.1);
+            assert!(!v.hover_blocked, "on: not blocked");
+            // A reload keeps them on; another document turns them off.
+            v.replace(Doc::parse(DOC), None);
+            assert!(v.remote_on());
+            v.open(Doc::parse(DOC), None);
+            assert!(!v.remote_on());
+            // `I` again hides them.
+            v.apply(Action::ToggleRemote, now);
+            v.apply(Action::ToggleRemote, now);
+            assert!(!v.remote_on());
+            v.ensure();
+            assert_eq!(v.layout().image_size(1), Some(ImageSize::Alt));
+        }
+
+        #[test]
+        fn the_policy_decides() {
+            // never: no button, no key, no note.
+            let mut v = shown(DOC);
+            v.set_remote_policy(RemoteImages::Never);
+            assert_eq!(v.toolbar_ctx().remote, 0);
+            assert_eq!(
+                v.apply(Action::ToggleRemote, Instant::now()),
+                Outcome::Nothing
+            );
+            frame(&mut v, Instant::now());
+            assert!(v.pulse.is_none() && !v.remote_on() && !v.images.remote.started());
+            // always: on after the first frame, never before.
+            let mut v = shown(DOC);
+            v.set_remote_policy(RemoteImages::Always);
+            let mut buf = vec![0u32; 600 * 400];
+            v.paint(&mut buf, 600, Instant::now());
+            v.tick(Instant::now(), None);
+            assert!(!v.remote_on(), "not before the first frame is out");
+            v.tick(Instant::now(), Some(Instant::now()));
+            assert!(v.remote_on());
+            // A document without remote images has no button.
+            let v = shown("![local](a.png)");
+            assert_eq!(v.toolbar_ctx().remote, 0);
+        }
+
+        /// With the toolbar hidden, a toast says what the pulsing button would have.
+        #[test]
+        fn a_toast_stands_in_for_a_hidden_toolbar() {
+            let mut v = view(DOC, 600, 400);
+            let now = Instant::now();
+            frame(&mut v, now);
+            let (until, text) = v.toast.clone().unwrap();
+            assert_eq!(until, now + TOAST);
+            assert_eq!(text, "2 remote images blocked · press I to load");
+            assert!(v.pulse.is_none());
+            // Once per document.
+            v.tick(now + TOAST, Some(now));
+            assert!(v.toast.is_none());
+            frame(&mut v, now + TOAST);
+            assert!(v.toast.is_none());
+        }
     }
 }

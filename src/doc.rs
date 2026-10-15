@@ -1339,7 +1339,9 @@ impl Builder {
     }
 
     fn push_image(&mut self, src: String) -> u32 {
-        let remote = src.starts_with("http://") || src.starts_with("https://");
+        // Schemes are case-insensitive (`HTTPS://`).
+        let scheme = src.get(..8).unwrap_or(&src).to_ascii_lowercase();
+        let remote = scheme.starts_with("http://") || scheme.starts_with("https://");
         push_id(&mut self.doc.images, ImageRef { src, remote })
     }
 

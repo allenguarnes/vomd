@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use unicode_bidi::{BidiClass, bidi_class};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -16,9 +16,11 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::cli::Input;
 use crate::doc::{Doc, Heading};
 use crate::fonts::Fonts;
+use crate::image::{Images, Wake as ImageWake};
 use crate::layout::{Anchor, BlockBox, Layout, Params};
 use crate::platform;
 use crate::render::{self, Clip, Frame, ScrollbarFade, Viewport};
+use crate::settings::RemoteImages;
 use crate::text::cache::GlyphCache;
 use crate::text::fallback::Found;
 use crate::text::{Align, Para, ParaLayout, TextCtx, TextStyle};
@@ -37,6 +39,12 @@ const PAGE_PAD: f32 = 2.0;
 pub const ZOOM_PIXELS: f64 = 50.0;
 /// Lines scrolled per wheel notch.
 const WHEEL_LINES: f64 = 3.0;
+/// How long the toolbar's remote-images button pulses after the first frame, and how long the
+/// toast stands in for it while the toolbar is hidden.
+const PULSE: Duration = Duration::from_millis(900);
+const TOAST: Duration = Duration::from_secs(4);
+/// What hovering a blocked remote image's placeholder says.
+pub const BLOCKED_NOTE: &str = "Remote image blocked · press I to load";
 /// Passes [`View::bottom`] makes: measuring the last screen changes the total height.
 const BOTTOM_PASSES: usize = 4;
 
@@ -64,6 +72,8 @@ pub enum Action {
     ToggleToolbar,
     /// Escape: closes the toolbar's dropdown if it's open, else quits.
     Escape,
+    /// Load remote images for this document, or hide them again (`I`).
+    ToggleRemote,
     Quit,
 }
 
@@ -172,6 +182,7 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             "[" => Some(Action::PrevHeading),
             "]" => Some(Action::NextHeading),
             "b" | "B" => Some(Action::ToggleToolbar),
+            "i" | "I" if cfg!(feature = "remote-images") => Some(Action::ToggleRemote),
             _ => None,
         },
         _ => None,
@@ -374,12 +385,25 @@ pub struct View {
     zoom_pixels: f64,
     /// The link under the pointer (1-based id into `Doc::links`): pointer cursor and URL preview.
     hover: Option<u32>,
+    /// The pointer is on a blocked remote image's placeholder (its note shows).
+    hover_blocked: bool,
     /// The link the mouse button went down on; a click is a release on the same link.
     pressed: Option<u32>,
     /// While a message replaces a reloaded document: the reading position of the last good
     /// one, for the next successful reload (a file that is briefly missing, as editors and
     /// branch switches make it, doesn't cost the position).
     kept: Option<(Option<Place>, Anchor)>,
+    images: Images,
+    /// A frame was painted since the images near the viewport were last asked for.
+    images_dirty: bool,
+    /// Remote images in the document (0 when they can't be loaded: the toolbar has no button).
+    remote_count: u32,
+    /// The first frame of the document was out and the remote images announced (or loaded,
+    /// with the `always` policy).
+    announced: bool,
+    /// Until when the toolbar's remote-images button pulses, and the toast shows.
+    pulse: Option<Instant>,
+    toast: Option<(Instant, String)>,
 }
 
 impl View {
@@ -395,7 +419,7 @@ impl View {
         let d = Params::default();
         let text = (d.font_size, d.line_width);
         let params = params(width, hidpi, 100, text);
-        View {
+        let mut view = View {
             layout: Layout::new(&doc, params),
             doc,
             fonts,
@@ -428,9 +452,18 @@ impl View {
             msg_missing: BTreeSet::new(),
             zoom_pixels: 0.0,
             hover: None,
+            hover_blocked: false,
             pressed: None,
             kept: None,
-        }
+            images: Images::default(),
+            images_dirty: false,
+            remote_count: 0,
+            announced: false,
+            pulse: None,
+            toast: None,
+        };
+        view.attach_images();
+        view
     }
 
     pub fn doc(&self) -> &Doc {
@@ -570,6 +603,10 @@ impl View {
             zoom: self.zoom,
             theme: self.theme,
             settings: self.settings,
+            remote: self.remote_count,
+            remote_on: self.images.remote_on(),
+            no_curl: self.images.no_curl(),
+            pulse: self.pulse.is_some(),
         }
     }
 
@@ -709,6 +746,13 @@ impl View {
                 self.set_toolbar(visible);
             }
             Action::Reload => return Outcome::Reload,
+            Action::ToggleRemote => {
+                if self.remote_count == 0 {
+                    return Outcome::Nothing;
+                }
+                let on = !self.images.remote_on();
+                self.set_remote(on);
+            }
             Action::Escape if self.close_menu() => {}
             Action::Escape | Action::Quit => return Outcome::Quit,
         }
@@ -857,18 +901,22 @@ impl View {
         self.ensure_content();
         let ctx = self.toolbar_ctx();
         let bar = self.toolbar.pointer(&ctx, x, y, now);
-        let link = if self.drag.is_some() || self.toolbar.covers(&ctx, x, y) {
-            None
-        } else {
-            self.link_at(x, y)
-        };
-        (std::mem::replace(&mut self.hover, link) != link) | bar
+        let free = self.drag.is_none() && !self.toolbar.covers(&ctx, x, y);
+        let link = if free { self.link_at(x, y) } else { None };
+        let blocked = cfg!(feature = "remote-images")
+            && free
+            && self
+                .image_at(x, y)
+                .is_some_and(|id| self.images.blocked(id));
+        let note = std::mem::replace(&mut self.hover_blocked, blocked) != blocked;
+        (std::mem::replace(&mut self.hover, link) != link) | bar | note
     }
 
     /// The pointer left the window. Returns true if a link was hovered (or the toolbar needs a
     /// repaint).
     pub fn hover_end(&mut self) -> bool {
-        self.hover.take().is_some() | self.toolbar.leave()
+        let note = std::mem::take(&mut self.hover_blocked);
+        self.hover.take().is_some() | self.toolbar.leave() | note
     }
 
     /// The target of the hovered link, as written in the document.
@@ -971,12 +1019,25 @@ impl View {
                 &mut self.cache,
                 theme,
             );
+            if cfg!(feature = "images") {
+                self.images.begin_frame();
+                render::paint_images(&mut frame, vp, &self.layout, &mut self.images, theme);
+                self.images_dirty = true;
+            }
             if self.fade.visible(now) || self.drag.is_some() {
                 let total = self.layout.total_height();
                 render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
             }
-            if let Some(url) = self.hovered().map(str::to_owned) {
-                self.paint_preview(&mut frame, &url, theme);
+            let note = self
+                .hovered()
+                .or(self.hover_blocked.then_some(BLOCKED_NOTE));
+            if let Some(text) = note.map(str::to_owned) {
+                self.paint_preview(&mut frame, &text, theme);
+            }
+            if cfg!(feature = "remote-images")
+                && let Some((_, text)) = self.toast.clone()
+            {
+                self.paint_toast(&mut frame, &text, theme);
             }
         }
         let ctx = self.toolbar_ctx();
@@ -1037,6 +1098,51 @@ impl View {
             theme,
         );
         frame.set_clip(prev);
+    }
+
+    /// A short note in a box at the bottom right (remote images are blocked and
+    /// the toolbar that would say so is hidden).
+    fn paint_toast(&mut self, frame: &mut Frame, text: &str, theme: &Theme) {
+        let (w, h) = (frame.width() as f32, frame.height() as f32);
+        let scale = self.hidpi as f32;
+        let size = 13.0 * scale;
+        let style = TextStyle {
+            bold: false,
+            italic: false,
+            mono: false,
+            size,
+            role: Role::Text,
+            deco: 0,
+            shift: 0.0,
+            link: 0,
+        };
+        let mut para = Para::default();
+        para.push_text(text, 0, style);
+        let (pad_x, pad_y, margin) = (0.8 * size, 0.5 * size, (12.0 * scale).round());
+        let max_w = (w - 2.0 * (margin + pad_x)).max(size);
+        let pl = self
+            .msg_ctx
+            .layout(&self.fonts, &para, max_w, Align::Start, 1.4);
+        self.msg_missing
+            .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
+        let (box_w, box_h) = (pl.width + 2.0 * pad_x, pl.height + 2.0 * pad_y);
+        let (x1, y1) = (w - margin, h - margin);
+        let (x0, y0) = ((x1 - box_w).max(0.0), y1 - box_h);
+        let px = |v: f32| v.round() as i32;
+        let rect = (px(x0), px(y0), px(x1), px(y1));
+        let r = (0.4 * size).round();
+        frame.rounded_rect(rect, r, None, theme.code_bg, 255);
+        frame.rounded_rect(rect, r, Some(scale.round().max(1.0)), theme.border, 255);
+        let content = BlockBox::from_para(pl, &para.styles);
+        render::paint_block(
+            frame,
+            &content,
+            x0 + pad_x,
+            y0 + pad_y,
+            &self.fonts,
+            &mut self.cache,
+            theme,
+        );
     }
 
     /// `url` laid out in one line no wider than `max_w`: cut short with a trailing `…` when it
@@ -1139,17 +1245,30 @@ impl View {
         } else {
             self.fade.deadline()
         };
-        match (fade, self.toolbar.deadline(&self.toolbar_ctx())) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            fade,
+            self.toolbar.deadline(&self.toolbar_ctx()),
+            self.pulse,
+            self.toast.as_ref().map(|t| t.0),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Hide the scrollbar or show the toolbar's tooltip if its time is up. Returns true if the
     /// window needs a repaint.
     pub fn expire(&mut self, now: Instant) -> bool {
         let fade = self.drag.is_none() && self.fade.expire(now);
-        fade | self.toolbar.expire(&self.toolbar_ctx(), now)
+        let pulse = self.pulse.is_some_and(|t| now >= t);
+        if pulse {
+            self.pulse = None;
+        }
+        let toast = self.toast.as_ref().is_some_and(|t| now >= t.0);
+        if toast {
+            self.toast = None;
+        }
+        fade | pulse | toast | self.toolbar.expire(&self.toolbar_ctx(), now)
     }
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its
@@ -1158,6 +1277,13 @@ impl View {
     /// screen is repainted when measuring moves its thumb.
     pub fn tick(&mut self, now: Instant, measure_until: Option<Instant>) -> Tick {
         let mut redraw = self.expire(now);
+        // Images wait for the first frame (`measure_until` is set once it's out).
+        if measure_until.is_some() && self.message.is_none() {
+            redraw |= self.announce(now);
+            if std::mem::take(&mut self.images_dirty) {
+                self.request_images();
+            }
+        }
         let showing = self.message.is_none() && (self.drag.is_some() || self.fade.visible(now));
         let thumb = showing.then(|| self.thumb_at(self.scroll()));
         let measured = measure_until.is_none_or(|t| self.idle(t));
@@ -1202,6 +1328,155 @@ impl View {
         added
     }
 
+    // ---- Images ---------------------------------------------------------------------------
+
+    /// Hand the document and its new layout to the images: local sizes come from their files,
+    /// remote ones from whether they're on.
+    fn attach_images(&mut self) {
+        self.images.attach(&self.doc, &mut self.layout);
+        self.remote_count = if self.images.policy() == RemoteImages::Never {
+            0
+        } else {
+            self.doc.remote_image_count().min(u32::MAX as usize) as u32
+        };
+    }
+
+    /// The directory the document's relative image paths resolve against (`None`: stdin, and
+    /// only absolute paths load).
+    pub fn set_image_base(&mut self, base: Option<PathBuf>) {
+        self.images.set_base(base);
+        self.attach_images();
+    }
+
+    /// How the image threads wake the event loop when a result is waiting for
+    /// [`View::poll_images`].
+    pub fn set_image_wake(&mut self, wake: ImageWake) {
+        self.images.set_wake(wake);
+    }
+
+    /// The `remote_images` setting: `never` turns them off and takes away the
+    /// button and the `I` key.
+    pub fn set_remote_policy(&mut self, policy: RemoteImages) {
+        if policy == self.images.policy() {
+            return;
+        }
+        self.images.set_policy(policy);
+        if policy == RemoteImages::Never && self.images.remote_on() {
+            self.set_remote(false);
+        }
+        self.remote_count = if policy == RemoteImages::Never {
+            0
+        } else {
+            self.doc.remote_image_count().min(u32::MAX as usize) as u32
+        };
+        self.close_menu();
+    }
+
+    /// Remote images are on for this document.
+    pub fn remote_on(&self) -> bool {
+        self.images.remote_on()
+    }
+
+    /// Turn remote images on or off for this document; the reading position is kept.
+    fn set_remote(&mut self, on: bool) {
+        self.images.set_remote(on, &self.doc, &mut self.layout);
+        self.pulse = None;
+        self.toast = None;
+        self.images_dirty = true;
+        self.close_menu();
+        self.ensure();
+    }
+
+    /// After the document's first frame: point out its blocked remote images once (the
+    /// toolbar's button pulses, or a toast stands in for a hidden toolbar), or load them with
+    /// the `always` policy. Returns true if the window needs a repaint.
+    fn announce(&mut self, now: Instant) -> bool {
+        if !cfg!(feature = "remote-images")
+            || std::mem::replace(&mut self.announced, true)
+            || self.remote_count == 0
+        {
+            return false;
+        }
+        match self.images.policy() {
+            RemoteImages::Always => self.set_remote(true),
+            RemoteImages::Ask if !self.images.remote_on() => {
+                if self.toolbar.visible() {
+                    self.pulse = Some(now + PULSE);
+                } else {
+                    let n = self.remote_count;
+                    let s = if n == 1 { "" } else { "s" };
+                    let text = format!("{n} remote image{s} blocked · press I to load");
+                    self.toast = Some((now + TOAST, text));
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Ask for the images within a screen of the viewport, those on screen first.
+    fn request_images(&mut self) {
+        let h = self.area_height() as f32;
+        let y = self.scroll() as f32;
+        let mut near = Vec::new();
+        for i in self.layout.range(y - h, y + 2.0 * h) {
+            let Some(content) = self.layout.geoms()[i].content.as_deref() else {
+                continue;
+            };
+            let top = self.layout.y(i);
+            for b in &content.boxes {
+                let (y0, y1) = (top + b.y, top + b.y + b.b.ascent + b.b.descent);
+                let off_screen = y1 <= y || y0 >= y + h;
+                let size = |v: f32| v.round().max(1.0) as u32;
+                near.push((
+                    off_screen,
+                    b.b.id,
+                    size(b.b.width),
+                    size(b.b.ascent + b.b.descent),
+                ));
+            }
+        }
+        // Stable: on screen first, then the rest in document order.
+        near.sort_by_key(|n| n.0);
+        let boxes: Vec<(u32, u32, u32)> =
+            near.into_iter().map(|(_, id, w, h)| (id, w, h)).collect();
+        self.images.request(&boxes);
+    }
+
+    /// Take what the image threads finished: decoded images show, fetched ones get their size
+    /// (the reading position is kept). Returns true if the window needs a repaint.
+    pub fn poll_images(&mut self, now: Instant) -> bool {
+        let no_curl = self.images.no_curl();
+        if !self.images.poll(&self.doc, &mut self.layout) {
+            return false;
+        }
+        if !no_curl && self.images.no_curl() && !self.toolbar.visible() {
+            self.toast = Some((now + TOAST, "Remote images: curl not found".into()));
+        }
+        if self.message.is_none() {
+            self.ensure();
+        }
+        true
+    }
+
+    /// The image whose placeholder or box is at window point (`x`, `y`), if any.
+    fn image_at(&self, x: f64, y: f64) -> Option<u32> {
+        let inside = (0.0..f64::from(self.width)).contains(&x)
+            && (f64::from(self.top_inset)..f64::from(self.height)).contains(&y);
+        if self.message.is_some() || !inside {
+            return None;
+        }
+        let doc_y = self.scroll() + (y - f64::from(self.top_inset));
+        let hit = self.layout.hit(x as f32, doc_y as f32)?;
+        let block = &self.doc.blocks[hit.block as usize];
+        let cells = self.doc.row_cells(block).map(|(_, spans)| spans);
+        std::iter::once(self.doc.block_spans(block))
+            .chain(cells)
+            .flatten()
+            .find(|s| s.image != 0 && (s.start..s.end.max(s.start + 1)).contains(&hit.doc))
+            .map(|s| s.image)
+    }
+
     // ---- Documents ------------------------------------------------------------------------
 
     /// Show a different document (or a message), from the top.
@@ -1216,7 +1491,14 @@ impl View {
         self.drag = None;
         self.kept = None;
         self.hover = None;
+        self.hover_blocked = false;
         self.pressed = None;
+        // Remote images are off again for another document.
+        self.images.forget_remote();
+        self.attach_images();
+        self.announced = false;
+        self.pulse = None;
+        self.toast = None;
     }
 
     /// Show a new version of the document (reload) or a message in its place. The position
@@ -1231,6 +1513,7 @@ impl View {
             .unwrap_or_else(|| (self.place(), self.anchor));
         // Link ids belong to the old document.
         self.hover = None;
+        self.hover_blocked = false;
         self.pressed = None;
         self.doc = doc;
         self.message = message;
@@ -1238,6 +1521,8 @@ impl View {
             &self.doc,
             params(self.width, self.hidpi, self.zoom, self.text),
         );
+        // A reload keeps remote images on.
+        self.attach_images();
         self.anchor = Anchor::TOP;
         if self.message.is_some() {
             self.kept = Some((place, old));

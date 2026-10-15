@@ -13,10 +13,11 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::doc::{self, Alert, Block, BlockKind, Doc, Marker, Span, style};
+use crate::doc::{self, Alert, Block, BlockKind, Doc, ImageRef, Marker, Span, style};
 use crate::fonts::Fonts;
 use crate::text::{
-    Align, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, TextCtx, TextStyle, deco,
+    Align, InlineBox, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, TextCtx,
+    TextStyle, deco,
 };
 use crate::theme::Role;
 
@@ -53,6 +54,26 @@ const NO_WRAP: f32 = 1.0e6;
 /// block the first frame. Later rows wrap within the sampled widths.
 const TABLE_SAMPLE_ROWS: usize = 256;
 const TABLE_SAMPLE_BYTES: usize = 64 * 1024;
+/// Width of the box a remote image loads in while its size is unknown (4:3), in em.
+const LOADING_EM: f32 = 16.0;
+/// Most pixels an image box may have (about two 4K screens): a tall, narrow image is shown
+/// smaller rather than decoded into hundreds of MB.
+const MAX_BOX_PIXELS: f32 = 16.0e6;
+
+/// How an image takes part in layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageSize {
+    /// Its alt text in an outlined placeholder: nothing to show (a remote image while remote
+    /// images are off, a missing file, not PNG or JPEG).
+    Alt,
+    /// Being fetched, size unknown: a 4:3 box.
+    Loading,
+    /// Its natural size in pixels: a box that many logical pixels, no wider than the line.
+    Pixels(u32, u32),
+}
+
+/// Finds a local image's size when its block is first measured (see `image.rs`).
+pub type ImageProbe = Box<dyn FnMut(&ImageRef) -> ImageSize>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
@@ -247,6 +268,11 @@ pub struct Layout {
     cells_laid: usize,
     ctx: TextCtx,
     para: Para,
+    /// Each image's size (by id − 1); `None`: not looked up yet (its block was never measured).
+    images: Vec<Option<ImageSize>>,
+    probe: Option<ImageProbe>,
+    /// The block each image is in (by id − 1), found when first needed.
+    image_blocks: Vec<u32>,
 }
 
 impl Layout {
@@ -272,6 +298,9 @@ impl Layout {
             cells_laid: 0,
             ctx: TextCtx::default(),
             para: Para::default(),
+            images: vec![None; doc.images.len()],
+            probe: None,
+            image_blocks: Vec::new(),
         };
         layout.meta = layout.prepass(doc);
         layout.set_geometry();
@@ -379,22 +408,99 @@ impl Layout {
             }
         }
         for i in 0..self.geoms.len() {
-            if !self.geoms[i].missing {
-                continue;
+            if self.geoms[i].missing {
+                self.invalidate_block(doc, i);
             }
-            let rows = match doc.blocks[i].kind {
-                BlockKind::TableRow { table, .. }
-                    if self.table_sample(doc, table as usize).contains(&(i as u32)) =>
-                {
-                    self.table_cols[table as usize] = None;
-                    self.table_rows[table as usize].clone()
-                }
-                _ => i as u32..i as u32 + 1,
-            };
-            self.reset_rows(rows);
         }
+    }
+
+    /// Lay block `i` out again: a table row in its table's sampled rows remeasures the whole
+    /// table, whose column widths depend on it.
+    fn invalidate_block(&mut self, doc: &Doc, i: usize) {
+        let rows = match doc.blocks[i].kind {
+            BlockKind::TableRow { table, .. }
+                if self.table_sample(doc, table as usize).contains(&(i as u32)) =>
+            {
+                self.table_cols[table as usize] = None;
+                self.table_rows[table as usize].clone()
+            }
+            _ => i as u32..i as u32 + 1,
+        };
+        self.reset_rows(rows);
         self.live
             .retain(|&i| self.geoms[i as usize].content.is_some());
+    }
+
+    /// How local images are sized (`None`: they all show their alt text). Sizes looked up so
+    /// far are forgotten, and their blocks laid out again.
+    pub fn set_image_probe(&mut self, doc: &Doc, probe: Option<ImageProbe>) {
+        self.probe = probe;
+        for id in 1..=self.images.len() as u32 {
+            if self.images[id as usize - 1].take().is_some() {
+                self.invalidate_image(doc, id);
+            }
+        }
+    }
+
+    /// Image `id` (1-based) has a new size (fetched, failed, turned on or off): its block is
+    /// laid out again.
+    pub fn set_image(&mut self, doc: &Doc, id: u32, size: ImageSize) {
+        let Some(slot) = id
+            .checked_sub(1)
+            .and_then(|i| self.images.get_mut(i as usize))
+        else {
+            return;
+        };
+        // A block measured with the image has looked its size up.
+        if slot.replace(size).is_some_and(|was| was != size) {
+            self.invalidate_image(doc, id);
+        }
+    }
+
+    /// The size image `id` was laid out with, if its block was measured.
+    pub fn image_size(&self, id: u32) -> Option<ImageSize> {
+        *self.images.get(id.checked_sub(1)? as usize)?
+    }
+
+    fn invalidate_image(&mut self, doc: &Doc, id: u32) {
+        if self.image_blocks.is_empty() {
+            self.image_blocks = vec![u32::MAX; self.images.len()];
+            for (b, block) in doc.blocks.iter().enumerate() {
+                let cells = doc.row_cells(block).map(|(_, spans)| spans);
+                for s in std::iter::once(doc.block_spans(block))
+                    .chain(cells)
+                    .flatten()
+                {
+                    if let Some(slot) = s
+                        .image
+                        .checked_sub(1)
+                        .and_then(|i| self.image_blocks.get_mut(i as usize))
+                        && *slot == u32::MAX
+                    {
+                        *slot = b as u32;
+                    }
+                }
+            }
+        }
+        if let Some(&b) = self.image_blocks.get(id as usize - 1)
+            && (b as usize) < self.geoms.len()
+        {
+            self.invalidate_block(doc, b as usize);
+        }
+    }
+
+    /// Look up the sizes of the images in `spans` not looked up yet.
+    fn resolve_images(&mut self, doc: &Doc, spans: &[Span]) {
+        for s in spans.iter().filter(|s| s.image != 0) {
+            let i = s.image as usize - 1;
+            if self.images.get(i) == Some(&None) {
+                let size = match (&mut self.probe, doc.images.get(i)) {
+                    (Some(probe), Some(img)) => probe(img),
+                    _ => ImageSize::Alt,
+                };
+                self.images[i] = Some(size);
+            }
+        }
     }
 
     /// Mark the blocks measured again.
@@ -726,7 +832,14 @@ impl Layout {
                 } else {
                     BODY_LH
                 };
-                fill_para(&mut self.para, doc, doc.block_spans(block), body);
+                self.resolve_images(doc, doc.block_spans(block));
+                let boxes = Boxes {
+                    sizes: &self.images,
+                    scale: self.params.scale,
+                    em,
+                    max_w: avail,
+                };
+                fill_para(&mut self.para, doc, doc.block_spans(block), body, &boxes);
                 let pl = self.ctx.layout(fonts, &self.para, avail, Align::Start, lh);
                 missing.extend_from_slice(&pl.missing);
                 let first_baseline = pl.lines.first().map(|l| l.baseline + gap);
@@ -1165,7 +1278,14 @@ impl Layout {
         // A fragment of a split row only stores the cells that still have text.
         let stored = doc.row_cells(block).take_while(|&(c, _)| c < visible);
         for (c, spans) in stored {
-            fill_para(&mut self.para, doc, spans, body);
+            self.resolve_images(doc, spans);
+            let boxes = Boxes {
+                sizes: &self.images,
+                scale: self.params.scale,
+                em,
+                max_w: (cols[c] - 2.0 * px).max(1.0),
+            };
+            fill_para(&mut self.para, doc, spans, body, &boxes);
             let align = match aligns.get(c) {
                 Some(doc::Align::Center) => Align::Center,
                 Some(doc::Align::Right) => Align::Right,
@@ -1265,7 +1385,16 @@ impl Layout {
                 ..self.body_style(block, self.meta[r as usize])
             };
             for (c, spans) in doc.row_cells(block).take_while(|&(c, _)| c < n) {
-                fill_para(&mut self.para, doc, spans, body);
+                self.resolve_images(doc, spans);
+                // An image claims at most its column's share of the line, so one doesn't push
+                // the others off the edge (a cell shrinks it to fit).
+                let boxes = Boxes {
+                    sizes: &self.images,
+                    scale: self.params.scale,
+                    em,
+                    max_w: ((self.col_w - indent) / n as f32 - 2.0 * px).max(em),
+                };
+                fill_para(&mut self.para, doc, spans, body, &boxes);
                 let (lo, hi, absent) = self.ctx.measure_missing(fonts, &self.para);
                 min[c] = min[c].max(lo);
                 max[c] = max[c].max(hi);
@@ -1471,10 +1600,63 @@ fn span_style(span: &Span, body: TextStyle) -> TextStyle {
     s
 }
 
-fn fill_para(para: &mut Para, doc: &Doc, spans: &[Span], body: TextStyle) {
+/// What [`fill_para`] needs to size image boxes: each image's size, the scale, and the line's
+/// width, which a box never exceeds.
+struct Boxes<'a> {
+    sizes: &'a [Option<ImageSize>],
+    scale: f32,
+    em: f32,
+    max_w: f32,
+}
+
+impl Boxes<'_> {
+    /// The box image `id` is shown in, whole physical pixels; `None` for its alt text.
+    fn size(&self, id: u32) -> Option<(f32, f32)> {
+        let (w, h) = match (*self.sizes.get(id.checked_sub(1)? as usize)?)? {
+            ImageSize::Alt => return None,
+            ImageSize::Loading => {
+                let w = (LOADING_EM * self.em).min(self.max_w);
+                (w, w * 0.75)
+            }
+            ImageSize::Pixels(w, h) => (w as f32 * self.scale, h as f32 * self.scale),
+        };
+        let max_w = self.max_w.floor().max(1.0);
+        let fit = (max_w / w).min((MAX_BOX_PIXELS / (w * h)).sqrt()).min(1.0);
+        Some((
+            (w * fit).round().clamp(1.0, max_w),
+            (h * fit).round().max(1.0),
+        ))
+    }
+}
+
+fn fill_para(para: &mut Para, doc: &Doc, spans: &[Span], body: TextStyle, boxes: &Boxes) {
     para.clear();
+    let mut last_image = 0;
     for span in spans {
-        para.push_text(doc.span_text(span), span.start, span_style(span, body));
+        let style = span_style(span, body);
+        if span.image != 0
+            && let Some((w, h)) = boxes.size(span.image)
+        {
+            // An alt text split over two spans (a long block cut in chunks) is one box.
+            if span.image != last_image {
+                let b = InlineBox {
+                    width: w,
+                    ascent: h,
+                    descent: 0.0,
+                    id: span.image,
+                };
+                let style = TextStyle {
+                    italic: false,
+                    deco: style.deco & !deco::IMAGE_BOX,
+                    ..style
+                };
+                para.push_box(b, span.start, style);
+            }
+            last_image = span.image;
+            continue;
+        }
+        last_image = span.image;
+        para.push_text(doc.span_text(span), span.start, style);
     }
     if para.styles.is_empty() {
         para.styles.push(body);

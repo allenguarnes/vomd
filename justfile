@@ -30,3 +30,8 @@ bench fixture="":
 # Regenerate assets/fonts from upstream release zips extracted into DIR.
 fonts dir:
     scripts/subset-fonts.sh {{dir}}
+
+# No network access without I: needs a display and user namespaces.
+netns:
+    cargo build --release
+    scripts/netns-check.sh
