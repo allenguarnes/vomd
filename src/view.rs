@@ -6,7 +6,7 @@
 //! offset: block heights change as idle layout measures them, and on resize, zoom and reload,
 //! and the anchor keeps the same text at the top of the window through all of it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -228,6 +228,8 @@ pub struct View {
     /// Characters already handed to a fallback scan, over all documents shown (the
     /// system fonts are scanned once per character, not once per reload).
     tried: HashSet<char>,
+    /// Characters of the message that no face covers, waiting for `take_missing`.
+    msg_missing: BTreeSet<char>,
     /// Ctrl + trackpad scroll not yet turned into zoom steps.
     zoom_pixels: f64,
     /// While a message replaces a reloaded document: the reading position of the last good
@@ -265,6 +267,7 @@ impl View {
             fade: ScrollbarFade::default(),
             drag: None,
             tried: HashSet::new(),
+            msg_missing: BTreeSet::new(),
             zoom_pixels: 0.0,
             kept: None,
         }
@@ -336,7 +339,7 @@ impl View {
     /// document area, its scrolling, pages and scrollbar start below it.
     pub fn set_top_inset(&mut self, px: u32) {
         self.top_inset = px.min(self.height);
-        self.clamp_scroll();
+        self.ensure();
     }
 
     pub fn top_inset(&self) -> u32 {
@@ -354,7 +357,6 @@ impl View {
         self.height = height;
         self.top_inset = self.top_inset.min(height);
         self.relayout();
-        self.clamp_scroll();
     }
 
     pub fn set_hidpi(&mut self, hidpi: f64) {
@@ -362,10 +364,14 @@ impl View {
         self.relayout();
     }
 
-    /// New layout parameters; the anchor keeps the reading position.
+    /// New layout parameters; the anchor keeps the reading position. The blocks around it are
+    /// measured at once: until they are, the heights are the old ones (scaled by the font size
+    /// only, nothing rewrapped), so a window that got narrower and taller would seem to end
+    /// above the position, and clamping against that would throw it away.
     fn relayout(&mut self) {
         self.layout
             .set_params(params(self.width, self.hidpi, self.zoom));
+        self.ensure();
     }
 
     // ---- Scrolling ------------------------------------------------------------------------
@@ -382,12 +388,6 @@ impl View {
     pub fn set_scroll(&mut self, y: f64) {
         let y = if y.is_nan() { 0.0 } else { y };
         self.anchor = self.layout.anchor_exact(y.clamp(0.0, self.max_scroll()));
-    }
-
-    fn clamp_scroll(&mut self) {
-        if self.scroll() > self.max_scroll() {
-            self.set_scroll(self.max_scroll());
-        }
     }
 
     pub fn scroll_by(&mut self, dy: f64, now: Instant) {
@@ -610,6 +610,9 @@ impl View {
         let pl = self
             .msg_ctx
             .layout(&self.fonts, &para, max_w, Align::Center, 1.5);
+        // The message is laid out on every paint, so a face found later covers it then.
+        self.msg_missing
+            .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
         let oy = ((h - pl.height) / 2.0).max(0.0);
         let content = BlockBox::from_para(pl, &para.styles);
         let ox = (w - max_w) / 2.0;
@@ -658,6 +661,7 @@ impl View {
     /// first seen in a later edit does get a scan of its own.)
     pub fn take_missing(&mut self) -> Vec<char> {
         let mut missing = self.layout.take_missing();
+        missing.extend(std::mem::take(&mut self.msg_missing));
         missing.retain(|&c| self.tried.insert(c));
         missing
     }

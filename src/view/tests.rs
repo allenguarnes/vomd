@@ -194,6 +194,87 @@ mod with_fonts {
         assert_eq!(v.scale(), 2.0);
     }
 
+    /// A lot of text that wraps differently at every width.
+    fn wrapping(n: usize) -> String {
+        (0..n)
+            .map(|_| format!("{}\n\n", "some normal words to wrap ".repeat(15)))
+            .collect()
+    }
+
+    /// Narrower and taller at once: the old heights (not rewrapped) would make the document
+    /// end above the position, but the new wrapping doesn't, so the position stays.
+    #[test]
+    fn resize_keeps_the_position_when_narrower_and_taller() {
+        let now = Instant::now();
+        let mut v = view(&wrapping(100), 900, 500);
+        v.apply(Action::Bottom, now);
+        v.ensure();
+        let before = v.anchor();
+        assert!(before.block >= 90, "{before:?}");
+        v.resize(300, 900);
+        assert_eq!(v.anchor(), before, "right after the resize");
+        v.ensure();
+        assert_eq!(v.anchor(), before, "after measuring");
+        assert!(v.scroll() <= v.max_scroll() + 0.5);
+        // The same for the strip above the document area, and for a size change in two steps.
+        v.set_top_inset(50);
+        v.resize(280, 1000);
+        v.set_top_inset(0);
+        v.ensure();
+        assert_eq!(v.anchor(), before, "inset");
+        // Moving by input before the next paint doesn't clamp against the old wrapping either.
+        v.resize(900, 500);
+        v.resize(300, 900);
+        v.wheel_lines(-1.0, now);
+        v.ensure();
+        assert!(v.anchor().block <= before.block, "{:?}", v.anchor());
+        assert!(v.scroll() <= v.max_scroll() + 0.5);
+    }
+
+    /// A zoom or HiDPI change measures around the position before anything clamps it.
+    #[test]
+    fn zoom_and_hidpi_keep_the_position_at_the_end() {
+        let now = Instant::now();
+        let mut v = view(&wrapping(100), 900, 500);
+        v.set_top_inset(100);
+        v.apply(Action::Bottom, now);
+        v.ensure();
+        let before = v.anchor();
+        v.set_hidpi(1.5);
+        v.set_top_inset(0);
+        assert_eq!(v.anchor(), before, "HiDPI");
+        v.set_top_inset(100);
+        v.apply(Action::ZoomOut, now);
+        v.set_top_inset(0);
+        assert_eq!(v.anchor(), before, "zoom out");
+        assert!(v.scroll() <= v.max_scroll() + 0.5);
+    }
+
+    /// A window that really got shorter text than the position settles at the real end.
+    #[test]
+    fn resize_wider_and_taller_clamps_to_the_real_end() {
+        let now = Instant::now();
+        let mut v = view(&wrapping(100), 300, 500);
+        v.apply(Action::Bottom, now);
+        v.ensure();
+        v.resize(1200, 1200);
+        v.ensure();
+        let n = v.doc().blocks.len();
+        assert!((v.scroll() - v.max_scroll()).abs() < 1e-3);
+        assert_eq!(
+            v.layout().range_exact(v.scroll(), v.scroll() + 1200.0).end,
+            n
+        );
+        let last = &v.layout().geoms()[n - 1];
+        assert!(last.measured && last.content.is_some());
+        // A document that fits the new window altogether starts at its top.
+        let mut v = view(&wrapping(5), 300, 300);
+        v.apply(Action::Bottom, now);
+        v.resize(1200, 1200);
+        v.ensure();
+        assert_eq!(v.scroll(), 0.0);
+    }
+
     #[test]
     fn zoom_limits() {
         let now = Instant::now();
@@ -312,6 +393,41 @@ mod with_fonts {
         );
         assert!((x0 as i32 + x1 as i32 - 600).abs() <= 4, "{x0}..{x1}");
         assert!((y0 as i32 + y1 as i32 - 400).abs() <= 12, "{y0}..{y1}");
+    }
+
+    /// An error message is shown with the same fallback fonts as a document: its uncovered
+    /// characters are reported, once.
+    #[test]
+    fn message_characters_are_scanned_once() {
+        let mut v = View::new(
+            Fonts::new().unwrap(),
+            Doc::default(),
+            Some("Cannot open /tmp/한국어-문서.md".into()),
+            (600, 400),
+            1.0,
+        );
+        assert!(v.take_missing().is_empty(), "nothing painted yet");
+        let mut buf = vec![0; 600 * 400];
+        v.paint(&mut buf, 600, Instant::now());
+        let missing = v.take_missing();
+        assert!(
+            missing.contains(&'한') && missing.contains(&'문'),
+            "{missing:?}"
+        );
+        assert!(missing.iter().all(|&c| c as u32 > 0x7f), "{missing:?}");
+        v.paint(&mut buf, 600, Instant::now());
+        assert!(
+            v.take_missing().is_empty(),
+            "the same characters, the same scan"
+        );
+        // The same characters in the next message (a failed reload) aren't new either.
+        v.replace(Doc::default(), Some("Cannot open 한국어".into()));
+        v.paint(&mut buf, 600, Instant::now());
+        assert!(v.take_missing().is_empty());
+        v.replace(Doc::default(), Some("Cannot open 字体".into()));
+        v.paint(&mut buf, 600, Instant::now());
+        let new = v.take_missing();
+        assert!(new.contains(&'字') && !new.contains(&'한'), "{new:?}");
     }
 
     #[test]
