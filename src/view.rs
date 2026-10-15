@@ -412,8 +412,21 @@ impl View {
         fonts: Fonts,
         doc: Doc,
         message: Option<String>,
+        size: (u32, u32),
+        hidpi: f64,
+    ) -> View {
+        View::with_base(fonts, doc, message, size, hidpi, None)
+    }
+
+    /// [`View::new`] for a document in directory `base` (see [`View::set_image_base`]), which
+    /// its images are attached to once.
+    pub fn with_base(
+        fonts: Fonts,
+        doc: Doc,
+        message: Option<String>,
         (width, height): (u32, u32),
         hidpi: f64,
+        base: Option<PathBuf>,
     ) -> View {
         let hidpi = sane_scale(hidpi);
         let d = Params::default();
@@ -462,6 +475,7 @@ impl View {
             pulse: None,
             toast: None,
         };
+        view.images.set_base(base);
         view.attach_images();
         view
     }

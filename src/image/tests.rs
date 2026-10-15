@@ -175,10 +175,23 @@ fn local_paths_resolve_against_the_document() {
         r"\\.\pipe\x",
         "//?/C:/x.png",
         "///x.png",
+        // The NT form is handed to the system as it is, with no parsing: `?` and `*` can't be in
+        // a Windows filename, so no path with one is a file.
+        r"%5C%3F%3F%5CUNC%5Chost%5Cshare%5Cx.png",
+        "%2F%3F%3F%2FUNC%2Fhost%2Fshare%2Fx.png",
+        r"\??\UNC\host\share\x.png",
+        "/??/UNC/host/share/x.png",
+        r"/??\UNC/host/x.png",
+        "%2F%3F%3F%2Fx.png",
+        "a%3Fb.png",
+        "a%2Ab.png",
+        "x/*.png",
     ] {
         assert_eq!(p(net), None, "{net:?}");
         assert_eq!(local_path(net, None), None, "{net:?}");
     }
+    // The query is cut off before decoding: a raw `?` ends the path, it isn't in it.
+    assert_eq!(p("a.png?x=?*"), Some(PathBuf::from("/docs/proj/a.png")));
     // A single root, and what only looks like one, are paths.
     assert_eq!(p("%2Fabs/a.png"), Some(PathBuf::from("/abs/a.png")));
     assert_eq!(p("a//b.png"), Some(PathBuf::from("/docs/proj/a//b.png")));
@@ -243,6 +256,112 @@ fn decoding_resamples_to_the_box() {
     let red = png_bytes(1, 1, |_, _| [255, 0, 0, 255]);
     let b = decode(&red, 3, 2).unwrap();
     assert_eq!(b.data, vec![0xFFFF_0000; 6]);
+}
+
+/// A PNG read a row at a time is resampled to the same pixels as its whole frame: sizes that
+/// shrink, enlarge and don't divide, and every color type the decoder expands to 8 bits.
+#[test]
+fn a_png_read_by_rows_decodes_like_its_whole_frame() {
+    let noise = |x: u32, y: u32| {
+        let v = x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503) ^ (x * y);
+        [
+            v as u8,
+            (v >> 8) as u8,
+            (v >> 16) as u8,
+            255 - (v >> 4) as u8 % 90,
+        ]
+    };
+    for (sw, sh) in [(1, 1), (7, 5), (64, 3), (3, 64), (101, 97)] {
+        let png = png_bytes(sw, sh, noise);
+        for (w, h) in [(1, 1), (2, 3), (sw, sh), (sw / 2 + 1, sh * 2), (200, 150)] {
+            let rows = decode_png(&png, w, h, true).unwrap();
+            let frame = decode_png(&png, w, h, false).unwrap();
+            assert_eq!(rows, frame, "{sw}×{sh} to {w}×{h}");
+        }
+    }
+    let encode = |color, depth, palette: Option<&[u8]>, trns: Option<&[u8]>, data: &[u8]| {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, 5, 4);
+        enc.set_color(color);
+        enc.set_depth(depth);
+        if let Some(p) = palette {
+            enc.set_palette(p.to_vec());
+        }
+        if let Some(t) = trns {
+            enc.set_trns(t.to_vec());
+        }
+        enc.write_header().unwrap().write_image_data(data).unwrap();
+        out
+    };
+    let ramp = |n: usize| (0..n).map(|i| (i * 37 % 251) as u8).collect::<Vec<u8>>();
+    for (name, png) in [
+        (
+            "gray",
+            encode(
+                png::ColorType::Grayscale,
+                png::BitDepth::Eight,
+                None,
+                None,
+                &ramp(20),
+            ),
+        ),
+        (
+            "gray alpha",
+            encode(
+                png::ColorType::GrayscaleAlpha,
+                png::BitDepth::Eight,
+                None,
+                None,
+                &ramp(40),
+            ),
+        ),
+        (
+            "rgb 16",
+            encode(
+                png::ColorType::Rgb,
+                png::BitDepth::Sixteen,
+                None,
+                None,
+                &ramp(120),
+            ),
+        ),
+        (
+            "gray 1",
+            encode(
+                png::ColorType::Grayscale,
+                png::BitDepth::One,
+                None,
+                None,
+                &[0b1010_0000; 4],
+            ),
+        ),
+        (
+            "indexed",
+            encode(
+                png::ColorType::Indexed,
+                png::BitDepth::Eight,
+                Some(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 9, 9, 9]),
+                Some(&[255, 128]),
+                &(0..20).map(|i| i as u8 % 4).collect::<Vec<u8>>(),
+            ),
+        ),
+    ] {
+        let rows = decode_png(&png, 3, 2, true).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(Some(rows), decode_png(&png, 3, 2, false), "{name}");
+    }
+    // An interlaced PNG is read whole (its rows arrive pass by pass) and comes out the same as
+    // the same pixels not interlaced.
+    let plain = fixture("alpha.png");
+    let adam7 = fixture("interlaced.png");
+    assert_eq!(header(&mut &adam7[..]), Some((Format::Png, 320, 160)));
+    for (w, h) in [(160, 80), (320, 160), (500, 333), (7, 5)] {
+        assert_eq!(decode(&plain, w, h), decode(&adam7, w, h), "{w}×{h}");
+    }
+    // Data that ends early doesn't decode, whichever way it's read.
+    let png = png_bytes(40, 40, noise);
+    let cut = &png[..png.len() - png.len() / 3];
+    assert_eq!(decode_png(cut, 10, 10, true), None);
+    assert_eq!(decode_png(cut, 10, 10, false), None);
 }
 
 /// Pixels are premultiplied, and a transparent neighbor doesn't darken or tint an edge.

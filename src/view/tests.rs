@@ -1976,6 +1976,25 @@ mod with_fonts {
         assert_eq!(v.images.generation(), before + 2);
     }
 
+    /// A view made with its base directory has attached its images once, base included (the
+    /// first document, which `main.rs` hands the base to).
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_new_view_attaches_its_images_once() {
+        let dir = std::env::temp_dir();
+        let v = View::with_base(
+            Fonts::new().unwrap(),
+            Doc::parse("![a](a.png)"),
+            None,
+            (600, 400),
+            1.0,
+            Some(dir.clone()),
+        );
+        assert_eq!(v.images.generation(), 1);
+        assert_eq!(v.images.base(), Some(dir.as_path()));
+        assert_eq!(view("![a](a.png)", 600, 400).images.generation(), 1);
+    }
+
     #[cfg(feature = "remote-images")]
     mod remote {
         use super::*;

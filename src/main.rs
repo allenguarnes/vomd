@@ -464,15 +464,15 @@ impl ApplicationHandler<UserEvent> for App {
         };
         self.stamp = loaded.stamp;
         let px = window.inner_size();
-        let mut view = View::new(
+        let mut view = View::with_base(
             fonts,
             loaded.doc,
             loaded.message,
             (px.width, px.height),
             window.scale_factor(),
+            nav::base_dir(&self.input),
         );
         view.set_settings_available(self.store.path().is_some());
-        view.set_image_base(nav::base_dir(&self.input));
         let proxy = Mutex::new(self.proxy.clone());
         view.set_image_wake(Arc::new(move || {
             if let Ok(p) = proxy.lock() {

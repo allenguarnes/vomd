@@ -59,8 +59,8 @@ fn main() {
         .map(|n| format!("Image {n}:\n\n![{n}]({n})\n\n"))
         .collect();
     let (w, h) = (1920u32, 1080u32);
-    let mut v = View::new(Fonts::new().unwrap(), Doc::parse(&src), None, (w, h), 1.0);
-    v.set_image_base(Some(dir));
+    let fonts = Fonts::new().unwrap();
+    let mut v = View::with_base(fonts, Doc::parse(&src), None, (w, h), 1.0, Some(dir));
     let mut buf = vec![0u32; (w * h) as usize];
     let start = Instant::now();
     let mut pages = 0;

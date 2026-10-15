@@ -154,8 +154,11 @@ pub fn local_path(src: &str, base: Option<&Path>) -> Option<PathBuf> {
     let path = src.split(['?', '#']).next().unwrap_or_default();
     let path = crate::nav::percent_decode(path);
     // Windows connects to a server just to look at its path (and sends credentials): no image
-    // may name one, written as is or percent-encoded.
-    if is_network(src) || is_network(&path) {
+    // may name one, written as is or percent-encoded. A filename can't hold `?` or `*` there,
+    // and the NT form `\??\UNC\host\share` (taken by the system as it is, with no parsing) has
+    // two: a `?` that survives the query split must have been encoded, so it is refused (on
+    // every system, which keeps this testable).
+    if is_network(src) || is_network(&path) || path.contains(['?', '*']) {
         return None;
     }
     let path = PathBuf::from(path);
@@ -170,13 +173,17 @@ pub fn local_path(src: &str, base: Option<&Path>) -> Option<PathBuf> {
 
 /// Whether `path` names a file on another machine, or a device, for Windows: two separators
 /// in a row at its start, in any mix of `/` and `\` (`\\host\share`, `//host/share`, the
-/// `\\?\` and `\\.\` forms), or any prefix but a plain drive letter. Plain drive-letter and
-/// rooted paths are the only absolute ones allowed. (Elsewhere a mount like autofs's `/net/host`
-/// can reach a server the same way: a path is only as local as the system makes it.)
+/// `\\?\` and `\\.\` forms), a separator, `??` and a separator (the NT form
+/// `\??\UNC\host\share`, which the system takes as it is: written with its `?` it would have
+/// begun the query, so `local_path` also refuses any decoded `?`), or any prefix but a plain
+/// drive letter. Plain drive-letter and rooted paths are the only absolute ones allowed.
+/// (Elsewhere a mount like autofs's `/net/host` can reach a server the same way: a path is only
+/// as local as the system makes it.)
 fn is_network(path: &str) -> bool {
+    let sep = |c: Option<char>| matches!(c, Some('/' | '\\'));
     let mut c = path.chars();
-    let sep = |c: char| matches!(c, '/' | '\\');
-    (c.next().is_some_and(sep) && c.next().is_some_and(sep))
+    let (a, b, x, y) = (c.next(), c.next(), c.next(), c.next());
+    (sep(a) && (sep(b) || (b == Some('?') && x == Some('?') && sep(y))))
         || matches!(
             Path::new(path).components().next(),
             Some(Component::Prefix(p)) if !matches!(p.kind(), Prefix::Disk(_))
@@ -217,7 +224,10 @@ fn probe(img: &ImageRef, base: Option<&Path>) -> ImageSize {
 
 fn read_file(path: &Path) -> Option<Vec<u8>> {
     let file = open_regular(path)?;
-    let mut bytes = Vec::new();
+    // `take` has no size hint: without the length the buffer doubles its way up, leaving up to
+    // twice the file in capacity.
+    let len = file.metadata().ok()?.len().min(MAX_FILE) as usize;
+    let mut bytes = Vec::with_capacity(len + 1);
     file.take(MAX_FILE + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= MAX_FILE).then_some(bytes)
 }
@@ -241,31 +251,7 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
     }
     let (w, h) = clamp_box(w, h);
     match format {
-        Format::Png => {
-            let limits = png::Limits {
-                bytes: (MAX_PIXELS * 4) as usize + (1 << 20),
-            };
-            let mut d = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), limits);
-            d.set_transformations(png::Transformations::normalize_to_color8());
-            let mut reader = d.read_info().ok()?;
-            let mut buf = vec![0; reader.output_buffer_size()?];
-            let info = reader.next_frame(&mut buf).ok()?;
-            let channels = match info.color_type {
-                png::ColorType::Grayscale => 1,
-                png::ColorType::GrayscaleAlpha => 2,
-                png::ColorType::Rgb => 3,
-                png::ColorType::Rgba => 4,
-                png::ColorType::Indexed => return None,
-            };
-            let src = Source8 {
-                data: &buf,
-                width: info.width,
-                height: info.height,
-                stride: info.line_size,
-                channels,
-            };
-            Some(resample(&src, w, h))
-        }
+        Format::Png => decode_png(bytes, w, h, true),
         Format::Jpeg => {
             use zune_jpeg::zune_core::{
                 bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions,
@@ -284,29 +270,107 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
                 return None;
             }
             let data = d.decode().ok()?;
-            let stride = sw as usize * 3;
-            if data.len() < stride * sh as usize {
-                return None;
-            }
-            let src = Source8 {
+            let frame = Frame {
                 data: &data,
                 width: sw,
                 height: sh,
-                stride,
+                stride: sw as usize * 3,
                 channels: 3,
             };
-            Some(resample(&src, w, h))
+            resample(frame, w, h)
         }
     }
 }
 
-/// 8-bit pixels: gray, gray + alpha, RGB or RGBA (`channels` 1–4), rows `stride` bytes apart.
-struct Source8<'a> {
+/// A PNG's pixels resampled to `w` × `h`. A PNG that isn't interlaced is read a row at a time
+/// (`rows`; `false` reads the whole frame, as an interlaced one must be): its full-size pixels
+/// can be hundreds of MB, and the memory the allocator then keeps would sit beside a full cache.
+#[cfg(feature = "images")]
+fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
+    let limits = png::Limits {
+        bytes: (MAX_PIXELS * 4) as usize + (1 << 20),
+    };
+    let mut d = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), limits);
+    d.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = d.read_info().ok()?;
+    let (width, height) = reader.info().size();
+    let channels = match reader.output_color_type().0 {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => return None,
+    };
+    if rows && !reader.info().interlaced {
+        let mut frame = PngRows {
+            reader,
+            row: Vec::new(),
+            next: 0,
+        };
+        return resample_rows(&mut frame, (width, height), channels, w, h);
+    }
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let frame = Frame {
+        data: &buf,
+        width: info.width,
+        height: info.height,
+        stride: info.line_size,
+        channels,
+    };
+    resample(frame, w, h)
+}
+
+/// The source rows of an image, as [`resample_rows`] takes them: it only ever asks for the row
+/// it last had or the next ones.
+trait Rows {
+    /// Row `y` (`channels` bytes a pixel, at least a row's worth; more is ignored), or `None` if
+    /// it can't be had: the data ended, or `y` is before the row the source is at.
+    fn row(&mut self, y: usize) -> Option<&[u8]>;
+}
+
+/// 8-bit pixels in memory: gray, gray + alpha, RGB or RGBA (`channels` 1–4), rows `stride` bytes
+/// apart.
+struct Frame<'a> {
     data: &'a [u8],
     width: u32,
     height: u32,
     stride: usize,
     channels: usize,
+}
+
+impl Rows for Frame<'_> {
+    fn row(&mut self, y: usize) -> Option<&[u8]> {
+        self.data.get(y * self.stride..)
+    }
+}
+
+/// A PNG decoded a row at a time: `row` holds row `next - 1`.
+#[cfg(feature = "images")]
+struct PngRows<'a> {
+    reader: png::Reader<std::io::Cursor<&'a [u8]>>,
+    row: Vec<u8>,
+    next: usize,
+}
+
+#[cfg(feature = "images")]
+impl Rows for PngRows<'_> {
+    fn row(&mut self, y: usize) -> Option<&[u8]> {
+        while self.next <= y {
+            let row = self.reader.next_row().ok()??;
+            self.row.clear();
+            self.row.extend_from_slice(row.data());
+            self.next += 1;
+        }
+        (self.next == y + 1).then_some(&self.row)
+    }
+}
+
+/// [`resample_rows`] for pixels in memory.
+fn resample(mut frame: Frame, w: u32, h: u32) -> Option<Bitmap> {
+    let size = (frame.width, frame.height);
+    let channels = frame.channels;
+    resample_rows(&mut frame, size, channels, w, h)
 }
 
 /// For each target pixel along one axis, the source pixels under it: (first, weights).
@@ -325,22 +389,29 @@ fn spans(src: u32, dst: u32) -> Vec<(usize, Vec<f32>)> {
         .collect()
 }
 
-/// Resample to `w` × `h` by averaging the source area under each target pixel, premultiplied
-/// (transparent pixels don't bleed their color). Shrinking averages many pixels; enlarging
-/// (a HiDPI window) blends the one or two under each edge. Works a target row at a time, so
-/// the only extra memory is one source row of sums.
-fn resample(src: &Source8, w: u32, h: u32) -> Bitmap {
-    let sw = src.width as usize;
-    let (xs, ys) = (spans(src.width, w), spans(src.height, h));
-    let mut acc = vec![0f32; sw * 4];
+/// Resample an image of `sw` × `sh` pixels to `w` × `h` by averaging the source area under each
+/// target pixel, premultiplied (transparent pixels don't bleed their color). Shrinking averages
+/// many pixels; enlarging (a HiDPI window) blends the one or two under each edge. Works a target
+/// row at a time and takes the source rows in order, each target row sharing at most its first
+/// source row with the last of the one before, so the only extra memory is one row of sums.
+/// `None` if the source ends early.
+fn resample_rows(
+    rows: &mut impl Rows,
+    (sw, sh): (u32, u32),
+    channels: usize,
+    w: u32,
+    h: u32,
+) -> Option<Bitmap> {
+    let sw_px = sw as usize;
+    let (xs, ys) = (spans(sw, w), spans(sh, h));
+    let mut acc = vec![0f32; sw_px * 4];
     let mut data = Vec::with_capacity(w as usize * h as usize);
     for (y0, wy) in &ys {
         acc.fill(0.0);
         for (k, &weight) in wy.iter().enumerate() {
-            let row = &src.data[(y0 + k) * src.stride..];
-            for (x, a) in acc.chunks_exact_mut(4).enumerate() {
-                let p = &row[x * src.channels..];
-                let (r, g, b, alpha) = match src.channels {
+            let row = rows.row(y0 + k)?.get(..sw_px * channels)?;
+            for (a, p) in acc.chunks_exact_mut(4).zip(row.chunks_exact(channels)) {
+                let (r, g, b, alpha) = match channels {
                     1 => (p[0], p[0], p[0], 255),
                     2 => (p[0], p[0], p[0], p[1]),
                     3 => (p[0], p[1], p[2], 255),
@@ -372,11 +443,11 @@ fn resample(src: &Source8, w: u32, h: u32) -> Bitmap {
             data.push(a << 24 | r << 16 | g << 8 | b);
         }
     }
-    Bitmap {
+    Some(Bitmap {
         width: w,
         height: h,
         data,
-    }
+    })
 }
 
 // ---- The cache ------------------------------------------------------------------------------
@@ -740,6 +811,12 @@ impl Images {
         }
         #[cfg(feature = "remote-images")]
         self.sync_remote(doc, layout);
+    }
+
+    /// The directory relative paths resolve against (tests).
+    #[cfg(all(test, feature = "embed-fonts"))]
+    pub(crate) fn base(&self) -> Option<&Path> {
+        self.base.as_deref()
     }
 
     /// How many documents were attached (tests).
