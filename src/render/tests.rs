@@ -101,6 +101,21 @@ fn frame_rejects_short_buffer() {
 }
 
 #[test]
+#[should_panic(expected = "too small")]
+fn frame_rejects_overflowing_size() {
+    // (height - 1) * stride wraps to 0, which a short buffer would satisfy.
+    let mut px = [0u32; 1];
+    Frame::new(&mut px, 1, 3, usize::MAX / 2 + 1);
+}
+
+#[test]
+#[should_panic(expected = "too small")]
+fn frame_rejects_overflowing_row() {
+    let mut px = [0u32; 4];
+    Frame::new(&mut px, usize::MAX, 2, usize::MAX);
+}
+
+#[test]
 fn frame_allows_short_last_row() {
     let mut px = vec![0; 16 * 3 + 10];
     let mut f = Frame::new(&mut px, 10, 4, 16);
@@ -183,6 +198,66 @@ fn rounded_rect_alpha_and_clip() {
         0x808080,
         "empty and transparent rects draw nothing"
     );
+}
+
+/// Drawing far outside the frame, or with extents past i32 when subtracted, neither panics
+/// nor changes the pixels.
+#[test]
+fn extreme_coordinates_are_clipped_not_overflowed() {
+    let mut b = Buf::new(10, 10, 12);
+    b.frame().fill_rect(0, 0, 10, 10, 0);
+    let before = b.px.clone();
+    let mut f = b.frame();
+    f.hline(0, 10, i32::MAX, RED);
+    f.hline(i32::MIN, i32::MAX, i32::MIN, RED);
+    f.fill_rect(i32::MIN, i32::MIN, i32::MAX, i32::MIN + 1, RED);
+    f.rounded_rect((i32::MIN, 20, i32::MAX, 30), 2.0, None, RED, 255);
+    f.rounded_rect((0, i32::MAX - 5, 10, i32::MAX), 2.0, Some(1.0), RED, 255);
+    f.rounded_rect((i32::MAX - 5, 0, i32::MAX, 10), 2.0, None, RED, 128);
+    f.rounded_rect((i32::MIN, i32::MIN, -5, -5), 1e9, Some(3.0), RED, 255);
+    f.blit_mask(i32::MIN, 0, 2, 2, &[255; 4], RED);
+    f.blit_rgba(0, i32::MIN, 1, 1, &[255; 4]);
+    f.blit_mask(i32::MAX, i32::MAX, 1, 1, &[255], RED);
+    assert!(b.px == before);
+
+    // A box spanning the whole i32 range still paints what it covers: a fill, and a rounded
+    // one whose corners are miles away.
+    let mut f = b.frame();
+    f.rounded_rect((i32::MIN, 0, i32::MAX, 10), 2.0, None, RED, 255);
+    assert!((0..10).all(|y| (0..10).all(|x| b.at(x, y) == RED)));
+    b.frame().fill_rect(0, 0, 10, 10, 0);
+    b.frame().rounded_rect(
+        (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+        1e9,
+        None,
+        RED,
+        255,
+    );
+    assert!((0..10).all(|y| (0..10).all(|x| b.at(x, y) == RED)));
+    assert!(b.padding_untouched());
+}
+
+/// A stroke on an edge of a box that begins far outside the frame keeps full precision.
+#[test]
+fn stroke_survives_a_far_off_edge() {
+    let mut b = Buf::new(10, 10, 10);
+    b.frame().fill_rect(0, 0, 10, 10, 0);
+    b.frame()
+        .rounded_rect((-100_000_000, 0, 6, 10), 0.0, Some(1.0), 0xffffff, 255);
+    // The right border is column 5; the interior and the rest are untouched.
+    assert!(
+        (0..10).all(|y| b.at(5, y) == 0xffffff || y == 0 || y == 9),
+        "right border"
+    );
+    assert!((1..9).all(|y| (0..5).all(|x| b.at(x, y) == 0)), "interior");
+    assert!((0..10).all(|y| (6..10).all(|x| b.at(x, y) == 0)), "outside");
+    assert!((0..6).all(|x| b.at(x, 0) == 0xffffff), "top border");
+    // The same stroke with the box near the frame paints identically.
+    let mut near = Buf::new(10, 10, 10);
+    near.frame().fill_rect(0, 0, 10, 10, 0);
+    near.frame()
+        .rounded_rect((-100, 0, 6, 10), 0.0, Some(1.0), 0xffffff, 255);
+    assert!(b.px == near.px);
 }
 
 #[test]
@@ -366,6 +441,50 @@ mod doc {
         let far = render(&src, 500, 150, (399_900, 3.0), &LIGHT);
         assert!(colors(&near, 10..160).contains(&LIGHT.text));
         assert!(near.px == far.px, "far blocks drift against near ones");
+    }
+
+    /// Blocks straddling the top of the viewport stay painted at fractional offsets far down a
+    /// tall document, where an f32 scroll position can't tell them from their neighbors.
+    #[test]
+    fn deep_scroll_keeps_block_at_the_top_edge() {
+        let src = "```\na\n```\n\n".repeat(60_000);
+        let fonts = Fonts::new().unwrap();
+        let doc = Doc::parse(&src);
+        let mut layout = Layout::new(
+            &doc,
+            Params {
+                width: 600.0,
+                scale: 6.0,
+                ..Params::default()
+            },
+        );
+        let mut cache = GlyphCache::default();
+        for k in [59_980, 59_981, 59_990] {
+            // The first rows of the viewport show the end of block k - 1.
+            let anchor = Anchor {
+                block: k as u32 - 1,
+                frac: 0.0,
+            };
+            layout.ensure(&doc, &fonts, anchor, 150.0);
+            let scroll = layout.top(k) - 0.75;
+            let area = Clip {
+                x0: 0,
+                y0: 0,
+                x1: 600,
+                y1: 150,
+            };
+            let range = layout.range_exact(scroll, scroll + 150.0);
+            assert_eq!(range.start, k - 1, "first overlapping block");
+            let mut b = Buf::new(600, 150, 600);
+            let v = Viewport { area, scroll };
+            paint(&mut b.frame(), v, &layout, &fonts, &mut cache, &LIGHT);
+            assert_eq!(
+                b.at(300, 0),
+                LIGHT.code_bg,
+                "block {} at the top row",
+                k - 1
+            );
+        }
     }
 
     #[test]

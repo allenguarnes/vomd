@@ -469,16 +469,17 @@ impl Layout {
     /// How many blocks end at or before `y` (strict: start before `y`), by the f32 tops
     /// [`Layout::y`] hands out, so a top maps back to its own block.
     fn blocks_before(&self, y: f32, strict: bool) -> usize {
+        self.blocks_before_by(f64::from(y), strict, |i| f64::from(self.y(i)))
+    }
+
+    /// [`Layout::blocks_before`] counting by `top(i)`, the top of block `i`.
+    fn blocks_before_by(&self, y: f64, strict: bool, top: impl Fn(usize) -> f64) -> usize {
         let n = self.geoms.len();
         let counted = |i: usize| {
-            if strict {
-                self.y(i) < y
-            } else {
-                self.y(i + 1) <= y
-            }
+            if strict { top(i) < y } else { top(i + 1) <= y }
         };
         // The tree searches in f64; the rounding to f32 can move the answer by a block or two.
-        let within = self.heights.blocks_within(f64::from(y), strict);
+        let within = self.heights.blocks_within(y, strict);
         let mut count = if strict {
             if y > 0.0 { (within + 1).min(n) } else { 0 }
         } else {
@@ -508,6 +509,17 @@ impl Layout {
         }
         let start = self.blocks_before(y0, false);
         let end = self.blocks_before(y1, true);
+        start..end.max(start)
+    }
+
+    /// [`Layout::range`] by the exact f64 tops ([`Layout::top`]), for painting: rounding the
+    /// bounds to f32 can drop a block that still overlaps the viewport deep into a tall document.
+    pub fn range_exact(&self, y0: f64, y1: f64) -> Range<usize> {
+        if self.geoms.is_empty() {
+            return 0..0;
+        }
+        let start = self.blocks_before_by(y0, false, |i| self.top(i));
+        let end = self.blocks_before_by(y1, true, |i| self.top(i));
         start..end.max(start)
     }
 

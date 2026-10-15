@@ -52,8 +52,12 @@ impl<'a> Frame<'a> {
     /// `width` long).
     pub fn new(buf: &'a mut [u32], width: usize, height: usize, stride: usize) -> Frame<'a> {
         assert!(stride >= width, "stride {stride} < width {width}");
+        // Checked: a wrapped product would let a too-small buffer through.
+        let needed = height
+            .checked_sub(1)
+            .map_or(Some(0), |rows| rows.checked_mul(stride)?.checked_add(width));
         assert!(
-            height == 0 || buf.len() >= (height - 1) * stride + width,
+            needed.is_some_and(|n| buf.len() >= n),
             "buffer of {} pixels is too small for {width}×{height} (stride {stride})",
             buf.len()
         );
@@ -115,7 +119,7 @@ impl<'a> Frame<'a> {
 
     /// A one-pixel horizontal line `x0..x1` at row `y`.
     pub fn hline(&mut self, x0: i32, x1: i32, y: i32, color: Rgb) {
-        self.fill_rect(x0, y, x1, y + 1, color);
+        self.fill_rect(x0, y, x1, y.saturating_add(1), color);
     }
 
     /// Fill a rounded rectangle, or stroke its outline `stroke` pixels wide, with corners of
@@ -129,25 +133,30 @@ impl<'a> Frame<'a> {
         color: Rgb,
         alpha: u8,
     ) {
-        let (w, h) = ((x1 - x0) as f32, (y1 - y0) as f32);
         let c = self.clip.intersect(Clip { x0, y0, x1, y1 });
         if c.is_empty() || alpha == 0 {
             return;
         }
-        let r = radius.clamp(0.0, w.min(h) / 2.0);
+        // f64 and i64 throughout: i32 extents overflow when subtracted, and f32 loses the
+        // pixel when a box reaches far past the clip.
+        let (x0, y0, x1, y1) = (x0 as i64, y0 as i64, x1 as i64, y1 as i64);
+        let (w, h) = ((x1 - x0) as f64, (y1 - y0) as f64);
+        let r = f64::from(radius).clamp(0.0, w.min(h) / 2.0);
         // A stroke that meets itself is a fill.
-        let stroke = stroke.filter(|&s| s > 0.0 && 2.0 * s < w.min(h));
+        let stroke = stroke
+            .map(f64::from)
+            .filter(|&s| s > 0.0 && 2.0 * s < w.min(h));
         if r < 0.5 && stroke.is_none() && alpha == 255 {
-            self.fill_rect(x0, y0, x1, y1, color);
+            self.fill_rect(c.x0, c.y0, c.x1, c.y1, color);
             return;
         }
-        let outer = RoundBox::new(x0 as f32, y0 as f32, x1 as f32, y1 as f32, r);
+        let outer = RoundBox::new(x0 as f64, y0 as f64, x1 as f64, y1 as f64, r);
         let inner = stroke.map(|s| {
             RoundBox::new(
-                x0 as f32 + s,
-                y0 as f32 + s,
-                x1 as f32 - s,
-                y1 as f32 - s,
+                x0 as f64 + s,
+                y0 as f64 + s,
+                x1 as f64 - s,
+                y1 as f64 - s,
                 (r - s).max(0.0),
             )
         });
@@ -157,10 +166,12 @@ impl<'a> Frame<'a> {
             Some(b) => b.hw - b.r,
             None => outer.hw - outer.r,
         };
-        let side = ((outer.hw - mid.max(0.0)).ceil() as i32 + 1).min(x1 - x0);
+        let side = ((outer.hw - mid.max(0.0)).ceil() as i64 + 1).min(x1 - x0);
         let (left_end, right_start) = (x0 + side, (x1 - side).max(x0 + side));
-        let a = alpha as f32;
-        let coverage = |fx: f32, py: f32| {
+        // Both lie within x0..=x1, and the clip is inside i32.
+        let (left_end, right_start) = (left_end as i32, right_start as i32);
+        let a = f64::from(alpha);
+        let coverage = |fx: f64, py: f64| {
             let mut cov = outer.coverage(fx, py);
             if let Some(inner) = inner {
                 cov -= inner.coverage(fx, py);
@@ -168,11 +179,11 @@ impl<'a> Frame<'a> {
             ((cov * a + 0.5) as u32).min(255)
         };
         for y in c.y0..c.y1 {
-            let py = y as f32 + 0.5;
+            let py = f64::from(y) + 0.5;
             let row_start = y as usize * self.stride;
             let row = &mut self.buf[row_start..row_start + self.width];
             let mut px = |x: i32| {
-                let cov = coverage(x as f32 + 0.5, py);
+                let cov = coverage(f64::from(x) + 0.5, py);
                 if cov > 0 {
                     let d = &mut row[x as usize];
                     *d = blend(*d, color, cov);
@@ -253,15 +264,15 @@ impl<'a> Frame<'a> {
 /// A rounded box for coverage tests: center, half extents, corner radius.
 #[derive(Clone, Copy)]
 struct RoundBox {
-    cx: f32,
-    cy: f32,
-    hw: f32,
-    hh: f32,
-    r: f32,
+    cx: f64,
+    cy: f64,
+    hw: f64,
+    hh: f64,
+    r: f64,
 }
 
 impl RoundBox {
-    fn new(x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> RoundBox {
+    fn new(x0: f64, y0: f64, x1: f64, y1: f64, r: f64) -> RoundBox {
         RoundBox {
             cx: (x0 + x1) / 2.0,
             cy: (y0 + y1) / 2.0,
@@ -272,7 +283,7 @@ impl RoundBox {
     }
 
     /// Fraction of the pixel centered at (`px`, `py`) inside the box, from its signed distance.
-    fn coverage(&self, px: f32, py: f32) -> f32 {
+    fn coverage(&self, px: f64, py: f64) -> f64 {
         let qx = (px - self.cx).abs() - (self.hw - self.r);
         let qy = (py - self.cy).abs() - (self.hh - self.r);
         let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
@@ -338,8 +349,7 @@ pub fn paint(
         frame.fill_rect(a.x0, a.y0, a.x1, a.y1, theme.bg);
         let (col_x, _) = layout.column();
         let ox = vp.area.x0 as f32 + col_x;
-        let top = vp.scroll as f32;
-        for i in layout.range(top, top + vp.height()) {
+        for i in layout.range_exact(vp.scroll, vp.scroll + f64::from(vp.height())) {
             let Some(content) = layout.geoms()[i].content.as_deref() else {
                 continue;
             };
