@@ -40,7 +40,8 @@ impl Entities<'_> {
 /// where it is cheap to: a link doesn't start in one or after one (`;` is not a boundary), a
 /// domain ends at one, and one at the end of a link is trimmed (`&copy;`, `&amp;`). An entity
 /// inside the path stays in the link, decoded, unless it decodes to whitespace or `<`, which end
-/// it (cmark-gfm links the written text, spaces and all).
+/// it (cmark-gfm links the written text, spaces and all). Email addresses are the exception:
+/// cmark-gfm finds them in the decoded text, as we do.
 pub fn find(s: &str, prev: char, ents: Entities) -> Vec<(Range<usize>, String)> {
     let mut out = Vec::new();
     let b = s.as_bytes();
@@ -68,10 +69,10 @@ pub fn find(s: &str, prev: char, ents: Entities) -> Vec<(Range<usize>, String)> 
                     continue;
                 }
             }
-            // Emails can start mid-word (`a.b@c.d`): back up over the local part.
-            b'@' if !ents.contains(i) => {
-                let hi = ents.next_start(i + 1).unwrap_or(s.len());
-                if let Some((start, end)) = email(&s[..hi], i)
+            // Emails can start mid-word (`a.b@c.d`): back up over the local part. cmark-gfm finds
+            // them in the decoded text, so entities mean nothing here (`a&#64;b.com` is one).
+            b'@' => {
+                if let Some((start, end)) = email(s, i)
                     && out.last().is_none_or(|(r, _)| r.end <= start)
                 {
                     out.push((start..end, format!("mailto:{}", &s[start..end])));
@@ -591,118 +592,118 @@ mod tests {
 
     #[test]
     fn pathological_trailing_parentheses_are_trimmed_in_linear_time() {
-        let t = std::time::Instant::now();
-        for url in ["www.a.bc/", "https://a.bc/"] {
-            let all = format!("{url}{}", ")".repeat(200_000));
-            assert_eq!(links(&all)[0].0, url);
-            let alternating = format!("{url}{}", ".)".repeat(100_000));
-            assert_eq!(links(&alternating)[0].0, url);
-            // Balanced pairs stay, the rest goes.
-            let paired = format!("{url}{}{}", "()".repeat(50_000), ")".repeat(50_000));
-            assert_eq!(links(&paired)[0].0, format!("{url}{}", "()".repeat(50_000)));
-            // Many lines of it, as a document of such lines would be.
-            let lines = format!("{url}{}\n", ")".repeat(2_000)).repeat(100);
-            assert_eq!(links(&lines).len(), 100);
-            // And entity-like endings and long runs of other trailing punctuation.
-            let entities = format!("{url}{}", "&a;".repeat(50_000));
-            assert_eq!(links(&entities)[0].0, url);
-            let semicolons = format!("{url}{}", ";".repeat(200_000));
-            assert_eq!(links(&semicolons)[0].0, url);
-            let doubled = format!("{url}{}", "&a;;".repeat(50_000));
-            assert_eq!(links(&doubled)[0].0, url);
-            // A long run of letters before a `;` is read once, whether or not an `&` starts it.
-            let name = format!("{url}&{};", "a".repeat(200_000));
-            assert_eq!(links(&name)[0].0, url);
-            let letters = format!("{url}{};", "a".repeat(200_000));
-            assert_eq!(links(&letters)[0].0, &letters[..letters.len() - 1]);
-            let each = format!("{url}{}", "a;".repeat(100_000));
-            assert_eq!(links(&each)[0].0, &each[..each.len() - 1]);
-            // Entities from the parser: a long run of them at the end, or one after another
-            // with a link between.
-            let amps = format!("{url}{}", "{&}".repeat(100_000));
-            assert_eq!(ent_links(&amps), [url]);
-            let parens = format!("{url}{}", "{)}".repeat(100_000));
-            assert_eq!(ent_links(&parens), [url]);
-            let paired = format!("{url}{}", "({)}".repeat(50_000));
-            let kept = format!("{url}{}{}", "()".repeat(49_999), "(");
-            assert_eq!(ent_links(&paired), [kept]);
-            let between = format!("{url}{{&}} ").repeat(50_000);
-            assert_eq!(ent_links(&between).len(), 50_000);
-            let punct = format!("{url}{}", "?!.,:*_~'\"".repeat(20_000));
-            assert_eq!(links(&punct)[0].0, url);
-        }
-        assert!(
-            t.elapsed() < std::time::Duration::from_secs(2),
-            "took {:?}",
-            t.elapsed()
-        );
+        // `n` is the length of the longest runs.
+        crate::doc::assert_linear("trailing parentheses", 50_000, |n| {
+            for url in ["www.a.bc/", "https://a.bc/"] {
+                let all = format!("{url}{}", ")".repeat(n));
+                assert_eq!(links(&all)[0].0, url);
+                let alternating = format!("{url}{}", ".)".repeat(n / 2));
+                assert_eq!(links(&alternating)[0].0, url);
+                // Balanced pairs stay, the rest goes.
+                let paired = format!("{url}{}{}", "()".repeat(n / 4), ")".repeat(n / 4));
+                assert_eq!(links(&paired)[0].0, format!("{url}{}", "()".repeat(n / 4)));
+                // Many lines of it, as a document of such lines would be.
+                let lines = format!("{url}{}\n", ")".repeat(2_000)).repeat(n / 2_000);
+                assert_eq!(links(&lines).len(), n / 2_000);
+                // And entity-like endings and long runs of other trailing punctuation.
+                let entities = format!("{url}{}", "&a;".repeat(n / 4));
+                assert_eq!(links(&entities)[0].0, url);
+                let semicolons = format!("{url}{}", ";".repeat(n));
+                assert_eq!(links(&semicolons)[0].0, url);
+                let doubled = format!("{url}{}", "&a;;".repeat(n / 4));
+                assert_eq!(links(&doubled)[0].0, url);
+                // A long run of letters before a `;` is read once, whether or not an `&` starts
+                // it.
+                let name = format!("{url}&{};", "a".repeat(n));
+                assert_eq!(links(&name)[0].0, url);
+                let letters = format!("{url}{};", "a".repeat(n));
+                assert_eq!(links(&letters)[0].0, &letters[..letters.len() - 1]);
+                let each = format!("{url}{}", "a;".repeat(n / 2));
+                assert_eq!(links(&each)[0].0, &each[..each.len() - 1]);
+                // Entities from the parser: a long run of them at the end, or one after another
+                // with a link between.
+                let amps = format!("{url}{}", "{&}".repeat(n / 2));
+                assert_eq!(ent_links(&amps), [url]);
+                let parens = format!("{url}{}", "{)}".repeat(n / 2));
+                assert_eq!(ent_links(&parens), [url]);
+                let paired = format!("{url}{}", "({)}".repeat(n / 4));
+                let kept = format!("{url}{}{}", "()".repeat(n / 4 - 1), "(");
+                assert_eq!(ent_links(&paired), [kept]);
+                let between = format!("{url}{{&}} ").repeat(n / 4);
+                assert_eq!(ent_links(&between).len(), n / 4);
+                let punct = format!("{url}{}", "?!.,:*_~'\"".repeat(n / 10));
+                assert_eq!(links(&punct)[0].0, url);
+            }
+        });
     }
 
     /// Failed candidates cost what they read, never the rest of the run: every scan in this
     /// module is linear over a whole text run (one line is one run), whatever the input.
     #[test]
     fn failing_candidates_are_scanned_in_linear_time() {
+        // Each case at a quarter of the size and at full size (a megabyte): the time may grow
+        // about fourfold, not sixteenfold.
+        let cases = |mb: usize| -> Vec<(&str, String)> {
+            vec![
+                ("empty domains", "http:// ".repeat(mb / 7)),
+                ("underscore domains", "http://_ ".repeat(mb / 9)),
+                ("bare schemes", "https://".repeat(mb / 8)),
+                ("ftp and spaces", "ftp://\t".repeat(mb / 6)),
+                ("no periods", format!("www.{}", "a".repeat(mb))),
+                ("failing www runs", "www.a ".repeat(mb / 6)),
+                ("www underscores", "www._".repeat(mb / 5)),
+                ("www underscore dots", "www._www._www.a_b".repeat(mb / 17)),
+                ("www tildes", "www.a_b~".repeat(mb / 8)),
+                ("www empty segments", "www.a..._".repeat(mb / 9)),
+                ("www periods", format!("www.{}", ".".repeat(mb))),
+                ("www dashes", format!("www.{}", "a-.".repeat(mb / 3))),
+                ("www letters", "w".repeat(mb)),
+                ("www dots", "www.".repeat(mb / 4)),
+                ("scheme letters", "http".repeat(mb / 4)),
+                ("scheme colons", "http:/".repeat(mb / 6)),
+                ("local parts", "a".repeat(mb) + "@"),
+                ("local parts and dots", "a.".repeat(mb / 2) + "@a"),
+                ("local part plus signs", "+a".repeat(mb / 2) + "@b"),
+                ("at signs", "@".repeat(mb)),
+                ("a at a at", "a@".repeat(mb / 2)),
+                ("a at a dot", "a@a.".repeat(mb / 4)),
+                ("local parts between ats", "aaaa@".repeat(mb / 5)),
+                ("domains that fail", "a@".to_string() + &"b".repeat(mb)),
+                (
+                    "domains of dots",
+                    "a@".to_string() + &"b.".repeat(mb / 2) + "1",
+                ),
+                ("domain dots", "a@b".to_string() + &".".repeat(mb)),
+                ("dashes", "a@b.c-".repeat(mb / 6)),
+                ("emails apart", "a.b+c@d.e1 ".repeat(mb / 11)),
+                ("emails joined", "a@b.co+".repeat(mb / 7)),
+                ("emails in urls", "www.a.bc/x@y.zz ".repeat(mb / 16)),
+                ("overlapping emails", "http://a.b/@c.de ".repeat(mb / 17)),
+                ("urls", "http://a.b ".repeat(mb / 11)),
+                ("url entities", "http://a.b/&a;&a;&a; ".repeat(mb / 21)),
+                ("long entity", format!("http://a.b/&{};", "a".repeat(mb))),
+                ("semicolons", format!("http://a.b/{}", ";".repeat(mb))),
+                ("amps", format!("http://a.b/{}", "&;".repeat(mb / 2))),
+                ("trimmed links", "www.a.bc?! ".repeat(mb / 11)),
+                ("alphabetic runs", format!("www.a.bc/&{}", "a".repeat(mb))),
+                (
+                    "alphabetic runs and semicolons",
+                    "www.a.bc/aaaa;".repeat(mb / 14),
+                ),
+                ("entity-like runs", "www.a.bc/&aa;;;".repeat(mb / 15)),
+                ("unicode", "é@é.é www.é_é.é_é ".repeat(mb / 28)),
+            ]
+        };
         let mb = 1 << 20;
-        let cases: Vec<(&str, String)> = vec![
-            ("empty domains", "http:// ".repeat(mb / 7)),
-            ("underscore domains", "http://_ ".repeat(mb / 9)),
-            ("bare schemes", "https://".repeat(mb / 8)),
-            ("ftp and spaces", "ftp://\t".repeat(mb / 6)),
-            ("no periods", format!("www.{}", "a".repeat(mb))),
-            ("failing www runs", "www.a ".repeat(mb / 6)),
-            ("www underscores", "www._".repeat(mb / 5)),
-            ("www underscore dots", "www._www._www.a_b".repeat(mb / 17)),
-            ("www tildes", "www.a_b~".repeat(mb / 8)),
-            ("www empty segments", "www.a..._".repeat(mb / 9)),
-            ("www periods", format!("www.{}", ".".repeat(mb))),
-            ("www dashes", format!("www.{}", "a-.".repeat(mb / 3))),
-            ("www letters", "w".repeat(mb)),
-            ("www dots", "www.".repeat(mb / 4)),
-            ("scheme letters", "http".repeat(mb / 4)),
-            ("scheme colons", "http:/".repeat(mb / 6)),
-            ("local parts", "a".repeat(mb) + "@"),
-            ("local parts and dots", "a.".repeat(mb / 2) + "@a"),
-            ("local part plus signs", "+a".repeat(mb / 2) + "@b"),
-            ("at signs", "@".repeat(mb)),
-            ("a at a at", "a@".repeat(mb / 2)),
-            ("a at a dot", "a@a.".repeat(mb / 4)),
-            ("local parts between ats", "aaaa@".repeat(mb / 5)),
-            ("domains that fail", "a@".to_string() + &"b".repeat(mb)),
-            (
-                "domains of dots",
-                "a@".to_string() + &"b.".repeat(mb / 2) + "1",
-            ),
-            ("domain dots", "a@b".to_string() + &".".repeat(mb)),
-            ("dashes", "a@b.c-".repeat(mb / 6)),
-            ("emails apart", "a.b+c@d.e1 ".repeat(mb / 11)),
-            ("emails joined", "a@b.co+".repeat(mb / 7)),
-            ("emails in urls", "www.a.bc/x@y.zz ".repeat(mb / 16)),
-            ("overlapping emails", "http://a.b/@c.de ".repeat(mb / 17)),
-            ("urls", "http://a.b ".repeat(mb / 11)),
-            ("url entities", "http://a.b/&a;&a;&a; ".repeat(mb / 21)),
-            ("long entity", format!("http://a.b/&{};", "a".repeat(mb))),
-            ("semicolons", format!("http://a.b/{}", ";".repeat(mb))),
-            ("amps", format!("http://a.b/{}", "&;".repeat(mb / 2))),
-            ("trimmed links", "www.a.bc?! ".repeat(mb / 11)),
-            ("alphabetic runs", format!("www.a.bc/&{}", "a".repeat(mb))),
-            (
-                "alphabetic runs and semicolons",
-                "www.a.bc/aaaa;".repeat(mb / 14),
-            ),
-            ("entity-like runs", "www.a.bc/&aa;;;".repeat(mb / 15)),
-            ("unicode", "é@é.é www.é_é.é_é ".repeat(mb / 28)),
-        ];
-        for (name, src) in cases {
-            assert!(src.len() >= mb / 2, "{name}: {}", src.len());
-            let t = std::time::Instant::now();
-            for prev in [' ', 'a'] {
-                let _ = find(&src, prev, Entities(&[]));
-            }
-            assert!(
-                t.elapsed() < std::time::Duration::from_secs(2),
-                "{name} took {:?}",
-                t.elapsed()
-            );
+        let (small, large) = (cases(mb / 4), cases(mb));
+        for ((name, small), (_, large)) in small.iter().zip(&large) {
+            assert!(large.len() >= mb / 2, "{name}: {}", large.len());
+            let run = |src: &str| {
+                for prev in [' ', 'a'] {
+                    let _ = find(src, prev, Entities(&[]));
+                }
+            };
+            crate::doc::assert_scales_linearly(name, || run(small), || run(large));
         }
     }
 
@@ -748,6 +749,37 @@ mod tests {
         assert!(links("a@1.2").is_empty());
         assert_eq!(links("a@b.c1d")[0].0, "a@b.c1d");
         assert_eq!(links("a@b1.co")[0].0, "a@b1.co");
+    }
+
+    /// cmark-gfm finds emails in the decoded text: an entity may be the `@`, a `.`, a letter of
+    /// either part, and doesn't cut the address short (unlike the guards on URLs and `www.`).
+    #[test]
+    fn emails_ignore_entities() {
+        for src in [
+            "a{@}b.com",
+            "a@b{.}com",
+            "a@b.c{o}m",
+            "a{.}b@c.com",
+            "x{a}@b.com",
+            "a@{b}.com",
+            "{a}{@}{b.com}",
+            "a@b.c{o}{m}",
+        ] {
+            let (text, ents) = with_ents(src);
+            assert_eq!(ent_links(src), std::slice::from_ref(&text), "{src}");
+            assert_eq!(
+                find(&text, ' ', Entities(&ents))[0].1,
+                format!("mailto:{text}"),
+                "{src}"
+            );
+        }
+        // Where the domain ends because the next character isn't one, an entity ends it too.
+        assert_eq!(ent_links("a@b.co{é}x"), ["a@b.co"]);
+        assert_eq!(ent_links("a@b.co{&}x"), ["a@b.co"]);
+        // The restrictions for the other links stay.
+        assert!(ent_links("{h}ttp://a.b").is_empty());
+        assert!(ent_links("{w}ww.a.com").is_empty());
+        assert_eq!(ent_links("www.a.co{m}"), ["www.a.co"]);
     }
 
     #[test]

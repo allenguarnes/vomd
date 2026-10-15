@@ -436,6 +436,9 @@ struct Builder {
     links: Vec<u32>,
     /// Styles opened by inline HTML tags in the open block.
     html_inline: HtmlInline,
+    /// For each emphasis, strong or strikethrough open now (innermost last): whether it started
+    /// inside `<script>`/`<style>`, so that it never styled anything.
+    hidden_styles: Vec<bool>,
     /// Plain text waiting for autolink detection: pulldown-cmark splits a run of text into
     /// several events (at entities, escapes, unmatched delimiters), and a URL can span them.
     pending: String,
@@ -515,6 +518,7 @@ impl Builder {
             strike: 0,
             links: Vec::new(),
             html_inline: HtmlInline::default(),
+            hidden_styles: Vec::new(),
             pending: String::new(),
             pending_ents: Vec::new(),
             decoded: false,
@@ -670,6 +674,17 @@ impl Builder {
             | Event::SoftBreak
             | Event::HardBreak
                 if self.html_inline.skip.is_some() => {}
+            // An emphasis that starts inside `<script>`/`<style>` has no style to apply, and
+            // neither has its end, wherever that is: `*a <script>b</script> c*`.
+            Event::Start(tag @ (Tag::Emphasis | Tag::Strong | Tag::Strikethrough)) => {
+                let hidden = self.html_inline.skip.is_some();
+                self.hidden_styles.push(hidden);
+                if !hidden {
+                    self.start(tag);
+                }
+            }
+            Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough)
+                if self.hidden_styles.pop() == Some(true) => {}
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => {
                 let def = matches!(tag, TagEnd::FootnoteDefinition);
@@ -1448,10 +1463,11 @@ impl Builder {
             };
             let tag = &rest[1..gt];
             rest = &rest[gt + 1..];
+            // The whole name, as an HTML parser reads it (`script-widget` is not `script`).
             let name: String = tag
                 .trim_start_matches('/')
                 .chars()
-                .take_while(|c| c.is_ascii_alphanumeric())
+                .take_while(|&c| !c.is_ascii_whitespace() && c != '/')
                 .map(|c| c.to_ascii_lowercase())
                 .collect();
             let closing = tag.starts_with('/');
@@ -1498,8 +1514,10 @@ impl Builder {
             "del" | "s" | "strike" => &mut h.strike,
             "sup" => &mut h.sup,
             "sub" => &mut h.sub,
+            // As in a browser, `<script/>` opens an element like `<script>` does: only void
+            // elements ignore the slash, and these aren't.
             "script" | "style" => {
-                if !closing && !tag.trim_end().ends_with('/') {
+                if !closing {
                     h.skip = Some(if name == "script" { "script" } else { "style" });
                 }
                 return true;
@@ -1518,7 +1536,7 @@ impl Builder {
         };
         if closing {
             *counter = counter.saturating_sub(1);
-        } else if !tag.trim_end().ends_with('/') {
+        } else {
             *counter += 1;
         }
         true
@@ -1808,10 +1826,40 @@ fn expansion(tag: &Tag) -> usize {
     }
 }
 
+/// For tests of linear-time scans: `large` works on four times what `small` does, so it may take
+/// about four times as long, where a quadratic scan takes sixteen times. Fails over ten times (with
+/// a floor of 20 ms under which timing is noise), which, unlike an absolute bound, holds up when
+/// the machine is busy. Load hits one run and not the other, so a failure is measured again, twice,
+/// before it counts.
+#[cfg(test)]
+fn assert_scales_linearly(what: &str, small: impl Fn(), large: impl Fn()) {
+    use std::time::{Duration, Instant};
+    let time = |run: &dyn Fn()| {
+        let t = Instant::now();
+        run();
+        t.elapsed()
+    };
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let (s, l) = (time(&small), time(&large));
+        if l <= s.max(Duration::from_millis(20)) * 10 {
+            return;
+        }
+        seen.push((s, l));
+    }
+    panic!("{what} is not linear (small, large): {seen:?}");
+}
+
+/// [`assert_scales_linearly`] for `work(n)`, at `quarter` and `4 * quarter`.
+#[cfg(test)]
+fn assert_linear(what: &str, quarter: usize, work: impl Fn(usize)) {
+    assert_scales_linearly(what, || work(quarter), || work(quarter * 4));
+}
+
 /// Where the raw text of a `<script>` or `<style>` (`name`) ends in `s`: after the first end tag,
-/// a `</` and the name (any case) followed by whitespace, `/` or `>`, and then everything up to
-/// its `>`, as an HTML parser has it. `Some(s.len())` if that tag is cut off, `None` if there is
-/// none.
+/// a `</` and the name (any case) followed by whitespace, `/` or `>`, and then the rest of that
+/// tag, up to a `>` that no quoted attribute value hides (`</script a=">">`), as an HTML parser
+/// has it. `Some(s.len())` if that tag is cut off, `None` if there is none.
 fn end_of_raw_text(s: &str, name: &str) -> Option<usize> {
     let b = s.as_bytes();
     let mut from = 0;
@@ -1825,7 +1873,8 @@ fn end_of_raw_text(s: &str, name: &str) -> Option<usize> {
                 b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'/' | b'>'
             )
         {
-            return Some(s[at..].find('>').map_or(s.len(), |gt| at + gt + 1));
+            // Only the end tag itself is read as a tag; what comes before it never is.
+            return Some(tag_end(&s[at..]).map_or(s.len(), |gt| at + gt + 1));
         }
         from = at + 2;
     }

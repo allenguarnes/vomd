@@ -334,33 +334,30 @@ fn urls_with_emphasis_delimiters_are_split() {
 /// candidates that fail (more in `autolink::tests`).
 #[test]
 fn autolink_scans_are_linear() {
-    let t = std::time::Instant::now();
-    let parens = format!("www.a.bc/{}\n", ")".repeat(200_000));
-    let alternating = format!("https://a.bc/{}\n\n", ".)".repeat(100_000));
-    let lines = format!("www.a.bc/{}\n\n", ")".repeat(2_000)).repeat(100);
-    let urls = "www.a.bc/x) http://a ftp://b a@b.cd ".repeat(20_000);
-    // Candidates that fail on one long line (a line is one text run): no period to stop a
-    // domain scan, repeated `www.` after `_`, and local parts running into each other.
-    let bare = "http:// ".repeat(150_000);
-    let underscores = "http://_ ftp://_ ".repeat(70_000);
-    let www = "www._www.".repeat(100_000);
-    let emails = "a@".repeat(300_000);
-    let locals = "a".repeat(1_000_000) + "@";
-    for src in [parens, alternating, lines, urls] {
-        let doc = Doc::parse(&src);
-        check_invariants(&doc);
-        assert!(!doc.links.is_empty());
-    }
-    for src in [bare, underscores, www, emails, locals] {
-        let doc = Doc::parse(&src);
-        check_invariants(&doc);
-        assert!(doc.links.is_empty());
-    }
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(5),
-        "took {:?}",
-        t.elapsed()
-    );
+    // `n` is the length of the longest runs.
+    super::assert_linear("autolinks", 50_000, |n| {
+        let parens = format!("www.a.bc/{}\n", ")".repeat(n));
+        let alternating = format!("https://a.bc/{}\n\n", ".)".repeat(n / 2));
+        let lines = format!("www.a.bc/{}\n\n", ")".repeat(2_000)).repeat(n / 2_000);
+        let urls = "www.a.bc/x) http://a ftp://b a@b.cd ".repeat(n / 10);
+        // Candidates that fail on one long line (a line is one text run): no period to stop a
+        // domain scan, repeated `www.` after `_`, and local parts running into each other.
+        let bare = "http:// ".repeat(n * 3 / 4);
+        let underscores = "http://_ ftp://_ ".repeat(n * 7 / 20);
+        let www = "www._www.".repeat(n / 2);
+        let emails = "a@".repeat(n * 3 / 2);
+        let locals = "a".repeat(n * 5) + "@";
+        for src in [parens, alternating, lines, urls] {
+            let doc = Doc::parse(&src);
+            check_invariants(&doc);
+            assert!(!doc.links.is_empty());
+        }
+        for src in [bare, underscores, www, emails, locals] {
+            let doc = Doc::parse(&src);
+            check_invariants(&doc);
+            assert!(doc.links.is_empty());
+        }
+    });
 }
 
 #[test]
@@ -413,15 +410,15 @@ fn entities() {
 #[test]
 fn entity_scan_is_linear() {
     // Every `&` used to scan the whole remainder for a `;`: quadratic on a run of them.
-    let amps = "&".repeat(400_000);
-    let t = std::time::Instant::now();
-    assert_eq!(decode_entities(&amps), amps);
-    let doc = Doc::parse(&format!("<div>{amps}</div>\n"));
-    check_invariants(&doc);
-    assert_eq!(doc.text, amps);
+    super::assert_linear("entity scan", 100_000, |n| {
+        let amps = "&".repeat(n);
+        assert_eq!(decode_entities(&amps), amps);
+        let doc = Doc::parse(&format!("<div>{amps}</div>\n"));
+        check_invariants(&doc);
+        assert_eq!(doc.text, amps);
+    });
     // A `;` just past the 10-byte reach is not an entity.
     assert_eq!(decode_entities("&aaaaaaaaaa;&lt;"), "&aaaaaaaaaa;<");
-    assert!(t.elapsed().as_secs_f64() < 1.0, "{:?}", t.elapsed());
 }
 
 /// Every example in the CommonMark spec parses without panicking and satisfies invariants.
@@ -1432,8 +1429,13 @@ const FUZZ_LINES: &[&str] = &[
     "</PRE>",
     "<script>",
     "</script>",
+    "<script/>",
+    "<script-x>",
+    "</script data-x=\"><b>\">",
     "<style>",
     "</style>",
+    "<b/>",
+    "<b-x>",
     "<?php",
     "?>",
     "<!DOCTYPE html>",
@@ -1578,6 +1580,8 @@ const FUZZ_BLOCKS: &[&str] = &[
     // Raw text elements and character references.
     "x <script>a `c` [l](u) [^a] ![i](r.png) *e*\nsoft</script> y [^b]",
     "<div><script>if (a < b) f();</script><p>v</p></div>\n\nnext <STYLE>p { a < b }\n\nunclosed",
+    "before <script>*hidden</script> visible* **a <style>~~b</style> c** ~~d~~\n\n*e*",
+    "<div><script>x</script data-x=\"><i>\">v</div>\n\nnext <script/>![i](r.png)</script> <b/>b",
     "https://a.b/c&copy; and https://a.b/?x=1&amp;y=2&amp; and www.a.com/&#35; &#104;ttp://a.b",
     // Fences in list items (closed or not) and other places the scan can't be sure about.
     "- item\n\n  ```\n  code\n  ```",
@@ -2232,19 +2236,12 @@ fn unclosed_metadata_candidates_parse_in_linear_time() {
     // pulldown-cmark's metadata option reads forward for a closing line at every `---` it sees
     // (quadratic when there is none), so front matter is only looked for at the start of the text
     // and the option is off. Every `---\t` after the intro is a rule, and each `x` a paragraph.
-    for kb in [64, 128, 256] {
-        let n = kb * 1024 / 8;
+    super::assert_linear("metadata candidates", 8 * 1024, |n| {
         let src = format!("intro\n\n{}", "---\t\nx\n\n".repeat(n));
-        let t = std::time::Instant::now();
         let doc = Doc::parse(&src);
-        assert_eq!(doc.blocks.len(), 1 + 2 * n, "{kb} KB");
-        assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(n)), "{kb} KB");
-        assert!(
-            t.elapsed().as_secs_f64() < 3.0,
-            "{kb} KB: {:?}",
-            t.elapsed()
-        );
-    }
+        assert_eq!(doc.blocks.len(), 1 + 2 * n, "{n}");
+        assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(n)), "{n}");
+    });
     // At the very start the first `---\t` opens front matter that the second closes.
     let doc = Doc::parse(&"---\t\nx\n\n".repeat(1000));
     assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(998)));
@@ -3424,13 +3421,149 @@ fn script_ends_at_its_end_tag_whatever_comes_before_it() {
         ("<div><script>if (a < b) foo();\n\nnext", "next"),
         ("x <script>if (a < b) foo();\n\nnext", "x |next"),
         ("<div><style>a < b\n\nnext", "next"),
-        // A self-closing tag has no content.
-        ("x <script src=\"a.js\"/> y", "x  y"),
-        ("<div><script src=a.js/>v</div>", "v"),
+        // A slash doesn't close it: script and style aren't void elements, as in a browser.
+        ("x <script src=\"a.js\"/> y", "x "),
+        ("<div><script src=a.js/>v</div>", ""),
+        ("<div><script/>a</script>v</div>", "v"),
+        ("x <style/>a</style> y", "x  y"),
+        // A longer name is another element, and its end tag doesn't end this one.
+        ("<div><script>a</script-x>b</script>v</div>", "v"),
+        (
+            "<div><script>a</script_x>b</script.x>c</script:x>d</script>v</div>",
+            "v",
+        ),
+        ("x <script>a</script-x>b</script> y", "x  y"),
+        ("<div><style>a</style-card>b</style>v</div>", "v"),
+        // The end tag's attributes may hold a `>` in quotes, which doesn't end the tag.
+        (
+            "<div><script>hidden</script data-x=\"><img src=https://x.y/i.png>\">visible</div>",
+            "visible",
+        ),
+        ("<div><script>a</script x='>'>v</div>", "v"),
+        ("<div><script>a</script x=>v</div>", "v"),
+        // A quote that is never closed takes the rest of the block, as in a browser.
+        ("<div><script>a</script x=\">v</div>\n\nnext", "next"),
     ] {
         let doc = Doc::parse(src);
         check_invariants(&doc);
         assert_eq!(shown(&doc), text, "{src:?}");
+    }
+}
+
+/// The element names are read whole: `<script-widget>` is a custom element, not `<script>`.
+#[test]
+fn custom_element_names_are_not_built_in_tags() {
+    for (src, text) in [
+        (
+            "before <script-widget>text</script-widget> after",
+            "before text after",
+        ),
+        (
+            "before <style-card>text</style-card> after",
+            "before text after",
+        ),
+        ("<div><script-widget>text</script-widget>v</div>", "textv"),
+        ("<div><style-card>text</style-card>v</div>", "textv"),
+        ("a <b-widget>x</b-widget> c", "a x c"),
+        (
+            "a <i-x>x</i-x> <code-block>y</code-block> <a-b href=\"u\">z</a-b>",
+            "a x y z",
+        ),
+        ("<div>a <sup.x>x</sup.x> <s_t>y</s_t></div>", "a xy"),
+        ("<div>a <b-widget>x</b-widget> c</div>", "a x c"),
+        ("a<br-x>b", "ab"),
+        ("<div>a<br-x>b<hr-x>c<p-x>d</div>", "abcd"),
+    ] {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        assert_eq!(shown(&doc), text, "{src:?}");
+        assert!(doc.spans.iter().all(|s| s.style == 0), "{src:?}");
+        assert!(doc.links.is_empty() && doc.images.is_empty(), "{src:?}");
+    }
+    // Not images, either.
+    let doc = Doc::parse("<div><img-x src=\"https://x.y/i.png\"></div>");
+    assert!(doc.images.is_empty());
+    // The built-in names still work, in any case, with attributes, and ending the name at `/`.
+    for (src, styled) in [
+        ("a <b>x</b> c", "x"),
+        ("a <B class=y>x</B> c", "x"),
+        ("a <b\nclass=y>x</b > c", "x"),
+        ("<div>a <strong/>x</strong> c</div>", "x"),
+    ] {
+        let doc = Doc::parse(src);
+        let bold: String = doc
+            .spans
+            .iter()
+            .filter(|s| s.style & style::BOLD != 0)
+            .map(|s| doc.span_text(s))
+            .collect();
+        assert_eq!(bold, styled, "{src:?}");
+    }
+    let doc = Doc::parse("a <br/>b <br />c");
+    assert_eq!(shown(&doc), "a \nb \nc");
+}
+
+/// Non-void elements ignore the slash of `<b/>`: it opens the element, as in a browser.
+#[test]
+fn self_closing_slash_does_not_hide_script_or_change_styles() {
+    for tag in ["script", "style"] {
+        let src = format!("before <{tag}/>![hidden](https://x.y/i.png)</{tag}> after");
+        let doc = Doc::parse(&src);
+        check_invariants(&doc);
+        assert_eq!(shown(&doc), "before  after", "{src:?}");
+        assert!(doc.images.is_empty() && doc.links.is_empty(), "{src:?}");
+        let src = format!("<div><{tag} src=a />`x` ![h](https://x.y/i.png)</{tag}>v</div>");
+        let doc = Doc::parse(&src);
+        assert_eq!(shown(&doc), "v", "{src:?}");
+        assert!(doc.images.is_empty(), "{src:?}");
+    }
+    let doc = Doc::parse("a <b/>bold</b> c");
+    assert_eq!(dump(&doc), "P | \"a \" [B]\"bold\" \" c\"\n");
+    let doc = Doc::parse("a <i/>x</i> <s/>y</s> <code/>z</code> <sup/>w</sup>");
+    assert!(doc.spans.iter().filter(|s| s.style != 0).count() >= 4);
+    // Still ends with the block.
+    let doc = Doc::parse("<b/>x\n\ny\n");
+    assert_eq!(dump(&doc), "P | [B]\"x\"\nP | \"y\"\n");
+}
+
+/// Emphasis, strong text and strikethrough that start inside script or style don't style
+/// anything, and neither do their ends outside.
+#[test]
+fn emphasis_opened_inside_script_does_not_style_the_text_after() {
+    for delim in ["*", "**", "~~", "_", "__"] {
+        for tag in ["script", "style"] {
+            let src = format!("before <{tag}>{delim}hidden</{tag}> visible{delim} after\n");
+            let doc = Doc::parse(&src);
+            check_invariants(&doc);
+            assert_eq!(shown(&doc), "before  visible after", "{src:?}");
+            assert!(doc.spans.iter().all(|s| s.style == 0), "{src:?}");
+            // In a block, with other text after it.
+            let src = format!("{src}\nnext\n");
+            let doc = Doc::parse(&src);
+            assert!(doc.spans.iter().all(|s| s.style == 0), "{src:?}");
+        }
+    }
+    for (src, dumped) in [
+        // Opened outside, closed inside: ends there (as before).
+        ("*a <script>b* c</script> d\n", "P | [I]\"a \" \" d\""),
+        // One kind inside the other, the inner one opened inside.
+        ("*a <script>**b</script> c** d*\n", "P | [I]\"a  c d\""),
+        // Opened inside, with another of the same kind inside that: stays styled.
+        (
+            "*a <script>*b</script> *c* d*\n",
+            "P | \"*a  \" [I]\"c\" \" d\"",
+        ),
+        // Two inside that end outside: only the outer strong styles.
+        (
+            "**a <script>*b *c</script> d* e* f**\n",
+            "P | [B]\"a  d e f\"",
+        ),
+        // Later text styled as usual.
+        ("a <script>*x</script> y* *z*\n", "P | \"a  y \" [I]\"z\""),
+    ] {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        assert_eq!(dump(&doc).trim_end(), dumped, "{src:?}");
     }
 }
 
@@ -3510,8 +3643,29 @@ fn autolinks_and_character_references() {
         runs("\\*www.a.com").0,
         [link("www.a.com", "http://www.a.com")]
     );
-    // An entity inside a domain ends the domain; the e-mail's domain ends at it too.
+    // An entity inside a domain ends the domain; an e-mail address is the decoded text, though
+    // (cmark-gfm finds them there): an entity is part of it, or not as what it decodes to.
     assert_eq!(runs("a@b.co&eacute;x").0, [link("a@b.co", "mailto:a@b.co")]);
+    for src in [
+        "a&#64;b.com",
+        "a&commat;b.com",
+        "a@b.c&#111;m",
+        "a@b&#46;com",
+        "a&#46;b@c.com &#120;",
+        "&#97;@b.com",
+    ] {
+        let (found, text) = runs(src);
+        assert_eq!(found.len(), 1, "{src}");
+        let (shown_text, href) = &found[0];
+        assert!(text.contains(shown_text.as_str()), "{src}: {text}");
+        assert_eq!(href, &format!("mailto:{shown_text}"), "{src}");
+    }
+    assert_eq!(runs("a&#64;b.com").0, [link("a@b.com", "mailto:a@b.com")]);
+    assert_eq!(runs("a@b.c&#111;m").0, [link("a@b.com", "mailto:a@b.com")]);
+    assert_eq!(
+        runs("a&#46;b@c.com").0,
+        [link("a.b@c.com", "mailto:a.b@c.com")]
+    );
 }
 
 /// Autolinks look at the same text however the parser cuts it up, in segments too.
@@ -3537,33 +3691,35 @@ fn autolinks_and_character_references_survive_segments() {
 /// Pathological raw text is linear too: many `</`, `<` and end tags that don't end the element.
 #[test]
 fn script_end_tag_search_is_linear() {
-    let t = std::time::Instant::now();
-    let many = format!(
-        "<div><script>{}</script>v</div>\n",
-        "</scrip </ </s<".repeat(80_000)
-    );
-    let unclosed = format!("<div><script>{}\n", "</scriptx ".repeat(100_000));
-    let inline = format!(
-        "x <script>{}</script> y\n",
-        "a < b </scriptx> ".repeat(60_000)
-    );
-    let tags = format!(
-        "x <script>{}</script> y\n",
-        "<b c=\"</scri\"> ".repeat(60_000)
-    );
-    for (src, text) in [
-        (many, "v"),
-        (unclosed, ""),
-        (inline, "x  y"),
-        (tags, "x  y"),
-    ] {
-        let doc = Doc::parse(&src);
-        check_invariants(&doc);
-        assert_eq!(shown(&doc), text);
-    }
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(5),
-        "took {:?}",
-        t.elapsed()
-    );
+    super::assert_linear("raw text", 5_000, |n| {
+        let many = format!(
+            "<div><script>{}</script>v</div>\n",
+            "</scrip </ </s<".repeat(n * 4)
+        );
+        let unclosed = format!("<div><script>{}\n", "</scriptx ".repeat(n * 5));
+        let inline = format!(
+            "x <script>{}</script> y\n",
+            "a < b </scriptx> ".repeat(n * 3)
+        );
+        let tags = format!(
+            "x <script>{}</script> y\n",
+            "<b c=\"</scri\"> ".repeat(n * 3)
+        );
+        // The quote of an end tag is never closed: one read of the rest, once.
+        let quote = format!(
+            "<div><script>x</script a=\"{}\n",
+            "</script b=\"".repeat(n * 5)
+        );
+        for (src, text) in [
+            (many, "v"),
+            (unclosed, ""),
+            (inline, "x  y"),
+            (tags, "x  y"),
+            (quote, ""),
+        ] {
+            let doc = Doc::parse(&src);
+            check_invariants(&doc);
+            assert_eq!(shown(&doc), text);
+        }
+    });
 }
