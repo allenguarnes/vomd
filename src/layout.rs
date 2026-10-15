@@ -345,13 +345,18 @@ impl Layout {
         self.remeasure(1.0);
     }
 
-    /// Mark every block unmeasured, its old height scaled by `ratio` as the estimate.
+    /// Mark every block unmeasured, its old height scaled by `ratio` as the estimate. What was
+    /// queued for `take_missing` came from measurements that are now void (the faces may have
+    /// changed): measuring again queues whatever is still uncovered. `tried` is kept, so a
+    /// character already returned is never returned again.
     fn remeasure(&mut self, ratio: f32) {
         for g in &mut self.geoms {
             g.h *= ratio;
             g.measured = false;
             g.content = None;
+            g.missing = false;
         }
+        self.missing.clear();
         self.live.clear();
         self.table_cols.iter_mut().for_each(|c| *c = None);
         self.table_missing.iter_mut().for_each(|m| *m = false);

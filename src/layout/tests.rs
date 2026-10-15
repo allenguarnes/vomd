@@ -519,6 +519,72 @@ fn uncoverable_characters_are_reported_once() {
     assert!(l.take_missing().is_empty());
 }
 
+/// JetBrains Mono as the body family: it has box drawing, the default Inter doesn't.
+fn jb_faces() -> [Option<(std::path::PathBuf, u32)>; 4] {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+    [
+        Some((dir.join("JetBrainsMono-Regular.ttf"), 0)),
+        Some((dir.join("JetBrainsMono-Bold.ttf"), 0)),
+        None,
+        None,
+    ]
+}
+
+#[test]
+fn a_family_switch_drops_queued_characters_it_covers() {
+    let mut fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("Lines \u{2500}\u{2500} and \u{E000}\n");
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    // Queued from the measurement with the defaults, not taken yet.
+    assert!(fonts.set_family(false, Some(&jb_faces())));
+    l.invalidate_all();
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    // The family covers the box drawing; what nothing covers is queued again by the new
+    // measurement, and reported once.
+    assert_eq!(l.take_missing(), vec!['\u{E000}']);
+    assert!(l.geoms().iter().any(|g| g.missing));
+    l.invalidate_all();
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    assert!(l.take_missing().is_empty(), "already returned");
+}
+
+#[test]
+fn a_family_switch_after_a_param_change_leaves_no_stale_characters() {
+    let mut fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(
+        "Lines \u{2500}\u{2500} and \u{E000}\n\n"
+            .repeat(30)
+            .as_str(),
+    );
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    l.set_params(params(900.0, 1.5));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    // Queued again by the remeasure with the defaults, not taken yet.
+    assert!(fonts.set_family(false, Some(&jb_faces())));
+    l.invalidate_all();
+    l.set_params(params(900.0, 2.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    assert_eq!(l.take_missing(), vec!['\u{E000}']);
+    // Without a family change a relayout queues what is uncovered again, not what was before.
+    let mut fonts = Fonts::new().unwrap();
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    l.set_params(params(900.0, 1.5));
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    let mut both = l.take_missing();
+    both.sort_unstable();
+    assert_eq!(both, vec!['\u{2500}', '\u{E000}']);
+    assert!(fonts.set_family(false, Some(&jb_faces())));
+    l.invalidate_all();
+    l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
+    assert!(
+        l.take_missing().is_empty(),
+        "returned characters stay returned"
+    );
+}
+
 #[test]
 fn blocks_measured_during_the_fallback_scan_are_invalidated() {
     let fonts = Fonts::new().unwrap();

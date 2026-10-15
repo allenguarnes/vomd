@@ -1114,6 +1114,19 @@ mod with_fonts {
         assert!(v.take_missing().is_empty());
     }
 
+    /// Startup with a cached family: the zoom and text settings are applied first, with the
+    /// defaults; what that queued and the family covers must not trigger a scan.
+    #[test]
+    fn a_cached_family_applied_after_zoom_needs_no_scan_for_what_it_covers() {
+        let mut v = view("Lines \u{2500}\u{2500} and \u{E000}", 600, 300);
+        v.set_zoom(125);
+        v.set_text(17.0, 90.0);
+        assert!(v.set_family(false, Some(&jb_family())));
+        settle(&mut v);
+        assert!(covered(&v, BOX));
+        assert_eq!(v.take_missing(), vec!['\u{E000}']);
+    }
+
     /// A face loaded for a family in use is not a fallback, so a scan may find it for the text
     /// in the other kind of slot.
     #[test]
