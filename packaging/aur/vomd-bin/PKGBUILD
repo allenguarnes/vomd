@@ -1,6 +1,7 @@
 # Maintainer: Allen Guarnes <allen@ggbite.com>
 # Repackages the release tarball (`cargo xtask dist`, attached to the GitHub release). After a
-# release: bump pkgver, run `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO`.
+# release: bump pkgver, run `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO` (sha256sums
+# is 'SKIP' until a release exists).
 pkgname=vomd-bin
 _pkgname=vomd
 pkgver=1.0.0

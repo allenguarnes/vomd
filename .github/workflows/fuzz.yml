@@ -38,12 +38,14 @@ jobs:
           else
             find fixtures -maxdepth 1 -name '*.md' -size -16k -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
           fi
+      - name: Minimize the cached corpus
+        run: cargo +nightly fuzz cmin -a ${{ matrix.target }}
       - name: Fuzz
         run: |
           case ${{ matrix.target }} in
             doc) max_len=65536 ;; layout) max_len=16384 ;; *) max_len=4096 ;;
           esac
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run -a ${{ matrix.target }} -- \
             -max_total_time=${{ inputs.seconds || '3600' }} -max_len=$max_len \
             -timeout=10 -rss_limit_mb=2048 -print_final_stats=1
       - uses: actions/upload-artifact@v4

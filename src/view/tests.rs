@@ -2034,6 +2034,27 @@ mod with_fonts {
         assert_eq!(v.notice(), None);
     }
 
+    /// The shell sets the notice after opening a document (argument, link, Back, drop) and
+    /// leaves it alone on reload: `open_in` clears one showing, `replace` keeps it.
+    #[test]
+    fn a_reload_keeps_the_notice_and_opening_clears_it() {
+        let mut v = view(&paras(40), 600, 400);
+        v.set_notice(large_notice(LARGE_FILE + 1));
+        let now = Instant::now();
+        let mut buf = vec![0u32; 600 * 400];
+        v.paint(&mut buf, 600, now);
+        assert_eq!(v.deadline(), Some(now + NOTICE));
+        v.replace(Doc::parse(&paras(41)), None);
+        assert_eq!(v.notice(), Some("This file is 10 MB, so it may be slow"));
+        assert_eq!(v.deadline(), Some(now + NOTICE), "the time isn't restarted");
+        v.open_in(Doc::parse("# b"), None, None);
+        assert_eq!(v.notice(), None);
+        assert_eq!(v.deadline(), None);
+        // The next document's own notice then shows from its first frame.
+        v.set_notice(large_notice(LARGE_FILE + 1));
+        assert_eq!(v.deadline(), None);
+    }
+
     #[cfg(feature = "remote-images")]
     mod remote {
         use super::*;

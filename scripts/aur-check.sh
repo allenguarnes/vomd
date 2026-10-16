@@ -9,6 +9,8 @@ ver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 work=$(mktemp -d /tmp/vomd-aur.XXXXXX)
 export CARGO_NET_OFFLINE=true
 echo "== work dir: $work"
+echo "== WARNING: both PKGBUILDs have sha256sums=('SKIP') until a release exists: run" \
+     "'updpkgsums' in each before publishing to the AUR"
 
 check() { # name
     local dir=$work/$1

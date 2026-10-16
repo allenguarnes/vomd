@@ -75,7 +75,8 @@ fn root() -> PathBuf {
 }
 
 /// Release binaries target baseline x86-64: a `target-cpu` flag would make them
-/// crash on older CPUs, so measuring or packaging such a build is refused.
+/// crash on older CPUs, so measuring or packaging a build whose environment sets one is
+/// refused. (A `target-cpu` in a cargo config file is overridden by [`cargo_build`].)
 fn baseline_cpu() -> bool {
     let set = |v: &str| env::var(v).is_ok_and(|f| f.contains("target-cpu"));
     if set("RUSTFLAGS") || set("CARGO_ENCODED_RUSTFLAGS") || set("CARGO_BUILD_RUSTFLAGS") {
@@ -85,9 +86,27 @@ fn baseline_cpu() -> bool {
     true
 }
 
+/// The rustflags of every release build: nothing but RELR, set through
+/// `CARGO_ENCODED_RUSTFLAGS` (unit-separator-joined), which overrides `[build] rustflags` and
+/// `[target] rustflags` in every config file, so no `target-cpu` from `~/.cargo/config.toml`
+/// or a parent directory's reaches the binary.
+const RELR_FLAGS: &str = "-C\x1flink-arg=-Wl,-z,pack-relative-relocs";
+
+/// A cargo command in the repository with [`RELR_FLAGS`] for what it builds.
+fn release_cargo() -> Command {
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.current_dir(root());
+    if cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) {
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", RELR_FLAGS);
+    }
+    cmd
+}
+
 fn cargo_build(extra: &[&str], target_dir: &str) -> PathBuf {
-    let status = Command::new(env!("CARGO"))
-        .current_dir(root())
+    let status = release_cargo()
         .args([
             "build",
             "--release",
@@ -209,14 +228,17 @@ fn run_once(bin: &Path, fixture: &Path) -> Option<Run> {
 }
 
 /// Cold (first run after evicting the binary) and warm (median) start of `fixture`, and the
-/// peak RSS at the first frame.
+/// peak RSS at the first frame. `None` unless all [`BENCH_RUNS`] runs gave a first frame: a
+/// failed cold run would otherwise make a warm one count as cold.
 fn startup(bin: &Path, fixture: &Path) -> Option<(f64, f64, f64, u64)> {
     evict(bin);
-    let mut runs: Vec<Run> = (0..BENCH_RUNS)
-        .filter_map(|_| run_once(bin, fixture))
-        .collect();
-    if runs.is_empty() {
-        return None;
+    let mut runs: Vec<Run> = Vec::with_capacity(BENCH_RUNS);
+    for i in 0..BENCH_RUNS {
+        let Some(run) = run_once(bin, fixture) else {
+            eprintln!("run {} of {BENCH_RUNS} gave no first frame", i + 1);
+            return None;
+        };
+        runs.push(run);
     }
     let cold = runs[0].wall_ms;
     let rss = runs.iter().map(|r| r.rss_kb).max().unwrap_or(0);
@@ -319,8 +341,7 @@ fn idle(bin: &Path, fixture: &Path) -> Option<Idle> {
 
 /// The scroll frame time of a 4K window (`examples/paint_bench.rs`): p95 in ms.
 fn scroll_p95(fixture: &Path) -> Option<f64> {
-    let out = Command::new(env!("CARGO"))
-        .current_dir(root())
+    let out = release_cargo()
         .args(["run", "--release", "--locked", "--quiet", "--example"])
         .arg("paint_bench")
         .arg("--")
@@ -374,6 +395,11 @@ fn budgets(report: Option<&Path>) -> bool {
             });
         };
     let mb = |kb: u64| format!("{kb} KB");
+    let allowance = if wayland {
+        format!(" + {frame_kb} KB (Wayland)")
+    } else {
+        String::new()
+    };
     for (i, (label, extra, dir)) in BUILDS.into_iter().enumerate() {
         let bin = cargo_build(extra, dir);
         let len = fs::metadata(&bin).expect("binary").len();
@@ -392,7 +418,7 @@ fn budgets(report: Option<&Path>) -> bool {
                         format!("cold start, {name}"),
                         label,
                         format!("{cold:.1} ms"),
-                        format!("≤ {COLD_BUDGET_MS} ms"),
+                        format!("≤ {COLD_BUDGET_MS} ms (first of {BENCH_RUNS} runs)"),
                         cold <= COLD_BUDGET_MS,
                         true,
                     );
@@ -400,7 +426,7 @@ fn budgets(report: Option<&Path>) -> bool {
                         format!("warm start, {name}"),
                         label,
                         format!("{warm:.1} ms"),
-                        format!("≤ {WARM_BUDGET_MS} ms"),
+                        format!("≤ {WARM_BUDGET_MS} ms (median of {})", BENCH_RUNS - 1),
                         warm <= WARM_BUDGET_MS,
                         !WARM_UNGATED.contains(name),
                     );
@@ -434,8 +460,8 @@ fn budgets(report: Option<&Path>) -> bool {
                 format!("idle RSS, {what} doc, 1080p"),
                 label,
                 mb(r.rss_kb),
-                format!("≤ {}", mb(budget)),
-                r.rss_kb <= budget,
+                format!("≤ {}{allowance}", mb(budget)),
+                r.rss_kb <= budget + frame_kb,
                 true,
             );
             gated_row(

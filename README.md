@@ -28,6 +28,10 @@ Raw HTML is never run. Tags are stripped and their text kept, and a few tags (`<
 paru -S vomd        # or: yay -S vomd-bin
 ```
 
+`vomd` honors `makepkg.conf`: its `RUSTFLAGS` (CachyOS sets `-C opt-level=3 -C target-cpu=native`)
+replace the size-tuned `opt-level`, so that binary can be larger (about 4.9 MB) and faster than the
+release one, and runs only on the CPU it was built on. `vomd-bin` is the small, portable build.
+
 **Release tarball:** each [release](https://github.com/allenguarnes/vomd/releases) has
 `vomd-<version>-x86_64-linux.tar.gz` (glibc 2.36 or newer, any x86-64 CPU):
 

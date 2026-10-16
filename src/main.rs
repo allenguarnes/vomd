@@ -3,6 +3,7 @@
 //! translates window events.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use std::cell::Cell;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -74,8 +75,10 @@ fn load(input: &Input, origin: Origin) -> Loaded {
 enum Bench {
     /// Print the time to the first frame and peak RSS, and exit (any value but `idle`).
     FirstFrame,
-    /// `idle`: once the document is measured and nothing is left to do, print the time and
-    /// RSS and keep running, for the budget harness to watch the CPU and end the process.
+    /// `idle`: once the document is measured, its fonts are applied and nothing is left to do,
+    /// print the time and RSS and keep running, for the budget harness to watch the CPU and end
+    /// the process. Fallback font scans run as in a real window (they're part of its idle RSS);
+    /// [`Bench::FirstFrame`] skips them.
     Idle,
 }
 
@@ -96,6 +99,8 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     /// A fallback font scan is running.
     scanning: bool,
+    /// A redraw was asked for and not yet painted.
+    redraw_pending: Cell<bool>,
     stamp: Option<Stamp>,
     store: Store,
     /// The `font_sans` and `font_mono` families applied to the view (`None`: embedded faces).
@@ -119,11 +124,13 @@ struct App {
 impl App {
     fn redraw(&self) {
         if let Some(g) = &self.gfx {
+            self.redraw_pending.set(true);
             g.window.request_redraw();
         }
     }
 
     fn paint(&mut self, event_loop: &ActiveEventLoop) {
+        self.redraw_pending.set(false);
         let (Some(gfx), Some(view)) = (self.gfx.as_mut(), self.view.as_mut()) else {
             return;
         };
@@ -207,7 +214,11 @@ impl App {
     /// Look up the files of `font_sans` / `font_mono` families on a background thread (one
     /// scan for both; never on the startup path).
     fn resolve_families(&mut self) {
-        if self.resolving || self.bench.is_some() || !self.shown || self.unresolved.is_empty() {
+        if self.resolving
+            || self.bench == Some(Bench::FirstFrame)
+            || !self.shown
+            || self.unresolved.is_empty()
+        {
             return;
         }
         let wanted: Vec<(bool, String)> = std::mem::take(&mut self.unresolved)
@@ -261,7 +272,7 @@ impl App {
     /// Start a fallback font scan for characters no loaded face covers (one at a time, off the
     /// main thread). Characters found missing meanwhile wait for the next scan.
     fn scan_fonts(&mut self) {
-        if self.scanning || self.bench.is_some() {
+        if self.scanning || self.bench == Some(Bench::FirstFrame) {
             return;
         }
         let Some(view) = self.view.as_mut() else {
@@ -715,6 +726,10 @@ impl ApplicationHandler<UserEvent> for App {
             && self.shown
             && !self.idle_reported
             && !matches!(tick.wake, Wake::Poll)
+            && !self.scanning
+            && !self.resolving
+            && self.unresolved.is_empty()
+            && !self.redraw_pending.get()
         {
             self.idle_reported = true;
             eprintln!(
@@ -783,6 +798,7 @@ fn main() {
         gfx: None,
         proxy: event_loop.create_proxy(),
         scanning: false,
+        redraw_pending: Cell::new(false),
         stamp: None,
         store,
         families: [None, None],

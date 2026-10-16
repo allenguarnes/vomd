@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run by hand before tagging: the start budgets have thin headroom on GitHub's runners and
+  # must be confirmed there.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +27,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends xvfb xauth libx11-6 libx11-xcb1 \
             libxcb1 libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 binutils
       - run: cargo fmt --all --check
+      - name: The fuzz crate's lock file is in sync
+        run: |
+          cargo metadata --locked --filter-platform x86_64-unknown-linux-gnu \
+            --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
       - name: Clippy (every feature set)
         run: |
           cargo clippy --workspace --all-targets --locked -- -D warnings
