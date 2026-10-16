@@ -43,11 +43,14 @@ struct Loaded {
     doc: Doc,
     message: Option<String>,
     stamp: Option<Stamp>,
+    /// The large-file notice.
+    notice: Option<String>,
 }
 
 fn load(input: &Input, origin: Origin) -> Loaded {
     match view::read_input(input, origin) {
         Ok((text, stamp)) => Loaded {
+            notice: view::large_notice(text.len()),
             doc: Doc::parse(&text),
             message: (*input == Input::None).then(|| EMPTY_MESSAGE.to_owned()),
             stamp,
@@ -60,9 +63,20 @@ fn load(input: &Input, origin: Origin) -> Loaded {
                 doc: Doc::default(),
                 message: Some(message),
                 stamp: None,
+                notice: None,
             }
         }
     }
+}
+
+/// What `VOMD_BENCH` asks for (budget measurement).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bench {
+    /// Print the time to the first frame and peak RSS, and exit (any value but `idle`).
+    FirstFrame,
+    /// `idle`: once the document is measured and nothing is left to do, print the time and
+    /// RSS and keep running, for the budget harness to watch the CPU and end the process.
+    Idle,
 }
 
 struct Gfx {
@@ -72,7 +86,9 @@ struct Gfx {
 
 struct App {
     start: Instant,
-    bench: bool,
+    bench: Option<Bench>,
+    /// [`Bench::Idle`] reported the idle state.
+    idle_reported: bool,
     input: Input,
     parse: Option<JoinHandle<Loaded>>,
     view: Option<View>,
@@ -133,7 +149,7 @@ impl App {
         if !self.shown {
             self.shown = true;
             gfx.window.set_visible(true);
-            if self.bench {
+            if self.bench == Some(Bench::FirstFrame) {
                 eprintln!(
                     "vomd-bench first_frame_ms={:.2} rss_kb={}",
                     self.start.elapsed().as_secs_f64() * 1e3,
@@ -191,7 +207,7 @@ impl App {
     /// Look up the files of `font_sans` / `font_mono` families on a background thread (one
     /// scan for both; never on the startup path).
     fn resolve_families(&mut self) {
-        if self.resolving || self.bench || !self.shown || self.unresolved.is_empty() {
+        if self.resolving || self.bench.is_some() || !self.shown || self.unresolved.is_empty() {
             return;
         }
         let wanted: Vec<(bool, String)> = std::mem::take(&mut self.unresolved)
@@ -245,7 +261,7 @@ impl App {
     /// Start a fallback font scan for characters no loaded face covers (one at a time, off the
     /// main thread). Characters found missing meanwhile wait for the next scan.
     fn scan_fonts(&mut self) {
-        if self.scanning || self.bench {
+        if self.scanning || self.bench.is_some() {
             return;
         }
         let Some(view) = self.view.as_mut() else {
@@ -287,6 +303,7 @@ impl App {
         self.stamp = loaded.stamp;
         if let Some(view) = self.view.as_mut() {
             view.open_in(loaded.doc, loaded.message, nav::base_dir(&self.input));
+            view.set_notice(loaded.notice);
         }
         if let Some(g) = &self.gfx {
             g.window.set_title(&view::title(&self.input));
@@ -415,8 +432,15 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let prefs = self.store.prefs();
         let mut size = LogicalSize::new(f64::from(prefs.window.0), f64::from(prefs.window.1));
+        let bench_size = self.bench.and(bench_size());
+        if let Some((w, h)) = bench_size {
+            size = LogicalSize::new(w, h);
+        }
         // Clamp to the monitor where the system reports one (Wayland doesn't).
-        if let Some(m) = event_loop.primary_monitor() {
+        if let Some(m) = event_loop
+            .primary_monitor()
+            .filter(|_| bench_size.is_none())
+        {
             let avail = m.size().to_logical::<f64>(m.scale_factor());
             size.width = size.width.min(avail.width * 0.95);
             size.height = size.height.min(avail.height * 0.9);
@@ -460,6 +484,7 @@ impl ApplicationHandler<UserEvent> for App {
                 doc: Doc::default(),
                 message: Some("Cannot read the document".into()),
                 stamp: None,
+                notice: None,
             },
         };
         self.stamp = loaded.stamp;
@@ -472,6 +497,7 @@ impl ApplicationHandler<UserEvent> for App {
             window.scale_factor(),
             nav::base_dir(&self.input),
         );
+        view.set_notice(loaded.notice);
         view.set_settings_available(self.store.path().is_some());
         let proxy = Mutex::new(self.proxy.clone());
         view.set_image_wake(Arc::new(move || {
@@ -685,6 +711,19 @@ impl ApplicationHandler<UserEvent> for App {
         self.scan_fonts();
         self.save(|s| s.poll(now));
         let save = self.store.deadline();
+        if self.bench == Some(Bench::Idle)
+            && self.shown
+            && !self.idle_reported
+            && !matches!(tick.wake, Wake::Poll)
+        {
+            self.idle_reported = true;
+            eprintln!(
+                "vomd-bench idle_ms={:.2} rss_kb={} peak_rss_kb={}",
+                self.start.elapsed().as_secs_f64() * 1e3,
+                platform::rss_kb(),
+                platform::peak_rss_kb()
+            );
+        }
         event_loop.set_control_flow(match (tick.wake, save) {
             (Wake::Poll, _) => ControlFlow::Poll,
             (Wake::At(t), Some(s)) => ControlFlow::WaitUntil(t.min(s)),
@@ -712,7 +751,13 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let bench = std::env::var_os("VOMD_BENCH").is_some();
+    let bench = std::env::var_os("VOMD_BENCH").map(|v| {
+        if v == "idle" {
+            Bench::Idle
+        } else {
+            Bench::FirstFrame
+        }
+    });
     // Settings come first: they size the window and set theme and zoom.
     let store = Store::open(if no_settings { None } else { settings::path() });
     // Read and parse in parallel with creating the window.
@@ -731,6 +776,7 @@ fn main() {
     let mut app = App {
         start,
         bench,
+        idle_reported: false,
         input,
         parse: Some(parse),
         view: None,
@@ -756,6 +802,15 @@ fn main() {
         std::process::exit(1);
     }
     std::process::exit(app.exit_code);
+}
+
+/// `VOMD_BENCH_SIZE=WxH`: the window's size in logical pixels for a bench run, unclamped
+/// (RSS is measured in a 1080p window).
+fn bench_size() -> Option<(f64, f64)> {
+    let v = std::env::var("VOMD_BENCH_SIZE").ok()?;
+    let (w, h) = v.split_once('x')?;
+    let (w, h): (f64, f64) = (w.parse().ok()?, h.parse().ok()?);
+    (w >= 1.0 && h >= 1.0 && w <= 16384.0 && h <= 16384.0).then_some((w, h))
 }
 
 /// Family names in settings compare case-insensitively.

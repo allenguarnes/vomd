@@ -43,6 +43,10 @@ const WHEEL_LINES: f64 = 3.0;
 /// toast stands in for it while the toolbar is hidden.
 const PULSE: Duration = Duration::from_millis(900);
 const TOAST: Duration = Duration::from_secs(4);
+/// How long the large-file notice shows from the document's first frame.
+const NOTICE: Duration = Duration::from_secs(6);
+/// Documents larger than this render with a one-line notice.
+pub const LARGE_FILE: usize = 10 << 20;
 /// What hovering a blocked remote image's placeholder says.
 pub const BLOCKED_NOTE: &str = "Remote image blocked · press I to load";
 /// Passes [`View::bottom`] makes: measuring the last screen changes the total height.
@@ -221,6 +225,11 @@ pub fn hover_change(pointer: bool, hovered: bool, changed: bool) -> HoverChange 
         set_cursor: hovered != pointer,
         redraw: changed,
     }
+}
+
+/// The notice for a document of `len` bytes: `None` up to [`LARGE_FILE`].
+pub fn large_notice(len: usize) -> Option<String> {
+    (len > LARGE_FILE).then(|| format!("This file is {} MB, so it may be slow", len >> 20))
 }
 
 /// The most a document may be: files over 10 MB render with a notice, but a link
@@ -404,6 +413,9 @@ pub struct View {
     /// Until when the toolbar's remote-images button pulses, and the toast shows.
     pulse: Option<Instant>,
     toast: Option<(Instant, String)>,
+    /// The large-file notice and until when it shows: set by the first frame that
+    /// paints it.
+    notice: Option<(Option<Instant>, String)>,
 }
 
 impl View {
@@ -474,6 +486,7 @@ impl View {
             announced: false,
             pulse: None,
             toast: None,
+            notice: None,
         };
         view.images.set_base(base);
         view.attach_images();
@@ -1051,7 +1064,12 @@ impl View {
             if cfg!(feature = "remote-images")
                 && let Some((_, text)) = self.toast.clone()
             {
-                self.paint_toast(&mut frame, &text, theme);
+                self.paint_toast(&mut frame, &text, theme, false);
+            }
+            if let Some((until, text)) = self.notice.as_mut() {
+                let text = text.clone();
+                until.get_or_insert(now + NOTICE);
+                self.paint_toast(&mut frame, &text, theme, true);
             }
         }
         let ctx = self.toolbar_ctx();
@@ -1115,8 +1133,9 @@ impl View {
     }
 
     /// A short note in a box at the bottom right (remote images are blocked and
-    /// the toolbar that would say so is hidden).
-    fn paint_toast(&mut self, frame: &mut Frame, text: &str, theme: &Theme) {
+    /// the toolbar that would say so is hidden), or at the top in the middle, below the
+    /// toolbar (`top`: the large-file notice).
+    fn paint_toast(&mut self, frame: &mut Frame, text: &str, theme: &Theme, top: bool) {
         let (w, h) = (frame.width() as f32, frame.height() as f32);
         let scale = self.hidpi as f32;
         let size = 13.0 * scale;
@@ -1140,8 +1159,13 @@ impl View {
         self.msg_missing
             .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
         let (box_w, box_h) = (pl.width + 2.0 * pad_x, pl.height + 2.0 * pad_y);
-        let (x1, y1) = (w - margin, h - margin);
-        let (x0, y0) = ((x1 - box_w).max(0.0), y1 - box_h);
+        let (x0, y0) = if top {
+            let y0 = self.top_inset as f32 + margin;
+            (((w - box_w) / 2.0).max(0.0), y0)
+        } else {
+            ((w - margin - box_w).max(0.0), h - margin - box_h)
+        };
+        let (x1, y1) = ((x0 + box_w).min(w), y0 + box_h);
         let px = |v: f32| v.round() as i32;
         let rect = (px(x0), px(y0), px(x1), px(y1));
         let r = (0.4 * size).round();
@@ -1264,6 +1288,7 @@ impl View {
             self.toolbar.deadline(&self.toolbar_ctx()),
             self.pulse,
             self.toast.as_ref().map(|t| t.0),
+            self.notice.as_ref().and_then(|n| n.0),
         ]
         .into_iter()
         .flatten()
@@ -1282,7 +1307,14 @@ impl View {
         if toast {
             self.toast = None;
         }
-        fade | pulse | toast | self.toolbar.expire(&self.toolbar_ctx(), now)
+        let notice = self
+            .notice
+            .as_ref()
+            .is_some_and(|n| n.0.is_some_and(|t| now >= t));
+        if notice {
+            self.notice = None;
+        }
+        fade | pulse | toast | notice | self.toolbar.expire(&self.toolbar_ctx(), now)
     }
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its
@@ -1525,6 +1557,18 @@ impl View {
         self.announced = false;
         self.pulse = None;
         self.toast = None;
+        self.notice = None;
+    }
+
+    /// Show `text` as the document's one-line notice from its next frame on, for a few seconds
+    /// (see [`large_notice`]). Opening another document takes it away.
+    pub fn set_notice(&mut self, text: Option<String>) {
+        self.notice = text.map(|t| (None, t));
+    }
+
+    /// The notice showing or waiting for a frame.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_ref().map(|n| n.1.as_str())
     }
 
     /// Show a new version of the document (reload) or a message in its place. The position

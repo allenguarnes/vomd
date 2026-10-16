@@ -110,15 +110,26 @@ pub fn stderr_is_tty() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Resident set size now in KB, for `VOMD_BENCH` (0 where unknown).
+pub fn rss_kb() -> u64 {
+    status_kb("VmRSS:")
+}
+
 /// Peak resident set size in KB, for `VOMD_BENCH` (0 where unknown).
 pub fn peak_rss_kb() -> u64 {
+    status_kb("VmHWM:")
+}
+
+/// A `/proc/self/status` field in kB (0 if unknown).
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn status_kb(field: &str) -> u64 {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|s| {
                 s.lines()
-                    .find_map(|l| l.strip_prefix("VmHWM:"))
+                    .find_map(|l| l.strip_prefix(field))
                     .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
             })
             .unwrap_or(0)
@@ -201,5 +212,6 @@ mod tests {
     #[test]
     fn reads_peak_rss() {
         assert!(peak_rss_kb() > 0);
+        assert!((1..=peak_rss_kb()).contains(&rss_kb()));
     }
 }

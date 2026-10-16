@@ -1,0 +1,41 @@
+# Fuzz targets: `cargo +nightly fuzz run <doc|layout|settings>`, or on
+# stable with `just fuzz <target> [seconds]`. Never shipped.
+[package]
+name = "vomd-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vomd = { path = "..", default-features = false, features = ["embed-fonts"] }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "doc"
+path = "fuzz_targets/doc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "layout"
+path = "fuzz_targets/layout.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "settings"
+path = "fuzz_targets/settings.rs"
+test = false
+doc = false
+bench = false

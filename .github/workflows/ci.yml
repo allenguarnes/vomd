@@ -1,0 +1,61 @@
+# Linux runs everything, budgets included; Windows and macOS are compile checks
+# only (unsupported until P14). Mirrors `just ci` and `cargo xtask budgets`.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Display libraries and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth libx11-6 libx11-xcb1 \
+            libxcb1 libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 binutils
+      - run: cargo fmt --all --check
+      - name: Clippy (every feature set)
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --no-default-features --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features images --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features images,embed-fonts --locked -- -D warnings
+      - name: Tests and goldens
+        run: cargo test --workspace --locked
+      - name: Tests without default features
+        run: cargo test --lib --no-default-features --features embed-fonts --locked
+      - name: Budgets
+        run: |
+          xvfb-run -a -s "-screen 0 3840x2160x24" \
+            cargo xtask budgets --report budgets.md
+          cat budgets.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: budgets
+          path: budgets.md
+          if-no-files-found: ignore
+
+  compile-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+      - run: cargo clippy --locked -- -D warnings

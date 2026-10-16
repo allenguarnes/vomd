@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=VOMD
+GenericName=Markdown Viewer
+Comment=View Markdown documents
+Exec=vomd %f
+Icon=vomd
+Terminal=false
+Categories=Office;Viewer;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;md;readme;viewer;
+StartupNotify=false

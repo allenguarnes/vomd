@@ -1995,6 +1995,45 @@ mod with_fonts {
         assert_eq!(view("![a](a.png)", 600, 400).images.generation(), 1);
     }
 
+    /// Files over 10 MB get a one-line notice for a few seconds from their first frame, drawn
+    /// at the top below the toolbar.
+    #[test]
+    fn large_files_show_a_notice() {
+        assert_eq!(large_notice(LARGE_FILE), None);
+        assert_eq!(
+            large_notice(23 << 20).as_deref(),
+            Some("This file is 23 MB, so it may be slow")
+        );
+        let mut v = view(&paras(40), 600, 400);
+        let mut plain = vec![0u32; 600 * 400];
+        let now = Instant::now();
+        v.paint(&mut plain, 600, now);
+        v.set_notice(large_notice(LARGE_FILE + 1));
+        assert_eq!(v.notice(), Some("This file is 10 MB, so it may be slow"));
+        assert_eq!(v.deadline(), None, "the time starts with the first frame");
+        let mut buf = vec![0u32; 600 * 400];
+        v.paint(&mut buf, 600, now);
+        assert_eq!(v.deadline(), Some(now + NOTICE));
+        // Drawn in the top middle, nowhere near the bottom.
+        let differs = |rows: std::ops::Range<usize>| {
+            rows.flat_map(|y| (0..600).map(move |x| y * 600 + x))
+                .any(|i| buf[i] != plain[i])
+        };
+        assert!(differs(0..60));
+        assert!(!differs(200..400));
+        // A later frame doesn't push the time back.
+        v.paint(&mut buf, 600, now + Duration::from_secs(1));
+        assert_eq!(v.deadline(), Some(now + NOTICE));
+        assert!(!v.tick(now + Duration::from_secs(1), None).redraw);
+        assert!(v.tick(now + NOTICE, None).redraw);
+        assert_eq!(v.notice(), None);
+        assert_eq!(v.deadline(), None);
+        // Another document takes it away.
+        v.set_notice(Some("x".into()));
+        v.open(Doc::parse("# b"), None);
+        assert_eq!(v.notice(), None);
+    }
+
     #[cfg(feature = "remote-images")]
     mod remote {
         use super::*;

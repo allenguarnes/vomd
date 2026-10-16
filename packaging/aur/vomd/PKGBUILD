@@ -1,0 +1,57 @@
+# Maintainer: Allen Guarnes <allen@ggbite.com>
+# Builds from the tagged source. After tagging a release: bump pkgver, run `updpkgsums` and
+# `makepkg --printsrcinfo > .SRCINFO`, then push to the AUR.
+pkgname=vomd
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='View-Only Markdown: a tiny, fast Markdown viewer'
+arch=('x86_64' 'aarch64')
+url='https://github.com/allenguarnes/vomd'
+license=('MIT' 'OFL-1.1' 'ISC')
+# The display libraries are loaded at run time (dlopen), for Wayland or X11, whichever the
+# session is: namcap can't see them.
+depends=('glibc' 'gcc-libs' 'hicolor-icon-theme' 'libxkbcommon' 'wayland'
+         'libx11' 'libxcb' 'libxcursor' 'libxi' 'libxkbcommon-x11')
+makedepends=('cargo')
+optdepends=('curl: remote images, loaded only after pressing I'
+            'xdg-utils: open web links in the browser'
+            'noto-fonts-cjk: CJK text'
+            'noto-fonts-emoji: color emoji')
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # makepkg.conf's RUSTFLAGS replace the repository's .cargo/config.toml flags: keep its
+  # packed relocations (RELR, smaller binary).
+  export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-z,pack-relative-relocs"
+  cargo build --frozen --release --package vomd
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --package vomd --lib
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/vomd "$pkgdir/usr/bin/vomd"
+  install -Dm644 packaging/vomd.desktop "$pkgdir/usr/share/applications/vomd.desktop"
+  install -Dm644 packaging/vomd.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/vomd.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+    assets/fonts/LICENSE-Inter.txt assets/fonts/LICENSE-JetBrainsMono.txt assets/fonts/LICENSE-Lucide.txt
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+}

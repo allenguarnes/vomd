@@ -1,0 +1,53 @@
+# Every fuzz target for an hour a night (cargo-fuzz, nightly, AddressSanitizer).
+# Crashes are uploaded as artifacts; the corpus is cached between runs.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "3600"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [doc, layout, settings]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Seed the corpus
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          if [ "${{ matrix.target }}" = settings ]; then
+            cp fuzz/seeds/settings/* fuzz/corpus/settings/
+          else
+            find fixtures -maxdepth 1 -name '*.md' -size -16k -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
+          fi
+      - name: Fuzz
+        run: |
+          case ${{ matrix.target }} in
+            doc) max_len=65536 ;; layout) max_len=16384 ;; *) max_len=4096 ;;
+          esac
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ inputs.seconds || '3600' }} -max_len=$max_len \
+            -timeout=10 -rss_limit_mb=2048 -print_final_stats=1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

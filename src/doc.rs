@@ -321,6 +321,15 @@ impl Doc {
         Some(feed.b.finish())
     }
 
+    /// For the fuzz targets (`fuzz/`): the one parser's document and the one cut into
+    /// segments of about `budget` bytes (on this thread), if the text can be cut. They
+    /// must be the same.
+    #[doc(hidden)]
+    pub fn fuzz_segments(src: &str, budget: usize) -> Option<(Doc, Doc)> {
+        let parts = Doc::parse_segments_with(src, budget, &pipeline::Config::new(0, 1))?;
+        Some((Doc::parse_whole(src), parts))
+    }
+
     pub fn span_text(&self, span: &Span) -> &str {
         &self.text[span.start as usize..span.end as usize]
     }

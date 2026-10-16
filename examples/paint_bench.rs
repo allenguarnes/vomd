@@ -73,4 +73,10 @@ fn main() {
         cache.len(),
         cache.bytes() / 1024,
     );
+    // For `cargo xtask budgets` (scroll frame time, 4K window).
+    println!(
+        "paint-bench p95_ms={:.3} worst_ms={:.3}",
+        ms(times[FRAMES * 95 / 100]),
+        ms(times[FRAMES - 1])
+    );
 }

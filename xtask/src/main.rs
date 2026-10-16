@@ -1,29 +1,66 @@
-//! Dev tooling: `cargo xtask <size|bench|fixtures|bless>`. Never shipped.
+//! Dev tooling: `cargo xtask <size|bench|budgets|dist|fixtures|bless>`. Never shipped.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-// Budgets (Linux x86_64).
-const SIZE_BUDGET_DEFAULT: u64 = 4_000_000;
-const SIZE_BUDGET_MIN: u64 = 3_000_000;
-const FIRST_FRAME_BUDGET_MS: f64 = 100.0;
-const RSS_BUDGET_KB: u64 = 30_000;
+// Budgets (Linux x86_64): (default build, --no-default-features).
+const SIZE_BUDGET: [u64; 2] = [4_000_000, 3_000_000];
+const COLD_BUDGET_MS: f64 = 100.0;
+const WARM_BUDGET_MS: f64 = 50.0;
+/// Idle RSS, 50 KB document, 1080p window.
+const RSS_SMALL_KB: [u64; 2] = [30_000, 25_000];
+/// Idle RSS, 5 MB document, 1080p window.
+const RSS_HUGE_KB: [u64; 2] = [60_000, 55_000];
+/// Idle CPU is 0%: clock ticks (1/100 s) allowed over `IDLE_WATCH`, for a stray event from
+/// the window system; a timer or a busy loop takes many more.
+const IDLE_TICKS: u64 = 1;
+const IDLE_WATCH: Duration = Duration::from_secs(3);
+const SCROLL_BUDGET_MS: f64 = 8.0;
 
-const BENCH_FIXTURES: &[&str] = &["tiny.md", "readme.md", "spec.md", "huge.md"];
+/// The window the RSS budgets are specified for (logical pixels; the CI display is 1x).
+const BENCH_SIZE: &str = "1920x1080";
+const STARTUP_FIXTURES: &[&str] = &["tiny.md", "readme.md", "spec.md", "huge.md"];
+/// The warm start budget is for documents up to the CommonMark spec (200 KB): the 5 MB one is
+/// parsed whole before its first frame (≈ 37 ms of it), so it is held to the cold budget only
+/// and its warm start reported.
+const WARM_UNGATED: &[&str] = &["huge.md"];
+/// On Wayland softbuffer keeps a second frame of the window's size (1920 × 1080 × 4 bytes),
+/// which X11 (CI's Xvfb) doesn't: the RSS budgets allow for it there.
+const WAYLAND_FRAME_KB: u64 = 1920 * 1080 * 4 / 1024;
 const BENCH_RUNS: usize = 20;
+
+const BUILDS: [(&str, &[&str], &str); 2] = [
+    ("default", &[], "target"),
+    (
+        "--no-default-features",
+        &["--no-default-features"],
+        "target/min",
+    ),
+];
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let ok = match args.first().map(String::as_str) {
+    let arg = |i: usize| args.get(i).map(String::as_str);
+    let ok = match arg(0) {
         Some("size") => size(),
-        Some("bench") => bench(args.get(1).map(String::as_str)),
+        Some("bench") => bench(arg(1)),
+        Some("budgets") => budgets(match (arg(1), arg(2)) {
+            (Some("--report"), Some(path)) => Some(Path::new(path)),
+            _ => None,
+        }),
+        Some("dist") => dist(arg(1) == Some("--release")),
         Some("fixtures") => fixtures(),
         Some("bless") => bless(),
         _ => {
-            eprintln!("usage: cargo xtask <size | bench [fixture] | fixtures | bless>");
+            eprintln!(
+                "usage: cargo xtask <size | bench [fixture] | budgets [--report FILE] | \
+                 dist [--release] | \
+                 fixtures | bless>"
+            );
             false
         }
     };
@@ -37,15 +74,24 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
-fn cargo_build(extra: &[&str], target_dir: &str) -> PathBuf {
-    if env::var("RUSTFLAGS").is_ok_and(|f| f.contains("target-cpu")) {
-        eprintln!("warning: RUSTFLAGS sets target-cpu; numbers won't match release builds");
+/// Release binaries target baseline x86-64: a `target-cpu` flag would make them
+/// crash on older CPUs, so measuring or packaging such a build is refused.
+fn baseline_cpu() -> bool {
+    let set = |v: &str| env::var(v).is_ok_and(|f| f.contains("target-cpu"));
+    if set("RUSTFLAGS") || set("CARGO_ENCODED_RUSTFLAGS") || set("CARGO_BUILD_RUSTFLAGS") {
+        eprintln!("error: the environment sets target-cpu; release builds must target baseline");
+        return false;
     }
+    true
+}
+
+fn cargo_build(extra: &[&str], target_dir: &str) -> PathBuf {
     let status = Command::new(env!("CARGO"))
         .current_dir(root())
         .args([
             "build",
             "--release",
+            "--locked",
             "--package",
             "vomd",
             "--target-dir",
@@ -59,16 +105,11 @@ fn cargo_build(extra: &[&str], target_dir: &str) -> PathBuf {
 }
 
 fn size() -> bool {
+    if !baseline_cpu() {
+        return false;
+    }
     let mut ok = true;
-    for (label, extra, dir, budget) in [
-        ("default", &[][..], "target", SIZE_BUDGET_DEFAULT),
-        (
-            "--no-default-features",
-            &["--no-default-features"][..],
-            "target/min",
-            SIZE_BUDGET_MIN,
-        ),
-    ] {
+    for ((label, extra, dir), budget) in BUILDS.into_iter().zip(SIZE_BUDGET) {
         let bin = cargo_build(extra, dir);
         let len = fs::metadata(&bin).expect("binary").len();
         let pass = len <= budget;
@@ -93,94 +134,493 @@ fn evict(path: &Path) {
     }
 }
 
+/// A `vomd-bench` line's `key=value` fields.
+fn field(line: &str, key: &str) -> Option<f64> {
+    line.split_whitespace()
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Start vomd on `fixture` with `VOMD_BENCH=mode`; its stderr lines come through the channel.
+fn spawn(bin: &Path, fixture: &Path, mode: &str) -> Option<(Child, mpsc::Receiver<String>)> {
+    let mut child = Command::new(bin)
+        .arg("--no-settings")
+        .arg(fixture)
+        .env("VOMD_BENCH", mode)
+        .env("VOMD_BENCH_SIZE", BENCH_SIZE)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let reader = BufReader::new(child.stderr.take()?);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    Some((child, rx))
+}
+
+/// Wait for the first `vomd-bench` line (at most `limit`).
+fn bench_line(rx: &mpsc::Receiver<String>, limit: Duration) -> Option<String> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        let line = rx.recv_timeout(left).ok()?;
+        if let Some(rest) = line.trim().strip_prefix("vomd-bench ") {
+            return Some(rest.to_owned());
+        }
+    }
+}
+
+fn reap(mut child: Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().ok().flatten().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 struct Run {
     wall_ms: f64,
     rss_kb: u64,
 }
 
-/// Spawn vomd with VOMD_BENCH=1 and time from spawn until it reports its first frame.
-/// The child prints `vomd-bench first_frame_ms=<f> rss_kb=<n>` to stderr and exits.
+/// Time from spawn until vomd reports its first frame (it prints
+/// `vomd-bench first_frame_ms=<f> rss_kb=<n>` and exits).
 fn run_once(bin: &Path, fixture: &Path) -> Option<Run> {
     let start = Instant::now();
-    let mut child = Command::new(bin)
-        .arg("--no-settings")
-        .arg(fixture)
-        .env("VOMD_BENCH", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let mut line = String::new();
-    let mut reader = BufReader::new(child.stderr.take()?);
-    let mut found = None;
-    while reader.read_line(&mut line).ok()? > 0 {
-        if let Some(rest) = line.trim().strip_prefix("vomd-bench ") {
-            let wall_ms = start.elapsed().as_secs_f64() * 1e3;
-            let rss_kb = rest
-                .split_whitespace()
-                .find_map(|kv| kv.strip_prefix("rss_kb="))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            found = Some(Run { wall_ms, rss_kb });
-            break;
-        }
-        line.clear();
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while child.try_wait().ok()?.is_none() {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    found
+    let (child, rx) = spawn(bin, fixture, "1")?;
+    let line = bench_line(&rx, Duration::from_secs(10));
+    let wall_ms = start.elapsed().as_secs_f64() * 1e3;
+    reap(child);
+    let line = line?;
+    Some(Run {
+        wall_ms,
+        rss_kb: field(&line, "rss_kb").unwrap_or(0.0) as u64,
+    })
 }
 
-fn bench(only: Option<&str>) -> bool {
-    if !root().join("fixtures/huge.md").exists() {
+/// Cold (first run after evicting the binary) and warm (median) start of `fixture`, and the
+/// peak RSS at the first frame.
+fn startup(bin: &Path, fixture: &Path) -> Option<(f64, f64, f64, u64)> {
+    evict(bin);
+    let mut runs: Vec<Run> = (0..BENCH_RUNS)
+        .filter_map(|_| run_once(bin, fixture))
+        .collect();
+    if runs.is_empty() {
+        return None;
+    }
+    let cold = runs[0].wall_ms;
+    let rss = runs.iter().map(|r| r.rss_kb).max().unwrap_or(0);
+    runs.remove(0);
+    runs.sort_by(|a, b| a.wall_ms.total_cmp(&b.wall_ms));
+    let warm = runs.get(runs.len() / 2).map_or(cold, |r| r.wall_ms);
+    let p90 = runs
+        .get((runs.len() * 9 / 10).min(runs.len().saturating_sub(1)))
+        .map_or(cold, |r| r.wall_ms);
+    Some((cold, warm, p90, rss))
+}
+
+fn ensure_fixtures() {
+    let dir = root().join("fixtures");
+    if !dir.join("huge.md").exists() || !dir.join("medium.md").exists() {
         fixtures();
     }
+}
+
+/// The startup table, not gated.
+fn bench(only: Option<&str>) -> bool {
+    ensure_fixtures();
     let bin = cargo_build(&[], "target");
     let mut ok = true;
     println!(
         "{:<12} {:>9} {:>9} {:>9} {:>10}",
-        "fixture", "cold ms", "median", "p90", "max rss"
+        "fixture", "cold ms", "median", "p90", "peak rss"
     );
-    for name in BENCH_FIXTURES
+    for name in STARTUP_FIXTURES
         .iter()
         .filter(|n| only.is_none_or(|o| o == **n))
     {
-        let fixture = root().join("fixtures").join(name);
-        evict(&bin);
-        let mut runs: Vec<Run> = (0..BENCH_RUNS)
-            .filter_map(|_| run_once(&bin, &fixture))
-            .collect();
-        if runs.is_empty() {
-            println!("{name:<12} no bench output (is VOMD_BENCH implemented?)");
+        let Some((cold, warm, p90, rss)) = startup(&bin, &root().join("fixtures").join(name))
+        else {
+            println!("{name:<12} no bench output (is there a display?)");
             ok = false;
             continue;
-        }
-        let cold = runs[0].wall_ms;
-        let max_rss = runs.iter().map(|r| r.rss_kb).max().unwrap_or(0);
-        runs.sort_by(|a, b| a.wall_ms.total_cmp(&b.wall_ms));
-        let median = runs[runs.len() / 2].wall_ms;
-        let p90 = runs[(runs.len() * 9 / 10).min(runs.len() - 1)].wall_ms;
-        let pass = cold <= FIRST_FRAME_BUDGET_MS && max_rss <= RSS_BUDGET_KB;
-        // The 5 MB fixture has its own RSS budget; report it but don't gate on 30 MB.
-        if *name != "huge.md" {
-            ok &= pass;
-        }
+        };
         println!(
-            "{name:<12} {cold:>9.1} {median:>9.1} {p90:>9.1} {:>7.1} MB",
-            max_rss as f64 / 1024.0
+            "{name:<12} {cold:>9.1} {warm:>9.1} {p90:>9.1} {:>7.1} MB",
+            rss as f64 / 1024.0
         );
     }
+    ok
+}
+
+/// CPU time of `pid` in clock ticks (user + system), from `/proc` (xtask is Linux-only).
+fn cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name can hold spaces; the fields after it are space-separated.
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // utime and stime are fields 14 and 15 of stat(5), 12 and 13 after the name.
+    Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
+}
+
+fn rss_now_kb(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()
+}
+
+struct Idle {
+    /// Time from spawn until the document was measured and the loop went to sleep.
+    ready_ms: f64,
+    rss_kb: u64,
+    ticks: u64,
+}
+
+/// Run vomd until it is idle (`VOMD_BENCH=idle`), then watch it: its RSS and the CPU ticks it
+/// takes while nothing happens.
+fn idle(bin: &Path, fixture: &Path) -> Option<Idle> {
+    let (mut child, rx) = spawn(bin, fixture, "idle")?;
+    let pid = child.id();
+    let result = (|| {
+        let line = bench_line(&rx, Duration::from_secs(60))?;
+        let ready_ms = field(&line, "idle_ms")?;
+        // Let anything due right after (a scrollbar fading out) pass first.
+        std::thread::sleep(Duration::from_secs(1));
+        let before = cpu_ticks(pid)?;
+        std::thread::sleep(IDLE_WATCH);
+        let ticks = cpu_ticks(pid)?.checked_sub(before)?;
+        let rss_kb = rss_now_kb(pid)?.max(field(&line, "rss_kb")? as u64);
+        Some(Idle {
+            ready_ms,
+            rss_kb,
+            ticks,
+        })
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+/// The scroll frame time of a 4K window (`examples/paint_bench.rs`): p95 in ms.
+fn scroll_p95(fixture: &Path) -> Option<f64> {
+    let out = Command::new(env!("CARGO"))
+        .current_dir(root())
+        .args(["run", "--release", "--locked", "--quiet", "--example"])
+        .arg("paint_bench")
+        .arg("--")
+        .arg(fixture)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    print!("{text}");
+    let line = text.lines().find(|l| l.starts_with("paint-bench "))?;
+    field(line, "p95_ms")
+}
+
+struct Row {
+    metric: String,
+    build: &'static str,
+    value: String,
+    budget: String,
+    pass: bool,
+    /// A miss fails the run (else the row is only reported).
+    gated: bool,
+}
+
+/// Every budget row, measured and checked; a miss fails. Needs a display (CI runs Xvfb).
+fn budgets(report: Option<&Path>) -> bool {
+    if !baseline_cpu() {
+        return false;
+    }
+    ensure_fixtures();
+    let fixture = |n: &str| root().join("fixtures").join(n);
+    let wayland = env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let frame_kb = if wayland { WAYLAND_FRAME_KB } else { 0 };
+    if wayland {
+        println!("Wayland: the RSS budgets allow {frame_kb} KB for softbuffer's second frame");
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut gated_row =
+        |metric: String, build, value: String, budget: String, pass: bool, gated: bool| {
+            let verdict = match (pass, gated) {
+                (true, _) => "PASS",
+                (false, true) => "FAIL",
+                (false, false) => "OVER",
+            };
+            println!("{verdict} {metric:<34} {build:<22} {value:>12}  budget {budget}");
+            rows.push(Row {
+                metric,
+                build,
+                value,
+                budget,
+                pass,
+                gated,
+            });
+        };
+    let mb = |kb: u64| format!("{kb} KB");
+    for (i, (label, extra, dir)) in BUILDS.into_iter().enumerate() {
+        let bin = cargo_build(extra, dir);
+        let len = fs::metadata(&bin).expect("binary").len();
+        gated_row(
+            "stripped binary".into(),
+            label,
+            format!("{:.2} MB", len as f64 / 1e6),
+            format!("≤ {:.1} MB", SIZE_BUDGET[i] as f64 / 1e6),
+            len <= SIZE_BUDGET[i],
+            true,
+        );
+        for name in STARTUP_FIXTURES {
+            match startup(&bin, &fixture(name)) {
+                Some((cold, warm, _, _)) => {
+                    gated_row(
+                        format!("cold start, {name}"),
+                        label,
+                        format!("{cold:.1} ms"),
+                        format!("≤ {COLD_BUDGET_MS} ms"),
+                        cold <= COLD_BUDGET_MS,
+                        true,
+                    );
+                    gated_row(
+                        format!("warm start, {name}"),
+                        label,
+                        format!("{warm:.1} ms"),
+                        format!("≤ {WARM_BUDGET_MS} ms"),
+                        warm <= WARM_BUDGET_MS,
+                        !WARM_UNGATED.contains(name),
+                    );
+                }
+                None => gated_row(
+                    format!("start, {name}"),
+                    label,
+                    "no output".into(),
+                    "a first frame".into(),
+                    false,
+                    true,
+                ),
+            }
+        }
+        for (name, what, budget) in [
+            ("medium.md", "50 KB", RSS_SMALL_KB[i]),
+            ("huge.md", "5 MB", RSS_HUGE_KB[i]),
+        ] {
+            let Some(r) = idle(&bin, &fixture(name)) else {
+                gated_row(
+                    format!("idle, {what} doc"),
+                    label,
+                    "no output".into(),
+                    "idle".into(),
+                    false,
+                    true,
+                );
+                continue;
+            };
+            gated_row(
+                format!("idle RSS, {what} doc, 1080p"),
+                label,
+                mb(r.rss_kb),
+                format!("≤ {}", mb(budget)),
+                r.rss_kb <= budget,
+                true,
+            );
+            gated_row(
+                format!("idle CPU, {what} doc (idle at {:.0} ms)", r.ready_ms),
+                label,
+                format!("{} ticks/{}s", r.ticks, IDLE_WATCH.as_secs()),
+                format!("≤ {IDLE_TICKS} tick"),
+                r.ticks <= IDLE_TICKS,
+                true,
+            );
+        }
+    }
+    // Painting doesn't depend on the features: one build measures it.
+    match scroll_p95(&fixture("readme.md")) {
+        Some(p95) => gated_row(
+            "scroll frame, 4K, p95".into(),
+            "default",
+            format!("{p95:.2} ms"),
+            format!("≤ {SCROLL_BUDGET_MS} ms"),
+            p95 <= SCROLL_BUDGET_MS,
+            true,
+        ),
+        None => gated_row(
+            "scroll frame, 4K".into(),
+            "default",
+            "no output".into(),
+            "a measurement".into(),
+            false,
+            true,
+        ),
+    }
+    let ok = rows.iter().all(|r| r.pass || !r.gated);
+    if let Some(path) = report {
+        let mut md =
+            String::from("| | Metric | Build | Measured | Budget |\n|---|---|---|---|---|\n");
+        for r in &rows {
+            md.push_str(&format!(
+                "| {} | {} | `{}` | {} | {} |\n",
+                match (r.pass, r.gated) {
+                    (true, _) => "✅",
+                    (false, true) => "❌",
+                    (false, false) => "⚠️ not gated",
+                },
+                r.metric,
+                r.build,
+                r.value,
+                r.budget
+            ));
+        }
+        fs::write(path, md).expect("write the report");
+    }
     println!(
-        "budgets: first frame ≤ {FIRST_FRAME_BUDGET_MS} ms, RSS ≤ {} MB (50 KB doc @1080p)",
-        RSS_BUDGET_KB / 1000
+        "{}",
+        if ok {
+            "all budgets met"
+        } else {
+            "BUDGET MISSED"
+        }
     );
     ok
+}
+
+/// The release tarball: `dist/vomd-<version>-x86_64-linux.tar.gz` holding the
+/// binary, the desktop entry, the icon, README, CHANGELOG and the licenses (ours and those of
+/// the embedded fonts).
+fn dist(release: bool) -> bool {
+    if !baseline_cpu() {
+        return false;
+    }
+    let bin = cargo_build(&[], "target");
+    // The newest glibc the binary can't run without (weak symbols are optional).
+    let floor = glibc_floor(&bin);
+    match floor {
+        Some((a, b)) if (a, b) <= GLIBC_FLOOR => println!("needs glibc {a}.{b}"),
+        Some((a, b)) => {
+            eprintln!(
+                "{}: the binary needs glibc {a}.{b}, newer than the {}.{} promised: build \
+                 releases on an older distribution (CI uses Ubuntu 24.04)",
+                if release { "error" } else { "warning" },
+                GLIBC_FLOOR.0,
+                GLIBC_FLOOR.1
+            );
+            if release {
+                return false;
+            }
+        }
+        None => {
+            eprintln!("cannot read the binary's glibc versions (objdump)");
+            if release {
+                return false;
+            }
+        }
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let manifest = fs::read_to_string(root().join("Cargo.toml")).expect("Cargo.toml");
+    let ours = manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \""))
+        .and_then(|v| v.strip_suffix('"'))
+        .expect("version in Cargo.toml");
+    if ours != version {
+        eprintln!("note: xtask {version}, vomd {ours}");
+    }
+    let name = format!("vomd-{ours}-x86_64-linux");
+    let dist = root().join("dist");
+    let stage = dist.join(&name);
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).expect("create dist/");
+    let files: [(&Path, &str); 9] = [
+        (&bin, "vomd"),
+        (Path::new("packaging/vomd.desktop"), "vomd.desktop"),
+        (Path::new("packaging/vomd.svg"), "vomd.svg"),
+        (Path::new("README.md"), "README.md"),
+        (Path::new("CHANGELOG.md"), "CHANGELOG.md"),
+        (Path::new("LICENSE"), "LICENSE"),
+        // The fonts and icons built into the binary.
+        (
+            Path::new("assets/fonts/LICENSE-Inter.txt"),
+            "LICENSE-Inter.txt",
+        ),
+        (
+            Path::new("assets/fonts/LICENSE-JetBrainsMono.txt"),
+            "LICENSE-JetBrainsMono.txt",
+        ),
+        (
+            Path::new("assets/fonts/LICENSE-Lucide.txt"),
+            "LICENSE-Lucide.txt",
+        ),
+    ];
+    for (from, to) in files {
+        fs::copy(root().join(from), stage.join(to))
+            .unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
+    }
+    let tarball = dist.join(format!("{name}.tar.gz"));
+    let ok = Command::new("tar")
+        .current_dir(&dist)
+        .args(["--owner=0", "--group=0", "--numeric-owner", "-czf"])
+        .arg(&tarball)
+        .arg(&name)
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = fs::remove_dir_all(&stage);
+    if !ok {
+        eprintln!("tar failed");
+        return false;
+    }
+    let sum = Command::new("sha256sum")
+        .current_dir(&dist)
+        .arg(tarball.file_name().unwrap())
+        .output()
+        .expect("sha256sum");
+    fs::write(dist.join(format!("{name}.tar.gz.sha256")), &sum.stdout).expect("write sum");
+    print!("{}", String::from_utf8_lossy(&sum.stdout));
+    println!("wrote {}", tarball.display());
+    true
+}
+
+/// The oldest glibc release binaries support: RELR relocations need 2.36.
+const GLIBC_FLOOR: (u32, u32) = (2, 36);
+
+/// The newest `GLIBC_x.y` version a strong undefined symbol of `bin` needs (`objdump -T`).
+fn glibc_floor(bin: &Path) -> Option<(u32, u32)> {
+    let out = Command::new("objdump").arg("-T").arg(bin).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut newest = (2, 0);
+    for line in text.lines().filter(|l| l.contains("*UND*")) {
+        // `0000… w   DF *UND*  0000… (GLIBC_2.39) name`: the flags come before `DF`.
+        let weak = line.split_whitespace().nth(1) == Some("w");
+        let Some(v) = line.split("GLIBC_").nth(1) else {
+            continue;
+        };
+        let v: String = v
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let mut parts = v.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+        let version = (parts.next()?, parts.next().unwrap_or(0));
+        if !weak {
+            newest = newest.max(version);
+        }
+    }
+    Some(newest)
 }
 
 /// Regenerate the render goldens in `tests/golden/`. Review the images before
@@ -203,7 +643,8 @@ fn bless() -> bool {
         .success()
 }
 
-/// Generate large fixtures that aren't committed.
+/// Generate the large fixtures that aren't committed: `huge.md` (5 MB) and `medium.md` (the
+/// 50 KB document of the idle RSS budget).
 fn fixtures() -> bool {
     let dir = root().join("fixtures");
     let mut seed = fs::read_to_string(dir.join("readme.md")).expect("fixtures/readme.md");
@@ -217,5 +658,15 @@ fn fixtures() -> bool {
     }
     fs::write(dir.join("huge.md"), &out).expect("write huge.md");
     println!("wrote fixtures/huge.md ({} bytes)", out.len());
+    // Whole lines of the same text, up to 50 KB.
+    let mut medium = String::with_capacity(52_000);
+    for line in out.split_inclusive('\n') {
+        if medium.len() + line.len() > 50_000 {
+            break;
+        }
+        medium.push_str(line);
+    }
+    fs::write(dir.join("medium.md"), &medium).expect("write medium.md");
+    println!("wrote fixtures/medium.md ({} bytes)", medium.len());
     true
 }

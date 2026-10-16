@@ -1,0 +1,49 @@
+# A `v*` tag builds the Linux x86_64 release (baseline x86-64, no target-cpu),
+# checks the budgets, and attaches the tarball, its checksum and the budget report to the
+# GitHub release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Display libraries and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth libx11-6 libx11-xcb1 \
+            libxcb1 libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 binutils
+      - name: The tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME"
+      - run: cargo test --workspace --locked
+      - name: Budgets
+        run: |
+          xvfb-run -a -s "-screen 0 3840x2160x24" \
+            cargo xtask budgets --report budgets.md
+      - name: Tarball (fails if it would need glibc newer than 2.36)
+        run: cargo xtask dist --release
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Budgets, measured on the release runner"
+            echo
+            cat budgets.md
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "VOMD $GITHUB_REF_NAME" \
+            --notes-file notes.md dist/*.tar.gz dist/*.sha256 budgets.md

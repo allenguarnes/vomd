@@ -1,2 +1,4 @@
 target/
 /fixtures/huge.md
+/fixtures/medium.md
+/dist/

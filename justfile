@@ -13,6 +13,7 @@ clippy:
 
 test:
     cargo test --workspace
+    cargo test --lib --no-default-features --features embed-fonts
 
 # Portability guard: needs `rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin`.
 check-other:
@@ -21,6 +22,22 @@ check-other:
 
 size:
     cargo xtask size
+
+# Every performance budget, measured on release builds (needs a display); fails on a miss.
+budgets:
+    cargo xtask budgets
+
+# Fuzz a target (doc, layout, settings) on stable for SECONDS.
+fuzz target seconds="60":
+    scripts/fuzz.sh {{target}} {{seconds}}
+
+# The release tarball in dist/.
+dist:
+    cargo xtask dist
+
+# Build and check both AUR packages offline, without installing (commit first).
+aur:
+    scripts/aur-check.sh
 
 # Regenerate the render goldens (tests/golden/); review the images before committing.
 bless:

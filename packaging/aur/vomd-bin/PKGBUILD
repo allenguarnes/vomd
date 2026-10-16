@@ -1,0 +1,36 @@
+# Maintainer: Allen Guarnes <allen@ggbite.com>
+# Repackages the release tarball (`cargo xtask dist`, attached to the GitHub release). After a
+# release: bump pkgver, run `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO`.
+pkgname=vomd-bin
+_pkgname=vomd
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='View-Only Markdown: a tiny, fast Markdown viewer (release binary)'
+arch=('x86_64')
+url='https://github.com/allenguarnes/vomd'
+license=('MIT' 'OFL-1.1' 'ISC')
+# The display libraries are loaded at run time (dlopen), for Wayland or X11, whichever the
+# session is: namcap can't see them. RELR relocations need glibc 2.36.
+depends=('glibc>=2.36' 'gcc-libs' 'hicolor-icon-theme' 'libxkbcommon' 'wayland'
+         'libx11' 'libxcb' 'libxcursor' 'libxi' 'libxkbcommon-x11')
+optdepends=('curl: remote images, loaded only after pressing I'
+            'xdg-utils: open web links in the browser'
+            'noto-fonts-cjk: CJK text'
+            'noto-fonts-emoji: color emoji')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+options=('!strip' '!debug')
+source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64-linux.tar.gz")
+sha256sums_x86_64=('SKIP')
+
+package() {
+  cd "$_pkgname-$pkgver-x86_64-linux"
+  install -Dm755 vomd "$pkgdir/usr/bin/vomd"
+  install -Dm644 vomd.desktop "$pkgdir/usr/share/applications/vomd.desktop"
+  install -Dm644 vomd.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/vomd.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+    LICENSE-Inter.txt LICENSE-JetBrainsMono.txt LICENSE-Lucide.txt
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+}
