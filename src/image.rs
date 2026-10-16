@@ -288,14 +288,21 @@ fn probe(img: &ImageRef, base: Option<&Path>) -> ImageSize {
     }
 }
 
-fn read_file(path: &Path) -> Option<Vec<u8>> {
+/// A file's bytes, read whole, if the file is at most `limit` bytes (what a decode of it was
+/// charged for: a file that grew since its header was read is refused before anything is
+/// allocated for it).
+fn read_file(path: &Path, limit: usize) -> Option<Vec<u8>> {
     let file = open_regular(path)?;
+    let len = file.metadata().ok()?.len().min(MAX_FILE) as usize;
+    if len > limit {
+        return None;
+    }
     // `take` has no size hint: without the length the buffer doubles its way up, leaving up to
     // twice the file in capacity.
-    let len = file.metadata().ok()?.len().min(MAX_FILE) as usize;
     let mut bytes = Vec::with_capacity(len + 1);
-    file.take(MAX_FILE + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= MAX_FILE).then_some(bytes)
+    // One byte more than the file had says it grew while it was read.
+    file.take(len as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= len).then_some(bytes)
 }
 
 /// What decoding an image holds besides the file's bytes and the result, at most: a JPEG's
@@ -798,6 +805,36 @@ fn reduce_row(row: &[u8], channels: usize, xs: &[(usize, Vec<f32>)], out: &mut [
 
 // ---- The cache ------------------------------------------------------------------------------
 
+// Memory accounting (review round 6): every allocation of the image and remote code,
+// who is charged for it, and until when. The rule is that a charge is released only after the
+// allocation is freed (or handed to something that is charged for it), never before.
+//
+// | allocation                         | charged by                                  | from -> to                                              |
+// |------------------------------------|---------------------------------------------|---------------------------------------------------------|
+// | fetchers' read buffers (4 x 64 KB) | `FETCH_RESERVE`, static (`Cache::fetching`) | set aside while a fetch is queued, running or untaken    |
+// | body being read                    | pool credit (`Active::held`), 256 KB steps  | first grant -> `Remote::release`, after the cache has it |
+// | copy made by `cut_to_size`         | `FETCH_RESERVE` (`FETCHER_SLACK`)           | transient, per fetcher                                   |
+// | result untaken (channel, `waiting`)| credit (held = capacity); its bookkeeping   | finish -> release; no fetch starts at `PENDING_MAX`      |
+// |                                    | in `FETCH_RESERVE` (`PENDING_COST`)         |                                                         |
+// | cached body                        | `Cache::bytes` (`Slot::cost`)               | insert -> removal, and removal only when no job holds    |
+// |                                    |                                             | its `Arc` (`Slot::pinned`)                               |
+// | `Arc` clones of a body in jobs     | the slot, pinned while they live            | `bytes_of` -> queue replaced or cleared, or the running  |
+// |                                    |                                             | job's source dropped before its result is sent           |
+// | decode memory and its pixels,      | `Job::cost` in `Cache::reserve` (max of     | request that queues it -> `Worker::taken` after the      |
+// | local file bytes                   | queued + running, plus replaced workers')   | result is in the cache; a local file is checked against  |
+// |                                    |                                             | what it was charged for before it is read                |
+// | worker replaced by `set_wake`      | `Images::retired`                           | until its running job's result is taken                  |
+// | bitmap: in the channel             | the job's cost, until taken                 |                                                         |
+// | bitmap: in the cache               | `Cache::bytes` (capacity)                   | insert -> eviction (paint only borrows it)               |
+// | `Remote::sizes`, `Images::deferred`| slot overhead, for what has a slot; else    | pruned to the current document's URLs (and cached ones)  |
+// |                                    | pruned (`Images::prune_urls`)               | at `attach`/`forget_remote`; late results are bounded by |
+// |                                    |                                             | the pending limit                                        |
+// | `srcs`, `costs`, `urls`, `in_view`,| the document (its size is bounded by the    | replaced by the next document                            |
+// | the worker's queue                 | input limit and the boxes of one request)   |                                                         |
+//
+// Only the main thread clones a body, so an `Arc` count of 1 can't go up: a slot is evictable
+// exactly when it is unique.
+
 /// What a cached image belongs to: an image of the current document (by id), or a remote URL,
 /// which stays valid across documents for the session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -852,6 +889,14 @@ impl Slot {
             Data::Pixels(b) => Some(b),
             Data::Bytes(_) => None,
         }
+    }
+
+    /// Whether a job of the worker, queued or running, holds this slot's bytes (an `Arc` clone):
+    /// they stay allocated until the job lets go of them, whatever happens to the slot, so the
+    /// slot keeps its charge, and isn't evicted or replaced, until then. Only the main thread
+    /// clones a body, so a count of 1 can't go up again: the check can only be too careful.
+    fn pinned(&self) -> bool {
+        matches!(&self.data, Data::Bytes(b) if Arc::strong_count(b) > 1)
     }
 }
 
@@ -951,6 +996,11 @@ impl Cache {
                     _ => false,
                 }
         };
+        // A body a job of the worker holds can't be replaced (its charge would go while it is
+        // allocated): it is the same URL's, and so the same body, and the new one is let go.
+        if matches!(data, Data::Bytes(_)) && self.slots.iter().any(|s| same(s) && s.pinned()) {
+            return;
+        }
         self.retain(|s| !same(s));
         // Pixels come in for a box that is wanted (and are as good as painted this frame). A
         // fetched body counts as used when something is made of it ([`Cache::bytes_of`]), not
@@ -973,7 +1023,8 @@ impl Cache {
 
     /// Drop the least recently painted slots until the budget holds beside what decoding needs
     /// ([`Cache::reserve`]), what is set aside for the fetchers ([`Cache::fetching`]) and
-    /// `extra` more bytes, never one painted in the current frame.
+    /// `extra` more bytes, never one painted in the current frame, nor one whose bytes a decode
+    /// holds ([`Slot::pinned`]): a pinned slot is charged until its job is done with it.
     fn evict_for(&mut self, extra: usize) {
         let held = self
             .reserve
@@ -984,7 +1035,7 @@ impl Cache {
                 .slots
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.used < self.frame)
+                .filter(|(_, s)| s.used < self.frame && !s.pinned())
                 .min_by_key(|(_, s)| s.used)
             else {
                 break;
@@ -1009,14 +1060,14 @@ impl Cache {
     }
 
     /// What [`Cache::room_for`] would say if `reserve` and `fetching` were what is set aside,
-    /// without evicting anything: whatever was painted this frame is all that can't go, so the
-    /// body fits exactly when it fits beside that.
+    /// without evicting anything: whatever was painted this frame, and the bodies decodes hold,
+    /// is all that can't go, so the body fits exactly when it fits beside that.
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
     fn would_fit(&self, cost: usize, decode: usize, reserve: usize, fetching: usize) -> bool {
         let kept: usize = self
             .slots
             .iter()
-            .filter(|s| s.used >= self.frame)
+            .filter(|s| s.used >= self.frame || s.pinned())
             .map(Slot::cost)
             .sum();
         kept.saturating_add(reserve)
@@ -1050,6 +1101,7 @@ impl Cache {
         self.slots.retain(|s| {
             let k = keep(s);
             if !k {
+                debug_assert!(!s.pinned(), "a slot a decode holds was dropped");
                 *bytes -= s.cost();
             }
             k
@@ -1134,9 +1186,19 @@ impl Worker {
                     job
                 };
                 let bitmap = decode_job(&job);
+                // The job's hold on a body (an `Arc` clone) ends before the result is sent: once
+                // the main thread has the result the body's slot may be evicted, and its charge
+                // with it ([`Slot::pinned`]).
+                let Job {
+                    doc_gen,
+                    key,
+                    source,
+                    ..
+                } = job;
+                drop(source);
                 let done = Done::Decoded {
-                    doc_gen: job.doc_gen,
-                    key: job.key,
+                    doc_gen,
+                    key,
                     bitmap,
                     worker: theirs.clone(),
                 };
@@ -1172,14 +1234,22 @@ impl Worker {
     /// Whether nothing is queued, being decoded, or decoded and not taken.
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
     fn idle(&self) -> bool {
-        let (lock, _) = &*self.shared;
+        Worker::idle_of(&self.shared)
+    }
+
+    fn idle_of(shared: &Shared) -> bool {
+        let (lock, _) = &**shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.jobs.is_empty() && q.busy.is_none()
     }
 
     /// What the job being decoded (or whose result isn't taken) holds, if any.
     fn busy_cost(&self) -> usize {
-        let (lock, _) = &*self.shared;
+        Worker::busy_cost_of(&self.shared)
+    }
+
+    fn busy_cost_of(shared: &Shared) -> usize {
+        let (lock, _) = &**shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.busy.as_ref().map_or(0, |b| b.3)
     }
@@ -1188,7 +1258,10 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         let (lock, cv) = &*self.shared;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).quit = true;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.quit = true;
+        // What was queued will not run: its hold on bodies ends now, not when the thread is gone.
+        q.jobs.clear();
         cv.notify_one();
     }
 }
@@ -1197,8 +1270,15 @@ impl Drop for Worker {
 fn decode_job(job: &Job) -> Option<Bitmap> {
     match &job.source {
         Source::File(path) => {
+            // What the job is charged for, bar its result, is what the file was when its header
+            // was read: a file that is bigger now, or has another header, is refused (it
+            // shows its alt text) instead of decoded with memory nothing counted.
+            let held = job.cost.saturating_sub(job.w as usize * job.h as usize * 4);
+            let mut bytes = read_file(path, held)?;
+            if bytes.len().saturating_add(bytes_cost(&bytes)?) > held {
+                return None;
+            }
             // The bytes are ours: a JPEG's metadata is cut out of them where they are.
-            let mut bytes = read_file(path)?;
             if !shed_jpeg_metadata(&mut bytes) {
                 return None;
             }
@@ -1268,6 +1348,9 @@ pub struct Images {
     rx: Receiver<Done>,
     wake: Wake,
     worker: Option<Worker>,
+    /// Workers replaced by [`Images::set_wake`] that may still be decoding (or hold a result the
+    /// main thread hasn't taken): what they hold is counted until they are idle.
+    retired: Vec<Shared>,
     /// The remote images in view when images were last asked for: a body that arrives for one
     /// is kept while the cache has room for it (and is decoded next), any other may be evicted
     /// at once.
@@ -1277,10 +1360,16 @@ pub struct Images {
     /// still held by the fetchers' credit, so they can't pile up while the decoder is behind.
     #[cfg(feature = "remote-images")]
     waiting: Vec<(Arc<str>, crate::remote::Fetched)>,
-    /// Bodies dropped for lack of room (their images weren't in view), by URL: what keeping
-    /// each would have cost in the cache and what decoding it needs. Such a URL is fetched
-    /// again only when its image is in view or there would be room for it now
-    /// ([`Cache::would_fit`]), not just because it is wanted: see [`Images::request`].
+    /// The URLs of the current document's remote images: what is kept per URL beyond it is
+    /// pruned ([`Images::attach`]).
+    #[cfg(feature = "remote-images")]
+    urls: std::collections::HashSet<Arc<str>>,
+    /// Bodies dropped for lack of room (their images weren't in view), by URL, for the current
+    /// document's URLs only: what keeping each would have cost in the cache and what decoding it
+    /// needs. Such a URL is fetched again only when its image is in view or there would be room
+    /// for it now ([`Cache::would_fit`]), not just because it is wanted: see [`Images::request`].
+    /// Repainting doesn't touch it (that would bring the refetch loop back); another document
+    /// replaces it ([`Images::attach`]).
     #[cfg(feature = "remote-images")]
     deferred: std::collections::HashMap<Arc<str>, (usize, usize)>,
     #[cfg(feature = "remote-images")]
@@ -1301,10 +1390,13 @@ impl Default for Images {
             rx,
             wake: Arc::new(|| {}),
             worker: None,
+            retired: Vec::new(),
             #[cfg(feature = "remote-images")]
             in_view: Vec::new(),
             #[cfg(feature = "remote-images")]
             waiting: Vec::new(),
+            #[cfg(feature = "remote-images")]
+            urls: std::collections::HashSet::new(),
             #[cfg(feature = "remote-images")]
             deferred: std::collections::HashMap::new(),
             #[cfg(feature = "remote-images")]
@@ -1315,8 +1407,11 @@ impl Default for Images {
 
 impl Images {
     pub fn set_wake(&mut self, wake: Wake) {
-        // The decoder thread keeps the old one: it is started again with the new one.
-        self.worker = None;
+        // The decoder thread keeps the old one: it is started again with the new one. It may be
+        // decoding: what it holds stays counted until its result is taken.
+        if let Some(old) = self.worker.take() {
+            self.retired.push(old.shared.clone());
+        }
         #[cfg(feature = "remote-images")]
         self.remote.set_wake(wake.clone());
         self.wake = wake;
@@ -1359,7 +1454,16 @@ impl Images {
         {
             // Nothing is in view of the new document yet: the bodies that waited are let go.
             self.in_view.clear();
+            self.urls = self
+                .srcs
+                .iter()
+                .filter_map(|s| match s {
+                    Src::Remote(url) => Some(url.clone()),
+                    _ => None,
+                })
+                .collect();
             self.admit_waiting();
+            self.prune_urls();
             self.sync_remote(doc, layout);
         }
     }
@@ -1470,7 +1574,9 @@ impl Images {
         #[cfg(feature = "remote-images")]
         let mut deferred: Vec<Arc<str>> = Vec::new();
         let mut wanted = 0usize;
-        let mut reserve = self.worker.as_ref().map_or(0, Worker::busy_cost);
+        // Decodes of replaced workers still running hold memory beside the current worker's.
+        let retired = self.retired_cost();
+        let mut reserve = retired + self.worker.as_ref().map_or(0, Worker::busy_cost);
         // What is set aside for the fetchers, if any are (or are about to be) running.
         #[cfg(feature = "remote-images")]
         let mut fetching = self.fetch_reserve(self.unfetched());
@@ -1494,7 +1600,8 @@ impl Images {
             } else {
                 self.cost(id).saturating_add(w as usize * h as usize * 4)
             };
-            let room = (self.cache.cap.saturating_sub(fetching)).saturating_sub(reserve.max(cost));
+            let room = (self.cache.cap.saturating_sub(fetching))
+                .saturating_sub(reserve.max(retired.saturating_add(cost)));
             let over = n >= on_screen && wanted >= room;
             wanted = wanted.saturating_add(w as usize * h as usize * 4);
             if over {
@@ -1532,7 +1639,7 @@ impl Images {
                 },
                 _ => continue,
             };
-            reserve = reserve.max(cost);
+            reserve = reserve.max(retired.saturating_add(cost));
             jobs.push(Job {
                 doc_gen: self.doc_gen,
                 key,
@@ -1586,6 +1693,13 @@ impl Images {
         if self.waiting_ready() {
             (self.wake)();
         }
+    }
+
+    /// What the replaced workers' decodes hold (see [`Images::retired`]); the idle ones are
+    /// forgotten.
+    fn retired_cost(&mut self) -> usize {
+        self.retired.retain(|w| !Worker::idle_of(w));
+        self.retired.iter().map(Worker::busy_cost_of).sum()
     }
 
     /// Take the results that arrived: decoded images go in the cache; an image that turned out
@@ -1677,11 +1791,35 @@ impl Images {
         }
     }
 
+    /// Forget what is kept per URL that the current document doesn't have and nothing holds:
+    /// the records of bodies dropped for room ([`Images::deferred`]), and what fetching found
+    /// ([`Remote::size`](crate::remote::Remote::size)) unless a body or pixels for the URL are
+    /// cached (the slot is charged for the entry). Without this, a session through many documents
+    /// would collect an entry for every URL ever seen. A failed URL of a document left is tried
+    /// again when it is opened again.
+    #[cfg(feature = "remote-images")]
+    fn prune_urls(&mut self) {
+        let urls = &self.urls;
+        self.deferred.retain(|u, _| urls.contains(u));
+        let cached: std::collections::HashSet<&Arc<str>> = self
+            .cache
+            .slots
+            .iter()
+            .filter_map(|s| match &s.key {
+                Key::Remote(url) => Some(url),
+                Key::Local(_) => None,
+            })
+            .collect();
+        self.remote
+            .retain_sizes(|u| urls.contains(u) || cached.contains(u));
+    }
+
     /// Take a body that is not kept (no room, its image not in view), remembering what it would
-    /// have cost so it is fetched again only when there is room for that.
+    /// have cost so it is fetched again only when there is room for that (if the document has
+    /// the URL: a body that comes late for another one is simply let go).
     #[cfg(feature = "remote-images")]
     fn drop_fetched(&mut self, url: Arc<str>, result: crate::remote::Fetched) {
-        if let Ok((bytes, ..)) = &result {
+        if let (Ok((bytes, ..)), true) = (&result, self.urls.contains(&url)) {
             let need = (
                 Slot::bytes_cost(&url, bytes),
                 bytes_cost(bytes).unwrap_or(0),
@@ -1715,17 +1853,22 @@ impl Images {
     /// free) and, if `keep`, goes to the cache, before the fetchers can use what they are given.
     #[cfg(feature = "remote-images")]
     fn take_fetched(&mut self, url: Arc<str>, result: crate::remote::Fetched, keep: bool) {
-        let taken = self.remote.fetched(&url, result);
+        let taken = self.remote.take_fetched(&url, result);
         if keep {
             self.deferred.remove(&url);
         }
-        if let (true, Some(bytes)) = (keep, taken) {
-            self.cache
-                .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
-            if self.in_view.contains(&url) {
-                self.cache.bytes_of(&url);
+        match (keep, taken) {
+            (true, Some(bytes)) => {
+                self.cache
+                    .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
+                if self.in_view.contains(&url) {
+                    self.cache.bytes_of(&url);
+                }
             }
+            (_, taken) => drop(taken),
         }
+        // The fetchers' credit goes last: the body is in the cache, charged there, or freed.
+        self.remote.release(&url);
         self.cache.fetching = self.fetch_reserve(false);
     }
 
@@ -1843,6 +1986,10 @@ impl Images {
         {
             self.remote.on = false;
             self.remote.stop();
+            // Nothing is wanted of the old document's URLs now (`attach` follows with the new
+            // one's).
+            self.urls.clear();
+            self.prune_urls();
         }
     }
 

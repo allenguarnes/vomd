@@ -246,8 +246,147 @@ fn pending_results_stay_in_the_budget() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A grayscale PNG of `side` × `side` zeros (a few hundred KB, whatever its size in pixels), and
+/// then `pad` bytes after its `IEND`: what the decoder never reads, to make the file as big as
+/// the fetchers allow.
+#[cfg(feature = "remote-images")]
+fn png_padded(side: u32, total: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, side, side);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Fast);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&vec![0u8; side as usize * side as usize])
+            .unwrap();
+    }
+    assert!(out.len() < total);
+    out.resize(total, 0);
+    out
+}
+
+/// The body being decoded is charged until the decode lets go of it, so navigating away doesn't
+/// make room for bodies on top of it: an 11 MiB body (a 6000 × 6000 PNG) was being decoded to
+/// 720 × 720 when another document with 30 inline 40 × 30 images of 4 MiB bodies was opened,
+/// and 43.7 MB were live over the start in a 33.5 MB budget, until the decode was done. The
+/// fetches are the system `curl`'s, a script in front of it on `PATH` that serves files of a
+/// scratch directory (nothing is fetched from anywhere).
+#[cfg(feature = "remote-images")]
+fn navigating_during_a_remote_decode_stays_in_the_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    use vomd::render::Pixels;
+    let dir = scratch("navigate");
+    std::fs::write(dir.join("giant"), png_padded(6000, 11 << 20)).unwrap();
+    let mut small = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut small, 40, 30);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&[7u8; 40 * 30])
+            .unwrap();
+    }
+    small.resize(small.len() + (4 << 20), 0);
+    std::fs::write(dir.join("body"), small).unwrap();
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let curl = bin.join("curl");
+    std::fs::write(
+        &curl,
+        format!(
+            "#!/bin/sh\nfor u; do :; done\nf=${{u##*/}}\nf=${{f%%\\?*}}\nexec cat '{}'/\"$f\"\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // Nothing else is running in this test binary: one test, run in steps.
+    unsafe { std::env::set_var("PATH", path) };
+
+    let first = Doc::parse("![x](http://127.0.0.1/giant)");
+    let mut first_layout = PageLayout::new(&first, Params::default());
+    let second_src: String = (0..30)
+        .map(|i| format!("![x](http://127.0.0.1/body?{i}) "))
+        .collect();
+    let second = Doc::parse(&second_src);
+    let mut second_layout = PageLayout::new(&second, Params::default());
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    let start = mark();
+    images.attach(&first, &mut first_layout);
+    images.set_remote(true, &first, &mut first_layout);
+    let t = Instant::now();
+    while images.stats().fetched == 0 {
+        assert!(t.elapsed() < Duration::from_secs(60), "timed out");
+        images.begin_frame();
+        images.request(&[(1, 720, 720)], 1);
+        std::thread::sleep(Duration::from_millis(5));
+        images.poll(&first, &mut first_layout);
+    }
+    // Its body is in the cache: the next frame starts the decode, which takes a while.
+    images.begin_frame();
+    images.request(&[(1, 720, 720)], 1);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        images.stats().decodes,
+        0,
+        "the decode is to be running when the document is left"
+    );
+    // The window moves on to another document.
+    images.forget_remote();
+    images.attach(&second, &mut second_layout);
+    images.set_remote(true, &second, &mut second_layout);
+    let boxes: Vec<_> = (1..=30).map(|id| (id, 40, 30)).collect();
+    let t = Instant::now();
+    loop {
+        images.begin_frame();
+        images.request(&boxes, boxes.len());
+        std::thread::sleep(Duration::from_millis(16));
+        images.poll(&second, &mut second_layout);
+        if (1..=30).all(|id| images.pixels(id, 40, 30).is_some()) {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(120),
+            "stuck: {:?}",
+            images.stats()
+        );
+    }
+    let over = peak_over(start);
+    println!("navigating during a remote decode: {over} bytes live over the start at most");
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    // The first decode finished too (its result is one more image).
+    let t = Instant::now();
+    while images.stats().decodes < 31 {
+        assert!(
+            t.elapsed() < Duration::from_secs(120),
+            "{:?}",
+            images.stats()
+        );
+        images.begin_frame();
+        images.request(&boxes, boxes.len());
+        std::thread::sleep(Duration::from_millis(16));
+        images.poll(&second, &mut second_layout);
+    }
+    assert!(peak_over(start) <= CACHE_BYTES);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn image_memory_stays_within_the_budget() {
     jpeg_metadata_is_not_kept();
     pending_results_stay_in_the_budget();
+    #[cfg(feature = "remote-images")]
+    navigating_during_a_remote_decode_stays_in_the_budget();
 }

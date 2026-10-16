@@ -238,7 +238,7 @@ fn probing_reads_only_regular_files() {
     {
         let t = Instant::now();
         assert_eq!(probe_file(&fifo), None);
-        assert_eq!(read_file(&fifo), None);
+        assert_eq!(read_file(&fifo, usize::MAX), None);
         assert!(t.elapsed() < Duration::from_secs(2));
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -1769,4 +1769,217 @@ fn a_dropped_body_is_fetched_again_when_room_is_made() {
     assert!(images.pixels(2, 40, 30).is_some(), "{:?}", images.stats());
     assert!(images.pixels(3, 40, 30).is_some(), "{:?}", images.stats());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A body a job of the worker holds (an `Arc` clone: the decode reads it in place) stays
+/// charged, and in the cache, until the job lets go of it, whatever the cache wants: it can't be
+/// evicted, replaced or counted as room, or the memory it is still using would be free on paper
+/// and taken by other bodies (a body of 11 MiB being decoded, the window moved on and 30 more
+/// bodies of 4 MiB let in beside it: 43.7 MB live over the start, in a 33.5 MB budget).
+#[test]
+fn a_body_a_job_holds_keeps_its_charge() {
+    let a: Arc<str> = "https://x.y/a.png".into();
+    let mut c = Cache::new(100_000);
+    c.insert(
+        Key::Remote(a.clone()),
+        Data::Bytes(Arc::new(vec![0u8; 40_000])),
+    );
+    // What `Images::request` gives a job.
+    let job = c.bytes_of(&a).unwrap();
+    c.frame += 1;
+    let charged = c.bytes;
+    assert!(charged >= 40_000);
+    c.evict_for(100_000);
+    assert_eq!(c.bytes, charged, "not evicted");
+    assert!(!c.room_for(80_000, 0), "not counted as room");
+    assert!(!c.would_fit(80_000, 0, 0, 0), "nor as room it would make");
+    // A body for the same URL doesn't replace it.
+    c.insert(Key::Remote(a.clone()), Data::Bytes(Arc::new(vec![1u8; 10])));
+    assert!(Arc::ptr_eq(c.peek_bytes(&a).unwrap(), &job));
+    assert_eq!(c.bytes, charged);
+    // The job is done with it: now it is the first to go.
+    drop(job);
+    assert!(c.would_fit(80_000, 0, 0, 0));
+    assert!(c.room_for(80_000, 0));
+    assert!(c.peek_bytes(&a).is_none());
+    assert_eq!(c.bytes, 0);
+}
+
+/// A job's hold ends before its result is sent: when the main thread has the result, the body's
+/// slot can go, and nothing is allocated that isn't charged.
+#[test]
+fn the_worker_lets_go_of_a_body_before_it_sends_the_result() {
+    let body = Arc::new(png_bytes(40, 30, |x, y| [x as u8, y as u8, 2, 255]));
+    let (tx, rx) = channel();
+    let worker = Worker::spawn(tx, Arc::new(|| {}));
+    worker.set(vec![Job {
+        doc_gen: 0,
+        key: Key::Remote("https://x.y/a.png".into()),
+        source: Source::Bytes(body.clone()),
+        w: 40,
+        h: 30,
+        cost: 40 * 30 * 4,
+    }]);
+    let Ok(Done::Decoded {
+        bitmap, worker: w, ..
+    }) = rx.recv_timeout(Duration::from_secs(10))
+    else {
+        panic!("a result");
+    };
+    assert!(bitmap.is_some());
+    assert_eq!(Arc::strong_count(&body), 1, "the job let go of the body");
+    Worker::taken(&w);
+}
+
+/// A file that is bigger now than when its header was read isn't decoded with memory nothing
+/// counted: the job is charged for the file as it was.
+#[test]
+fn a_file_that_changed_since_it_was_sized_is_refused() {
+    let dir = scratch("grew");
+    let path = dir.join("a.png");
+    std::fs::write(&path, png_bytes(40, 30, |x, y| [x as u8, y as u8, 3, 255])).unwrap();
+    let job = |cost| Job {
+        doc_gen: 0,
+        key: Key::Local(1),
+        source: Source::File(path.clone()),
+        w: 40,
+        h: 30,
+        cost,
+    };
+    let cost = file_cost(&path).unwrap() + 40 * 30 * 4;
+    assert!(decode_job(&job(cost)).is_some());
+    std::fs::write(
+        &path,
+        png_bytes(400, 300, |x, y| [(x * y) as u8, y as u8, 3, 255]),
+    )
+    .unwrap();
+    assert!(decode_job(&job(cost)).is_none(), "bigger than it was");
+    // Charged for what it is now, it decodes.
+    let cost = file_cost(&path).unwrap() + 40 * 30 * 4;
+    assert!(decode_job(&job(cost)).is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a replaced worker is decoding stays counted ([`Images::set_wake`] starts another).
+#[test]
+fn a_replaced_worker_still_counts_what_it_holds() {
+    let mut images = Images::default();
+    images.worker = Some(Worker::spawn(images.tx.clone(), images.wake.clone()));
+    let shared = images.worker.as_ref().unwrap().shared.clone();
+    shared.0.lock().unwrap().busy = Some((Key::Local(1), 10, 10, 5000));
+    images.set_wake(Arc::new(|| {}));
+    assert!(images.worker.is_none());
+    assert_eq!(images.retired_cost(), 5000);
+    images.request(&[], 0);
+    assert_eq!(images.cache.reserve, 5000);
+    // Its result is taken: it holds nothing, and is forgotten.
+    Worker::taken(&shared);
+    assert_eq!(images.retired_cost(), 0);
+    assert!(images.retired.is_empty());
+}
+
+/// A fetcher that fails for URLs with `bad` in them and brings a small PNG for the rest.
+#[cfg(feature = "remote-images")]
+fn fake_remote(images: &mut Images) {
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 1, 255]);
+    images.remote.set_fetcher(Arc::new(move |url, _| {
+        if url.contains("bad") {
+            Err(crate::remote::Error::Failed)
+        } else {
+            Ok((Arc::new(png.clone()), 40, 30))
+        }
+    }));
+    images.set_policy(crate::settings::RemoteImages::Always);
+}
+
+/// Open `src` as `View::open` does (remote images off, then on at once) and frame until every
+/// remote image of it has been fetched or has failed.
+#[cfg(feature = "remote-images")]
+fn open_and_settle(images: &mut Images, src: &str) -> (Doc, Layout) {
+    let doc = Doc::parse(src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    images.forget_remote();
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    settle(images, &doc, &mut layout);
+    (doc, layout)
+}
+
+#[cfg(feature = "remote-images")]
+fn settle(images: &mut Images, doc: &Doc, layout: &mut Layout) {
+    let n = doc.remote_image_count() as u32;
+    let boxes: Vec<_> = (1..=n).map(|id| (id, 40, 30)).collect();
+    let t = Instant::now();
+    loop {
+        images.begin_frame();
+        images.request(&boxes, boxes.len());
+        std::thread::sleep(Duration::from_millis(3));
+        images.poll(doc, layout);
+        let done = images.srcs.iter().all(|s| match s {
+            Src::Remote(url) => images.remote.size(url).is_some(),
+            _ => true,
+        });
+        if done && images.waiting.is_empty() && images.worker.as_ref().is_none_or(Worker::idle) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "stuck");
+    }
+}
+
+/// What is kept per URL goes with the document that had it, so a session through many documents
+/// doesn't collect a record for every URL it has seen; a repaint or a reload doesn't clear
+/// the records of the document it keeps (the refetch loop would be back), and a body that comes
+/// late for a document that is gone leaves none.
+#[cfg(feature = "remote-images")]
+#[test]
+fn per_url_records_do_not_outlive_their_document() {
+    let src = |tag: &str, bad: usize, good: bool| -> String {
+        let mut s: String = (0..bad)
+            .map(|i| format!("![x](https://x.y/{tag}-bad{i}.png) "))
+            .collect();
+        if good {
+            s += &format!("![g](https://x.y/{tag}-good.png)");
+        }
+        s
+    };
+    let url = |s: &str| -> Arc<str> { s.into() };
+    let mut images = Images::default();
+    fake_remote(&mut images);
+    let (doc_a, mut layout_a) = open_and_settle(&mut images, &src("a", 5, true));
+    assert_eq!(images.remote.counts(), (1, 5));
+    // A reload of the same document keeps what is known of it, and its records.
+    images
+        .deferred
+        .insert(url("https://x.y/a-bad0.png"), (1, 1));
+    images
+        .deferred
+        .insert(url("https://x.y/elsewhere.png"), (1, 1));
+    images.attach(&doc_a, &mut layout_a);
+    assert_eq!(images.remote.counts(), (1, 5));
+    assert_eq!(images.deferred.len(), 1, "{:?}", images.deferred);
+    assert!(images.deferred.contains_key("https://x.y/a-bad0.png"));
+    // Repainting changes nothing.
+    settle(&mut images, &doc_a, &mut layout_a);
+    assert_eq!(images.deferred.len(), 1);
+    // Another document: the failures of the first are forgotten, and so is its record. What is
+    // cached stays known (its slot is charged for it).
+    let (doc_b, _) = open_and_settle(&mut images, &src("b", 5, true));
+    assert_eq!(images.remote.counts(), (2, 5), "a's good, b's");
+    assert!(images.deferred.is_empty());
+    // A body that comes late for a URL the document hasn't leaves no record.
+    let png = Arc::new(png_bytes(40, 30, |_, _| [0, 0, 0, 255]));
+    images.drop_fetched(url("https://x.y/late.png"), Ok((png.clone(), 40, 30)));
+    assert!(images.deferred.is_empty());
+    images.drop_fetched(url("https://x.y/b-good.png"), Ok((png, 40, 30)));
+    assert_eq!(images.deferred.len(), 1, "one the document has");
+    drop(doc_b);
+    // Many documents of failing URLs don't pile up.
+    for k in 0..30 {
+        open_and_settle(&mut images, &src(&format!("k{k}"), 20, false));
+        let (fetched, failed) = images.remote.counts();
+        assert!(
+            fetched <= 2 && failed <= 21,
+            "after {k}: {fetched} {failed}"
+        );
+    }
 }

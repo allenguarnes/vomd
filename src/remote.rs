@@ -22,7 +22,8 @@
 //! buffers, [`FETCH_RESERVE`]) aside as long as any fetch is queued or running
 //! (`Cache::fetching`), and the bodies, the bytes kept and the pixels together stay within the
 //! one budget at every moment, not only after the main thread has polled. A body that is taken
-//! goes to the cache before its credit is let go, and only if the cache has room for it
+//! goes to the cache before its credit is let go (`Remote::release`: the body is never allocated
+//! and uncounted at once), and only if the cache has room for it
 //! (`Images::admission`): a body for an image in view that has none stays in the pool, its credit
 //! held, until the decoder has made room, so the fetchers stop, instead of the bodies of every
 //! image in view piling up, protected from eviction, while the decoder works through them. A
@@ -51,9 +52,24 @@ pub const FETCH_BYTES: usize = 12 << 20;
 /// What a fetcher reads the pipe into: a buffer of its own, not part of the body.
 const READ_BUF: usize = 64 << 10;
 
-/// What the image cache sets aside while anything is fetched: the bodies ([`FETCH_BYTES`]) and
-/// the fetchers' read buffers, so nothing the fetchers allocate is outside the budget.
-pub const FETCH_RESERVE: usize = FETCH_BYTES + FETCHERS * READ_BUF;
+/// Results (bodies and failures) fetched and not yet taken by the main thread, at most: no fetch
+/// starts while there are this many, so what the pool keeps per result besides the body is bounded.
+const PENDING_MAX: usize = 256;
+
+/// What a result costs besides its body, at most: its entry in the pool, the message in the
+/// channel, the `Arc` of the body and the URL (a failure costs these only).
+const PENDING_COST: usize = 512;
+
+/// What a fetcher holds beside the credit it has taken: its read buffer, and the copy of a body
+/// under [`STEP`] made while the buffer it was read into (credited whole) is still allocated
+/// ([`cut_to_size`]).
+const FETCHER_SLACK: usize = READ_BUF + STEP;
+
+/// What the image cache sets aside while anything is fetched: the bodies ([`FETCH_BYTES`]), what
+/// the fetchers hold beside them ([`FETCHER_SLACK`]) and the bookkeeping of the results waiting
+/// ([`PENDING_MAX`]), so nothing the fetchers allocate is outside the budget.
+pub const FETCH_RESERVE: usize =
+    FETCH_BYTES + FETCHERS * FETCHER_SLACK + PENDING_MAX * PENDING_COST;
 
 /// Credit is taken and the body's buffer grown by this much at a time.
 pub(crate) const STEP: usize = 256 << 10;
@@ -338,10 +354,12 @@ impl Pool {
                 let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
                 // Nothing starts while the credit is spent, or while a fetch waits for it: a
                 // `curl` left waiting for credit would time out, and one that starts only to
-                // give up again (see `grant`) would be fetched over and over.
+                // give up again (see `grant`) would be fetched over and over. Nor while
+                // `PENDING_MAX` results wait to be taken.
                 while (q.urls.is_empty()
                     || q.held() >= FETCH_BYTES
-                    || q.active.iter().any(|a| a.blocked))
+                    || q.active.iter().any(|a| a.blocked)
+                    || q.active.iter().filter(|a| !a.reading).count() >= PENDING_MAX)
                     && !q.quit
                 {
                     q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
@@ -516,7 +534,8 @@ pub struct Remote {
     pub on: bool,
     /// `curl` couldn't be run: nothing is fetched, the toolbar says why.
     pub no_curl: bool,
-    /// Each URL fetched: its natural size, or `None` if it failed or isn't PNG or JPEG.
+    /// Each URL fetched: its natural size, or `None` if it failed or isn't PNG or JPEG. Kept for
+    /// the current document's URLs and those with a body or pixels cached (`Images::attach`).
     sizes: HashMap<Arc<str>, Option<(u32, u32)>>,
     pool: Option<Pool>,
     fetcher: Fetcher,
@@ -560,11 +579,19 @@ impl Remote {
         }
     }
 
-    /// A fetch finished: the bytes to keep, if it brought an image.
+    /// A fetch finished and its result is taken: the bytes to keep, if it brought an image. The
+    /// fetchers' credit for it is free ([`Remote::release`]).
+    #[cfg(test)]
     pub(crate) fn fetched(&mut self, url: &Arc<str>, result: Fetched) -> Option<Bytes> {
-        if let Some(pool) = &self.pool {
-            pool.done(url);
-        }
+        let bytes = self.take_fetched(url, result);
+        self.release(url);
+        bytes
+    }
+
+    /// [`Remote::fetched`] without letting the credit go: the caller puts the bytes where they
+    /// are charged (the cache) or frees them, and then calls [`Remote::release`], so the body is
+    /// never allocated and uncounted at once.
+    pub(crate) fn take_fetched(&mut self, url: &Arc<str>, result: Fetched) -> Option<Bytes> {
         match result {
             Ok((bytes, w, h)) => {
                 self.sizes.insert(url.clone(), Some((w, h)));
@@ -582,6 +609,19 @@ impl Remote {
                 None
             }
         }
+    }
+
+    /// The result for `url` is out of the fetchers' hands (kept in the cache or freed): its
+    /// credit is free.
+    pub(crate) fn release(&mut self, url: &Arc<str>) {
+        if let Some(pool) = &self.pool {
+            pool.done(url);
+        }
+    }
+
+    /// Forget what fetching found for the URLs `keep` says no to.
+    pub(crate) fn retain_sizes(&mut self, mut keep: impl FnMut(&Arc<str>) -> bool) {
+        self.sizes.retain(|u, _| keep(u));
     }
 
     /// The image at `url` didn't decode: it shows its alt text from now on.

@@ -762,3 +762,46 @@ fn real_bodies_stop_at_the_budget() {
     }
     assert_eq!(r.inflight(), 0);
 }
+
+/// Results nobody has taken are bounded in number too, not only in bytes: tiny bodies and
+/// failures hold no credit to speak of, so without a limit of their own the pool would run
+/// through every URL, keeping a record and a message for each. Taking them lets the rest
+/// through.
+#[test]
+fn results_waiting_for_the_main_thread_are_bounded_in_number() {
+    let fetcher: Fetcher = Arc::new(|url: &str, grant: Grant| {
+        if url.ends_with('7') {
+            return Err(Error::Failed);
+        }
+        assert!(grant(STEP));
+        Ok((Arc::new(vec![0u8; 8]), 2, 1))
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut r = Remote {
+        on: true,
+        fetcher,
+        ..Remote::default()
+    };
+    let all = urls(2000);
+    r.fetch(all.clone(), tx.clone(), Arc::new(|| {}));
+    std::thread::sleep(Duration::from_millis(500));
+    let mut waiting: Vec<_> = rx.try_iter().collect();
+    assert!(
+        (PENDING_MAX..PENDING_MAX + FETCHERS).contains(&waiting.len()),
+        "{} results waiting",
+        waiting.len()
+    );
+    let mut taken = std::collections::HashSet::new();
+    while taken.len() < all.len() {
+        let done = match waiting.pop() {
+            Some(done) => done,
+            None => rx.recv_timeout(Duration::from_secs(10)).expect("a result"),
+        };
+        let Done::Fetched { url, result } = done else {
+            panic!("a fetch result");
+        };
+        r.fetched(&url, result);
+        assert!(taken.insert(url), "once");
+    }
+    assert!(!r.busy());
+}
