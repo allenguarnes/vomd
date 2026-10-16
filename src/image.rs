@@ -6,7 +6,8 @@
 //! lazily, for boxes within a screen of the viewport, on a worker thread, straight to the size
 //! the box is shown at; the full-size pixels are dropped. Decoded images (and the bytes of
 //! fetched remote ones, see `remote.rs`) share a ~32 MB budget; the least recently painted go
-//! first, never one painted in the current frame.
+//! first, never one painted in the current frame. A fetched body gets in only if it fits, so
+//! those for the images in view can't pile up undecoded ([`Images::admission`]).
 // Without decoders nothing is ever queued: the worker and the cache are dead code.
 #![cfg_attr(not(feature = "images"), allow(dead_code))]
 
@@ -398,27 +399,100 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
     }
 }
 
-/// Upper bound on the bytes a JPEG decoder keeps of what is in `bytes`: for every `FF E1`
-/// (EXIF, XMP, extended XMP), `FF E2` (ICC profile, HDR gain map) and `FF ED` (IPTC) anywhere in
-/// the file, the length that follows it (what the decoder copies if it takes that for a segment)
-/// and [`JPEG_META_ENTRY`] for what it keeps beside it. Counted wherever the pairs are, not where
-/// the segments should be, so a file arranged to be read differently by us and by the decoder
-/// (the two skip over segments in their own ways) is counted the way the decoder reads it. (A
-/// pair inside entropy-coded data can't be: `FF` is `FF 00` there.)
+/// The segments of a JPEG as its decoder (zune-jpeg 0.5) finds them: [`JpegWalk::next`] gives
+/// the start, end and code of every `APP1` (EXIF, XMP, extended XMP), `APP2` (ICC profile, HDR
+/// gain map, MPF) and `APP13` (IPTC) segment, the ones it keeps a copy of. A segment is a
+/// marker, `FF` and a code, and the length that follows it (which counts itself), and what is
+/// inside one, a comment holding `FF E1 FF FF` say, is its payload, skipped by the decoder and by
+/// this. Before the first start of scan the decoder looks for `FF` and skips any `FF` and `00`
+/// after it; in the scan data after it `FF 00` is a stuffed byte, and `FF`, fill and a code is a
+/// marker (a restart marker has no segment; any other the decoder gives a segment, wherever it
+/// is: even between and inside scans, where none should be). The walk ends at the end of the
+/// image, or where the decoder gives up (a length under 2, one past the end of the file) having
+/// kept what came before. Where this can't be sure of the decoder it takes the larger count: an
+/// unknown marker in scan data is skipped by its length, as the decoder does between scans (in a
+/// scan it fails).
+///
+/// It reads the bytes after the last segment it gave only: the ones before may be moved
+/// (see [`shed_jpeg_metadata`]).
+#[cfg(feature = "images")]
+struct JpegWalk {
+    /// Where to look next: 0 before the first call (the start of the image is checked).
+    at: usize,
+    scan: bool,
+}
+
+#[cfg(feature = "images")]
+impl JpegWalk {
+    fn new() -> JpegWalk {
+        JpegWalk { at: 0, scan: false }
+    }
+
+    fn next(&mut self, bytes: &[u8]) -> Option<(usize, usize, u8)> {
+        if self.at == 0 {
+            if !bytes.starts_with(&[0xFF, 0xD8]) {
+                return None;
+            }
+            self.at = 2;
+        }
+        let len = bytes.len();
+        while let Some(at) = bytes
+            .get(self.at..)
+            .and_then(|b| b.iter().position(|&b| b == 0xFF))
+        {
+            let start = self.at + at;
+            let mut q = start + 1;
+            if self.scan {
+                while bytes.get(q) == Some(&0xFF) {
+                    q += 1;
+                }
+                if bytes.get(q) == Some(&0x00) {
+                    self.at = q + 1;
+                    continue;
+                }
+            } else {
+                while matches!(bytes.get(q), Some(0x00 | 0xFF)) {
+                    q += 1;
+                }
+            }
+            let code = *bytes.get(q)?;
+            match code {
+                0xD9 => break,
+                0xD0..=0xD7 if self.scan => {
+                    self.at = q + 1;
+                    continue;
+                }
+                _ => {}
+            }
+            let l = bytes.get(q + 1..q + 3)?;
+            let n = usize::from(u16::from_be_bytes([l[0], l[1]]));
+            if n < 2 {
+                break;
+            }
+            let end = (q + 1 + n).min(len);
+            self.scan |= code == 0xDA;
+            self.at = end;
+            if matches!(code, 0xE1 | 0xE2 | 0xED) {
+                return Some((start, end, code));
+            }
+        }
+        // The end, or where the decoder gives up: nothing more is read.
+        self.at = len.max(2);
+        None
+    }
+}
+
+/// Upper bound on the bytes a JPEG decoder keeps of what is in `bytes`: for every metadata
+/// segment ([`JpegWalk`]) the length it declares (what the decoder copies, as far as the
+/// file goes) and [`JPEG_META_ENTRY`] for what it keeps beside it.
 #[cfg(feature = "images")]
 fn jpeg_metadata(bytes: &[u8]) -> usize {
     let mut total = 0usize;
-    let mut i = 0;
-    while let Some(at) = bytes[i..].iter().position(|&b| b == 0xFF) {
-        let at = i + at;
-        i = at + 1;
-        if matches!(bytes.get(at + 1), Some(0xE1 | 0xE2 | 0xED)) {
-            let len = bytes
-                .get(at + 2..at + 4)
-                .map_or(0, |l| usize::from(u16::from_be_bytes([l[0], l[1]])));
-            let payload = len.saturating_sub(2).min(bytes.len() - at - 2);
-            total = total.saturating_add(payload + JPEG_META_ENTRY);
-        }
+    let mut walk = JpegWalk::new();
+    while let Some((start, end, _)) = walk.next(bytes) {
+        // The marker, its fill and the length are not copied.
+        let payload = (end - start).saturating_sub(4);
+        total = total.saturating_add(payload + JPEG_META_ENTRY);
     }
     total
 }
@@ -430,45 +504,26 @@ const JPEG_META_ENTRY: usize = 256;
 
 /// Cut every `APP1`, `APP2` and `APP13` segment out of a JPEG in place (`FF D8 ...`: the
 /// metadata its decoder keeps and nothing here uses; `APP0` and `APP14` stay, the decoder reads
-/// the color transform from `APP14`), if there is more than [`MAX_JPEG_META`] of it. Markers are
-/// found as the decoder finds them, byte by byte: `FF` and a code that isn't `00` or `FF`,
-/// whatever came before (a restart marker is no segment, a `FF 00` is data); a segment is the
-/// marker and the length that follows it. `false` if what is left is still over the limit (the
-/// file is arranged so the decoder reads segments where this found none: see [`jpeg_metadata`]).
+/// the color transform from `APP14`), if there is more than [`MAX_JPEG_META`] of it, the segments
+/// as [`JpegWalk`] finds them. `false` if what is left is still over the limit (cutting put
+/// together bytes the decoder reads as a segment, which the walk of the bytes as they were
+/// didn't find): the file is refused.
 #[cfg(feature = "images")]
 pub(crate) fn shed_jpeg_metadata(buf: &mut Vec<u8>) -> bool {
-    if !buf.starts_with(&[0xFF, 0xD8]) || jpeg_metadata(buf) <= MAX_JPEG_META {
+    if jpeg_metadata(buf) <= MAX_JPEG_META {
         return true;
     }
-    let len = buf.len();
-    // `buf[..kept]` is what stays; `buf[from..]` hasn't been looked at, or is to stay once it is.
-    let (mut kept, mut from, mut i) = (0, 0, 0);
-    while i + 1 < len {
-        if buf[i] != 0xFF || matches!(buf[i + 1], 0x00 | 0xFF) {
-            i += 1;
-            continue;
-        }
-        let code = buf[i + 1];
-        // SOI, TEM and RSTn have no segment (the decoder gives them one, but they only come
-        // where the file is broken; if it matters to it, it matters the same after this).
-        if matches!(code, 0x01 | 0xD0..=0xD8) {
-            i += 2;
-            continue;
-        }
-        if code == 0xD9 {
-            break;
-        }
-        let Some(l) = buf.get(i + 2..i + 4) else {
-            break;
-        };
-        let end = (i + 2 + usize::from(u16::from_be_bytes([l[0], l[1]]))).min(len);
-        if matches!(code, 0xE1 | 0xE2 | 0xED) {
-            buf.copy_within(from..i, kept);
-            kept += i - from;
-            from = end;
-        }
-        i = end.max(i + 2);
+    // `buf[..kept]` is what stays; `buf[from..]` hasn't been looked at, or is to stay once it is
+    // (the walk reads on from the end of the last segment, which is not moved: no list of
+    // segments is kept, 450,000 of them being 7 MB).
+    let (mut kept, mut from) = (0, 0);
+    let mut walk = JpegWalk::new();
+    while let Some((start, end, _)) = walk.next(buf) {
+        buf.copy_within(from..start, kept);
+        kept += start - from;
+        from = end;
     }
+    let len = buf.len();
     buf.copy_within(from..len, kept);
     buf.truncate(kept + len - from);
     buf.shrink_to_fit();
@@ -916,12 +971,6 @@ impl Cache {
         self.evict_for(0);
     }
 
-    /// Evict for a slot of `cost` that is about to come in.
-    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
-    fn make_room(&mut self, cost: usize) {
-        self.evict_for(cost);
-    }
-
     /// Drop the least recently painted slots until the budget holds beside what decoding needs
     /// ([`Cache::reserve`]), what is set aside for the fetchers ([`Cache::fetching`]) and
     /// `extra` more bytes, never one painted in the current frame.
@@ -942,6 +991,39 @@ impl Cache {
             };
             let s = self.slots.swap_remove(i);
             self.bytes -= s.cost();
+        }
+    }
+
+    /// Make room for a body of `cost` that will be decoded for `decode` more than what is kept
+    /// free for decoding already, evicting what was not painted this frame, and say whether it
+    /// fits. (A decode's memory is not held at the same time as another's: the larger counts.)
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn room_for(&mut self, cost: usize, decode: usize) -> bool {
+        let extra = cost.saturating_add(decode.saturating_sub(self.reserve));
+        self.evict_for(extra);
+        self.bytes
+            .saturating_add(self.reserve)
+            .saturating_add(self.fetching)
+            .saturating_add(extra)
+            <= self.cap
+    }
+
+    /// Whether a fetched body is held that was used this frame, which can't be evicted.
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn holds_used_bytes(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| matches!(s.data, Data::Bytes(_)) && s.used >= self.frame)
+    }
+
+    /// The decoded image for `url` has come: its fetched body is of no use until another size is
+    /// wanted, and is the first to go (it was marked used for the frame it was decoded in).
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn release_bytes(&mut self, url: &Arc<str>) {
+        for s in &mut self.slots {
+            if matches!(s.data, Data::Bytes(_)) && matches!(&s.key, Key::Remote(u) if u == url) {
+                s.used = 0;
+            }
         }
     }
 
@@ -1069,6 +1151,14 @@ impl Worker {
         cv.notify_one();
     }
 
+    /// Whether nothing is queued, being decoded, or decoded and not taken.
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn idle(&self) -> bool {
+        let (lock, _) = &*self.shared;
+        let q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.jobs.is_empty() && q.busy.is_none()
+    }
+
     /// What the job being decoded (or whose result isn't taken) holds, if any.
     fn busy_cost(&self) -> usize {
         let (lock, _) = &*self.shared;
@@ -1116,6 +1206,33 @@ enum Src {
     Remote(Arc<str>),
 }
 
+/// What has been loaded so far (the RSS examples and tests check that the images they measure
+/// were).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Images decoded and in the cache (a size of an image is one).
+    pub decoded: usize,
+    /// Images decoded since the start, those evicted since too.
+    pub decodes: usize,
+    /// Images that couldn't be loaded or decoded: they show their alt text.
+    pub failed: usize,
+    /// Remote images fetched (their size is known).
+    pub fetched: usize,
+    /// Fetched bodies held for room in the cache.
+    pub waiting: usize,
+}
+
+/// What [`Images::admission`] says of a fetched body.
+#[cfg(feature = "remote-images")]
+enum Admit {
+    /// Into the cache.
+    Yes,
+    /// Not kept: there is no room, and its image isn't in view.
+    Drop,
+    /// Held by the fetchers until there is room: its image is in view.
+    Wait,
+}
+
 /// The current document's images: where each comes from, the cache, and the threads that
 /// decode (and, with `remote-images`, fetch) them.
 pub struct Images {
@@ -1127,14 +1244,21 @@ pub struct Images {
     /// What decoding each local image holds (see [`decode_cost`]), once its header is read.
     costs: Vec<Option<usize>>,
     cache: Cache,
+    /// Results with pixels taken so far ([`Stats::decodes`]).
+    decodes: usize,
     tx: Sender<Done>,
     rx: Receiver<Done>,
     wake: Wake,
     worker: Option<Worker>,
     /// The remote images in view when images were last asked for: a body that arrives for one
-    /// is as good as painted (it is decoded next), any other may be evicted at once.
+    /// is kept while the cache has room for it (and is decoded next), any other may be evicted
+    /// at once.
     #[cfg(feature = "remote-images")]
     in_view: Vec<Arc<str>>,
+    /// Bodies fetched for images in view that the cache had no room for ([`Images::admission`]):
+    /// still held by the fetchers' credit, so they can't pile up while the decoder is behind.
+    #[cfg(feature = "remote-images")]
+    waiting: Vec<(Arc<str>, crate::remote::Fetched)>,
     #[cfg(feature = "remote-images")]
     pub(crate) remote: crate::remote::Remote,
 }
@@ -1148,12 +1272,15 @@ impl Default for Images {
             srcs: Vec::new(),
             costs: Vec::new(),
             cache: Cache::new(CACHE_BYTES),
+            decodes: 0,
             tx,
             rx,
             wake: Arc::new(|| {}),
             worker: None,
             #[cfg(feature = "remote-images")]
             in_view: Vec::new(),
+            #[cfg(feature = "remote-images")]
+            waiting: Vec::new(),
             #[cfg(feature = "remote-images")]
             remote: crate::remote::Remote::default(),
         }
@@ -1203,7 +1330,41 @@ impl Images {
             );
         }
         #[cfg(feature = "remote-images")]
-        self.sync_remote(doc, layout);
+        {
+            // Nothing is in view of the new document yet: the bodies that waited are let go.
+            self.in_view.clear();
+            self.admit_waiting();
+            self.sync_remote(doc, layout);
+        }
+    }
+
+    /// What has been loaded (see [`Stats`]).
+    pub fn stats(&self) -> Stats {
+        let decoded = self
+            .cache
+            .slots
+            .iter()
+            .filter(|s| s.pixels().is_some())
+            .count();
+        #[cfg(feature = "remote-images")]
+        let (fetched, failed, waiting) = {
+            let (fetched, failed) = self.remote.counts();
+            let local = self.srcs.iter().filter(|s| matches!(s, Src::None)).count();
+            (fetched, failed + local, self.waiting.len())
+        };
+        #[cfg(not(feature = "remote-images"))]
+        let (fetched, failed, waiting) = (
+            0,
+            self.srcs.iter().filter(|s| matches!(s, Src::None)).count(),
+            0,
+        );
+        Stats {
+            decoded,
+            decodes: self.decodes,
+            failed,
+            fetched,
+            waiting,
+        }
     }
 
     /// The directory relative paths resolve against (tests).
@@ -1368,6 +1529,12 @@ impl Images {
             }
             self.remote.fetch(fetch, self.tx.clone(), self.wake.clone());
         }
+        // Room was made (a frame went by, what was decoded is released): the window takes the
+        // bodies that wait, as it does when a result comes.
+        #[cfg(feature = "remote-images")]
+        if self.waiting_ready() {
+            (self.wake)();
+        }
     }
 
     /// Take the results that arrived: decoded images go in the cache; an image that turned out
@@ -1395,7 +1562,14 @@ impl Images {
                         continue;
                     }
                     match (bitmap, key) {
-                        (Some(b), key) => self.cache.insert(key, Data::Pixels(b)),
+                        (Some(b), key) => {
+                            #[cfg(feature = "remote-images")]
+                            if let Key::Remote(url) = &key {
+                                self.cache.release_bytes(url);
+                            }
+                            self.decodes += 1;
+                            self.cache.insert(key, Data::Pixels(b));
+                        }
                         (None, Key::Local(id)) => {
                             if let Some(s) = id
                                 .checked_sub(1)
@@ -1416,26 +1590,108 @@ impl Images {
                     Worker::taken(&worker);
                 }
                 #[cfg(feature = "remote-images")]
-                Done::Fetched { url, result } => {
-                    // The cache is made room for the body while the fetchers still hold it, so
-                    // when its credit is let go (and they use it) it is in the cache.
-                    if let Ok((bytes, ..)) = &result {
-                        self.cache.make_room(Slot::bytes_cost(&url, bytes));
-                    }
-                    let taken = self.remote.fetched(&url, result);
-                    if let Some(bytes) = taken {
-                        self.cache
-                            .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
-                        if self.in_view.contains(&url) {
-                            self.cache.bytes_of(&url);
-                        }
-                    }
-                    self.cache.fetching = self.fetch_reserve(false);
-                    self.sync_remote(doc, layout);
+                Done::Fetched { url, result } => self.arrived(url, result),
+            }
+        }
+        #[cfg(feature = "remote-images")]
+        {
+            // What the decoder made room for (its results are taken, a frame has passed) goes to
+            // the bodies that waited.
+            any |= self.admit_waiting();
+            if any {
+                self.sync_remote(doc, layout);
+            }
+        }
+        any
+    }
+
+    /// A fetch finished. Its body is admitted to the cache only if the cache has room for it
+    /// beside what is set aside already (the budget, less what decoding and the fetchers
+    /// hold), after evicting what was not painted this frame: a body for an image in view is
+    /// protected from eviction (it is decoded next), so without this the bodies of a screen of
+    /// images could pile up, as many as the fetchers bring while the decoder works through them
+    /// one at a time. A body that doesn't fit waits for room if its image is in view (see
+    /// [`Images::admission`]), still holding the fetchers' credit, which stops them. Any other is
+    /// dropped (its size is kept, it is fetched again when it is wanted).
+    #[cfg(feature = "remote-images")]
+    fn arrived(&mut self, url: Arc<str>, result: crate::remote::Fetched) {
+        let admit = match &result {
+            Ok((bytes, ..)) => self.admission(&url, bytes),
+            Err(_) => Admit::Drop,
+        };
+        match admit {
+            Admit::Wait => self.waiting.push((url, result)),
+            Admit::Yes => self.take_fetched(url, result, true),
+            Admit::Drop => self.take_fetched(url, result, false),
+        }
+    }
+
+    /// Whether the body fetched for `url` can go to the cache now. One in view that doesn't fit
+    /// is let in anyway if nothing could free room for it: when the decoder is idle and no body
+    /// in the cache is held for it (a screen of decoded images, which are never evicted, may
+    /// fill the budget, as [`Images::request`] says), so it is the one body over the budget at
+    /// a time, and as soon as it is decoded it is the first to go.
+    #[cfg(feature = "remote-images")]
+    fn admission(&mut self, url: &Arc<str>, bytes: &Bytes) -> Admit {
+        let cost = Slot::bytes_cost(url, bytes);
+        let decode = bytes_cost(bytes).unwrap_or(0);
+        if self.cache.room_for(cost, decode) {
+            Admit::Yes
+        } else if !self.in_view.contains(url) {
+            Admit::Drop
+        } else if self.worker.as_ref().is_none_or(Worker::idle) && !self.cache.holds_used_bytes() {
+            Admit::Yes
+        } else {
+            Admit::Wait
+        }
+    }
+
+    /// The body (or failure) of a finished fetch is taken from the fetchers (their credit is
+    /// free) and, if `keep`, goes to the cache, before the fetchers can use what they are given.
+    #[cfg(feature = "remote-images")]
+    fn take_fetched(&mut self, url: Arc<str>, result: crate::remote::Fetched, keep: bool) {
+        let taken = self.remote.fetched(&url, result);
+        if let (true, Some(bytes)) = (keep, taken) {
+            self.cache
+                .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
+            if self.in_view.contains(&url) {
+                self.cache.bytes_of(&url);
+            }
+        }
+        self.cache.fetching = self.fetch_reserve(false);
+    }
+
+    /// Admit the bodies that waited, as far as there is room now. Returns true if any was
+    /// taken.
+    #[cfg(feature = "remote-images")]
+    fn admit_waiting(&mut self) -> bool {
+        let mut any = false;
+        for (url, result) in std::mem::take(&mut self.waiting) {
+            let admit = match &result {
+                Ok((bytes, ..)) => self.admission(&url, bytes),
+                Err(_) => Admit::Drop,
+            };
+            match admit {
+                Admit::Wait => self.waiting.push((url, result)),
+                Admit::Yes | Admit::Drop => {
+                    self.take_fetched(url, result, matches!(admit, Admit::Yes));
+                    any = true;
                 }
             }
         }
         any
+    }
+
+    /// Whether a body that waited can go on now: its image is no longer in view, or there is room.
+    #[cfg(feature = "remote-images")]
+    fn waiting_ready(&mut self) -> bool {
+        let waiting = std::mem::take(&mut self.waiting);
+        let ready = waiting.iter().any(|(url, result)| match result {
+            Ok((bytes, ..)) => !matches!(self.admission(url, bytes), Admit::Wait),
+            Err(_) => true,
+        });
+        self.waiting = waiting;
+        ready
     }
 
     /// What the cache sets aside for the fetchers: [`remote::FETCH_RESERVE`] if any are running or

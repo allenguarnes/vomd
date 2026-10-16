@@ -1187,7 +1187,7 @@ fn jpeg_metadata_over_the_limit_is_cut_out_in_place() {
             segments.push(a.clone());
             segments.push(b.clone());
         }
-        segments.extend(gone[2..].iter().cloned());
+        segments.extend(gone[keep.len()..].iter().cloned());
         let with = with_segments(&plain, 0, &segments);
         // The same with everything that stays, and none that goes.
         let expect = with_segments(&plain, 0, &keep);
@@ -1230,22 +1230,176 @@ fn metadata_between_scans_is_cut_out() {
     assert_eq!(decode(&with, 8, 8), want);
 }
 
-/// A file that has the pairs the decoder takes for metadata where no segment of them is
-/// (a comment is skipped by us and the decoder alike, whatever is in it) can't be cut: it is
-/// refused, not decoded with what it makes the decoder keep.
+/// What is inside a segment that isn't metadata is payload, however much it looks like metadata:
+/// a comment or an application segment (`APP12`) full of `FF E1 FF FF` is skipped by the decoder
+/// and by [`JpegWalk`] alike, so it is not counted, not cut, and the image decodes (the
+/// bytes were once counted as 16,000 segments of 65,535, and the image refused).
 #[test]
-fn metadata_that_cannot_be_cut_out_is_refused() {
+fn marker_pairs_inside_a_segments_payload_are_not_metadata() {
     let plain = fixture("wide.jpg");
-    // 16,000 pairs of `FF E1` and a length of 65,535, each of which the decoder may read.
-    let comment = segment(0xFE, &[0xFF, 0xE1, 0xFF, 0xFF].repeat(16_000));
-    let bad = with_segments(&plain, 0, &[comment]);
-    assert!(jpeg_metadata(&bad) > MAX_JPEG_META);
-    let mut copy = bad.clone();
-    assert!(!shed_jpeg_metadata(&mut copy));
-    assert_eq!(decode(&bad, 8, 8), None);
-    // The same comment without them decodes.
-    let fine = with_segments(&plain, 0, &[segment(0xFE, &[b'a'; 64_000])]);
-    assert!(decode(&fine, 8, 8).is_some());
+    let want = decode(&plain, 8, 8).unwrap();
+    let pairs = [0xFF, 0xE1, 0xFF, 0xFF].repeat(16_000);
+    for code in [0xFE, 0xEC, 0xE3, 0xE0] {
+        let bytes = with_segments(&plain, 0, &[segment(code, &pairs)]);
+        assert_eq!(jpeg_metadata(&bytes), 0, "FF {code:X}");
+        assert_eq!(decode(&bytes, 8, 8).as_ref(), Some(&want), "FF {code:X}");
+        let mut same = bytes.clone();
+        assert!(shed_jpeg_metadata(&mut same));
+        assert_eq!(same, bytes, "FF {code:X}: nothing to cut");
+    }
+    // Beside real metadata over the limit: that is cut, the payload isn't.
+    let comment = segment(0xFE, &pairs);
+    let mut bytes = with_segments(
+        &plain,
+        0,
+        &[
+            comment.clone(),
+            segment(0xE1, &[b'E'; 65_000]),
+            segment(0xE1, &[b'E'; 65_000]),
+            segment(0xE1, &[b'E'; 10_000]),
+        ],
+    );
+    assert!(jpeg_metadata(&bytes) > MAX_JPEG_META);
+    assert!(shed_jpeg_metadata(&mut bytes));
+    assert_eq!(bytes, with_segments(&plain, 0, &[comment]));
+    assert_eq!(decode(&bytes, 8, 8).as_ref(), Some(&want));
+}
+
+/// What [`jpeg_metadata`] counts is what the decoder reads as metadata, wherever it finds it: for
+/// every way of putting a segment in a file that the decoder takes (fill bytes before the marker, a
+/// stuffed zero, between scans, after the last), it is counted, and what the decoder has kept
+/// of it is within the count. (Checked against zune-jpeg 0.5: its marker reading is what this
+/// follows.)
+#[test]
+fn metadata_is_counted_where_the_decoder_reads_it() {
+    use zune_jpeg::zune_core::{
+        bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions,
+    };
+    let exif = |n: usize| {
+        let mut d = b"Exif\0\0".to_vec();
+        d.extend(vec![b'E'; n]);
+        d
+    };
+    let seg = |n: usize| segment(0xE1, &exif(n));
+    let plain = fixture("wide.jpg");
+    let eoi = plain.len() - 2;
+    assert_eq!(&plain[eoi..], [0xFF, 0xD9]);
+    let mut fill = vec![0xFF];
+    fill.extend(seg(40_000));
+    let mut stuffed = vec![0xFF, 0x00];
+    stuffed.extend(seg(40_000));
+    let mut after = plain[..eoi].to_vec();
+    after.extend(seg(40_000));
+    after.extend([0xFF, 0xD9]);
+    let cases = [
+        ("plain", with_segments(&plain, 0, &[seg(40_000)])),
+        ("fill byte", with_segments(&plain, 0, &[fill])),
+        ("stuffed zero", with_segments(&plain, 0, &[stuffed])),
+        ("after the scan", after),
+    ];
+    for (name, bytes) in cases {
+        let counted = jpeg_metadata(&bytes);
+        assert!(counted >= 40_000, "{name}: {counted}");
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+        let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&bytes[..]), options);
+        d.decode().unwrap();
+        let kept = d.exif().map_or(0, Vec::len);
+        assert_eq!(kept, 40_000, "{name}: the decoder keeps it");
+        assert!(kept <= counted, "{name}");
+        // And it is cut out, whichever it was.
+        let mut cut = with_segments(&bytes, 0, &[seg(60_000), seg(60_000)]);
+        assert!(shed_jpeg_metadata(&mut cut), "{name}");
+        assert_eq!(jpeg_metadata(&cut), 0, "{name}");
+        assert_eq!(decode(&cut, 8, 8), decode(&plain, 8, 8), "{name}");
+    }
+}
+
+/// What the decoder keeps of what is put into a JPEG anywhere, with markers, fill, stuffed zeros,
+/// lengths and payloads made of the bytes that matter most, is never more than is counted: the
+/// bound the cache's budget relies on (checked against zune-jpeg 0.5, whose marker reading
+/// [`JpegWalk`] follows). A fixed seed, so a failure repeats.
+#[test]
+fn the_decoder_never_keeps_more_than_is_counted() {
+    use zune_jpeg::zune_core::{
+        bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions,
+    };
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as usize % n
+    };
+    let mut kept_some = 0;
+    for name in ["wide.jpg", "progressive.jpg", "gray.jpg"] {
+        let plain = fixture(name);
+        for round in 0..150 {
+            let mut bytes = plain.clone();
+            for _ in 0..1 + next(3) {
+                // Where: at a marker (before a segment, a scan, the end), or anywhere (inside a
+                // segment, inside the entropy-coded data).
+                let starts: Vec<usize> = bytes
+                    .windows(2)
+                    .enumerate()
+                    .filter(|(_, w)| {
+                        w[0] == 0xFF
+                            && matches!(w[1], 0xC0 | 0xC2 | 0xC4 | 0xDA | 0xDB | 0xE0 | 0xD9)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let at = if next(8) == 0 {
+                    2 + next(bytes.len() - 2)
+                } else {
+                    starts[next(starts.len())]
+                };
+                let mut put = Vec::new();
+                for _ in 0..next(3) {
+                    put.push(if next(2) == 0 { 0xFF } else { 0x00 });
+                }
+                let code = [0xE1, 0xE1, 0xE2, 0xED, 0xFE, 0xEC, 0xE0, 0xEE, 0xD0, 0xFF][next(10)];
+                let body: Vec<u8> = (0..next(300))
+                    .map(|_| [0xFF, 0xE1, b'E', b'E', b'E', b'E', b'E', 0xE2][next(8)])
+                    .collect();
+                let prefix: &[u8] = [
+                    &b"Exif\0\0"[..],
+                    b"ICC_PROFILE\0\x01\x01",
+                    b"",
+                    b"Photoshop 3.0\0",
+                ][next(4)];
+                let mut data = prefix.to_vec();
+                data.extend(body);
+                put.extend([0xFF, code]);
+                // The length is right, or whatever it is.
+                let l = if next(10) == 0 {
+                    next(70_000) as u16
+                } else {
+                    (data.len() + 2) as u16
+                };
+                put.extend(l.to_be_bytes());
+                put.extend(data);
+                let tail = bytes.split_off(at);
+                bytes.extend(put);
+                bytes.extend(tail);
+            }
+            let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+            let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&bytes[..]), options);
+            let _ = d.decode();
+            let kept = d.exif().map_or(0, Vec::len)
+                + d.xmp().map_or(0, Vec::len)
+                + d.iptc().map_or(0, Vec::len)
+                + d.icc_profile().map_or(0, |v| v.len());
+            kept_some += usize::from(kept > 0);
+            let counted = jpeg_metadata(&bytes);
+            assert!(
+                kept <= counted,
+                "{name} round {round}: kept {kept}, counted {counted}"
+            );
+        }
+    }
+    assert!(
+        kept_some > 50,
+        "the test puts metadata where it is read: {kept_some}"
+    );
 }
 
 /// A decode's result is held (and its cost kept free of the cache) until the main thread takes
@@ -1350,4 +1504,132 @@ fn costing_remote_bytes_does_not_pin_them() {
     // Over the budget, it goes.
     c.insert(Key::Local(1), Data::Bytes(vec![0u8; 8].into()));
     assert!(c.peek_bytes(&url).is_none());
+}
+
+/// A fetched body that nothing painted yet is protected only once the cache has admitted it,
+/// and it is admitted only if it fits: 24 images in view with 3 MiB bodies (72 MiB, for 40 × 30
+/// pictures of 4.8 KB) are fetched while the window polls only every 30 ms (the fetchers fill the
+/// time with bodies, the decoder takes one result at a time), and what is held, outside the
+/// cache and in it, never goes over the budget, nothing waits forever and every image is shown.
+#[cfg(feature = "remote-images")]
+#[test]
+fn bodies_of_images_in_view_wait_for_room_instead_of_piling_up() {
+    use crate::remote::{Error, STEP};
+    use crate::render::Pixels;
+    const N: u32 = 24;
+    let body = {
+        let mut b = png_bytes(40, 30, |x, y| [x as u8, y as u8, 7, 255]);
+        let tail = vec![0u8; 3 << 20];
+        b.extend(tail);
+        b
+    };
+    let src: String = (0..N)
+        .map(|i| format!("![{i}](https://x.y/{i}.png) "))
+        .collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let fetcher: crate::remote::Fetcher = Arc::new(move |_, grant| {
+        for _ in 0..body.len().div_ceil(STEP) {
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+        }
+        // The body is its own buffer, as allocated.
+        Ok((Arc::new(body.clone()), 40, 30))
+    });
+    images.remote.set_fetcher(fetcher);
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let boxes: Vec<_> = (1..=N).map(|id| (id, 40, 30)).collect();
+    let (mut waited, mut peak) = (0, 0);
+    let t = Instant::now();
+    loop {
+        images.begin_frame();
+        images.request(&boxes, boxes.len());
+        // The window is busy: the fetchers fetch, the decoder decodes, nothing is taken.
+        std::thread::sleep(Duration::from_millis(30));
+        let held = images.cache.bytes + images.remote.inflight();
+        peak = peak.max(held);
+        assert!(held <= CACHE_BYTES, "{held} bytes held in all");
+        let before = images.stats();
+        images.poll(&doc, &mut layout);
+        waited = waited.max(before.waiting);
+        let s = images.stats();
+        if s.decoded == N as usize && s.waiting == 0 {
+            break;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "stuck: {s:?}, {} held",
+            images.cache.bytes
+        );
+    }
+    assert!(waited > 0, "bodies had to wait, or this tests nothing");
+    assert!(peak > 3 << 20, "bodies were held: {peak}");
+    for id in 1..=N {
+        assert!(images.pixels(id, 40, 30).is_some(), "image {id}");
+    }
+    // Decoded, the bodies are no use: what is cached is not what they cost.
+    assert!(images.cache.bytes <= CACHE_BYTES);
+}
+
+/// With the cache full of what is in view (decoded images are never evicted, so a window of
+/// them may take the whole budget), a body for an image in view is still let in, one at a time,
+/// when nothing else could make room (no decode is running and no body is waiting for one): the
+/// images load, one after another, and the cache never holds two bodies of them.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_body_is_let_in_alone_when_nothing_can_make_room() {
+    use crate::remote::{Error, STEP};
+    use crate::render::Pixels;
+    const N: u32 = 4;
+    let body = {
+        let mut b = png_bytes(40, 30, |x, y| [x as u8, y as u8, 9, 255]);
+        b.extend(vec![0u8; 300 << 10]);
+        b
+    };
+    let src: String = (0..N)
+        .map(|i| format!("![{i}](https://x.y/{i}.png) "))
+        .collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let fetcher: crate::remote::Fetcher = Arc::new(move |_, grant| {
+        for _ in 0..body.len().div_ceil(STEP) {
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+        }
+        Ok((Arc::new(body.clone()), 40, 30))
+    });
+    images.remote.set_fetcher(fetcher);
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    // Less than the fetchers are set aside: no body fits, ever.
+    images.cache.cap = 1 << 20;
+    let boxes: Vec<_> = (1..=N).map(|id| (id, 40, 30)).collect();
+    let t = Instant::now();
+    loop {
+        images.begin_frame();
+        images.request(&boxes, boxes.len());
+        std::thread::sleep(Duration::from_millis(10));
+        images.poll(&doc, &mut layout);
+        let bodies = images
+            .cache
+            .slots
+            .iter()
+            .filter(|s| matches!(s.data, Data::Bytes(_)))
+            .count();
+        assert!(bodies <= 1, "{bodies} bodies held");
+        if images.stats().decoded == N as usize {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(30), "stuck");
+    }
+    for id in 1..=N {
+        assert!(images.pixels(id, 40, 30).is_some(), "image {id}");
+    }
 }

@@ -1506,6 +1506,11 @@ impl View {
         true
     }
 
+    /// What has been loaded of the document's images (the RSS examples).
+    pub fn image_stats(&self) -> crate::image::Stats {
+        self.images.stats()
+    }
+
     /// The image whose placeholder or box is at window point (`x`, `y`), if any.
     fn image_at(&self, x: f64, y: f64) -> Option<u32> {
         let inside = (0.0..f64::from(self.width)).contains(&x)

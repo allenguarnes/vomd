@@ -419,9 +419,11 @@ fn local_image_rss(examples: &Path) -> Option<u64> {
     peak
 }
 
-/// Peak RSS with 50 remote PNGs of 4 MiB from a server on 127.0.0.1 that `scripts/remote-rss.sh`
-/// starts and stops (`python3`; `None` with `Err` if there is none, which skips the row).
-fn remote_image_rss(examples: &Path) -> Result<Option<u64>, ()> {
+/// Peak RSS of `scripts/remote-rss.sh`'s `mode` run with `n` images (PNGs of 4 MiB, or JPEGs
+/// that are 325 KB and 178 bytes without metadata), polled every `poll` ms, from a server on
+/// 127.0.0.1 that it starts and stops (`python3`; `None` with `Err` if there is none, which skips
+/// the row). A run that didn't fetch and decode what it was to fails, and so gives `None`.
+fn remote_image_rss(examples: &Path, n: &str, mode: &str, poll: &str) -> Result<Option<u64>, ()> {
     let python = Command::new("python3")
         .arg("--version")
         .stdout(Stdio::null())
@@ -432,7 +434,7 @@ fn remote_image_rss(examples: &Path) -> Result<Option<u64>, ()> {
     }
     let out = Command::new("sh")
         .arg(root().join("scripts/remote-rss.sh"))
-        .args(["50", "big"])
+        .args([n, mode, poll])
         .env("REMOTE_RSS_BIN", examples.join("remote_rss"))
         .output()
         .ok();
@@ -612,9 +614,33 @@ fn budgets(report: Option<&Path>) -> bool {
                 ),
             };
             row("image RSS, 50 local PNGs", local_image_rss(&examples));
-            match remote_image_rss(&examples) {
-                Ok(peak) => row("image RSS, 50 remote PNGs", peak),
-                Err(()) => println!("SKIP image RSS, 50 remote PNGs: python3 not found"),
+            // Every way the memory budget is to hold: far from the viewport, in view, fast or
+            // slow to be polled, and for bodies that shrink once their metadata is cut out.
+            for (metric, n, mode, poll) in [
+                ("image RSS, 50 remote PNGs", "50", "big", "16"),
+                (
+                    "image RSS, 50 remote PNGs in view, polled every 16 ms",
+                    "50",
+                    "inline",
+                    "16",
+                ),
+                (
+                    "image RSS, 50 remote PNGs in view, polled every 50 ms",
+                    "50",
+                    "inline",
+                    "50",
+                ),
+                (
+                    "image RSS, 16,384 remote JPEGs of 325 KB cut to 178 bytes",
+                    "16384",
+                    "stripped",
+                    "16",
+                ),
+            ] {
+                match remote_image_rss(&examples, n, mode, poll) {
+                    Ok(peak) => row(metric, peak),
+                    Err(()) => println!("SKIP {metric}: python3 not found"),
+                }
             }
         }
     }

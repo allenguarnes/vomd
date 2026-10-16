@@ -22,8 +22,12 @@
 //! buffers, [`FETCH_RESERVE`]) aside as long as any fetch is queued or running
 //! (`Cache::fetching`), and the bodies, the bytes kept and the pixels together stay within the
 //! one budget at every moment, not only after the main thread has polled. A body that is taken
-//! goes to the cache before its credit is let go. A JPEG's metadata is cut out of its body
-//! where it is, before it is kept (`image::shed_jpeg_metadata`).
+//! goes to the cache before its credit is let go, and only if the cache has room for it
+//! (`Images::admission`): a body for an image in view that has none stays in the pool, its credit
+//! held, until the decoder has made room, so the fetchers stop, instead of the bodies of every
+//! image in view piling up, protected from eviction, while the decoder works through them. A
+//! JPEG's metadata is cut out of its body where it is, before it is kept
+//! (`image::shed_jpeg_metadata`), and the buffer is cut to size after that.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -52,7 +56,7 @@ const READ_BUF: usize = 64 << 10;
 pub const FETCH_RESERVE: usize = FETCH_BYTES + FETCHERS * READ_BUF;
 
 /// Credit is taken and the body's buffer grown by this much at a time.
-const STEP: usize = 256 << 10;
+pub(crate) const STEP: usize = 256 << 10;
 const _: () = assert!(FETCH_BYTES.is_multiple_of(STEP));
 
 /// Takes credit for that many more bytes of the body being read, waiting until it is given
@@ -104,10 +108,12 @@ pub fn fetchable(url: &str) -> bool {
 
 /// Fetch `url` with the system `curl` within `limits`.
 pub fn fetch(url: &str, limits: Limits) -> Result<Vec<u8>, Error> {
-    fetch_with("curl", url, limits, &|_| true)
+    fetch_with("curl", url, limits, &|_| true).map(cut_to_size)
 }
 
-/// [`fetch`] with `program` standing in for `curl`, taking credit as the body is read.
+/// [`fetch`] with `program` standing in for `curl`, taking credit as the body is read. The body
+/// is as it was read: its buffer is as big as the credit taken, for the caller to [`cut_to_size`]
+/// once it has done what changes the size of it.
 fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<Vec<u8>, Error> {
     if !fetchable(url) {
         return Err(Error::Refused);
@@ -220,14 +226,15 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
     if !ok {
         return Err(Error::Failed);
     }
-    Ok(cut_to_size(bytes))
+    Ok(bytes)
 }
 
 /// `bytes` with no more allocated than it holds (a small body, as most are, doesn't keep a 256 KB
 /// buffer). A body under [`STEP`] is copied to a buffer of its size: the one it was read into is
 /// a mapping of its own (see `platform::tune_allocator`), and the allocator shrinks a mapping
 /// only to a whole page, which for a 69-byte image is 4 KB and a mapping per URL: 12,288 of them
-/// were 70 MB resident. A bigger one is cut where it is (the mapping gives the rest back).
+/// were 70 MB resident. A bigger one is cut where it is (the mapping gives the rest back). What
+/// is left of the body, once its metadata is cut out, is what is cut to size, not what was read.
 pub(crate) fn cut_to_size(mut bytes: Vec<u8>) -> Vec<u8> {
     if bytes.len() < STEP {
         bytes = bytes.as_slice().to_vec();
@@ -247,10 +254,13 @@ pub(crate) type Fetcher = Arc<dyn Fn(&str, Grant) -> Fetched + Send + Sync>;
 fn fetch_image(url: &str, grant: Grant) -> Fetched {
     let mut bytes = fetch_with("curl", url, LIMITS, grant)?;
     // A JPEG's metadata is cut out of the body where it is, so the cache doesn't keep it and the
-    // decoder never sees it (the buffer is cut to size again, its credit with it).
+    // decoder never sees it. The buffer is cut to size after (its credit goes with it, as the
+    // body is what is left: a 300 KB JPEG that is 178 bytes without its metadata must not stay a
+    // mapping of its own, a page at least, for every URL).
     if !image::shed_jpeg_metadata(&mut bytes) {
         return Err(Error::NotAnImage);
     }
+    let bytes = cut_to_size(bytes);
     match image::header(&mut &bytes[..]) {
         Some((_, w, h)) if u64::from(w) * u64::from(h) <= image::MAX_PIXELS => {
             Ok((Arc::new(bytes), w, h))
@@ -532,6 +542,12 @@ impl Remote {
     /// What fetching found for `url`: `None` not fetched, `Some(None)` failed.
     pub fn size(&self, url: &str) -> Option<Option<(u32, u32)>> {
         self.sizes.get(url).copied()
+    }
+
+    /// How many URLs were fetched, and how many failed or aren't PNG or JPEG.
+    pub fn counts(&self) -> (usize, usize) {
+        let fetched = self.sizes.values().filter(|s| s.is_some()).count();
+        (fetched, self.sizes.len() - fetched)
     }
 
     /// The size layout gives a remote image now.

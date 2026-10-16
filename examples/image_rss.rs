@@ -2,7 +2,9 @@
 //! `cargo run --release --example image_rss -- DIR`
 //! Peak RSS with many images ("RSS with 50 images stays ≤ budget + cap"): a document of
 //! every PNG/JPEG in DIR (one per paragraph) in a 1920 × 1080 view, scrolled from top to bottom
-//! a page at a time, waiting at each page for the images near it to decode. Prints the peak RSS.
+//! a page at a time, waiting at each page for the images near it to decode. Prints the peak RSS,
+//! and fails (exit status 1) unless every image was decoded, none failed, and each page showed
+//! some: a run that loaded nothing is no measurement.
 //! `--generate` first writes the 50 PNGs of 2000 × 1500 the figure is for (noisy gradients, ~4 MB
 //! each) to DIR, in a process of its own so making them doesn't count in the peak.
 use std::time::{Duration, Instant};
@@ -78,11 +80,21 @@ fn main() {
             std::thread::sleep(Duration::from_millis(5));
         }
         pages += 1;
+        let stats = v.image_stats();
+        if stats.failed > 0 || stats.decoded == 0 {
+            eprintln!("FAILED: page {pages}: {stats:?}");
+            std::process::exit(1);
+        }
         let before = v.scroll();
         v.apply(Action::Pages(1), Instant::now());
         if v.scroll() <= before {
             break;
         }
+    }
+    let stats = v.image_stats();
+    if stats.decodes < names.len() {
+        eprintln!("FAILED: {} images, {stats:?}", names.len());
+        std::process::exit(1);
     }
     println!(
         "{} images, {pages} pages in {:.1} s: peak RSS {} KB",

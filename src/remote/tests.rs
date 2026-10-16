@@ -49,6 +49,26 @@ fn jpeg_with_exif() -> Vec<u8> {
     out
 }
 
+/// `fixtures/images/gray.jpg` (178 bytes) with 5 `APP1` segments of 65,000 bytes before its scan:
+/// 325 KB of which all but 178 bytes go.
+fn tiny_jpeg_with_exif() -> Vec<u8> {
+    let src = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/images/gray.jpg"
+    ))
+    .unwrap();
+    let sos = src.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+    let mut out = src[..sos].to_vec();
+    for _ in 0..5 {
+        out.extend([0xFF, 0xE1]);
+        out.extend(65_002u16.to_be_bytes());
+        out.extend(b"Exif\0\0");
+        out.resize(out.len() + 64_994, 0x55);
+    }
+    out.extend(&src[sos..]);
+    out
+}
+
 fn respond(mut s: TcpStream, status: &str, headers: &str, body: &[u8]) {
     let _ = write!(s, "HTTP/1.1 {status}\r\n{headers}Connection: close\r\n\r\n");
     let _ = s.write_all(body);
@@ -117,6 +137,10 @@ fn serve(s: TcpStream, port: u16) {
         // `wide.jpg` with 390 KB of EXIF between its frame header and its scan.
         "/meta.jpg" => {
             let body = jpeg_with_exif();
+            respond(s, "200 OK", &len(body.len()), &body);
+        }
+        "/tiny-meta.jpg" => {
+            let body = tiny_jpeg_with_exif();
             respond(s, "200 OK", &len(body.len()), &body);
         }
         "/page.html" => respond(s, "200 OK", &len(6), b"<html>"),
@@ -263,6 +287,7 @@ fn a_small_body_keeps_only_what_it_needs() {
             true
         },
     )
+    .map(cut_to_size)
     .unwrap();
     assert_eq!(bytes, png());
     assert_eq!(
@@ -336,6 +361,33 @@ fn a_fetched_jpegs_metadata_is_cut_out() {
         image::decode(&plain, 60, 20),
         "decodes as it does without the metadata"
     );
+}
+
+/// A JPEG over 256 KB that is tiny without its metadata is copied to a buffer of its own size
+/// *after* the metadata is cut out, not before: cut to size while it was 325 KB (a mapping of its
+/// own) and shrunk in place after, it stays a mapping of a page at least, for every URL (16,384
+/// of them were 70 MB resident, by 4 KB each, that nothing counted).
+#[test]
+fn a_jpeg_that_is_tiny_without_its_metadata_is_cut_to_size_after() {
+    if !have_curl() {
+        eprintln!("curl not installed: skipped");
+        return;
+    }
+    let port = server();
+    let url = format!("http://127.0.0.1:{port}/tiny-meta.jpg");
+    // What is read is as it comes, with its credit's buffer: nothing is cut yet.
+    let raw = fetch_with("curl", &url, LIMITS, &|_| true).unwrap();
+    assert_eq!(raw.len(), tiny_jpeg_with_exif().len());
+    assert!(raw.capacity() >= raw.len());
+    let (bytes, w, h) = fetch_image(&url, &|_| true).expect("an image");
+    assert!(w > 0 && h > 0);
+    assert!(bytes.len() < 1024, "{} bytes kept", bytes.len());
+    assert_eq!(
+        bytes.capacity(),
+        bytes.len(),
+        "a buffer of its size, not what it was"
+    );
+    assert!(image::decode(&bytes, 8, 8).is_some());
 }
 
 #[test]
