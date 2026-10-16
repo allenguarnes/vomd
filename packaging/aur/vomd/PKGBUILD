@@ -10,7 +10,7 @@ url='https://github.com/allenguarnes/vomd'
 license=('MIT' 'OFL-1.1' 'ISC')
 # The display libraries are loaded at run time (dlopen), for Wayland or X11, whichever the
 # session is: namcap can't see them.
-depends=('glibc' 'gcc-libs' 'hicolor-icon-theme' 'libxkbcommon' 'wayland'
+depends=('glibc' 'libgcc' 'hicolor-icon-theme' 'libxkbcommon' 'wayland'
          'libx11' 'libxcb' 'libxcursor' 'libxi' 'libxkbcommon-x11')
 makedepends=('cargo')
 optdepends=('curl: remote images, loaded only after pressing I'

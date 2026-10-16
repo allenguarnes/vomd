@@ -11,7 +11,7 @@ url='https://github.com/allenguarnes/vomd'
 license=('MIT' 'OFL-1.1' 'ISC')
 # The display libraries are loaded at run time (dlopen), for Wayland or X11, whichever the
 # session is: namcap can't see them. RELR relocations need glibc 2.36.
-depends=('glibc>=2.36' 'gcc-libs' 'hicolor-icon-theme' 'libxkbcommon' 'wayland'
+depends=('glibc>=2.36' 'libgcc' 'hicolor-icon-theme' 'libxkbcommon' 'wayland'
          'libx11' 'libxcb' 'libxcursor' 'libxi' 'libxkbcommon-x11')
 optdepends=('curl: remote images, loaded only after pressing I'
             'xdg-utils: open web links in the browser'
@@ -24,7 +24,7 @@ source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64-linux.t
 sha256sums_x86_64=('SKIP')
 
 package() {
-  cd "$_pkgname-$pkgver-x86_64-linux"
+  cd "$_pkgname-$pkgver-$CARCH-linux"
   install -Dm755 vomd "$pkgdir/usr/bin/vomd"
   install -Dm644 vomd.desktop "$pkgdir/usr/share/applications/vomd.desktop"
   install -Dm644 vomd.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/vomd.svg"
