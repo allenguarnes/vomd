@@ -10,12 +10,18 @@
 //! sniffed: only PNG and JPEG are kept.
 //!
 //! Bodies are read into memory, so what is held is bounded: a fetcher takes credit for every
-//! 256 KB it reads, and for as long as the body is its own, or waits in a result the main
-//! thread hasn't taken, it counts against [`FETCH_BYTES`]; a fetcher over it waits (`curl`
-//! blocked on its pipe) until the main thread takes a result, and no fetch starts while it is
-//! reached. The oldest fetch still reading is let go on when nothing else can free credit, so
-//! the pool can't deadlock. The cache counts what is held (`Cache::inflight`), so bodies, the
-//! bytes kept and the pixels together stay within the one budget.
+//! 256 KB it reads (before its buffer grows by that much), and for as long as the body is its
+//! own, or waits in a result the main thread hasn't taken, it counts against [`FETCH_BYTES`],
+//! as allocated (the buffer is cut to size when the body is whole). A fetcher that would go over
+//! it waits (`curl` blocked on its pipe) until the main thread takes a result, and no fetch
+//! starts while it is reached. When all the fetchers wait and no result is waiting to be taken,
+//! the youngest gives up its body and its credit (it is fetched again later, as if it had
+//! never started), so the oldest can finish: a body is never bigger than [`FETCH_BYTES`], so it
+//! always can once it is the only one. So the pool alone never holds more than [`FETCH_BYTES`],
+//! with nothing to look at or sample: the image cache sets that much aside as long as any
+//! fetch is queued or running (`Cache::fetching`), and the bodies, the bytes kept and the
+//! pixels together stay within the one budget at every moment, not only after the main thread
+//! has polled. A body that is taken goes to the cache before its credit is let go.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -31,17 +37,18 @@ use crate::settings::RemoteImages;
 /// Fetchers running at once, at most.
 pub const FETCHERS: usize = 4;
 
-/// Bytes of fetched bodies held outside the cache at once, at most: the ones being read and
-/// the ones fetched and not yet taken by the main thread. (The oldest fetch still reading may
-/// go past it, up to [`LIMITS`]'s size, when nothing else can free credit.)
+/// Bytes of fetched bodies held outside the cache at once, at most, as allocated: the ones
+/// being read and the ones fetched and not yet taken by the main thread. The largest body
+/// ([`LIMITS`]) is as big, so a fetch alone always fits.
 pub const FETCH_BYTES: usize = 12 << 20;
 
 /// Credit is taken and the body's buffer grown by this much at a time.
 const STEP: usize = 256 << 10;
+const _: () = assert!(FETCH_BYTES.is_multiple_of(STEP));
 
 /// Takes credit for that many more bytes of the body being read, waiting until it is given
-/// (see [`FETCH_BYTES`]).
-type Grant<'a> = &'a dyn Fn(usize);
+/// (see [`FETCH_BYTES`]): `false` if the fetch is to be given up instead (see [`Error::Yielded`]).
+pub(crate) type Grant<'a> = &'a dyn Fn(usize) -> bool;
 
 /// What one fetch may cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,9 +61,9 @@ pub struct Limits {
 /// How long a `curl` may run past its own `--max-time` before it is killed.
 const GRACE: Duration = Duration::from_secs(2);
 
-/// `--max-redirs 5 --max-time 15 --max-filesize 20M`.
+/// `--max-redirs 5 --max-time 15 --max-filesize 12M` (what the fetchers may hold).
 pub const LIMITS: Limits = Limits {
-    bytes: 20 << 20,
+    bytes: FETCH_BYTES as u64,
     secs: 15,
     redirects: 5,
 };
@@ -71,6 +78,9 @@ pub enum Error {
     Failed,
     /// More than [`Limits::bytes`].
     TooLarge,
+    /// Given up to let an older fetch have the credit it needs: nothing was found out about the
+    /// URL, it is fetched again.
+    Yielded,
     /// Not a PNG or JPEG (or too many pixels to decode).
     NotAnImage,
 }
@@ -85,7 +95,7 @@ pub fn fetchable(url: &str) -> bool {
 
 /// Fetch `url` with the system `curl` within `limits`.
 pub fn fetch(url: &str, limits: Limits) -> Result<Vec<u8>, Error> {
-    fetch_with("curl", url, limits, &|_| {})
+    fetch_with("curl", url, limits, &|_| true)
 }
 
 /// [`fetch`] with `program` standing in for `curl`, taking credit as the body is read.
@@ -139,6 +149,7 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
     let mut bytes: Vec<u8> = Vec::new();
     let mut granted = 0usize;
     let mut over = false;
+    let mut yielded = false;
     let read = match stdout {
         Some(mut out) => {
             let mut buf = vec![0u8; 64 << 10];
@@ -151,7 +162,10 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
                             break true;
                         }
                         if bytes.len() + n > granted {
-                            grant(STEP);
+                            if !grant(STEP) {
+                                yielded = true;
+                                break true;
+                            }
                             granted += STEP;
                             bytes.reserve_exact(granted - bytes.len());
                         }
@@ -174,6 +188,11 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
         drop(done);
         return Err(Error::TooLarge);
     }
+    if yielded {
+        kill(&child);
+        drop(done);
+        return Err(Error::Yielded);
+    }
     if !read {
         kill(&child);
         drop(done);
@@ -189,14 +208,19 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
         }
     };
     drop(done);
-    if ok { Ok(bytes) } else { Err(Error::Failed) }
+    if !ok {
+        return Err(Error::Failed);
+    }
+    // Cut to size: a small body (most are) doesn't keep a 256 KB buffer.
+    bytes.shrink_to_fit();
+    Ok(bytes)
 }
 
 /// A fetched image: its bytes and natural size.
 pub(crate) type Fetched = Result<(Bytes, u32, u32), Error>;
 
 /// What a fetcher thread runs for a URL (tests put their own in place of [`fetch_image`]).
-type Fetcher = Arc<dyn Fn(&str, Grant) -> Fetched + Send + Sync>;
+pub(crate) type Fetcher = Arc<dyn Fn(&str, Grant) -> Fetched + Send + Sync>;
 
 /// Fetch a remote image: its bytes and natural size, if it's a PNG or JPEG.
 fn fetch_image(url: &str, grant: Grant) -> Fetched {
@@ -218,6 +242,8 @@ struct Active {
     held: usize,
     /// Still being fetched (not a result waiting for the main thread).
     reading: bool,
+    /// Waiting for credit.
+    blocked: bool,
 }
 
 struct Queue {
@@ -227,6 +253,8 @@ struct Queue {
     active: Vec<Active>,
     next_seq: u64,
     wake: Wake,
+    /// Fetching was stopped (and not asked for since): a fetch that gave up isn't queued again.
+    stopped: bool,
     quit: bool,
 }
 
@@ -251,6 +279,7 @@ impl Pool {
             active: Vec::new(),
             next_seq: 0,
             wake,
+            stopped: false,
             quit: false,
         };
         let shared = Arc::new((Mutex::new(queue), Condvar::new()));
@@ -271,9 +300,14 @@ impl Pool {
         loop {
             let (url, seq) = {
                 let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
-                // Nothing starts while the credit is spent: a `curl` left waiting for it
-                // would time out.
-                while (q.urls.is_empty() || q.held() >= FETCH_BYTES) && !q.quit {
+                // Nothing starts while the credit is spent, or while a fetch waits for it: a
+                // `curl` left waiting for credit would time out, and one that starts only to
+                // give up again (see `grant`) would be fetched over and over.
+                while (q.urls.is_empty()
+                    || q.held() >= FETCH_BYTES
+                    || q.active.iter().any(|a| a.blocked))
+                    && !q.quit
+                {
                     q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
                 }
                 if q.quit {
@@ -287,11 +321,23 @@ impl Pool {
                     seq,
                     held: 0,
                     reading: true,
+                    blocked: false,
                 });
                 (url, seq)
             };
             let result = fetch(&url, &|n| Pool::grant(shared, seq, n));
             Pool::finish(shared, seq, &result);
+            if matches!(result, Err(Error::Yielded)) {
+                // It gave up for an older fetch: it is next in line again, as if it hadn't
+                // started, and the main thread has nothing to take.
+                let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                q.active.retain(|a| a.seq != seq);
+                if !q.stopped {
+                    q.urls.insert(0, url);
+                }
+                cv.notify_all();
+                continue;
+            }
             if tx.send(Done::Fetched { url, result }).is_err() {
                 return;
             }
@@ -301,21 +347,51 @@ impl Pool {
     }
 
     /// Fetch `seq` takes credit for `n` more bytes: it waits while that would go over
-    /// [`FETCH_BYTES`] and credit may yet be freed (by a result being taken, or by a fetch that
-    /// is older finishing).
-    fn grant(shared: &(Mutex<Queue>, Condvar), seq: u64, n: usize) {
+    /// [`FETCH_BYTES`] and credit may yet be freed (by a result being taken, or by a fetch
+    /// giving up). `false` if it is to give up itself (or the pool is gone): when every fetch
+    /// still reading waits and no result is waiting to be taken, the youngest does.
+    fn grant(shared: &(Mutex<Queue>, Condvar), seq: u64, n: usize) -> bool {
         let (lock, cv) = shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut told = false;
         loop {
-            let oldest = q.active.iter().filter(|a| a.reading).map(|a| a.seq).min() == Some(seq);
-            let waiting = q.active.iter().any(|a| !a.reading && a.held > 0);
-            if q.quit || q.held().saturating_add(n) <= FETCH_BYTES || (oldest && !waiting) {
-                break;
+            if q.quit {
+                return false;
+            }
+            // Credit goes to the oldest that waits for it first, so the youngest can't keep
+            // taking what the oldest needs.
+            let older = q
+                .active
+                .iter()
+                .any(|a| a.reading && a.blocked && a.seq < seq);
+            if q.held().saturating_add(n) <= FETCH_BYTES && !older {
+                if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
+                    a.held += n;
+                    if std::mem::take(&mut a.blocked) {
+                        // Fetches may start again, and the next in line may go on.
+                        cv.notify_all();
+                    }
+                }
+                return true;
+            }
+            if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
+                a.blocked = true;
+            }
+            let reading = || q.active.iter().filter(|a| a.reading);
+            let stuck =
+                reading().all(|a| a.blocked) && !q.active.iter().any(|a| !a.reading && a.held > 0);
+            if stuck && reading().map(|a| a.seq).max() == Some(seq) {
+                if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
+                    a.blocked = false;
+                }
+                return false;
+            }
+            // The one that made them all wait may not be the youngest, which has to know.
+            if !told {
+                told = true;
+                cv.notify_all();
             }
             q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
-        }
-        if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
-            a.held += n;
         }
     }
 
@@ -325,8 +401,9 @@ impl Pool {
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
             a.reading = false;
+            // What it holds is what the body is allocated, the credit it took or not.
             a.held = match result {
-                Ok((bytes, ..)) => a.held.max(bytes.len()),
+                Ok((bytes, ..)) => bytes.capacity(),
                 Err(_) => 0,
             };
         }
@@ -345,9 +422,18 @@ impl Pool {
     }
 
     /// Bytes of bodies held: being read, or waiting to be taken.
+    #[cfg(test)]
     fn inflight(&self) -> usize {
         let (lock, _) = &*self.shared;
         lock.lock().unwrap_or_else(|e| e.into_inner()).held()
+    }
+
+    /// Whether anything is queued, being fetched, or fetched and not taken: the fetchers may
+    /// hold memory, up to [`FETCH_BYTES`].
+    fn busy(&self) -> bool {
+        let (lock, _) = &*self.shared;
+        let q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        !q.urls.is_empty() || !q.active.is_empty()
     }
 
     /// Replace the queue with `urls` (not the ones being fetched).
@@ -355,7 +441,17 @@ impl Pool {
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         urls.retain(|u| !q.active.iter().any(|a| a.url == *u));
+        q.stopped = false;
         q.urls = urls;
+        cv.notify_all();
+    }
+
+    /// Drop the queue, and don't queue again what gives up.
+    fn stop(&self) {
+        let (lock, cv) = &*self.shared;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.stopped = true;
+        q.urls.clear();
         cv.notify_all();
     }
 
@@ -437,6 +533,8 @@ impl Remote {
                 self.stop();
                 None
             }
+            // Nothing was found out: asked for again, as an image not fetched yet.
+            Err(Error::Yielded) => None,
             Err(_) => {
                 self.sizes.insert(url.clone(), None);
                 None
@@ -470,7 +568,7 @@ impl Remote {
     /// Stop fetching: what's queued is dropped (fetches in flight finish and are kept).
     pub(crate) fn stop(&mut self) {
         if let Some(pool) = &self.pool {
-            pool.set(Vec::new());
+            pool.stop();
         }
     }
 
@@ -482,8 +580,20 @@ impl Remote {
     }
 
     /// Bytes of bodies held outside the cache: being read, or waiting to be taken.
+    #[cfg(test)]
     pub(crate) fn inflight(&self) -> usize {
         self.pool.as_ref().map_or(0, Pool::inflight)
+    }
+
+    /// Whether fetches are queued, running, or done and not taken: [`FETCH_BYTES`] may be held.
+    pub(crate) fn busy(&self) -> bool {
+        self.pool.as_ref().is_some_and(Pool::busy)
+    }
+
+    /// Fetch with `fetcher` instead of `curl` (tests).
+    #[cfg(test)]
+    pub(crate) fn set_fetcher(&mut self, fetcher: Fetcher) {
+        self.fetcher = fetcher;
     }
 
     /// Whether any fetcher was ever started (tests: nothing touches the network unasked).

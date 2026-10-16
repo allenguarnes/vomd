@@ -504,6 +504,47 @@ fn a_very_wide_png_is_refused_or_decoded_in_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A PNG's last row is not trusted before the checksum of the data it came in: a bit wrong in
+/// the last `IDAT`'s checksum, or the image cut inside it, is refused whether the PNG is read by
+/// rows or whole (the rows were resampled, and the bitmap returned, before it was looked at: a
+/// PNG the decoder itself rejects with a checksum mismatch showed as an image).
+#[test]
+fn a_png_with_a_bad_final_checksum_is_refused() {
+    let good = png_bytes(9, 7, |x, y| [x as u8 * 20, y as u8 * 30, 5, 255]);
+    assert!(decode(&good, 9, 7).is_some());
+    // The last `IDAT` ends 12 bytes (the whole `IEND`) before the end: its checksum is the 4
+    // before that.
+    let crc = good.len() - 12 - 4;
+    assert_eq!(&good[good.len() - 8..good.len() - 4], b"IEND");
+    let flip = |at: usize| {
+        let mut bad = good.clone();
+        bad[at] ^= 1;
+        bad
+    };
+    let cases = [
+        ("a bit of the checksum", flip(crc + 3)),
+        ("a bit of the first byte of the checksum", flip(crc)),
+        ("a bit of the pixel data", flip(crc - 3)),
+        ("cut inside the checksum", good[..crc + 2].to_vec()),
+        ("cut after the checksum, no IEND", good[..crc + 4].to_vec()),
+        ("cut before the checksum", good[..crc].to_vec()),
+        ("a bit of the IEND checksum", flip(good.len() - 1)),
+    ];
+    for (what, bad) in cases {
+        for rows in [true, false] {
+            // The whole-frame decode doesn't read what follows the image data: only a
+            // by-rows decode is held to `IEND`, but both refuse what fails inside the data.
+            let got = decode_png(&bad, 9, 7, rows);
+            let inside_the_data =
+                what != "cut after the checksum, no IEND" && what != "a bit of the IEND checksum";
+            if inside_the_data || rows {
+                assert_eq!(got, None, "{what} (rows: {rows})");
+            }
+        }
+        assert_eq!(decode(&bad, 4, 3), None, "{what}");
+    }
+}
+
 /// `png` with `chunks` (type, data) put after its `IHDR`, their checksums left zero: the
 /// decoder only checks the ones it reads.
 fn with_chunks(png: &[u8], chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
@@ -665,8 +706,9 @@ fn the_cache_evicts_the_least_recently_painted_first() {
             data: vec![0; w as usize],
         })
     };
-    // Room for 10 pixels.
-    let mut c = Cache::new(40);
+    // Room for two bitmaps of 4 pixels (and their overhead), not three.
+    let one = 16 + SLOT_OVERHEAD;
+    let mut c = Cache::new(2 * one + 20);
     c.insert(Key::Local(1), bm(4));
     c.frame += 1;
     c.insert(Key::Local(2), bm(4));
@@ -676,24 +718,23 @@ fn the_cache_evicts_the_least_recently_painted_first() {
     c.insert(Key::Local(3), bm(4));
     assert!(c.has(&Key::Local(1), 4, 1) && c.has(&Key::Local(3), 4, 1));
     assert!(!c.has(&Key::Local(2), 4, 1));
-    assert_eq!(c.bytes, 32);
+    assert_eq!(c.bytes, 2 * one);
     // Nothing painted this frame is evicted, even over the budget.
     c.frame += 1;
     assert!(c.pixels(&Key::Local(1), 4, 1).is_some());
     assert!(c.pixels(&Key::Local(3), 4, 1).is_some());
     c.insert(Key::Local(4), bm(4));
     assert_eq!(c.slots.len(), 3);
-    assert_eq!(c.bytes, 48);
+    assert_eq!(c.bytes, 3 * one);
     // Another size of an image stands in while the right one is decoded; the same size
     // replaces its slot.
     assert_eq!(c.pixels(&Key::Local(1), 8, 2).map(|b| b.width), Some(4));
     c.insert(Key::Local(1), bm(4));
     assert_eq!(c.slots.iter().filter(|s| s.key == Key::Local(1)).count(), 1);
     c.retain(|s| s.key != Key::Local(1));
-    assert_eq!(c.bytes, 32);
+    assert_eq!(c.bytes, 2 * one);
 }
 
-/// Wait for `images` to hand over results until `done` holds (or fail after a while).
 /// A fetched body that arrives is not "painted this frame": one for an image far from the
 /// viewport is the first to go when room is needed, and what the fetchers hold is room too.
 /// (Bodies were stored as used in the current frame, so a stream of them pushed out what was
@@ -702,13 +743,15 @@ fn the_cache_evicts_the_least_recently_painted_first() {
 fn fetched_bytes_are_evictable_and_what_fetchers_hold_counts() {
     let body = |n: usize| Data::Bytes(Arc::new(vec![0u8; n]));
     let url = |n: u32| Key::Remote(format!("https://x.y/{n}.png").into());
-    let mut c = Cache::new(250);
+    // A slot of a body of 100 bytes costs this (the URLs are 17 bytes).
+    let one = 100 + SLOT_OVERHEAD + 17;
+    let mut c = Cache::new(one * 5 / 2);
     c.frame = 5;
     c.insert(url(1), body(100));
     c.insert(url(2), body(100));
     // The third doesn't fit: the first, unpainted, goes (not the one arriving).
     c.insert(url(3), body(100));
-    assert_eq!(c.bytes, 200);
+    assert_eq!(c.bytes, 2 * one);
     assert!(c.peek_bytes(&"https://x.y/1.png".into()).is_none());
     assert!(c.peek_bytes(&"https://x.y/3.png".into()).is_some());
     // A body something was made of this frame stays.
@@ -717,20 +760,137 @@ fn fetched_bytes_are_evictable_and_what_fetchers_hold_counts() {
     c.insert(url(4), body(100));
     assert!(c.peek_bytes(&two).is_some(), "painted this frame");
     assert!(c.peek_bytes(&"https://x.y/3.png".into()).is_none());
-    // What the fetchers hold comes out of the budget as well.
+    // What is set aside for the fetchers comes out of the budget as well.
     c.frame += 1;
-    c.inflight = 100;
+    c.fetching = one;
     c.evict();
-    assert_eq!(c.bytes, 100, "one of two bodies goes");
-    c.inflight = 200;
+    assert_eq!(c.bytes, one, "one of two bodies goes");
+    c.fetching = 2 * one;
     c.evict();
     assert_eq!(c.bytes, 0);
     // A body bigger than the room isn't evicted by arriving: it is the only one.
-    c.inflight = 0;
-    c.insert(url(5), body(300));
-    assert_eq!(c.bytes, 300);
+    c.fetching = 0;
+    c.insert(url(5), body(3 * one));
+    assert_eq!(c.bytes, 3 * one + SLOT_OVERHEAD + 17);
 }
 
+/// A buffer costs what it is allocated, not what it holds, and every slot costs a little more
+/// than its buffer: a 1,333-byte image in a 256 KB buffer was charged 1,333, and 12,288 tiny
+/// bodies raised the resident size by 53 MB while charging 0.8 MB.
+#[test]
+fn a_slot_costs_its_allocation_and_its_bookkeeping() {
+    let mut loose = Vec::with_capacity(256 << 10);
+    loose.extend_from_slice(&[0u8; 1333]);
+    let url: Arc<str> = "https://x.y/a.png".into();
+    let slot = |data| Slot {
+        key: Key::Remote(url.clone()),
+        data,
+        used: 0,
+    };
+    assert_eq!(
+        slot(Data::Bytes(Arc::new(loose))).cost(),
+        (256 << 10) + SLOT_OVERHEAD + url.len()
+    );
+    let mut pixels = Vec::with_capacity(100);
+    pixels.push(0u32);
+    let bitmap = Bitmap {
+        width: 1,
+        height: 1,
+        data: pixels,
+    };
+    assert_eq!(
+        Slot {
+            key: Key::Local(1),
+            data: Data::Pixels(bitmap),
+            used: 0
+        }
+        .cost(),
+        400 + SLOT_OVERHEAD
+    );
+    // Thousands of tiny bodies (69 bytes each) are charged their overhead too.
+    let mut c = Cache::new(CACHE_BYTES);
+    for n in 0..12_288u32 {
+        c.insert(
+            Key::Remote(format!("https://x.y/{n}.png").into()),
+            Data::Bytes(Arc::new(vec![0u8; 69])),
+        );
+    }
+    assert_eq!(c.slots.len(), 12_288);
+    assert!(
+        c.bytes >= 12_288 * (69 + SLOT_OVERHEAD),
+        "{} charged",
+        c.bytes
+    );
+    assert_eq!(c.bytes, c.slots.iter().map(Slot::cost).sum::<usize>());
+}
+
+/// What the fetchers may hold is set aside before they start and as long as any run, not
+/// sampled as they grow: the cache is made small when the fetches are asked for, and a body
+/// taken is in the cache before its credit goes (it was a snapshot of what the fetchers held
+/// at the last poll, so fetches growing after it went over the budget: eight cached 4 MiB
+/// bodies and four unfinished 7 MiB ones held 46 MB with old ones evictable).
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_cache_is_made_room_for_the_fetchers_before_they_start() {
+    use crate::remote::FETCH_BYTES;
+    let doc = Doc::parse("![a](https://x.y/a.png) ![b](https://x.y/b.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.attach(&doc, &mut layout);
+    // The cache is full of pixels that aren't in view.
+    for id in 10..18u32 {
+        images.cache.insert(
+            Key::Local(id),
+            Data::Pixels(Bitmap {
+                width: 1024,
+                height: 768,
+                data: vec![0; 1024 * 768],
+            }),
+        );
+    }
+    images.begin_frame();
+    assert!(images.cache.bytes > CACHE_BYTES - FETCH_BYTES);
+    // Remote images are off: nothing is set aside, nothing evicted.
+    images.request(&[], 0);
+    assert_eq!(images.cache.fetching, 0);
+    // Turned on, with the fetches not started yet when the cache is made small.
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let fetcher: crate::remote::Fetcher = {
+        let gate = gate.clone();
+        Arc::new(move |_, grant| {
+            let mut open = gate.0.lock().unwrap();
+            while !*open {
+                open = gate.1.wait(open).unwrap();
+            }
+            assert!(grant(256 << 10));
+            Ok((Arc::new(vec![0u8; 256 << 10]), 2, 1))
+        })
+    };
+    images.remote.set_fetcher(fetcher);
+    images.set_remote(true, &doc, &mut layout);
+    images.request(&[], 0);
+    assert_eq!(images.cache.fetching, FETCH_BYTES);
+    assert!(
+        images.cache.bytes + FETCH_BYTES <= CACHE_BYTES,
+        "{} kept",
+        images.cache.bytes
+    );
+    // Taken, they are in the cache, and what is set aside goes once nothing is running.
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.cache
+            .slots
+            .iter()
+            .filter(|s| matches!(s.key, Key::Remote(_)))
+            .count()
+            == 2
+    });
+    assert_eq!(images.cache.fetching, 0);
+    assert!(images.cache.bytes <= CACHE_BYTES);
+}
+
+/// Wait for `images` to hand over results until `done` holds (or fail after a while).
 fn wait(images: &mut Images, doc: &Doc, layout: &mut Layout, done: impl Fn(&mut Images) -> bool) {
     let t = Instant::now();
     while !done(images) {

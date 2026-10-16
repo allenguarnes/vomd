@@ -107,7 +107,7 @@ Theme, zoom, toolbar and window size are saved automatically when you change the
 
 VOMD makes no network requests of its own. Remote (`http`/`https`) images show as
 placeholders until you press `I` (or click the toolbar's image button) for that document.
-They are then fetched with the system `curl`, at most 4 at a time, limited to 20 MB and
+They are then fetched with the system `curl`, at most 4 at a time, limited to 12 MiB and
 15 seconds each, and kept in memory only. `remote_images = always` loads them for every
 document without asking, which lets any document you open contact the servers its images are
 on. `never` removes the option.

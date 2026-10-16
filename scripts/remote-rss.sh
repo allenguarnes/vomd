@@ -1,31 +1,76 @@
 #!/bin/sh
-# Peak RSS with 16 remote images of ~4 MiB each from a server on 127.0.0.1 (never the network):
-# `scripts/remote-rss.sh [N]`. Writes the images to a temporary directory and removes it, and
-# stops the server, when done.
+# Memory with many remote images from a server on 127.0.0.1 (never the network):
+# `scripts/remote-rss.sh [N [big|tiny|grow]]` (N 0 or none: the mode's own), see examples/remote_rss.rs for what each does.
+# The server makes the images as they are asked for; it and everything else is stopped (and the
+# temporary directory removed) when done.
 set -eu
-n=${1:-16}
+n=${1:-}
+mode=${2:-big}
 dir=$(mktemp -d)
 trap 'kill "$server" 2>/dev/null || true; rm -rf "$dir"' EXIT INT TERM
-mkdir "$dir/big"
-# A 1 x 1 PNG, then 4 MiB of zeros: the header is all that is looked at.
-python3 -I - "$dir/big" "$n" <<'PY'
-import struct, sys, zlib
+cat >"$dir/server.py" <<'PY'
+import struct, sys, time, zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 def chunk(t, d):
-    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
-png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 40, 30, 8, 2, 0, 0, 0))
-png += chunk(b"IDAT", zlib.compress(b"\0" * (40 * 3 * 30 + 30))) + chunk(b"IEND", b"")
-for i in range(int(sys.argv[2])):
-    open(f"{sys.argv[1]}/{i}.png", "wb").write(png + b"\0" * (4 << 20))
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+
+def png(w, h):
+    head = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    return head + chunk(b"IDAT", zlib.compress(b"\0" * (w * 3 * h + h))) + chunk(b"IEND", b"")
+
+BIG = png(40, 30)
+TINY = png(1, 1)
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        kind = self.path.split("/")[1]
+        if kind == "tiny":
+            body = TINY
+        elif kind == "big":
+            # The header is all that is looked at, then 4 MiB.
+            body = BIG + b"\0" * (4 << 20)
+        elif kind == "stall":
+            # Says 7 MiB, sends 6.5 MiB and stops: a transfer that doesn't finish.
+            self.send_response(200)
+            self.send_header("Content-Length", str(7 << 20))
+            self.end_headers()
+            try:
+                self.wfile.write(BIG + b"\0" * (13 << 19))
+                self.wfile.flush()
+                time.sleep(30)
+            except OSError:
+                pass
+            return
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+s = ThreadingHTTPServer(("127.0.0.1", 0), H)
+print(s.server_address[1], flush=True)
+s.serve_forever()
 PY
-python3 -I -u -m http.server 0 --bind 127.0.0.1 --directory "$dir" >"$dir/log" 2>&1 &
+python3 -I -u "$dir/server.py" >"$dir/port" 2>"$dir/log" &
 server=$!
 port=
 for _ in $(seq 50); do
-    port=$(sed -n 's/.*port \([0-9]*\).*/\1/p' "$dir/log" | head -1)
+    port=$(head -1 "$dir/port")
     [ -n "$port" ] && break
     sleep 0.1
 done
 [ -n "$port" ] || { echo "no server" >&2; exit 1; }
 cd "$(dirname "$0")/.."
 XDG_CONFIG_HOME="$dir/config" \
-    cargo run --release --example remote_rss -- "http://127.0.0.1:$port" "$n"
+    cargo run --release --example remote_rss -- "http://127.0.0.1:$port" "${n:-0}" "$mode"

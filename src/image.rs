@@ -488,6 +488,12 @@ trait Rows {
     /// the next call, or `None` if it can't be had: the data ended, or `y` is before the row the
     /// source is at.
     fn row(&mut self, y: usize) -> Option<&[u8]>;
+
+    /// Called once the last row is taken: whether what follows it is sound too (a PNG's final
+    /// checksum), so a result isn't returned for data the decoder would refuse.
+    fn finish(&mut self) -> bool {
+        true
+    }
 }
 
 /// 8-bit pixels in memory: gray, gray + alpha, RGB or RGBA (`channels` 1–4), rows `stride` bytes
@@ -526,6 +532,13 @@ impl Rows for PngRows<'_> {
         self.next = y + 1;
         Some(self.reader.next_row().ok()??.data())
     }
+
+    /// Reads through the end of the image data to `IEND`, which checks the checksum of the last
+    /// `IDAT` (a row is only as good as the chunk it came in): a PNG cut short, or with a bit
+    /// wrong anywhere in its pixel data, is refused whole, as a whole-frame decode refuses it.
+    fn finish(&mut self) -> bool {
+        self.reader.finish().is_ok()
+    }
 }
 
 /// [`resample_rows`] for pixels in memory.
@@ -556,7 +569,7 @@ fn spans(src: u32, dst: u32) -> Vec<(usize, Vec<f32>)> {
 /// many pixels; enlarging (a HiDPI window) blends the one or two under each edge. Each source row
 /// is taken once, in order, and reduced to the target width at once, then summed into the target
 /// row under it (the one row of the next target row it shares is kept): the extra memory is two
-/// rows of the target width however wide the source is. `None` if the source ends early.
+/// rows of the target width however wide the source is. `None` if the source ends early or its end is bad ([`Rows::finish`]).
 fn resample_rows(
     rows: &mut impl Rows,
     (sw, sh): (u32, u32),
@@ -595,7 +608,7 @@ fn resample_rows(
             data.push(a << 24 | r << 16 | g << 8 | b);
         }
     }
-    Some(Bitmap {
+    rows.finish().then_some(Bitmap {
         width: w,
         height: h,
         data,
@@ -647,12 +660,31 @@ struct Slot {
     used: u64,
 }
 
+/// What a slot costs besides its buffer, at least: the slot, the `Arc` and `Vec` headers, the
+/// allocator's rounding, the key and the URL's entry in the sizes table (about 230 bytes, and
+/// the URL's own length is added), so thousands of tiny images can't pass through the budget as
+/// bookkeeping.
+const SLOT_OVERHEAD: usize = 256;
+
 impl Slot {
+    /// What it holds: the buffer's allocated size (a `Vec` may hold more than it has filled, and
+    /// all of it is memory), and [`SLOT_OVERHEAD`].
     fn cost(&self) -> usize {
-        match &self.data {
-            Data::Pixels(b) => b.data.len() * 4,
-            Data::Bytes(b) => b.len(),
-        }
+        let buffer = match &self.data {
+            Data::Pixels(b) => b.data.capacity() * 4,
+            Data::Bytes(b) => b.capacity(),
+        };
+        let key = match &self.key {
+            Key::Local(_) => 0,
+            Key::Remote(url) => url.len(),
+        };
+        buffer + SLOT_OVERHEAD + key
+    }
+
+    /// What a fetched body for `url` costs once it is a slot.
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn bytes_cost(url: &str, bytes: &Bytes) -> usize {
+        bytes.capacity() + SLOT_OVERHEAD + url.len()
     }
 
     fn pixels(&self) -> Option<&Bitmap> {
@@ -670,9 +702,11 @@ struct Cache {
     cap: usize,
     /// What the worker's decodes hold while they run, at most: it comes out of the budget.
     reserve: usize,
-    /// What the fetchers hold (bodies being read or not yet taken), as of the last time it
-    /// was looked at: it comes out of the budget too.
-    inflight: usize,
+    /// What is set aside for the fetchers while any fetch is queued or running: all of
+    /// `FETCH_BYTES` (the most the fetchers can hold, whatever they hold now), or nothing. It
+    /// comes out of the budget too, so the fetchers need no more than what they are given and
+    /// the cache is made small before they start, not as they grow.
+    fetching: usize,
     frame: u64,
 }
 
@@ -683,7 +717,7 @@ impl Cache {
             bytes: 0,
             cap,
             reserve: 0,
-            inflight: 0,
+            fetching: 0,
             frame: 0,
         }
     }
@@ -777,13 +811,19 @@ impl Cache {
         self.evict_for(0);
     }
 
+    /// Evict for a slot of `cost` that is about to come in.
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn make_room(&mut self, cost: usize) {
+        self.evict_for(cost);
+    }
+
     /// Drop the least recently painted slots until the budget holds beside what decoding needs
-    /// ([`Cache::reserve`]), what the fetchers hold ([`Cache::inflight`]) and `extra` more
-    /// bytes, never one painted in the current frame.
+    /// ([`Cache::reserve`]), what is set aside for the fetchers ([`Cache::fetching`]) and
+    /// `extra` more bytes, never one painted in the current frame.
     fn evict_for(&mut self, extra: usize) {
         let held = self
             .reserve
-            .saturating_add(self.inflight)
+            .saturating_add(self.fetching)
             .saturating_add(extra);
         while self.bytes.saturating_add(held) > self.cap {
             let Some((i, _)) = self
@@ -1112,6 +1152,11 @@ impl Images {
         let mut fetch: Vec<Arc<str>> = Vec::new();
         let mut wanted = 0usize;
         let mut reserve = self.worker.as_ref().map_or(0, Worker::busy_cost);
+        // What is set aside for the fetchers, if any are (or are about to be) running.
+        #[cfg(feature = "remote-images")]
+        let mut fetching = self.fetch_reserve(self.unfetched());
+        #[cfg(not(feature = "remote-images"))]
+        let fetching = 0;
         #[cfg(feature = "remote-images")]
         self.in_view.clear();
         for (n, &(id, w, h)) in boxes.iter().enumerate() {
@@ -1130,7 +1175,7 @@ impl Images {
             } else {
                 self.cost(id).saturating_add(w as usize * h as usize * 4)
             };
-            let room = self.cache.cap.saturating_sub(reserve.max(cost));
+            let room = (self.cache.cap.saturating_sub(fetching)).saturating_sub(reserve.max(cost));
             let over = n >= on_screen && wanted >= room;
             wanted = wanted.saturating_add(w as usize * h as usize * 4);
             if over {
@@ -1155,6 +1200,7 @@ impl Images {
                         // Not fetched yet, or its bytes were evicted: fetch it (again).
                         if self.remote.size(&url) != Some(None) {
                             fetch.push(url);
+                            fetching = self.fetch_reserve(true);
                         }
                         continue;
                     }
@@ -1172,10 +1218,8 @@ impl Images {
             });
         }
         self.cache.reserve = reserve;
-        #[cfg(feature = "remote-images")]
-        {
-            self.cache.inflight = self.remote.inflight();
-        }
+        // The cache is made room for them before they are let start: they can't take more.
+        self.cache.fetching = fetching;
         self.cache.evict();
         if !jobs.is_empty() && self.worker.is_none() {
             self.worker = Some(Worker::spawn(self.tx.clone(), self.wake.clone()));
@@ -1238,20 +1282,44 @@ impl Images {
                 }
                 #[cfg(feature = "remote-images")]
                 Done::Fetched { url, result } => {
-                    if let Some(bytes) = self.remote.fetched(&url, result) {
-                        // Its credit is free: what the others hold is what's left.
-                        self.cache.inflight = self.remote.inflight();
+                    // The cache is made room for the body while the fetchers still hold it, so
+                    // when its credit is let go (and they use it) it is in the cache.
+                    if let Ok((bytes, ..)) = &result {
+                        self.cache.make_room(Slot::bytes_cost(&url, bytes));
+                    }
+                    let taken = self.remote.fetched(&url, result);
+                    if let Some(bytes) = taken {
                         self.cache
                             .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
                         if self.in_view.contains(&url) {
                             self.cache.bytes_of(&url);
                         }
                     }
+                    self.cache.fetching = self.fetch_reserve(false);
                     self.sync_remote(doc, layout);
                 }
             }
         }
         any
+    }
+
+    /// What the cache sets aside for the fetchers: [`remote::FETCH_BYTES`] if any are running or
+    /// queued, or about to be (`starting`), else nothing.
+    #[cfg(feature = "remote-images")]
+    fn fetch_reserve(&self, starting: bool) -> usize {
+        if self.remote.busy() || (starting && self.remote.on && !self.remote.no_curl) {
+            crate::remote::FETCH_BYTES
+        } else {
+            0
+        }
+    }
+
+    /// Whether the document has a remote image nothing is known about yet.
+    #[cfg(feature = "remote-images")]
+    fn unfetched(&self) -> bool {
+        self.srcs
+            .iter()
+            .any(|s| matches!(s, Src::Remote(url) if self.remote.size(url).is_none()))
     }
 
     /// Give every remote image of the document the size layout should use now: its alt text

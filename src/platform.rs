@@ -212,6 +212,8 @@ mod tests {
     #[test]
     fn reads_peak_rss() {
         assert!(peak_rss_kb() > 0);
-        assert!((1..=peak_rss_kb()).contains(&rss_kb()));
+        // The current size first: tests running beside this one may grow it, and the peak with it.
+        let now = rss_kb();
+        assert!((1..=peak_rss_kb()).contains(&now));
     }
 }
