@@ -25,6 +25,30 @@ fn png() -> Vec<u8> {
     out
 }
 
+/// `fixtures/images/wide.jpg` and the same with 6 `APP1` segments of 65,000 bytes after its
+/// frame header: more metadata than a decode keeps.
+fn wide_jpeg() -> Vec<u8> {
+    std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/images/wide.jpg"
+    ))
+    .unwrap()
+}
+
+fn jpeg_with_exif() -> Vec<u8> {
+    let src = wide_jpeg();
+    let sos = src.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+    let mut out = src[..sos].to_vec();
+    for _ in 0..6 {
+        out.extend([0xFF, 0xE1]);
+        out.extend(65_002u16.to_be_bytes());
+        out.extend(b"Exif\0\0");
+        out.resize(out.len() + 64_994, 0x55);
+    }
+    out.extend(&src[sos..]);
+    out
+}
+
 fn respond(mut s: TcpStream, status: &str, headers: &str, body: &[u8]) {
     let _ = write!(s, "HTTP/1.1 {status}\r\n{headers}Connection: close\r\n\r\n");
     let _ = s.write_all(body);
@@ -88,6 +112,11 @@ fn serve(s: TcpStream, port: u16) {
         p if p.starts_with("/big/") => {
             let mut body = png.clone();
             body.resize(png.len() + (4 << 20), 0);
+            respond(s, "200 OK", &len(body.len()), &body);
+        }
+        // `wide.jpg` with 390 KB of EXIF between its frame header and its scan.
+        "/meta.jpg" => {
+            let body = jpeg_with_exif();
             respond(s, "200 OK", &len(body.len()), &body);
         }
         "/page.html" => respond(s, "200 OK", &len(6), b"<html>"),
@@ -265,6 +294,48 @@ fn a_small_body_keeps_only_what_it_needs() {
         &|_| false,
     );
     assert_eq!(got, Err(Error::Yielded));
+}
+
+/// A body is cut to the size it holds: a small one is copied (the buffer it was read into is a
+/// mapping of its own, which the allocator would only shrink to a page), a big one cut in place.
+#[test]
+fn bodies_are_cut_to_size() {
+    let mut small = Vec::with_capacity(STEP);
+    small.extend([1u8; 69]);
+    let small = cut_to_size(small);
+    assert_eq!((small.len(), small.capacity()), (69, 69));
+    let mut big = Vec::with_capacity(4 << 20);
+    big.extend(vec![2u8; (3 << 20) + 5]);
+    let big = cut_to_size(big);
+    assert_eq!((big.len(), big.capacity()), ((3 << 20) + 5, (3 << 20) + 5));
+    assert!(cut_to_size(Vec::new()).is_empty());
+}
+
+/// A fetched JPEG's metadata is cut out of its body where it is, so the cache doesn't keep it
+/// and the decoder never sees it (the buffer is cut to size, its credit with it).
+#[test]
+fn a_fetched_jpegs_metadata_is_cut_out() {
+    if !have_curl() {
+        eprintln!("curl not installed: skipped");
+        return;
+    }
+    let port = server();
+    let plain = wide_jpeg();
+    let (bytes, w, h) = fetch_image(&format!("http://127.0.0.1:{port}/meta.jpg"), &|_| true)
+        .expect("a JPEG with metadata is an image");
+    assert_eq!((w, h), (600, 200));
+    assert_eq!(bytes.len(), plain.len(), "all of the 390 KB went");
+    assert!(
+        bytes.capacity() < plain.len() + 4096,
+        "{} allocated for {} bytes",
+        bytes.capacity(),
+        bytes.len()
+    );
+    assert_eq!(
+        image::decode(&bytes, 60, 20),
+        image::decode(&plain, 60, 20),
+        "decodes as it does without the metadata"
+    );
 }
 
 #[test]

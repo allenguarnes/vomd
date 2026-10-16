@@ -10,7 +10,7 @@
 //! - `tiny`: N images (default 12,288) `BASE/tiny/0.png` … of 69 bytes each, polled as `big`.
 //! - `grow`: N images (default 8) of 4 MiB are fetched, taken and cached; then another document
 //!   asks for 4 images that start and don't finish (`BASE/stall/0.png` …, 7 MiB declared, about
-//!   6.5 MiB sent, polled every 5 ms for 4 s): the cache is full of bodies nothing shows.
+//!   6.5 MiB sent, polled every ms for 4 s): the cache is full of bodies nothing shows.
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -80,7 +80,10 @@ fn report(what: &str) {
     );
 }
 
-/// Paint and take results every 5 ms until `stop` says so.
+/// Paint and take results every millisecond until `stop` says so: the window takes them as soon
+/// as it is woken, and the decode worker waits for each result to be taken, so a loop that
+/// polled every 5 ms would hold the worker back and the bodies of images in view (which are not
+/// evicted until decoded) would pile up, up to 38 MB of images live in 1 run in 5.
 fn run(v: &mut View, buf: &mut [u32], mut stop: impl FnMut(bool) -> bool) {
     loop {
         let now = Instant::now();
@@ -90,7 +93,7 @@ fn run(v: &mut View, buf: &mut [u32], mut stop: impl FnMut(bool) -> bool) {
         if stop(got) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -106,6 +109,7 @@ fn drain(v: &mut View, buf: &mut [u32]) {
 }
 
 fn main() {
+    platform::tune_allocator();
     let mut args = std::env::args().skip(1);
     let base = args.next().expect("BASE url");
     let n = args
@@ -152,4 +156,6 @@ fn main() {
         );
         report("grow");
     }
+    // For `cargo xtask budgets`.
+    println!("image-rss peak_rss_kb={}", platform::peak_rss_kb());
 }

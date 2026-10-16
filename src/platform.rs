@@ -104,6 +104,28 @@ pub fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File
     options.open(path)
 }
 
+/// Keeps glibc's malloc from raising its mmap threshold (review round 3): by default the
+/// threshold goes up to the size of every mapped block freed (as far as 32 MB), after which blocks
+/// of a few MB (fetched image bodies, decoded rows, a file read whole) come out of the heap, are
+/// grown by copying (the old block and the new one at once) and, freed, leave holes the heap keeps:
+/// 50 remote images of 4 MB held 41 MB of live allocations and 67 MB of resident memory. Pinned at
+/// 256 KB, each of them is a mapping of its own, grown in place (`mremap`) and given back to the
+/// system when freed, so resident memory follows the live allocations the image budget counts. A
+/// no-op where the allocator isn't glibc's. Call it first, before any thread is started.
+pub fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_MMAP_THRESHOLD: i32 = -3;
+        // SAFETY: a libc function of plain integers, called before other threads start.
+        unsafe {
+            mallopt(M_MMAP_THRESHOLD, 256 << 10);
+        }
+    }
+}
+
 /// Errors go to stderr only when someone can see them.
 pub fn stderr_is_tty() -> bool {
     use std::io::IsTerminal;

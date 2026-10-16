@@ -504,10 +504,9 @@ fn a_very_wide_png_is_refused_or_decoded_in_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A PNG's last row is not trusted before the checksum of the data it came in: a bit wrong in
-/// the last `IDAT`'s checksum, or the image cut inside it, is refused whether the PNG is read by
-/// rows or whole (the rows were resampled, and the bitmap returned, before it was looked at: a
-/// PNG the decoder itself rejects with a checksum mismatch showed as an image).
+/// A PNG's last row is not trusted before the checksum of the data it came in, nor is the
+/// image before its `IEND`: a bit wrong in the last `IDAT`'s checksum or `IEND`'s, or the image
+/// cut anywhere in them, is refused whether the PNG is read by rows or whole.
 #[test]
 fn a_png_with_a_bad_final_checksum_is_refused() {
     let good = png_bytes(9, 7, |x, y| [x as u8 * 20, y as u8 * 30, 5, 255]);
@@ -532,17 +531,49 @@ fn a_png_with_a_bad_final_checksum_is_refused() {
     ];
     for (what, bad) in cases {
         for rows in [true, false] {
-            // The whole-frame decode doesn't read what follows the image data: only a
-            // by-rows decode is held to `IEND`, but both refuse what fails inside the data.
-            let got = decode_png(&bad, 9, 7, rows);
-            let inside_the_data =
-                what != "cut after the checksum, no IEND" && what != "a bit of the IEND checksum";
-            if inside_the_data || rows {
-                assert_eq!(got, None, "{what} (rows: {rows})");
-            }
+            assert_eq!(decode_png(&bad, 9, 7, rows), None, "{what} (rows: {rows})");
         }
         assert_eq!(decode(&bad, 4, 3), None, "{what}");
     }
+    // What follows a good `IEND` isn't looked at.
+    let mut trailing = good.clone();
+    trailing.extend(b"trailing bytes");
+    for rows in [true, false] {
+        assert!(decode_png(&trailing, 9, 7, rows).is_some(), "rows: {rows}");
+    }
+}
+
+/// An interlaced (Adam7) PNG is read whole, and held to its `IEND` as a PNG read by rows is: a
+/// flipped bit in the checksum of `IEND`, or no `IEND`, shows the alt text, and bytes after it
+/// don't matter.
+#[test]
+fn an_interlaced_png_is_checked_to_its_iend() {
+    let good = fixture("interlaced.png");
+    assert_eq!(good[28], 1, "Adam7");
+    assert_eq!(&good[good.len() - 8..good.len() - 4], b"IEND");
+    let (w, h, _) = header(&mut &good[..]).map(|(f, w, h)| (w, h, f)).unwrap();
+    assert!(decode(&good, w, h).is_some());
+    let flip = |at: usize| {
+        let mut bad = good.clone();
+        bad[at] ^= 1;
+        bad
+    };
+    let cases = [
+        ("a bit of the IEND checksum", flip(good.len() - 1)),
+        ("no IEND", good[..good.len() - 12].to_vec()),
+        ("a cut IEND", good[..good.len() - 6].to_vec()),
+        (
+            "a bit of the last IDAT's checksum",
+            flip(good.len() - 12 - 1),
+        ),
+    ];
+    for (what, bad) in cases {
+        assert_eq!(decode(&bad, w, h), None, "{what}");
+        assert_eq!(decode_png(&bad, w, h, true), None, "{what}");
+    }
+    let mut trailing = good.clone();
+    trailing.extend(b"trailing bytes");
+    assert!(decode(&trailing, w, h).is_some());
 }
 
 /// `png` with `chunks` (type, data) put after its `IHDR`, their checksums left zero: the
@@ -832,7 +863,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
 #[cfg(feature = "remote-images")]
 #[test]
 fn the_cache_is_made_room_for_the_fetchers_before_they_start() {
-    use crate::remote::FETCH_BYTES;
+    use crate::remote::FETCH_RESERVE;
     let doc = Doc::parse("![a](https://x.y/a.png) ![b](https://x.y/b.png)");
     let mut layout = Layout::new(&doc, crate::layout::Params::default());
     let mut images = Images::default();
@@ -849,7 +880,7 @@ fn the_cache_is_made_room_for_the_fetchers_before_they_start() {
         );
     }
     images.begin_frame();
-    assert!(images.cache.bytes > CACHE_BYTES - FETCH_BYTES);
+    assert!(images.cache.bytes > CACHE_BYTES - FETCH_RESERVE);
     // Remote images are off: nothing is set aside, nothing evicted.
     images.request(&[], 0);
     assert_eq!(images.cache.fetching, 0);
@@ -869,9 +900,9 @@ fn the_cache_is_made_room_for_the_fetchers_before_they_start() {
     images.remote.set_fetcher(fetcher);
     images.set_remote(true, &doc, &mut layout);
     images.request(&[], 0);
-    assert_eq!(images.cache.fetching, FETCH_BYTES);
+    assert_eq!(images.cache.fetching, FETCH_RESERVE);
     assert!(
-        images.cache.bytes + FETCH_BYTES <= CACHE_BYTES,
+        images.cache.bytes + FETCH_RESERVE <= CACHE_BYTES,
         "{} kept",
         images.cache.bytes
     );
@@ -1071,7 +1102,7 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
     images.attach(&doc, &mut layout);
     // The JPEG is 600 × 200: a frame of 360,000 bytes of RGB, and its file.
     let file = std::fs::metadata(dir.join("a.jpg")).unwrap().len() as usize;
-    assert_eq!(images.cost(1), 360_000 + file);
+    assert_eq!(images.cost(1), 360_000 + file + JPEG_META_COST);
     // Two other slots of 100,000 bytes beside it, in a cache that has no room for them and the
     // decode: one painted this frame.
     let slot = |n| {
@@ -1081,7 +1112,7 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
             data: vec![0; n as usize],
         })
     };
-    images.cache.cap = 500_000;
+    images.cache.cap = 500_000 + JPEG_META_COST;
     images.srcs[1] = Src::File(dir.join("b.png"));
     images.srcs[2] = Src::File(dir.join("c.png"));
     images.cache.insert(Key::Local(2), slot(25_000));
@@ -1089,8 +1120,11 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
     images.begin_frame();
     let _ = images.pixels(3, 25_000, 1);
     images.request(&[(1, 600, 200)], 1);
-    // The frame, the file, and the result (600 × 200 pixels).
-    assert_eq!(images.cache.reserve, 360_000 + file + 480_000);
+    // The frame, the metadata allowance, the file, and the result (600 × 200 pixels).
+    assert_eq!(
+        images.cache.reserve,
+        360_000 + JPEG_META_COST + file + 480_000
+    );
     assert!(
         !images.cache.has(&Key::Local(2), 25_000, 1),
         "evicted for the decode"
@@ -1102,6 +1136,164 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
         images.cache.reserve,
         images.worker.as_ref().map_or(0, Worker::busy_cost)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A segment with marker `FF code` and `data`.
+fn segment(code: u8, data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0xFF, code];
+    out.extend(((data.len() + 2) as u16).to_be_bytes());
+    out.extend(data);
+    out
+}
+
+/// `jpeg` with `segments` put before its `n`th start of scan (0 for the first).
+fn with_segments(jpeg: &[u8], n: usize, segments: &[Vec<u8>]) -> Vec<u8> {
+    let sos = jpeg
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| *w == [0xFF, 0xDA])
+        .nth(n)
+        .unwrap()
+        .0;
+    let mut out = jpeg[..sos].to_vec();
+    out.extend(segments.concat());
+    out.extend(&jpeg[sos..]);
+    out
+}
+
+/// A JPEG's decoder keeps its EXIF, XMP, ICC and IPTC segments, none of which is used: more than
+/// [`MAX_JPEG_META`] of them are cut out of the bytes in place, and nothing else is.
+#[test]
+fn jpeg_metadata_over_the_limit_is_cut_out_in_place() {
+    for name in ["wide.jpg", "progressive.jpg", "gray.jpg"] {
+        let plain = fixture(name);
+        // What stays: JFIF, a comment, Adobe's color transform. What goes: the rest.
+        let mut keep = vec![segment(
+            0xFE,
+            b"a comment with an FF E1 inside: \xFF\xE1\xFF\xFF is only text",
+        )];
+        if name != "gray.jpg" {
+            keep.push(segment(0xEE, b"Adobe\0\x64\0\0\0\0\x01"));
+        }
+        let gone = [
+            segment(0xE1, &[b'E'; 65_000]),
+            segment(0xE2, &[b'I'; 40_000]),
+            segment(0xED, &[b'P'; 30_000]),
+            segment(0xE1, &[b'X'; 10]),
+        ];
+        let mut segments = Vec::new();
+        for (a, b) in keep.iter().zip(&gone) {
+            segments.push(a.clone());
+            segments.push(b.clone());
+        }
+        segments.extend(gone[2..].iter().cloned());
+        let with = with_segments(&plain, 0, &segments);
+        // The same with everything that stays, and none that goes.
+        let expect = with_segments(&plain, 0, &keep);
+        let want = decode(&expect, 8, 8).unwrap();
+        assert!(jpeg_metadata(&with) > MAX_JPEG_META);
+        let mut cut = with.clone();
+        assert!(shed_jpeg_metadata(&mut cut), "{name}");
+        assert_eq!(cut, expect, "{name}: what stays is what was kept");
+        assert!(cut.capacity() <= cut.len() + 64, "{name}: cut to size");
+        // Decoding is the same either way (a copy is cut first if the bytes are borrowed).
+        assert_eq!(decode(&with, 8, 8).as_ref(), Some(&want), "{name}");
+        assert_eq!(decode(&cut, 8, 8).as_ref(), Some(&want), "{name}");
+        // Under the limit nothing is touched.
+        let little = with_segments(&plain, 0, &[segment(0xE1, &[b'E'; 60_000])]);
+        let mut same = little.clone();
+        assert!(shed_jpeg_metadata(&mut same));
+        assert_eq!(same, little, "{name}");
+        // Other formats are left alone, however many `FF E1` they hold.
+        let mut not_jpeg = [0x89, b'P', 0xFF, 0xE1, 0xFF, 0xFF].repeat(100_000);
+        let copy = not_jpeg.clone();
+        assert!(shed_jpeg_metadata(&mut not_jpeg));
+        assert_eq!(not_jpeg, copy);
+    }
+}
+
+/// Segments between the scans of a progressive JPEG (where the decoder reads markers too) go
+/// as well.
+#[test]
+fn metadata_between_scans_is_cut_out() {
+    let plain = fixture("progressive.jpg");
+    let scans = plain.windows(2).filter(|w| *w == [0xFF, 0xDA]).count();
+    assert!(scans > 2, "{scans} scans");
+    let want = decode(&plain, 8, 8);
+    let with = with_segments(&plain, 2, &vec![segment(0xE1, &[b'E'; 65_000]); 4]);
+    assert!(jpeg_metadata(&with) > MAX_JPEG_META);
+    let mut cut = with.clone();
+    assert!(shed_jpeg_metadata(&mut cut));
+    assert_eq!(cut, plain);
+    assert_eq!(decode(&cut, 8, 8), want);
+    assert_eq!(decode(&with, 8, 8), want);
+}
+
+/// A file that has the pairs the decoder takes for metadata where no segment of them is
+/// (a comment is skipped by us and the decoder alike, whatever is in it) can't be cut: it is
+/// refused, not decoded with what it makes the decoder keep.
+#[test]
+fn metadata_that_cannot_be_cut_out_is_refused() {
+    let plain = fixture("wide.jpg");
+    // 16,000 pairs of `FF E1` and a length of 65,535, each of which the decoder may read.
+    let comment = segment(0xFE, &[0xFF, 0xE1, 0xFF, 0xFF].repeat(16_000));
+    let bad = with_segments(&plain, 0, &[comment]);
+    assert!(jpeg_metadata(&bad) > MAX_JPEG_META);
+    let mut copy = bad.clone();
+    assert!(!shed_jpeg_metadata(&mut copy));
+    assert_eq!(decode(&bad, 8, 8), None);
+    // The same comment without them decodes.
+    let fine = with_segments(&plain, 0, &[segment(0xFE, &[b'a'; 64_000])]);
+    assert!(decode(&fine, 8, 8).is_some());
+}
+
+/// A decode's result is held (and its cost kept free of the cache) until the main thread takes
+/// it: the worker starts no other job meanwhile, so results can't pile up unpolled outside the
+/// budget.
+#[test]
+fn the_worker_waits_for_its_result_to_be_taken() {
+    use crate::render::Pixels;
+    let dir = scratch("ack");
+    for i in 0..3 {
+        std::fs::write(
+            dir.join(format!("{i}.png")),
+            png_bytes(40, 30, |x, y| [x as u8, y as u8, i, 255]),
+        )
+        .unwrap();
+    }
+    let doc = Doc::parse("![a](0.png) ![b](1.png) ![c](2.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let w = woken.clone();
+    images.set_wake(Arc::new(move || {
+        w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    images.attach(&doc, &mut layout);
+    let woken = || woken.load(std::sync::atomic::Ordering::SeqCst);
+    images.request(&[(1, 40, 30), (2, 40, 30), (3, 40, 30)], 3);
+    let t = Instant::now();
+    while woken() == 0 {
+        assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Nobody polls: the first result waits, charged, and the others aren't started.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(woken(), 1, "one result, no other decode");
+    let held = images.worker.as_ref().unwrap().busy_cost();
+    assert!(held >= 40 * 30 * 4, "the result is still counted: {held}");
+    // Taking it lets the next go: all three arrive, one result at a time.
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.pixels(1, 40, 30).is_some()
+            && i.pixels(2, 40, 30).is_some()
+            && i.pixels(3, 40, 30).is_some()
+    });
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.worker.as_ref().unwrap().busy_cost() == 0
+    });
+    assert_eq!(woken(), 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1127,7 +1319,10 @@ fn progressive_jpegs_count_their_coefficients() {
     // 48 × 24, every component sampled 1 × 1: three planes of 48 × 24 i16.
     let p = info(&fixture("progressive.jpg"));
     assert_eq!(p.coefficients, 3 * 48 * 24 * 2);
-    assert_eq!(decode_cost(&p, false), 48 * 24 * 3 + 3 * 48 * 24 * 2);
+    assert_eq!(
+        decode_cost(&p, false),
+        48 * 24 * 3 + 3 * 48 * 24 * 2 + JPEG_META_COST
+    );
     // A 4000 × 3000 phone photo saved progressive at 4:2:0: luma padded to 16-pixel MCUs
     // (4000 × 3008), chroma at half size each way.
     let mut j = vec![0xFF, 0xD8, 0xFF, 0xC2, 0x00, 0x11, 0x08];

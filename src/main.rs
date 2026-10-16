@@ -750,6 +750,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn main() {
     let start = Instant::now();
+    platform::tune_allocator();
     platform::attach_console();
     let (input, no_settings) = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Cli::Help) => {

@@ -35,6 +35,13 @@ pub const MAX_SOURCE_SIDE: u32 = 65_535;
 /// Bytes of a JPEG looked through for its size, at most (segments before the frame header are
 /// metadata: EXIF, color profiles, thumbnails).
 const MAX_HEADER_SCAN: u64 = 4 << 20;
+/// What a JPEG's decoder keeps of its metadata segments (EXIF, XMP, ICC profile, IPTC), at most,
+/// as [`jpeg_metadata`] counts it: a JPEG with more has the segments cut out before it is
+/// decoded ([`shed_jpeg_metadata`]). None of it is used, and none of it is in the file's header.
+const MAX_JPEG_META: usize = 128 << 10;
+/// What decoding a JPEG holds for its metadata: the segments kept and, for extended XMP, the
+/// copy made of them put together.
+const JPEG_META_COST: usize = 2 * MAX_JPEG_META;
 
 /// Calls the event loop back when a result is waiting ([`Images::poll`]).
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -291,13 +298,17 @@ fn read_file(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// What decoding an image holds besides the file's bytes and the result, at most: a JPEG's
-/// whole frame of RGB (nothing smaller is had from its decoder) and, progressive, its
+/// whole frame of RGB (nothing smaller is had from its decoder), the metadata it keeps
+/// ([`JPEG_META_COST`]) and, progressive, its
 /// coefficients, an interlaced PNG's whole frame, or a few rows of a PNG that isn't (read a
 /// row at a time).
 fn decode_cost(header: &Header, interlaced: bool) -> usize {
     let pixels = header.w as usize * header.h as usize;
     match header.format {
-        Format::Jpeg => pixels.saturating_mul(3).saturating_add(header.coefficients),
+        Format::Jpeg => pixels
+            .saturating_mul(3)
+            .saturating_add(header.coefficients)
+            .saturating_add(JPEG_META_COST),
         Format::Png if interlaced => pixels.saturating_mul(4),
         Format::Png => header.w as usize * 32,
     }
@@ -346,6 +357,20 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
             use zune_jpeg::zune_core::{
                 bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions,
             };
+            // The decoder keeps every EXIF, XMP and ICC segment it reads, wherever they are: more
+            // than `MAX_JPEG_META` of them are cut out first. (A caller that owns the bytes has
+            // done it already, in place, see `shed_jpeg_metadata`; this copy is for the rest.)
+            let shed;
+            let bytes = if jpeg_metadata(bytes) > MAX_JPEG_META {
+                let mut copy = bytes.to_vec();
+                if !shed_jpeg_metadata(&mut copy) {
+                    return None;
+                }
+                shed = copy;
+                &shed[..]
+            } else {
+                bytes
+            };
             // The decoder may find a frame header other than the one `header` did (they read
             // odd markers differently): it gets the size we checked as its limit, and what it
             // reads must be that size, before it allocates anything.
@@ -355,8 +380,9 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
                 .set_max_height(sh as usize);
             let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
             d.decode_headers().ok()?;
-            let info = d.info()?;
-            if (u32::from(info.width), u32::from(info.height)) != (sw, sh) {
+            // Neither side is over the limit, so the product is the size only if both are it.
+            // (`info` would copy all the metadata, to read what this says.)
+            if d.output_buffer_size()? != sw as usize * sh as usize * 3 {
                 return None;
             }
             let data = d.decode().ok()?;
@@ -370,6 +396,83 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
             resample(frame, w, h)
         }
     }
+}
+
+/// Upper bound on the bytes a JPEG decoder keeps of what is in `bytes`: for every `FF E1`
+/// (EXIF, XMP, extended XMP), `FF E2` (ICC profile, HDR gain map) and `FF ED` (IPTC) anywhere in
+/// the file, the length that follows it (what the decoder copies if it takes that for a segment)
+/// and [`JPEG_META_ENTRY`] for what it keeps beside it. Counted wherever the pairs are, not where
+/// the segments should be, so a file arranged to be read differently by us and by the decoder
+/// (the two skip over segments in their own ways) is counted the way the decoder reads it. (A
+/// pair inside entropy-coded data can't be: `FF` is `FF 00` there.)
+#[cfg(feature = "images")]
+fn jpeg_metadata(bytes: &[u8]) -> usize {
+    let mut total = 0usize;
+    let mut i = 0;
+    while let Some(at) = bytes[i..].iter().position(|&b| b == 0xFF) {
+        let at = i + at;
+        i = at + 1;
+        if matches!(bytes.get(at + 1), Some(0xE1 | 0xE2 | 0xED)) {
+            let len = bytes
+                .get(at + 2..at + 4)
+                .map_or(0, |l| usize::from(u16::from_be_bytes([l[0], l[1]])));
+            let payload = len.saturating_sub(2).min(bytes.len() - at - 2);
+            total = total.saturating_add(payload + JPEG_META_ENTRY);
+        }
+    }
+    total
+}
+
+/// What the decoder keeps besides a metadata segment's bytes: its entry in a `Vec`, the buffer's
+/// allocator rounding and, for extended XMP, the segment's GUID.
+#[cfg(feature = "images")]
+const JPEG_META_ENTRY: usize = 256;
+
+/// Cut every `APP1`, `APP2` and `APP13` segment out of a JPEG in place (`FF D8 ...`: the
+/// metadata its decoder keeps and nothing here uses; `APP0` and `APP14` stay, the decoder reads
+/// the color transform from `APP14`), if there is more than [`MAX_JPEG_META`] of it. Markers are
+/// found as the decoder finds them, byte by byte: `FF` and a code that isn't `00` or `FF`,
+/// whatever came before (a restart marker is no segment, a `FF 00` is data); a segment is the
+/// marker and the length that follows it. `false` if what is left is still over the limit (the
+/// file is arranged so the decoder reads segments where this found none: see [`jpeg_metadata`]).
+#[cfg(feature = "images")]
+pub(crate) fn shed_jpeg_metadata(buf: &mut Vec<u8>) -> bool {
+    if !buf.starts_with(&[0xFF, 0xD8]) || jpeg_metadata(buf) <= MAX_JPEG_META {
+        return true;
+    }
+    let len = buf.len();
+    // `buf[..kept]` is what stays; `buf[from..]` hasn't been looked at, or is to stay once it is.
+    let (mut kept, mut from, mut i) = (0, 0, 0);
+    while i + 1 < len {
+        if buf[i] != 0xFF || matches!(buf[i + 1], 0x00 | 0xFF) {
+            i += 1;
+            continue;
+        }
+        let code = buf[i + 1];
+        // SOI, TEM and RSTn have no segment (the decoder gives them one, but they only come
+        // where the file is broken; if it matters to it, it matters the same after this).
+        if matches!(code, 0x01 | 0xD0..=0xD8) {
+            i += 2;
+            continue;
+        }
+        if code == 0xD9 {
+            break;
+        }
+        let Some(l) = buf.get(i + 2..i + 4) else {
+            break;
+        };
+        let end = (i + 2 + usize::from(u16::from_be_bytes([l[0], l[1]]))).min(len);
+        if matches!(code, 0xE1 | 0xE2 | 0xED) {
+            buf.copy_within(from..i, kept);
+            kept += i - from;
+            from = end;
+        }
+        i = end.max(i + 2);
+    }
+    buf.copy_within(from..len, kept);
+    buf.truncate(kept + len - from);
+    buf.shrink_to_fit();
+    jpeg_metadata(buf) <= MAX_JPEG_META
 }
 
 /// A PNG's pixels resampled to `w` × `h`. A PNG that isn't interlaced is read a row at a time
@@ -397,6 +500,8 @@ fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
     }
     let mut buf = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
+    // The checksum of `IEND` too, as for rows (`Rows::finish`).
+    reader.finish().ok()?;
     let frame = Frame {
         data: &buf,
         width: info.width,
@@ -703,7 +808,7 @@ struct Cache {
     /// What the worker's decodes hold while they run, at most: it comes out of the budget.
     reserve: usize,
     /// What is set aside for the fetchers while any fetch is queued or running: all of
-    /// `FETCH_BYTES` (the most the fetchers can hold, whatever they hold now), or nothing. It
+    /// `FETCH_RESERVE` (the most the fetchers can hold, whatever they hold now), or nothing. It
     /// comes out of the budget too, so the fetchers need no more than what they are given and
     /// the cache is made small before they start, not as they grow.
     fetching: usize,
@@ -877,6 +982,8 @@ pub(crate) enum Done {
         doc_gen: u64,
         key: Key,
         bitmap: Option<Bitmap>,
+        /// The worker that made it, which waits until the result is taken ([`Worker::taken`]).
+        worker: Shared,
     },
     /// A remote image was fetched: its bytes and natural size, or why not.
     #[cfg(feature = "remote-images")]
@@ -886,10 +993,16 @@ pub(crate) enum Done {
     },
 }
 
+/// The worker's queue and its condition variable, shared with the main thread.
+pub(crate) type Shared = Arc<(Mutex<Queue>, Condvar)>;
+
 #[derive(Default)]
-struct Queue {
+pub(crate) struct Queue {
     jobs: Vec<Job>,
-    /// The job being decoded: (key, size, cost) — not queued again while it runs.
+    /// The job being decoded, and then its result until the main thread takes it
+    /// ([`Worker::taken`]): (key, size, cost). The worker starts no other meanwhile, so what is
+    /// held beside the cache is one job's cost (result included) from its start until its result
+    /// is in the cache, and not queued again while it is here.
     busy: Option<(Key, u32, u32, usize)>,
     quit: bool,
 }
@@ -897,7 +1010,7 @@ struct Queue {
 /// One thread decoding the most wanted image first; the queue is replaced as the viewport
 /// moves, so images scrolled past are never decoded.
 struct Worker {
-    shared: Arc<(Mutex<Queue>, Condvar)>,
+    shared: Shared,
 }
 
 impl Worker {
@@ -909,7 +1022,8 @@ impl Worker {
             loop {
                 let job = {
                     let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    while q.jobs.is_empty() && !q.quit {
+                    // The last result still waits to be taken: its memory isn't free yet.
+                    while (q.jobs.is_empty() || q.busy.is_some()) && !q.quit {
                         q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
                     }
                     if q.quit {
@@ -920,11 +1034,11 @@ impl Worker {
                     job
                 };
                 let bitmap = decode_job(&job);
-                lock.lock().unwrap_or_else(|e| e.into_inner()).busy = None;
                 let done = Done::Decoded {
                     doc_gen: job.doc_gen,
                     key: job.key,
                     bitmap,
+                    worker: theirs.clone(),
                 };
                 if tx.send(done).is_err() {
                     return;
@@ -946,7 +1060,16 @@ impl Worker {
         cv.notify_one();
     }
 
-    /// What the job being decoded holds, if any.
+    /// The main thread took the result of the job the worker `shared` ran (it is in the cache,
+    /// or dropped): that worker may go on to the next. It goes by the result, not by the current
+    /// worker, which may be another one ([`Images::set_wake`]).
+    fn taken(shared: &Shared) {
+        let (lock, cv) = &**shared;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).busy = None;
+        cv.notify_one();
+    }
+
+    /// What the job being decoded (or whose result isn't taken) holds, if any.
     fn busy_cost(&self) -> usize {
         let (lock, _) = &*self.shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -965,7 +1088,14 @@ impl Drop for Worker {
 #[cfg(feature = "images")]
 fn decode_job(job: &Job) -> Option<Bitmap> {
     match &job.source {
-        Source::File(path) => decode(&read_file(path)?, job.w, job.h),
+        Source::File(path) => {
+            // The bytes are ours: a JPEG's metadata is cut out of them where they are.
+            let mut bytes = read_file(path)?;
+            if !shed_jpeg_metadata(&mut bytes) {
+                return None;
+            }
+            decode(&bytes, job.w, job.h)
+        }
         Source::Bytes(bytes) => decode(bytes, job.w, job.h),
     }
 }
@@ -1256,8 +1386,12 @@ impl Images {
                     doc_gen,
                     key,
                     bitmap,
+                    worker,
                 } => {
+                    // The result is in the cache (or dropped) before the worker is let go on,
+                    // so what it holds is never uncounted: see `Queue::busy`.
                     if matches!(key, Key::Local(_)) && doc_gen != self.doc_gen {
+                        Worker::taken(&worker);
                         continue;
                     }
                     match (bitmap, key) {
@@ -1279,6 +1413,7 @@ impl Images {
                         #[cfg(not(feature = "remote-images"))]
                         (None, Key::Remote(_)) => {}
                     }
+                    Worker::taken(&worker);
                 }
                 #[cfg(feature = "remote-images")]
                 Done::Fetched { url, result } => {
@@ -1303,12 +1438,12 @@ impl Images {
         any
     }
 
-    /// What the cache sets aside for the fetchers: [`remote::FETCH_BYTES`] if any are running or
+    /// What the cache sets aside for the fetchers: [`remote::FETCH_RESERVE`] if any are running or
     /// queued, or about to be (`starting`), else nothing.
     #[cfg(feature = "remote-images")]
     fn fetch_reserve(&self, starting: bool) -> usize {
         if self.remote.busy() || (starting && self.remote.on && !self.remote.no_curl) {
-            crate::remote::FETCH_BYTES
+            crate::remote::FETCH_RESERVE
         } else {
             0
         }

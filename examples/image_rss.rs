@@ -41,6 +41,7 @@ fn generate(dir: &std::path::Path) {
 }
 
 fn main() {
+    platform::tune_allocator();
     let mut args = std::env::args().skip(1);
     let first = args.next().expect("DIR, or --generate DIR");
     if first == "--generate" {
@@ -89,4 +90,6 @@ fn main() {
         start.elapsed().as_secs_f64(),
         platform::peak_rss_kb()
     );
+    // For `cargo xtask budgets`.
+    println!("image-rss peak_rss_kb={}", platform::peak_rss_kb());
 }

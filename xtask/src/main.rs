@@ -20,6 +20,9 @@ const RSS_HUGE_KB: [u64; 2] = [60_000, 55_000];
 const IDLE_TICKS: u64 = 1;
 const IDLE_WATCH: Duration = Duration::from_secs(3);
 const SCROLL_BUDGET_MS: f64 = 8.0;
+/// Peak RSS with 50 images, local or remote: 30,000 KB idle and the image budget
+/// of 32 MiB. (The examples have no window, so no Wayland allowance.)
+const IMAGE_RSS_KB: u64 = 30_000 + 32_768;
 
 /// The window the RSS budgets are specified for (logical pixels; the CI display is 1x).
 const BENCH_SIZE: &str = "1920x1080";
@@ -358,6 +361,84 @@ fn scroll_p95(fixture: &Path, extra: &[&str], target_dir: &str) -> Option<f64> {
     field(line, "p95_ms")
 }
 
+/// The peak RSS an RSS example reports in its `image-rss peak_rss_kb=N` line, in KB.
+fn image_rss_line(output: &std::process::Output) -> Option<u64> {
+    let text = String::from_utf8_lossy(&output.stdout);
+    print!("{text}");
+    let line = text.lines().find(|l| l.starts_with("image-rss "))?;
+    output.status.success().then_some(())?;
+    field(line, "peak_rss_kb").map(|v| v as u64)
+}
+
+/// Build the RSS examples like the default binary and give the directory they are in.
+fn image_examples() -> Option<PathBuf> {
+    let built = release_cargo()
+        .args(["build", "--release", "--locked", "--package", "vomd"])
+        .args(["--target-dir", "target"])
+        .args(["--example", "image_rss", "--example", "remote_rss"])
+        .status()
+        .ok()?
+        .success();
+    built.then(|| root().join("target/release/examples"))
+}
+
+/// A scratch directory of our own for an RSS run, empty.
+fn scratch(name: &str) -> PathBuf {
+    let dir = env::temp_dir().join(format!("vomd-xtask-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+/// Peak RSS scrolling through 50 local PNGs of 2000 × 1500 (`examples/image_rss.rs`: the images
+/// are written first, by a process of their own, and removed after).
+fn local_image_rss(examples: &Path) -> Option<u64> {
+    let dir = scratch("images");
+    let config = scratch("images-config");
+    let bin = examples.join("image_rss");
+    let made = Command::new(&bin)
+        .arg("--generate")
+        .arg(dir.join("img"))
+        .env("XDG_CONFIG_HOME", &config)
+        .stdout(Stdio::null())
+        .status()
+        .ok()?
+        .success();
+    let peak = made
+        .then(|| {
+            Command::new(&bin)
+                .arg(dir.join("img"))
+                .env("XDG_CONFIG_HOME", &config)
+                .output()
+                .ok()
+        })
+        .flatten()
+        .and_then(|out| image_rss_line(&out));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&config);
+    peak
+}
+
+/// Peak RSS with 50 remote PNGs of 4 MiB from a server on 127.0.0.1 that `scripts/remote-rss.sh`
+/// starts and stops (`python3`; `None` with `Err` if there is none, which skips the row).
+fn remote_image_rss(examples: &Path) -> Result<Option<u64>, ()> {
+    let python = Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !python.is_ok_and(|s| s.success()) {
+        return Err(());
+    }
+    let out = Command::new("sh")
+        .arg(root().join("scripts/remote-rss.sh"))
+        .args(["50", "big"])
+        .env("REMOTE_RSS_BIN", examples.join("remote_rss"))
+        .output()
+        .ok();
+    Ok(out.and_then(|out| image_rss_line(&out)))
+}
+
 struct Row {
     metric: String,
     build: &'static str,
@@ -497,6 +578,44 @@ fn budgets(report: Option<&Path>) -> bool {
                 false,
                 true,
             ),
+        }
+    }
+    // Memory with 50 images, from files and from a local server.
+    let label = BUILDS[0].0;
+    let budget = format!("≤ {}", mb(IMAGE_RSS_KB));
+    match image_examples() {
+        None => gated_row(
+            "image RSS examples".into(),
+            label,
+            "no build".into(),
+            "built".into(),
+            false,
+            true,
+        ),
+        Some(examples) => {
+            let mut row = |metric: &str, peak: Option<u64>| match peak {
+                Some(kb) => gated_row(
+                    metric.into(),
+                    label,
+                    mb(kb),
+                    budget.clone(),
+                    kb <= IMAGE_RSS_KB,
+                    true,
+                ),
+                None => gated_row(
+                    metric.into(),
+                    label,
+                    "no output".into(),
+                    "a measurement".into(),
+                    false,
+                    true,
+                ),
+            };
+            row("image RSS, 50 local PNGs", local_image_rss(&examples));
+            match remote_image_rss(&examples) {
+                Ok(peak) => row("image RSS, 50 remote PNGs", peak),
+                Err(()) => println!("SKIP image RSS, 50 remote PNGs: python3 not found"),
+            }
         }
     }
     let ok = rows.iter().all(|r| r.pass || !r.gated);

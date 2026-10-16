@@ -18,10 +18,12 @@
 //! the youngest gives up its body and its credit (it is fetched again later, as if it had
 //! never started), so the oldest can finish: a body is never bigger than [`FETCH_BYTES`], so it
 //! always can once it is the only one. So the pool alone never holds more than [`FETCH_BYTES`],
-//! with nothing to look at or sample: the image cache sets that much aside as long as any
-//! fetch is queued or running (`Cache::fetching`), and the bodies, the bytes kept and the
-//! pixels together stay within the one budget at every moment, not only after the main thread
-//! has polled. A body that is taken goes to the cache before its credit is let go.
+//! with nothing to look at or sample: the image cache sets that much (and the fetchers' read
+//! buffers, [`FETCH_RESERVE`]) aside as long as any fetch is queued or running
+//! (`Cache::fetching`), and the bodies, the bytes kept and the pixels together stay within the
+//! one budget at every moment, not only after the main thread has polled. A body that is taken
+//! goes to the cache before its credit is let go. A JPEG's metadata is cut out of its body
+//! where it is, before it is kept (`image::shed_jpeg_metadata`).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -41,6 +43,13 @@ pub const FETCHERS: usize = 4;
 /// being read and the ones fetched and not yet taken by the main thread. The largest body
 /// ([`LIMITS`]) is as big, so a fetch alone always fits.
 pub const FETCH_BYTES: usize = 12 << 20;
+
+/// What a fetcher reads the pipe into: a buffer of its own, not part of the body.
+const READ_BUF: usize = 64 << 10;
+
+/// What the image cache sets aside while anything is fetched: the bodies ([`FETCH_BYTES`]) and
+/// the fetchers' read buffers, so nothing the fetchers allocate is outside the budget.
+pub const FETCH_RESERVE: usize = FETCH_BYTES + FETCHERS * READ_BUF;
 
 /// Credit is taken and the body's buffer grown by this much at a time.
 const STEP: usize = 256 << 10;
@@ -152,7 +161,7 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
     let mut yielded = false;
     let read = match stdout {
         Some(mut out) => {
-            let mut buf = vec![0u8; 64 << 10];
+            let mut buf = vec![0u8; READ_BUF];
             loop {
                 match out.read(&mut buf) {
                     Ok(0) => break true,
@@ -211,9 +220,21 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
     if !ok {
         return Err(Error::Failed);
     }
-    // Cut to size: a small body (most are) doesn't keep a 256 KB buffer.
-    bytes.shrink_to_fit();
-    Ok(bytes)
+    Ok(cut_to_size(bytes))
+}
+
+/// `bytes` with no more allocated than it holds (a small body, as most are, doesn't keep a 256 KB
+/// buffer). A body under [`STEP`] is copied to a buffer of its size: the one it was read into is
+/// a mapping of its own (see `platform::tune_allocator`), and the allocator shrinks a mapping
+/// only to a whole page, which for a 69-byte image is 4 KB and a mapping per URL: 12,288 of them
+/// were 70 MB resident. A bigger one is cut where it is (the mapping gives the rest back).
+pub(crate) fn cut_to_size(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() < STEP {
+        bytes = bytes.as_slice().to_vec();
+    } else {
+        bytes.shrink_to_fit();
+    }
+    bytes
 }
 
 /// A fetched image: its bytes and natural size.
@@ -224,7 +245,12 @@ pub(crate) type Fetcher = Arc<dyn Fn(&str, Grant) -> Fetched + Send + Sync>;
 
 /// Fetch a remote image: its bytes and natural size, if it's a PNG or JPEG.
 fn fetch_image(url: &str, grant: Grant) -> Fetched {
-    let bytes = fetch_with("curl", url, LIMITS, grant)?;
+    let mut bytes = fetch_with("curl", url, LIMITS, grant)?;
+    // A JPEG's metadata is cut out of the body where it is, so the cache doesn't keep it and the
+    // decoder never sees it (the buffer is cut to size again, its credit with it).
+    if !image::shed_jpeg_metadata(&mut bytes) {
+        return Err(Error::NotAnImage);
+    }
     match image::header(&mut &bytes[..]) {
         Some((_, w, h)) if u64::from(w) * u64::from(h) <= image::MAX_PIXELS => {
             Ok((Arc::new(bytes), w, h))

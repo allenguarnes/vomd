@@ -2,7 +2,8 @@
 # Memory with many remote images from a server on 127.0.0.1 (never the network):
 # `scripts/remote-rss.sh [N [big|tiny|grow]]` (N 0 or none: the mode's own), see examples/remote_rss.rs for what each does.
 # The server makes the images as they are asked for; it and everything else is stopped (and the
-# temporary directory removed) when done.
+# temporary directory removed) when done. With `REMOTE_RSS_BIN` set to a built `remote_rss` that
+# is run instead of `cargo run` (`cargo xtask budgets` does).
 set -eu
 n=${1:-}
 mode=${2:-big}
@@ -72,5 +73,9 @@ for _ in $(seq 50); do
 done
 [ -n "$port" ] || { echo "no server" >&2; exit 1; }
 cd "$(dirname "$0")/.."
-XDG_CONFIG_HOME="$dir/config" \
+export XDG_CONFIG_HOME="$dir/config"
+if [ -n "${REMOTE_RSS_BIN:-}" ]; then
+    "$REMOTE_RSS_BIN" "http://127.0.0.1:$port" "${n:-0}" "$mode"
+else
     cargo run --release --example remote_rss -- "http://127.0.0.1:$port" "${n:-0}" "$mode"
+fi
