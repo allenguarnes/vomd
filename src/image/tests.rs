@@ -75,8 +75,10 @@ fn jpeg_size_after_metadata_segments() {
         j.extend(((60_000 + 2) as u16).to_be_bytes());
         j.extend(std::iter::repeat_n(0xAB, 60_000));
     }
-    // Fill bytes before the marker, then SOF0: precision, height 300, width 400.
-    j.extend([0xFF, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0x2C, 0x01, 0x90]);
+    // Fill bytes before the marker, then SOF0: precision, height 300, width 400, one
+    // component.
+    j.extend([0xFF, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0x2C, 0x01, 0x90]);
+    j.extend([0x01, 0x01, 0x11, 0x00]);
     assert_eq!(header(&mut &j[..]), Some((Format::Jpeg, 400, 300)));
     // DHT (C4) isn't a frame header; the scan starting first means there's none.
     let j = [0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x02, 0xFF, 0xDA, 0x00, 0x02];
@@ -727,8 +729,9 @@ fn images_beyond_the_cache_are_not_decoded_over_and_over() {
     let mut images = Images::default();
     images.set_base(Some(dir.clone()));
     images.attach(&doc, &mut layout);
-    // Room for two and a half of them (40 000 bytes each).
-    images.cache.cap = 100_000;
+    // Room for three of them (40,000 bytes each) and the decode of another (its result and a
+    // few rows).
+    images.cache.cap = 140_000;
     // Image 1 in view, the others a screen away.
     let boxes = [(1, 100, 100), (2, 100, 100), (3, 100, 100), (4, 100, 100)];
     // A frame per result: results straddle frames, as the decodes of big images do.
@@ -787,7 +790,8 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
     images.begin_frame();
     let _ = images.pixels(3, 25_000, 1);
     images.request(&[(1, 600, 200)], 1);
-    assert_eq!(images.cache.reserve, 360_000 + file);
+    // The frame, the file, and the result (600 × 200 pixels).
+    assert_eq!(images.cache.reserve, 360_000 + file + 480_000);
     assert!(
         !images.cache.has(&Key::Local(2), 25_000, 1),
         "evicted for the decode"
@@ -813,4 +817,43 @@ fn blocked_images_are_not_offered_without_curl() {
     assert!(images.blocked(1));
     images.remote.no_curl = true;
     assert!(!images.blocked(1));
+}
+
+/// A progressive JPEG's decoder holds every coefficient of the image as well as its RGB frame:
+/// both count in what a decode costs (a baseline JPEG's only the frame).
+#[test]
+fn progressive_jpegs_count_their_coefficients() {
+    let info = |b: &[u8]| header_info(&mut &b[..]).unwrap();
+    assert_eq!(info(&fixture("gradient.jpg")).coefficients, 0, "baseline");
+    // 48 × 24, every component sampled 1 × 1: three planes of 48 × 24 i16.
+    let p = info(&fixture("progressive.jpg"));
+    assert_eq!(p.coefficients, 3 * 48 * 24 * 2);
+    assert_eq!(decode_cost(&p, false), 48 * 24 * 3 + 3 * 48 * 24 * 2);
+    // A 4000 × 3000 phone photo saved progressive at 4:2:0: luma padded to 16-pixel MCUs
+    // (4000 × 3008), chroma at half size each way.
+    let mut j = vec![0xFF, 0xD8, 0xFF, 0xC2, 0x00, 0x11, 0x08];
+    j.extend(3000u16.to_be_bytes());
+    j.extend(4000u16.to_be_bytes());
+    j.extend([3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    let p = info(&j);
+    assert_eq!((p.w, p.h), (4000, 3000));
+    assert_eq!(p.coefficients, (4000 * 3008 + 2 * 2000 * 1504) * 2);
+    // The same as baseline (SOF0): nothing but the frame.
+    j[3] = 0xC0;
+    assert_eq!(info(&j).coefficients, 0);
+}
+
+/// Looking at a fetched image's bytes to cost its decode doesn't mark them painted, so an
+/// image that isn't decoded now doesn't keep them from being evicted.
+#[test]
+fn costing_remote_bytes_does_not_pin_them() {
+    let url: Arc<str> = "https://x.y/a.png".into();
+    let mut c = Cache::new(10);
+    c.insert(Key::Remote(url.clone()), Data::Bytes(vec![0u8; 8].into()));
+    c.frame += 1;
+    assert!(c.peek_bytes(&url).is_some());
+    assert_eq!(c.slots[0].used, 0);
+    // Over the budget, it goes.
+    c.insert(Key::Local(1), Data::Bytes(vec![0u8; 8].into()));
+    assert!(c.peek_bytes(&url).is_none());
 }

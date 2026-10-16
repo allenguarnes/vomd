@@ -59,6 +59,20 @@ pub enum Format {
 /// or the JPEG frame header (`SOFn`). `None` for anything else (GIF, WebP, SVG, ...), broken
 /// data, a zero size or a side over [`MAX_SOURCE_SIDE`].
 pub fn header(r: &mut impl Read) -> Option<(Format, u32, u32)> {
+    header_info(r).map(|h| (h.format, h.w, h.h))
+}
+
+/// What [`header`] reads, and the bytes of coefficients a progressive JPEG's decoder holds
+/// for the whole image (every component's samples as `i16`, padded to whole MCUs) on top of
+/// its frame of RGB (0 for a baseline JPEG, which decodes an MCU row at a time, and a PNG).
+struct Header {
+    format: Format,
+    w: u32,
+    h: u32,
+    coefficients: usize,
+}
+
+fn header_info(r: &mut impl Read) -> Option<Header> {
     let mut start = [0u8; 2];
     r.read_exact(&mut start).ok()?;
     match start {
@@ -72,16 +86,27 @@ pub fn header(r: &mut impl Read) -> Option<(Format, u32, u32)> {
             let be = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
             let (w, h) = (be(14), be(18));
             let ok = (1..=MAX_SOURCE_SIDE).contains(&w) && (1..=MAX_SOURCE_SIDE).contains(&h);
-            ok.then_some((Format::Png, w, h))
+            ok.then_some(Header {
+                format: Format::Png,
+                w,
+                h,
+                coefficients: 0,
+            })
         }
-        [0xFF, 0xD8] => jpeg_size(r).map(|(w, h)| (Format::Jpeg, w, h)),
+        [0xFF, 0xD8] => jpeg_size(r).map(|(w, h, coefficients)| Header {
+            format: Format::Jpeg,
+            w,
+            h,
+            coefficients,
+        }),
         _ => None,
     }
 }
 
 /// The size in a JPEG's frame header, the segments after the start-of-image marker walked
-/// (and skipped) until it. Every marker is taken to have a length, as the decoder does.
-fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32)> {
+/// (and skipped) until it, and the coefficients its decoder holds (see [`Header`]). Every
+/// marker is taken to have a length, as the decoder does.
+fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32, usize)> {
     let mut byte = || {
         let mut b = [0u8; 1];
         r.read_exact(&mut b).ok().map(|_| b[0])
@@ -112,14 +137,42 @@ fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32)> {
         }
         // SOF0..SOF15, but not DHT (C4), JPG (C8) or DAC (CC).
         if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
-            let mut sof = [0u8; 5];
+            // Precision, height, width, components; then id, sampling (H << 4 | V) and
+            // quantization table of each component.
+            let mut sof = [0u8; 6];
             for b in &mut sof {
                 *b = byte()?;
             }
             let h = u32::from(u16::from_be_bytes([sof[1], sof[2]]));
             let w = u32::from(u16::from_be_bytes([sof[3], sof[4]]));
+            let mut sampling = Vec::with_capacity(usize::from(sof[5]));
+            for _ in 0..sof[5] {
+                let (_, hv, _) = (byte()?, byte()?, byte()?);
+                sampling.push((u64::from(hv >> 4).max(1), u64::from(hv & 15).max(1)));
+            }
             // A height of 0 is defined later in the data (DNL): not worth supporting.
-            return (w > 0 && h > 0).then_some((w, h));
+            if w == 0 || h == 0 {
+                return None;
+            }
+            // SOF2, SOF6, SOF10 and SOF14 are progressive.
+            let progressive = matches!(marker, 0xC2 | 0xC6 | 0xCA | 0xCE);
+            let coefficients = if progressive {
+                let hmax = sampling.iter().map(|s| s.0).max().unwrap_or(1);
+                let vmax = sampling.iter().map(|s| s.1).max().unwrap_or(1);
+                let (mw, mh) = (8 * hmax, 8 * vmax);
+                let (pw, ph) = (
+                    u64::from(w).div_ceil(mw) * mw,
+                    u64::from(h).div_ceil(mh) * mh,
+                );
+                let samples: u64 = sampling
+                    .iter()
+                    .map(|&(hc, vc)| pw * hc / hmax * (ph * vc / vmax))
+                    .sum();
+                usize::try_from(samples * 2).unwrap_or(usize::MAX)
+            } else {
+                0
+            };
+            return Some((w, h, coefficients));
         }
         let skip = u64::from(len - 2);
         scanned += skip + 2;
@@ -234,15 +287,16 @@ fn read_file(path: &Path) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= MAX_FILE).then_some(bytes)
 }
 
-/// What decoding an image of `w` × `h` holds besides the file's bytes and the result, at most:
-/// a JPEG's whole frame of RGB (nothing smaller is had from its decoder), an interlaced PNG's
-/// whole frame, or a few rows of a PNG that isn't (read a row at a time).
-fn decode_cost(format: Format, interlaced: bool, w: u32, h: u32) -> usize {
-    let pixels = w as usize * h as usize;
-    match format {
-        Format::Jpeg => pixels * 3,
-        Format::Png if interlaced => pixels * 4,
-        Format::Png => w as usize * 32,
+/// What decoding an image holds besides the file's bytes and the result, at most: a JPEG's
+/// whole frame of RGB (nothing smaller is had from its decoder) and, progressive, its
+/// coefficients, an interlaced PNG's whole frame, or a few rows of a PNG that isn't (read a
+/// row at a time).
+fn decode_cost(header: &Header, interlaced: bool) -> usize {
+    let pixels = header.w as usize * header.h as usize;
+    match header.format {
+        Format::Jpeg => pixels.saturating_mul(3).saturating_add(header.coefficients),
+        Format::Png if interlaced => pixels.saturating_mul(4),
+        Format::Png => header.w as usize * 32,
     }
 }
 
@@ -254,15 +308,15 @@ fn file_cost(path: &Path) -> Option<usize> {
     let mut r = std::io::BufReader::with_capacity(4096, file);
     // The interlace method is the last byte of a PNG's `IHDR`.
     let interlaced = r.fill_buf().ok()?.get(28) == Some(&1);
-    let (format, w, h) = header(&mut r)?;
-    Some(len.saturating_add(decode_cost(format, interlaced, w, h)))
+    let header = header_info(&mut r)?;
+    Some(len.saturating_add(decode_cost(&header, interlaced)))
 }
 
 /// [`decode_cost`] of an image already in memory.
 #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
 fn bytes_cost(bytes: &[u8]) -> Option<usize> {
-    let (format, w, h) = header(&mut &bytes[..])?;
-    Some(decode_cost(format, bytes.get(28) == Some(&1), w, h))
+    let header = header_info(&mut &bytes[..])?;
+    Some(decode_cost(&header, bytes.get(28) == Some(&1)))
 }
 
 // ---- Decoding ---------------------------------------------------------------------------
@@ -587,6 +641,16 @@ impl Cache {
         slot.pixels()
     }
 
+    /// A URL's bytes without marking them used: looking at an image that won't be decoded now
+    /// mustn't keep its bytes from being evicted.
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn peek_bytes(&self, url: &Arc<str>) -> Option<&Arc<[u8]>> {
+        self.slots.iter().find_map(|s| match &s.data {
+            Data::Bytes(b) if s.key == Key::Remote(url.clone()) => Some(b),
+            _ => None,
+        })
+    }
+
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
     fn bytes_of(&mut self, url: &Arc<str>) -> Option<Arc<[u8]>> {
         let frame = self.frame;
@@ -667,7 +731,7 @@ pub(crate) struct Job {
     source: Source,
     w: u32,
     h: u32,
-    /// What it holds while it runs, besides its result: see [`decode_cost`].
+    /// What it holds while it runs, its result included: see [`decode_cost`].
     cost: usize,
 }
 
@@ -898,7 +962,7 @@ impl Images {
     }
 
     /// What decoding image `id` holds while it runs, besides its result (0 if not known yet: a
-    /// remote image's bytes aren't fetched).
+    /// remote image's bytes aren't fetched). Doesn't mark anything used.
     fn cost(&mut self, id: u32) -> usize {
         let i = id.checked_sub(1).map_or(usize::MAX, |i| i as usize);
         match self.src(id).clone() {
@@ -909,8 +973,8 @@ impl Images {
             #[cfg(feature = "remote-images")]
             Src::Remote(url) if self.remote.on => self
                 .cache
-                .bytes_of(&url)
-                .and_then(|b| bytes_cost(&b))
+                .peek_bytes(&url)
+                .and_then(|b| bytes_cost(b))
                 .unwrap_or(0),
             _ => 0,
         }
@@ -952,7 +1016,12 @@ impl Images {
             };
             let (w, h) = clamp_box(w, h);
             let cached = self.cache.has(&key, w, h);
-            let cost = if cached { 0 } else { self.cost(id) };
+            // The result is held beside the cache too, until it goes in.
+            let cost = if cached {
+                0
+            } else {
+                self.cost(id).saturating_add(w as usize * h as usize * 4)
+            };
             let room = self.cache.cap.saturating_sub(reserve.max(cost));
             let over = n >= on_screen && wanted >= room;
             wanted = wanted.saturating_add(w as usize * h as usize * 4);
