@@ -1633,3 +1633,140 @@ fn a_body_is_let_in_alone_when_nothing_can_make_room() {
         assert!(images.pixels(id, 40, 30).is_some(), "image {id}");
     }
 }
+
+/// A decoded image in view (17.3 MB: decoded images are never evicted) leaves no room for the
+/// 8 MiB body of the remote image just below it, which is within the prefetch range but not in
+/// view: the body is dropped, and it is not fetched again while nothing changes, however often
+/// the window paints and polls. It is fetched when its image comes into view, and when the
+/// image above is gone and there is room.
+#[cfg(all(feature = "remote-images", feature = "images"))]
+#[test]
+fn a_body_dropped_for_lack_of_room_is_not_fetched_in_a_loop() {
+    use crate::remote::{Error, STEP};
+    use crate::render::Pixels;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = scratch("refetch");
+    std::fs::write(
+        dir.join("tall.png"),
+        png_bytes(720, 6000, |_, y| [y as u8, 3, 4, 255]),
+    )
+    .unwrap();
+    let body = {
+        let mut b = png_bytes(40, 30, |x, y| [x as u8, y as u8, 5, 255]);
+        b.extend(vec![0u8; 8 << 20]);
+        b
+    };
+    let doc = Doc::parse("![t](tall.png)\n\n![r](https://x.y/r.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let count = fetches.clone();
+    let fetcher: crate::remote::Fetcher = Arc::new(move |_, grant| {
+        count.fetch_add(1, Ordering::SeqCst);
+        for _ in 0..body.len().div_ceil(STEP) {
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+        }
+        Ok((Arc::new(body.clone()), 40, 30))
+    });
+    images.remote.set_fetcher(fetcher);
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let both = [(1, 720, 6000), (2, 40, 30)];
+    // Frames at 16 ms, the first image the only one in view, until `done`.
+    let mut frames = |images: &mut Images, boxes: &[(u32, u32, u32)], on_screen, ms: u64| {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(ms) {
+            images.begin_frame();
+            images.request(boxes, on_screen);
+            std::thread::sleep(Duration::from_millis(16));
+            images.poll(&doc, &mut layout);
+            if let Some(b) = images.pixels(1, 720, 6000) {
+                let _ = b;
+            }
+        }
+    };
+    frames(&mut images, &both, 1, 3000);
+    let n = fetches.load(Ordering::SeqCst);
+    assert!(n <= 2, "the body was fetched {n} times in 3 s");
+    assert!(images.pixels(1, 720, 6000).is_some());
+    assert!(images.pixels(2, 40, 30).is_none());
+    assert_eq!(images.stats().waiting, 0);
+    // Scrolled into view, it loads.
+    frames(&mut images, &both, 2, 1000);
+    assert!(images.pixels(2, 40, 30).is_some(), "{:?}", images.stats());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same, then the image above goes (the window moves on): there is room, so the body is
+/// fetched again, once, and decoded.
+#[cfg(all(feature = "remote-images", feature = "images"))]
+#[test]
+fn a_dropped_body_is_fetched_again_when_room_is_made() {
+    use crate::remote::{Error, STEP};
+    use crate::render::Pixels;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = scratch("refetch-room");
+    std::fs::write(
+        dir.join("tall.png"),
+        png_bytes(720, 6000, |_, y| [y as u8, 3, 4, 255]),
+    )
+    .unwrap();
+    let body = {
+        let mut b = png_bytes(40, 30, |x, y| [x as u8, y as u8, 5, 255]);
+        b.extend(vec![0u8; 8 << 20]);
+        b
+    };
+    let doc = Doc::parse("![t](tall.png)\n\n![r](https://x.y/r.png)\n\n![s](https://x.y/s.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let count = fetches.clone();
+    let fetcher: crate::remote::Fetcher = Arc::new(move |_, grant| {
+        count.fetch_add(1, Ordering::SeqCst);
+        for _ in 0..body.len().div_ceil(STEP) {
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+        }
+        Ok((Arc::new(body.clone()), 40, 30))
+    });
+    images.remote.set_fetcher(fetcher);
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let run = |images: &mut Images, layout: &mut Layout, boxes: &[(u32, u32, u32)], on, ms| {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(ms) {
+            images.begin_frame();
+            images.request(boxes, on);
+            std::thread::sleep(Duration::from_millis(16));
+            images.poll(&doc, layout);
+        }
+    };
+    run(
+        &mut images,
+        &mut layout,
+        &[(1, 720, 6000), (2, 40, 30), (3, 40, 30)],
+        1,
+        2000,
+    );
+    let n = fetches.load(Ordering::SeqCst);
+    assert!(n <= 4, "{n} fetches of two bodies that don't fit");
+    assert!(images.pixels(2, 40, 30).is_none() && images.pixels(3, 40, 30).is_none());
+    // Scrolled past the tall image: it is out of the boxes, and what was dropped is wanted.
+    run(
+        &mut images,
+        &mut layout,
+        &[(2, 40, 30), (3, 40, 30)],
+        1,
+        2000,
+    );
+    assert!(images.pixels(2, 40, 30).is_some(), "{:?}", images.stats());
+    assert!(images.pixels(3, 40, 30).is_some(), "{:?}", images.stats());
+    let _ = std::fs::remove_dir_all(&dir);
+}

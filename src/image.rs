@@ -1008,6 +1008,24 @@ impl Cache {
             <= self.cap
     }
 
+    /// What [`Cache::room_for`] would say if `reserve` and `fetching` were what is set aside,
+    /// without evicting anything: whatever was painted this frame is all that can't go, so the
+    /// body fits exactly when it fits beside that.
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn would_fit(&self, cost: usize, decode: usize, reserve: usize, fetching: usize) -> bool {
+        let kept: usize = self
+            .slots
+            .iter()
+            .filter(|s| s.used >= self.frame)
+            .map(Slot::cost)
+            .sum();
+        kept.saturating_add(reserve)
+            .saturating_add(fetching)
+            .saturating_add(cost)
+            .saturating_add(decode.saturating_sub(reserve))
+            <= self.cap
+    }
+
     /// Whether a fetched body is held that was used this frame, which can't be evicted.
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
     fn holds_used_bytes(&self) -> bool {
@@ -1259,6 +1277,12 @@ pub struct Images {
     /// still held by the fetchers' credit, so they can't pile up while the decoder is behind.
     #[cfg(feature = "remote-images")]
     waiting: Vec<(Arc<str>, crate::remote::Fetched)>,
+    /// Bodies dropped for lack of room (their images weren't in view), by URL: what keeping
+    /// each would have cost in the cache and what decoding it needs. Such a URL is fetched
+    /// again only when its image is in view or there would be room for it now
+    /// ([`Cache::would_fit`]), not just because it is wanted: see [`Images::request`].
+    #[cfg(feature = "remote-images")]
+    deferred: std::collections::HashMap<Arc<str>, (usize, usize)>,
     #[cfg(feature = "remote-images")]
     pub(crate) remote: crate::remote::Remote,
 }
@@ -1281,6 +1305,8 @@ impl Default for Images {
             in_view: Vec::new(),
             #[cfg(feature = "remote-images")]
             waiting: Vec::new(),
+            #[cfg(feature = "remote-images")]
+            deferred: std::collections::HashMap::new(),
             #[cfg(feature = "remote-images")]
             remote: crate::remote::Remote::default(),
         }
@@ -1441,6 +1467,8 @@ impl Images {
         let mut jobs = Vec::new();
         #[cfg(feature = "remote-images")]
         let mut fetch: Vec<Arc<str>> = Vec::new();
+        #[cfg(feature = "remote-images")]
+        let mut deferred: Vec<Arc<str>> = Vec::new();
         let mut wanted = 0usize;
         let mut reserve = self.worker.as_ref().map_or(0, Worker::busy_cost);
         // What is set aside for the fetchers, if any are (or are about to be) running.
@@ -1488,10 +1516,16 @@ impl Images {
                 Src::Remote(url) if self.remote.on => match self.cache.bytes_of(&url) {
                     Some(bytes) => Source::Bytes(bytes),
                     None => {
-                        // Not fetched yet, or its bytes were evicted: fetch it (again).
+                        // Not fetched yet, or its bytes were evicted: fetch it (again). One
+                        // dropped for lack of room, whose image isn't in view, waits to see
+                        // if there is room once what is wanted this frame is known.
                         if self.remote.size(&url) != Some(None) {
-                            fetch.push(url);
-                            fetching = self.fetch_reserve(true);
+                            if n >= on_screen && self.deferred.contains_key(&url) {
+                                deferred.push(url);
+                            } else {
+                                fetch.push(url);
+                                fetching = self.fetch_reserve(true);
+                            }
                         }
                         continue;
                     }
@@ -1507,6 +1541,23 @@ impl Images {
                 h,
                 cost,
             });
+        }
+        // A body dropped for lack of room is fetched again only if it would fit now, beside
+        // what this frame keeps (the decoded images and bodies painted or wanted, which can't
+        // be evicted), what decoding holds and what the fetchers are given: the test the body
+        // meets when it arrives (`Cache::room_for`), so if the state doesn't change it is
+        // admitted and the loop is over, and if it does not fit nothing is fetched until
+        // something changes. (Its image coming into view is the other way: handled above.)
+        #[cfg(feature = "remote-images")]
+        for url in deferred {
+            let fits = self.deferred.get(&url).is_some_and(|&(cost, decode)| {
+                self.cache
+                    .would_fit(cost, decode, reserve, self.fetch_reserve(true))
+            });
+            if fits {
+                fetch.push(url);
+                fetching = self.fetch_reserve(true);
+            }
         }
         self.cache.reserve = reserve;
         // The cache is made room for them before they are let start: they can't take more.
@@ -1622,8 +1673,22 @@ impl Images {
         match admit {
             Admit::Wait => self.waiting.push((url, result)),
             Admit::Yes => self.take_fetched(url, result, true),
-            Admit::Drop => self.take_fetched(url, result, false),
+            Admit::Drop => self.drop_fetched(url, result),
         }
+    }
+
+    /// Take a body that is not kept (no room, its image not in view), remembering what it would
+    /// have cost so it is fetched again only when there is room for that.
+    #[cfg(feature = "remote-images")]
+    fn drop_fetched(&mut self, url: Arc<str>, result: crate::remote::Fetched) {
+        if let Ok((bytes, ..)) = &result {
+            let need = (
+                Slot::bytes_cost(&url, bytes),
+                bytes_cost(bytes).unwrap_or(0),
+            );
+            self.deferred.insert(url.clone(), need);
+        }
+        self.take_fetched(url, result, false);
     }
 
     /// Whether the body fetched for `url` can go to the cache now. One in view that doesn't fit
@@ -1651,6 +1716,9 @@ impl Images {
     #[cfg(feature = "remote-images")]
     fn take_fetched(&mut self, url: Arc<str>, result: crate::remote::Fetched, keep: bool) {
         let taken = self.remote.fetched(&url, result);
+        if keep {
+            self.deferred.remove(&url);
+        }
         if let (true, Some(bytes)) = (keep, taken) {
             self.cache
                 .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
@@ -1673,8 +1741,12 @@ impl Images {
             };
             match admit {
                 Admit::Wait => self.waiting.push((url, result)),
-                Admit::Yes | Admit::Drop => {
-                    self.take_fetched(url, result, matches!(admit, Admit::Yes));
+                Admit::Yes => {
+                    self.take_fetched(url, result, true);
+                    any = true;
+                }
+                Admit::Drop => {
+                    self.drop_fetched(url, result);
                     any = true;
                 }
             }
