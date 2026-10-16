@@ -39,6 +39,9 @@ const MAX_HEADER_SCAN: u64 = 4 << 20;
 /// Calls the event loop back when a result is waiting ([`Images::poll`]).
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// A fetched image's bytes: the buffer the body was read into, not copied to a slice.
+pub(crate) type Bytes = Arc<Vec<u8>>;
+
 /// A decoded image at the size it is shown: premultiplied `0xAARRGGBB`, rows packed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bitmap {
@@ -374,10 +377,10 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
 /// can be hundreds of MB, and the memory the allocator then keeps would sit beside a full cache.
 #[cfg(feature = "images")]
 fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
-    let limits = png::Limits {
-        bytes: (MAX_PIXELS * 4) as usize + (1 << 20),
-    };
-    let mut d = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), limits);
+    // What the decoder may allocate for itself: the palette and `tRNS` (the chunks it is given
+    // besides the pixels, see `PngChunks`) and a row of output. Not the pixels.
+    let limits = png::Limits { bytes: 1 << 20 };
+    let mut d = png::Decoder::new_with_limits(PngChunks::new(bytes), limits);
     d.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = d.read_info().ok()?;
     let (width, height) = reader.info().size();
@@ -402,6 +405,81 @@ fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
         channels,
     };
     resample(frame, w, h)
+}
+
+/// A PNG's bytes with the chunks nothing here uses left out: only the critical ones (`IHDR`,
+/// `PLTE`, `IDAT`, `IEND`, and any other the decoder must refuse) and `tRNS` are read. The
+/// decoder keeps ancillary chunks it is given (`eXIf` always, and `iCCP`, `tEXt` and the like
+/// decompressed to up to its limit): a 100 KB PNG can hold a profile of 100 MB, or an `eXIf` of
+/// the file's size, none of it in a decode's cost, none of it drawn. A chunk is skipped whole,
+/// its checksum with it; an animated PNG is its default image, as in a browser's first frame.
+#[cfg(feature = "images")]
+struct PngChunks<'a> {
+    /// The chunks not yet looked at.
+    rest: &'a [u8],
+    /// The part of the chunk being handed out that hasn't been.
+    chunk: &'a [u8],
+}
+
+#[cfg(feature = "images")]
+impl<'a> PngChunks<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        // The signature goes through as it is, like the first chunk (`IHDR`, critical).
+        let at = bytes.len().min(8);
+        PngChunks {
+            rest: &bytes[at..],
+            chunk: &bytes[..at],
+        }
+    }
+}
+
+#[cfg(feature = "images")]
+impl std::io::BufRead for PngChunks<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        while self.chunk.is_empty() {
+            let Some(head) = self.rest.get(..8) else {
+                // What's left is no chunk: the decoder reports it.
+                self.chunk = std::mem::take(&mut self.rest);
+                break;
+            };
+            let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+            // Length, type, data and checksum; a chunk the data ends in is cut short.
+            let end = len.saturating_add(12).min(self.rest.len());
+            let (chunk, rest) = self.rest.split_at(end);
+            self.rest = rest;
+            // The type's first letter is upper case for a critical chunk.
+            if head[4] & 0x20 == 0 || &head[4..8] == b"tRNS" {
+                self.chunk = chunk;
+            }
+        }
+        Ok(self.chunk)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.chunk = &self.chunk[amt.min(self.chunk.len())..];
+    }
+}
+
+#[cfg(feature = "images")]
+impl std::io::Read for PngChunks<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = {
+            let chunk = std::io::BufRead::fill_buf(self)?;
+            let n = buf.len().min(chunk.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            n
+        };
+        std::io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+/// The decoder only needs this to be there: it never seeks.
+#[cfg(feature = "images")]
+impl std::io::Seek for PngChunks<'_> {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// The source rows of an image, as [`resample_rows`] takes them: each at most once, in order.
@@ -431,7 +509,7 @@ impl Rows for Frame<'_> {
 /// A PNG decoded a row at a time, `next` the row the decoder is at.
 #[cfg(feature = "images")]
 struct PngRows<'a> {
-    reader: png::Reader<std::io::Cursor<&'a [u8]>>,
+    reader: png::Reader<PngChunks<'a>>,
     next: usize,
 }
 
@@ -559,7 +637,7 @@ enum Data {
     Pixels(Bitmap),
     /// A fetched remote image's bytes, to decode at whatever size its box needs.
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
-    Bytes(Arc<[u8]>),
+    Bytes(Bytes),
 }
 
 struct Slot {
@@ -592,6 +670,9 @@ struct Cache {
     cap: usize,
     /// What the worker's decodes hold while they run, at most: it comes out of the budget.
     reserve: usize,
+    /// What the fetchers hold (bodies being read or not yet taken), as of the last time it
+    /// was looked at: it comes out of the budget too.
+    inflight: usize,
     frame: u64,
 }
 
@@ -602,6 +683,7 @@ impl Cache {
             bytes: 0,
             cap,
             reserve: 0,
+            inflight: 0,
             frame: 0,
         }
     }
@@ -644,7 +726,7 @@ impl Cache {
     /// A URL's bytes without marking them used: looking at an image that won't be decoded now
     /// mustn't keep its bytes from being evicted.
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
-    fn peek_bytes(&self, url: &Arc<str>) -> Option<&Arc<[u8]>> {
+    fn peek_bytes(&self, url: &Arc<str>) -> Option<&Bytes> {
         self.slots.iter().find_map(|s| match &s.data {
             Data::Bytes(b) if s.key == Key::Remote(url.clone()) => Some(b),
             _ => None,
@@ -652,7 +734,7 @@ impl Cache {
     }
 
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
-    fn bytes_of(&mut self, url: &Arc<str>) -> Option<Arc<[u8]>> {
+    fn bytes_of(&mut self, url: &Arc<str>) -> Option<Bytes> {
         let frame = self.frame;
         self.slots.iter_mut().find_map(|s| match &s.data {
             Data::Bytes(b) if s.key == Key::Remote(url.clone()) => {
@@ -676,20 +758,34 @@ impl Cache {
                 }
         };
         self.retain(|s| !same(s));
-        let slot = Slot {
-            key,
-            data,
-            used: self.frame,
+        // Pixels come in for a box that is wanted (and are as good as painted this frame). A
+        // fetched body counts as used when something is made of it ([`Cache::bytes_of`]), not
+        // before: it may belong to an image far from the viewport, and mustn't push out
+        // what is being looked at.
+        let used = match data {
+            Data::Pixels(_) => self.frame,
+            Data::Bytes(_) => 0,
         };
+        let slot = Slot { key, data, used };
+        // Room is made before the slot is in, so it can't be the one evicted.
+        self.evict_for(slot.cost());
         self.bytes += slot.cost();
         self.slots.push(slot);
-        self.evict();
+    }
+
+    fn evict(&mut self) {
+        self.evict_for(0);
     }
 
     /// Drop the least recently painted slots until the budget holds beside what decoding needs
-    /// ([`Cache::reserve`]), never one painted in the current frame.
-    fn evict(&mut self) {
-        while self.bytes.saturating_add(self.reserve) > self.cap {
+    /// ([`Cache::reserve`]), what the fetchers hold ([`Cache::inflight`]) and `extra` more
+    /// bytes, never one painted in the current frame.
+    fn evict_for(&mut self, extra: usize) {
+        let held = self
+            .reserve
+            .saturating_add(self.inflight)
+            .saturating_add(extra);
+        while self.bytes.saturating_add(held) > self.cap {
             let Some((i, _)) = self
                 .slots
                 .iter()
@@ -721,7 +817,7 @@ impl Cache {
 pub(crate) enum Source {
     File(PathBuf),
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
-    Bytes(Arc<[u8]>),
+    Bytes(Bytes),
 }
 
 /// Decode `source` to `w` × `h` for `key` (of document generation `doc_gen`).
@@ -865,6 +961,10 @@ pub struct Images {
     rx: Receiver<Done>,
     wake: Wake,
     worker: Option<Worker>,
+    /// The remote images in view when images were last asked for: a body that arrives for one
+    /// is as good as painted (it is decoded next), any other may be evicted at once.
+    #[cfg(feature = "remote-images")]
+    in_view: Vec<Arc<str>>,
     #[cfg(feature = "remote-images")]
     pub(crate) remote: crate::remote::Remote,
 }
@@ -882,6 +982,8 @@ impl Default for Images {
             rx,
             wake: Arc::new(|| {}),
             worker: None,
+            #[cfg(feature = "remote-images")]
+            in_view: Vec::new(),
             #[cfg(feature = "remote-images")]
             remote: crate::remote::Remote::default(),
         }
@@ -1010,10 +1112,16 @@ impl Images {
         let mut fetch: Vec<Arc<str>> = Vec::new();
         let mut wanted = 0usize;
         let mut reserve = self.worker.as_ref().map_or(0, Worker::busy_cost);
+        #[cfg(feature = "remote-images")]
+        self.in_view.clear();
         for (n, &(id, w, h)) in boxes.iter().enumerate() {
             let Some(key) = self.key(id) else {
                 continue;
             };
+            #[cfg(feature = "remote-images")]
+            if let (true, Key::Remote(url)) = (n < on_screen, &key) {
+                self.in_view.push(url.clone());
+            }
             let (w, h) = clamp_box(w, h);
             let cached = self.cache.has(&key, w, h);
             // The result is held beside the cache too, until it goes in.
@@ -1064,6 +1172,10 @@ impl Images {
             });
         }
         self.cache.reserve = reserve;
+        #[cfg(feature = "remote-images")]
+        {
+            self.cache.inflight = self.remote.inflight();
+        }
         self.cache.evict();
         if !jobs.is_empty() && self.worker.is_none() {
             self.worker = Some(Worker::spawn(self.tx.clone(), self.wake.clone()));
@@ -1127,7 +1239,13 @@ impl Images {
                 #[cfg(feature = "remote-images")]
                 Done::Fetched { url, result } => {
                     if let Some(bytes) = self.remote.fetched(&url, result) {
-                        self.cache.insert(Key::Remote(url), Data::Bytes(bytes));
+                        // Its credit is free: what the others hold is what's left.
+                        self.cache.inflight = self.remote.inflight();
+                        self.cache
+                            .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
+                        if self.in_view.contains(&url) {
+                            self.cache.bytes_of(&url);
+                        }
                     }
                     self.sync_remote(doc, layout);
                 }

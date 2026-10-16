@@ -84,6 +84,12 @@ fn serve(s: TcpStream, port: u16) {
             GLOB_HITS.fetch_add(1, Ordering::SeqCst);
             respond(s, "404 Not Found", &len(0), b"");
         }
+        // A PNG with 4 MiB after it (the image's header is all that is looked at).
+        p if p.starts_with("/big/") => {
+            let mut body = png.clone();
+            body.resize(png.len() + (4 << 20), 0);
+            respond(s, "200 OK", &len(body.len()), &body);
+        }
         "/page.html" => respond(s, "200 OK", &len(6), b"<html>"),
         _ => respond(s, "404 Not Found", &len(0), b""),
     }
@@ -124,7 +130,7 @@ fn only_http_urls_are_handed_to_curl() {
     ] {
         assert!(!fetchable(url), "{url:?}");
         assert_eq!(
-            fetch_with("/nonexistent/curl", url, SMALL),
+            fetch_with("/nonexistent/curl", url, SMALL, &|_| {}),
             Err(Error::Refused)
         );
     }
@@ -142,7 +148,7 @@ fn reading_stops_at_the_size_cap() {
     std::fs::write(&fake, "#!/bin/sh\nexec yes\n").unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let t = Instant::now();
-    let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", SMALL);
+    let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", SMALL, &|_| {});
     assert_eq!(got, Err(Error::TooLarge));
     assert!(t.elapsed() < Duration::from_secs(5));
     let _ = std::fs::remove_dir_all(&dir);
@@ -151,7 +157,12 @@ fn reading_stops_at_the_size_cap() {
 #[test]
 fn a_missing_curl_is_told_apart() {
     assert_eq!(
-        fetch_with("/nonexistent/vomd-curl", "https://x.y/a.png", SMALL),
+        fetch_with(
+            "/nonexistent/vomd-curl",
+            "https://x.y/a.png",
+            SMALL,
+            &|_| {}
+        ),
         Err(Error::NoCurl)
     );
 }
@@ -193,8 +204,11 @@ fn fetching_follows_the_rules() {
     );
     // Only images are kept.
     assert!(fetch(&url("/page.html"), SMALL).is_ok());
-    assert_eq!(fetch_image(&url("/page.html")), Err(Error::NotAnImage));
-    let (bytes, w, h) = fetch_image(&url("/ok.png")).unwrap();
+    assert_eq!(
+        fetch_image(&url("/page.html"), &|_| {}),
+        Err(Error::NotAnImage)
+    );
+    let (bytes, w, h) = fetch_image(&url("/ok.png"), &|_| {}).unwrap();
     assert_eq!((&bytes[..], w, h), (&png()[..], 2, 1));
 }
 
@@ -205,7 +219,7 @@ fn what_fetching_found_decides_the_layout() {
     assert_eq!(r.layout_size(&url), ImageSize::Alt, "off");
     r.on = true;
     assert_eq!(r.layout_size(&url), ImageSize::Loading);
-    let bytes: Arc<[u8]> = png().into();
+    let bytes: Bytes = Arc::new(png());
     assert!(r.fetched(&url, Ok((bytes, 2, 1))).is_some());
     assert_eq!(r.layout_size(&url), ImageSize::Pixels(2, 1));
     r.failed(&url);
@@ -252,7 +266,7 @@ fn a_curl_that_overstays_is_killed() {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let limits = Limits { secs: 1, ..SMALL };
     let t = Instant::now();
-    let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", limits);
+    let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", limits, &|_| {});
     assert_eq!(got, Err(Error::Failed));
     let took = t.elapsed();
     assert!(
@@ -276,7 +290,7 @@ struct Probe {
 impl Probe {
     fn fetcher(self: &Arc<Self>) -> Fetcher {
         let p = self.clone();
-        Arc::new(move |url: &str| {
+        Arc::new(move |url: &str, _grant: Grant| {
             p.log.lock().unwrap().push(url.to_owned());
             let now = p.now.fetch_add(1, Ordering::SeqCst) + 1;
             p.peak.fetch_max(now, Ordering::SeqCst);
@@ -285,7 +299,7 @@ impl Probe {
                 open = p.cv.wait(open).unwrap();
             }
             p.now.fetch_sub(1, Ordering::SeqCst);
-            Ok((png().into(), 2, 1))
+            Ok((Arc::new(png()), 2, 1))
         })
     }
 
@@ -364,7 +378,7 @@ fn the_fetchers_never_exceed_their_number_or_repeat_a_url() {
     assert_eq!(woken.load(Ordering::SeqCst), FETCHERS);
     // Taken, they can be fetched again (an evicted image); the rest of the queue goes on.
     for url in &got {
-        assert!(r.fetched(url, Ok((png().into(), 2, 1))).is_some());
+        assert!(r.fetched(url, Ok((Arc::new(png()), 2, 1))).is_some());
     }
     r.fetch(all[FETCHERS..].to_vec(), tx.clone(), wake.clone());
     let mut seen = got.len();
@@ -381,4 +395,145 @@ fn the_fetchers_never_exceed_their_number_or_repeat_a_url() {
     assert_eq!(log.len(), probe.started(), "no URL twice");
     assert_eq!(probe.started(), 10);
     assert_eq!(probe.peak.load(Ordering::SeqCst), FETCHERS);
+}
+
+/// Bodies in memory are bounded: fetchers whose results nobody takes stop at [`FETCH_BYTES`]
+/// (a fetch that would go past it waits, none starts), whatever the number of URLs; taking
+/// results lets the rest through, and every URL is fetched once. (It was 16 bodies of 4 MiB
+/// held at once in a channel, 99 MB, before anything was decoded.)
+#[test]
+fn bodies_waiting_for_the_main_thread_are_bounded() {
+    const BODY: usize = 4 << 20;
+    let started = Arc::new(AtomicUsize::new(0));
+    let fetcher: Fetcher = {
+        let started = started.clone();
+        Arc::new(move |_: &str, grant: Grant| {
+            started.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..BODY / STEP {
+                grant(STEP);
+            }
+            Ok((Arc::new(vec![0u8; BODY]), 2, 1))
+        })
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut r = Remote {
+        on: true,
+        fetcher,
+        ..Remote::default()
+    };
+    let all = urls(16);
+    r.fetch(all.clone(), tx.clone(), Arc::new(|| {}));
+    std::thread::sleep(Duration::from_millis(400));
+    // Nothing is taken: the 12 MiB are spent, by finished bodies and by what the others had
+    // read (or the oldest fetcher, let go on past the budget, took a step or two more).
+    let (held, mut waiting) = (r.inflight(), rx.try_iter().collect::<Vec<_>>());
+    assert!(
+        (FETCH_BYTES..=FETCH_BYTES + BODY).contains(&held),
+        "{held} held"
+    );
+    assert!(
+        (1..=4).contains(&waiting.len()),
+        "{} bodies waiting",
+        waiting.len()
+    );
+    let n = started.load(Ordering::SeqCst);
+    assert!((3..=4).contains(&n), "{n} fetches started");
+    // Taking results frees credit, a fetch at a time.
+    let mut taken = 0;
+    let mut most = 0;
+    while taken < 16 {
+        let done = match waiting.pop() {
+            Some(done) => done,
+            None => rx.recv_timeout(Duration::from_secs(10)).expect("a result"),
+        };
+        let Done::Fetched { url, result } = done else {
+            panic!("a fetch result");
+        };
+        most = most.max(r.inflight());
+        assert!(r.fetched(&url, result).is_some());
+        taken += 1;
+        std::thread::sleep(Duration::from_millis(5));
+        most = most.max(r.inflight());
+    }
+    assert!(most <= FETCH_BYTES + BODY, "{most} held at most");
+    assert_eq!(started.load(Ordering::SeqCst), 16, "each URL once");
+    assert_eq!(r.inflight(), 0);
+}
+
+/// Fetchers that all wait for credit while none holds a finished body can't deadlock: the
+/// oldest goes on past the budget (by at most one body: 20 MiB), the rest follow.
+#[test]
+fn fetchers_waiting_on_each_other_are_let_through() {
+    // Five fetchers' worth of bodies of 7 MiB: four read at once, none done at 12 MiB.
+    const BODY: usize = 7 << 20;
+    let fetcher: Fetcher = Arc::new(|_: &str, grant: Grant| {
+        for _ in 0..BODY / STEP {
+            grant(STEP);
+        }
+        Ok((Arc::new(vec![0u8; BODY]), 2, 1))
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut r = Remote {
+        on: true,
+        fetcher,
+        ..Remote::default()
+    };
+    let all = urls(6);
+    r.fetch(all, tx.clone(), Arc::new(|| {}));
+    let mut got = 0;
+    while got < 6 {
+        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(10)) else {
+            panic!("deadlocked after {got} of 6");
+        };
+        assert!(r.inflight() <= FETCH_BYTES + BODY, "{} held", r.inflight());
+        assert!(r.fetched(&url, result).is_some());
+        got += 1;
+    }
+}
+
+/// The same with a real `curl` and bodies of 4 MiB from a local server: 16 URLs, results not
+/// taken, hold no more than the budget.
+#[test]
+fn real_bodies_stop_at_the_budget() {
+    const BODY: usize = 4 << 20;
+    if !have_curl() {
+        eprintln!("curl not installed: skipped");
+        return;
+    }
+    let port = server();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut r = Remote {
+        on: true,
+        ..Remote::default()
+    };
+    let all: Vec<Arc<str>> = (0..16)
+        .map(|i| format!("http://127.0.0.1:{port}/big/{i}").into())
+        .collect();
+    r.fetch(all, tx.clone(), Arc::new(|| {}));
+    std::thread::sleep(Duration::from_millis(1500));
+    // (The oldest fetch still reading is let go on past it when nothing else can free credit,
+    // by at most one body.)
+    assert!(r.inflight() <= FETCH_BYTES + BODY, "{} held", r.inflight());
+    let mut waiting: Vec<_> = rx.try_iter().collect();
+    assert!(
+        (1..=3).contains(&waiting.len()),
+        "{} waiting",
+        waiting.len()
+    );
+    // Taking them lets the rest through, all 16 once, within the budget throughout.
+    let mut taken = 0;
+    while taken < 16 {
+        let done = match waiting.pop() {
+            Some(done) => done,
+            None => rx.recv_timeout(Duration::from_secs(20)).expect("a result"),
+        };
+        let Done::Fetched { url, result } = done else {
+            panic!("a fetch result");
+        };
+        assert!(r.inflight() <= FETCH_BYTES + BODY, "{} held", r.inflight());
+        assert!(result.is_ok(), "{url}: {result:?}");
+        assert!(r.fetched(&url, result).is_some());
+        taken += 1;
+    }
+    assert_eq!(r.inflight(), 0);
 }

@@ -504,6 +504,88 @@ fn a_very_wide_png_is_refused_or_decoded_in_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `png` with `chunks` (type, data) put after its `IHDR`, their checksums left zero: the
+/// decoder only checks the ones it reads.
+fn with_chunks(png: &[u8], chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+    // Signature, then `IHDR`: length, type, 13 bytes of data, checksum.
+    let at = 8 + 12 + 13;
+    let mut out = png[..at].to_vec();
+    for (kind, data) in chunks {
+        out.extend((data.len() as u32).to_be_bytes());
+        out.extend(*kind);
+        out.extend(*data);
+        out.extend([0; 4]);
+    }
+    out.extend(&png[at..]);
+    out
+}
+
+/// A PNG's metadata is never given to its decoder, which keeps `eXIf` as it comes and
+/// decompresses `iCCP` and text up to its limit: a 100 KB file held a 100 MiB profile (peak RSS
+/// 117 MB for a 1 × 1 image), none of it part of a decode's cost. The profile here is 64 MiB.
+#[test]
+fn png_metadata_is_not_given_to_the_decoder() {
+    let plain = png_bytes(3, 2, |x, y| [x as u8 * 80, y as u8 * 120, 9, 255]);
+    let mut info = png::Info::with_size(3, 2);
+    info.color_type = png::ColorType::Rgba;
+    info.bit_depth = png::BitDepth::Eight;
+    info.icc_profile = Some(vec![0u8; 64 << 20].into());
+    info.exif_metadata = Some(vec![7u8; 4 << 20].into());
+    let mut with = Vec::new();
+    let mut enc = png::Encoder::with_info(&mut with, info).unwrap();
+    enc.add_text_chunk("Comment".into(), "x".repeat(1 << 20))
+        .unwrap();
+    enc.add_ztxt_chunk("Zipped".into(), "y".repeat(8 << 20))
+        .unwrap();
+    enc.set_compression(png::Compression::Fast);
+    let mut w = enc.write_header().unwrap();
+    let mut data = Vec::new();
+    for y in 0..2u32 {
+        for x in 0..3u32 {
+            data.extend([x as u8 * 80, y as u8 * 120, 9, 255]);
+        }
+    }
+    w.write_image_data(&data).unwrap();
+    w.finish().unwrap();
+    // The metadata is really there (4 MiB of `eXIf` alone), and not read.
+    assert!(with.len() > plain.len() + 1000);
+    for kind in [&b"iCCP"[..], b"eXIf", b"tEXt", b"zTXt"] {
+        assert!(with.windows(4).any(|w| w == kind), "{kind:?}");
+    }
+    let mut seen = Vec::new();
+    std::io::Read::read_to_end(&mut PngChunks::new(&with), &mut seen).unwrap();
+    assert!(seen.len() < 200, "{} bytes", seen.len());
+    for kind in [&b"iCCP"[..], b"eXIf", b"tEXt", b"zTXt"] {
+        assert!(!seen.windows(4).any(|w| w == kind), "{kind:?}");
+    }
+    // The decoder with the limit `decode` gives it refuses the file as it is.
+    let limits = png::Limits { bytes: 1 << 20 };
+    let raw = png::Decoder::new_with_limits(std::io::Cursor::new(&with[..]), limits);
+    assert!(raw.read_info().is_err());
+    assert_eq!(decode(&with, 3, 2), decode(&plain, 3, 2));
+    assert!(decode(&with, 3, 2).is_some());
+    for rows in [true, false] {
+        assert_eq!(
+            decode_png(&with, 2, 2, rows),
+            decode_png(&plain, 2, 2, rows),
+            "rows {rows}"
+        );
+    }
+    // Metadata anywhere in the file, a chunk of a type nothing knows, and animation chunks
+    // are skipped; a critical chunk nothing knows still makes it undecodable.
+    let odd = with_chunks(
+        &plain,
+        &[(b"acTL", &[0; 8]), (b"abCD", &[1; 99]), (b"eXIf", &[0; 5])],
+    );
+    assert_eq!(decode(&odd, 3, 2), decode(&plain, 3, 2));
+    let critical = with_chunks(&plain, &[(b"ABCD", &[1; 9])]);
+    assert_eq!(decode(&critical, 3, 2), None);
+    // Cut off inside a skipped chunk's length, or inside a kept one.
+    for cut in [8 + 12 + 13 + 5, plain.len() - 20] {
+        assert_eq!(decode(&odd[..cut], 3, 2), None, "cut at {cut}");
+    }
+}
+
 /// Pixels are premultiplied, and a transparent neighbor doesn't darken or tint an edge.
 #[test]
 fn transparency_is_premultiplied() {
@@ -547,11 +629,31 @@ fn every_fixture_decodes() {
     let b = decode(&fixture("gray.jpg"), 16, 16).unwrap();
     let p = b.data[0];
     assert_eq!((p >> 16) & 0xff, p & 0xff);
-    // Broken data after a good header doesn't decode.
-    let mut broken = fixture("wide.jpg");
-    broken.truncate(400);
-    broken.extend([0xFF, 0xD9]);
-    let _ = decode(&broken, 10, 10);
+    // A JPEG cut short after its header decodes as far as it goes, the rest gray, as in a
+    // browser; one without a decodable scan (the tables cut off, the data garbage) doesn't.
+    let wide = fixture("wide.jpg");
+    let mut cut = wide[..400].to_vec();
+    cut.extend([0xFF, 0xD9]);
+    let b = decode(&cut, 10, 10).expect("a truncated scan decodes as far as it goes");
+    assert_eq!((b.width, b.height), (10, 10));
+    for (name, bad) in [
+        ("tables cut off", {
+            let mut v = wide[..60].to_vec();
+            v.extend([0xFF, 0xD9]);
+            v
+        }),
+        ("garbage after the SOI", {
+            let mut v = vec![0xFF, 0xD8];
+            v.extend((0..200u32).map(|i| (i * 37 + 11) as u8));
+            v
+        }),
+        ("header only", {
+            let sof = wide.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+            wide[..sof + 19].to_vec()
+        }),
+    ] {
+        assert_eq!(decode(&bad, 10, 10), None, "{name}");
+    }
 }
 
 #[test]
@@ -592,6 +694,43 @@ fn the_cache_evicts_the_least_recently_painted_first() {
 }
 
 /// Wait for `images` to hand over results until `done` holds (or fail after a while).
+/// A fetched body that arrives is not "painted this frame": one for an image far from the
+/// viewport is the first to go when room is needed, and what the fetchers hold is room too.
+/// (Bodies were stored as used in the current frame, so a stream of them pushed out what was
+/// on screen, or stayed, unpainted, over the budget.)
+#[test]
+fn fetched_bytes_are_evictable_and_what_fetchers_hold_counts() {
+    let body = |n: usize| Data::Bytes(Arc::new(vec![0u8; n]));
+    let url = |n: u32| Key::Remote(format!("https://x.y/{n}.png").into());
+    let mut c = Cache::new(250);
+    c.frame = 5;
+    c.insert(url(1), body(100));
+    c.insert(url(2), body(100));
+    // The third doesn't fit: the first, unpainted, goes (not the one arriving).
+    c.insert(url(3), body(100));
+    assert_eq!(c.bytes, 200);
+    assert!(c.peek_bytes(&"https://x.y/1.png".into()).is_none());
+    assert!(c.peek_bytes(&"https://x.y/3.png".into()).is_some());
+    // A body something was made of this frame stays.
+    let two: Arc<str> = "https://x.y/2.png".into();
+    assert!(c.bytes_of(&two).is_some());
+    c.insert(url(4), body(100));
+    assert!(c.peek_bytes(&two).is_some(), "painted this frame");
+    assert!(c.peek_bytes(&"https://x.y/3.png".into()).is_none());
+    // What the fetchers hold comes out of the budget as well.
+    c.frame += 1;
+    c.inflight = 100;
+    c.evict();
+    assert_eq!(c.bytes, 100, "one of two bodies goes");
+    c.inflight = 200;
+    c.evict();
+    assert_eq!(c.bytes, 0);
+    // A body bigger than the room isn't evicted by arriving: it is the only one.
+    c.inflight = 0;
+    c.insert(url(5), body(300));
+    assert_eq!(c.bytes, 300);
+}
+
 fn wait(images: &mut Images, doc: &Doc, layout: &mut Layout, done: impl Fn(&mut Images) -> bool) {
     let t = Instant::now();
     while !done(images) {

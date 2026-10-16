@@ -339,10 +339,14 @@ fn idle(bin: &Path, fixture: &Path) -> Option<Idle> {
     result
 }
 
-/// The scroll frame time of a 4K window (`examples/paint_bench.rs`): p95 in ms.
-fn scroll_p95(fixture: &Path) -> Option<f64> {
+/// The scroll frame time of a 4K window (`examples/paint_bench.rs`), built with `extra` features
+/// into `target_dir` like the binary of that build: p95 in ms.
+fn scroll_p95(fixture: &Path, extra: &[&str], target_dir: &str) -> Option<f64> {
     let out = release_cargo()
-        .args(["run", "--release", "--locked", "--quiet", "--example"])
+        .args(["run", "--release", "--locked", "--quiet", "--target-dir"])
+        .arg(target_dir)
+        .args(extra)
+        .arg("--example")
         .arg("paint_bench")
         .arg("--")
         .arg(fixture)
@@ -474,24 +478,26 @@ fn budgets(report: Option<&Path>) -> bool {
             );
         }
     }
-    // Painting doesn't depend on the features: one build measures it.
-    match scroll_p95(&fixture("readme.md")) {
-        Some(p95) => gated_row(
-            "scroll frame, 4K, p95".into(),
-            "default",
-            format!("{p95:.2} ms"),
-            format!("≤ {SCROLL_BUDGET_MS} ms"),
-            p95 <= SCROLL_BUDGET_MS,
-            true,
-        ),
-        None => gated_row(
-            "scroll frame, 4K".into(),
-            "default",
-            "no output".into(),
-            "a measurement".into(),
-            false,
-            true,
-        ),
+    // Both builds have a scroll budget.
+    for (label, extra, dir) in BUILDS {
+        match scroll_p95(&fixture("readme.md"), extra, dir) {
+            Some(p95) => gated_row(
+                "scroll frame, 4K, p95".into(),
+                label,
+                format!("{p95:.2} ms"),
+                format!("≤ {SCROLL_BUDGET_MS} ms"),
+                p95 <= SCROLL_BUDGET_MS,
+                true,
+            ),
+            None => gated_row(
+                "scroll frame, 4K".into(),
+                label,
+                "no output".into(),
+                "a measurement".into(),
+                false,
+                true,
+            ),
+        }
     }
     let ok = rows.iter().all(|r| r.pass || !r.gated);
     if let Some(path) = report {
