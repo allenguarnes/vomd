@@ -2530,6 +2530,70 @@ fn results_nobody_painted_are_evictable() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A request is the budget's up to its last allocation (round 17): a 823 x 9,950 bitmap decoded
+/// (32.7 MB: the cache is full with it), a frame begun and nothing painted, remote images on, and
+/// then `refs` references to one remote 1 x 1 PNG asked for. The set of the URLs in view was made
+/// by the request with the room for its *references* (139,280 bytes for 4,096 of them, a place
+/// each for a URL that is one), and charged, which evicts nothing: the image code's live bytes
+/// went from 33,472,686 to 33,612,062 (57,630 over the 33,554,432 allowed), and only then was the bitmap
+/// (not painted) evicted. The set is made with the document's tables, for its distinct URLs.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_request_for_many_references_to_one_url_allocates_nothing_over_the_budget() {
+    let _serial = serial();
+    let refs = 4_096usize;
+    let dir = scratch("refs-scratch");
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    std::fs::write(serve.join("tiny.png"), zero_png(1, 1, 0, 8, false, 1 << 20)).unwrap();
+    std::fs::write(
+        dir.join("big.png"),
+        zero_png(823, 9_950, 0, 8, false, 1 << 20),
+    )
+    .unwrap();
+    fake_curl(&dir, &serve);
+    let mut src = String::from("![b](big.png)");
+    src.extend((0..refs).map(|_| " ![t](http://127.0.0.1/tiny.png)"));
+    let ((doc, mut layout), _) = built(|| {
+        let doc = Doc::parse(&src);
+        let layout = PageLayout::new(&doc, Params::default());
+        (doc, layout)
+    });
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    let big = [(1u32, 823u32, 9_950u32)];
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &big,
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    images.set_remote(true, &doc, &mut layout);
+    // The next frame paints nothing: the bitmap may go to make room.
+    images.begin_frame();
+    let mut remote: Vec<(u32, u32, u32)> = Vec::new();
+    driver(|| remote.extend((2..=refs as u32 + 1).map(|id| (id, 1, 1))));
+    let before = mark();
+    let live = image_live();
+    images.request(&remote, remote.len());
+    let peak = image_step_over(0);
+    println!(
+        "a decoded 823 x 9,950 bitmap, then {refs} references to one remote URL: {live} bytes live before the request, {peak} at its peak, {CACHE_BYTES} allowed (all live {before})"
+    );
+    assert!(
+        peak <= CACHE_BYTES,
+        "{peak} bytes of the image code live at the request's peak, {CACHE_BYTES} allowed\n{}",
+        images.memory_report()
+    );
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// How many times the fake `curl` was run for each URL (the most of any one), and in all.
 #[cfg(feature = "remote-images")]
 fn curl_per_url(dir: &Path) -> (usize, usize) {

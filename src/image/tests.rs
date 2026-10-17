@@ -3439,7 +3439,7 @@ fn the_view_counts_each_remote_image_once_and_ends_at_the_cap() {
         images.set_policy(crate::settings::RemoteImages::Always);
         images.set_remote(true, &doc, &mut layout);
         let view = images.view_of(&boxes(n), on_screen);
-        (view.len, view.places, view.urls.len())
+        (view.len, view.places, images.view_urls.len())
     };
     // 5,000 references to one URL and then another: two images, all in view.
     let mut text = "![t](http://127.0.0.1/a.png) ".repeat(5_000);
@@ -3502,7 +3502,7 @@ fn the_view_advances_past_the_images_that_have_loaded() {
         }
         let boxes: Vec<_> = (1..=n as u32).map(|id| (id, 1, 1)).collect();
         let view = images.view_of(&boxes, n);
-        (view.len, view.places, view.urls.len())
+        (view.len, view.places, images.view_urls.len())
     };
     // None loaded: the cap ends the view; the first VIEW_MAX loaded: the rest are in view.
     assert_eq!(

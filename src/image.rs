@@ -2175,6 +2175,14 @@ pub struct Images {
     /// may be evicted at once.
     #[cfg(feature = "remote-images")]
     in_view: Vec<(Arc<str>, u32, u32)>,
+    /// The scratch set of the distinct remote URLs in view that a request builds
+    /// ([`Images::view_of`]), kept empty between requests. It is made with the document's tables,
+    /// at the room for the most it can hold (the document's distinct URLs, at most [`VIEW_MAX`]),
+    /// which is made and charged there ([`Images::tables_bytes`], [`Images::bookkeeping_bytes`]):
+    /// a request never allocates it, so none of its room has to be made, or taken from what the
+    /// request keeps, in the middle of it. It never grows.
+    #[cfg(feature = "remote-images")]
+    view_urls: std::collections::HashSet<Arc<str>>,
     /// Bodies fetched for images in view that the cache had no room for ([`Images::admission`]):
     /// still held by the fetchers' credit, so they can't pile up while the decoder is behind.
     #[cfg(feature = "remote-images")]
@@ -2353,14 +2361,13 @@ const REQUEST_PER_REMOTE: usize = 128;
 /// of view does.
 const VIEW_MAX: usize = 4096;
 
-/// The images in view in a request ([`Images::view_of`]): how many of its boxes are, how many
-/// distinct images they are (a place each in the list of slots), and the distinct remote URLs
-/// among them (taken out of the set as [`Images::in_view`] is made of them).
+/// The images in view in a request ([`Images::view_of`]): how many of its boxes are, and how many
+/// distinct images they are (a place each in the list of slots). The distinct remote URLs among
+/// them are in [`Images::view_urls`] until [`Images::note_viewport`] has made [`Images::in_view`]
+/// of them.
 struct View {
     len: usize,
     places: usize,
-    #[cfg(feature = "remote-images")]
-    urls: std::collections::HashSet<Arc<str>>,
 }
 
 /// What a document of `images` images, `remote` of them remote, costs to keep in [`Images`]: a
@@ -2403,6 +2410,8 @@ impl Default for Images {
             retired: Vec::new(),
             #[cfg(feature = "remote-images")]
             in_view: Vec::new(),
+            #[cfg(feature = "remote-images")]
+            view_urls: std::collections::HashSet::new(),
             #[cfg(feature = "remote-images")]
             waiting: Vec::new(),
             #[cfg(feature = "remote-images")]
@@ -2508,6 +2517,7 @@ impl Images {
         #[cfg(feature = "remote-images")]
         {
             self.urls = std::collections::HashSet::new();
+            self.view_urls = std::collections::HashSet::new();
             self.remote_images = 0;
             self.in_view = Vec::new();
         }
@@ -2546,6 +2556,7 @@ impl Images {
             own
         } else {
             own.saturating_add(self.remote.sizes_bytes_for(remote))
+                .saturating_add(table_bytes(remote.min(VIEW_MAX), size_of::<Arc<str>>()))
                 .saturating_add(table_bytes(remote, DEFERRED_ENTRY))
                 .saturating_add(remote.saturating_mul(REQUEST_PER_REMOTE))
         };
@@ -2636,6 +2647,9 @@ impl Images {
             }));
             self.urls = urls;
             self.remote_images = self.urls.len();
+            // (Charged with the tables: [`Images::tables_bytes`].)
+            self.view_urls =
+                std::collections::HashSet::with_capacity(self.urls.len().min(VIEW_MAX));
             // Nothing is wanted of the new document yet: the first request says.
             self.heavy_wanted = false;
             self.held = None;
@@ -3415,38 +3429,27 @@ impl Images {
     /// another (a viewport of references to one URL followed by a heavy image fetched it at
     /// every request, 784 times in 8 s).
     ///
-    /// The set of URLs is made once, with the room for the most it can hold (the remote boxes of
-    /// the view, at most `VIEW_MAX`), which is charged ([`Images::extra`]) before it is allocated
-    /// and until [`Images::note_viewport`] has dropped it.
+    /// The set of URLs is [`Images::view_urls`], made with the document's tables (room made and
+    /// charged then, for the most it can hold: the document's distinct URLs, at most `VIEW_MAX`):
+    /// a request allocates nothing here, and so has no room to make before it has protected what
+    /// it keeps (a set sized by the references in view, charged and then allocated in the middle
+    /// of a request, took 139,280 bytes the budget had not made room for).
     fn view_of(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) -> View {
         let shown = on_screen.min(boxes.len());
         #[cfg(feature = "remote-images")]
-        let urls = {
-            let remote = if self.remote.on {
-                boxes[..shown]
-                    .iter()
-                    .filter(|b| matches!(self.src(b.0), Src::Remote(_)))
-                    .take(VIEW_MAX)
-                    .count()
-            } else {
-                0
-            };
-            self.extra = table_bytes(remote, size_of::<Arc<str>>());
-            self.charge_bookkeeping();
-            std::collections::HashSet::with_capacity(remote)
-        };
+        let mut urls = std::mem::take(&mut self.view_urls);
+        #[cfg(feature = "remote-images")]
+        urls.clear();
         let mut view = View {
             len: shown,
             places: 0,
-            #[cfg(feature = "remote-images")]
-            urls,
         };
         for (n, b) in boxes[..shown].iter().enumerate() {
             let src = self.src(b.0);
             match src {
                 Src::None => continue,
                 #[cfg(feature = "remote-images")]
-                Src::Remote(url) if view.urls.contains(url) => continue,
+                Src::Remote(url) if urls.contains(url) => continue,
                 _ => {}
             }
             if self.resolved(b.0, b.1, b.2) {
@@ -3459,8 +3462,12 @@ impl Images {
             view.places += 1;
             #[cfg(feature = "remote-images")]
             if let Src::Remote(url) = self.src(b.0) {
-                view.urls.insert(url.clone());
+                urls.insert(url.clone());
             }
+        }
+        #[cfg(feature = "remote-images")]
+        {
+            self.view_urls = urls;
         }
         view
     }
@@ -3507,15 +3514,19 @@ impl Images {
         self.cache.set_floor(view.places);
         #[cfg(feature = "remote-images")]
         {
-            let mut urls = view.urls;
             self.in_view.clear();
-            if urls.len() > self.in_view.capacity() {
+            if self.view_urls.len() > self.in_view.capacity() {
                 self.make_room(
                     "request: the viewport",
-                    urls.len().saturating_mul(size_of::<(Arc<str>, u32, u32)>()),
+                    self.view_urls
+                        .len()
+                        .saturating_mul(size_of::<(Arc<str>, u32, u32)>()),
                 );
-                self.in_view.reserve_exact(urls.len());
+                self.in_view.reserve_exact(self.view_urls.len());
             }
+            // (Out of `self` for the loop only, which allocates nothing but its pushes, made room
+            // for above.)
+            let mut urls = std::mem::take(&mut self.view_urls);
             // (Each URL is listed once, with the box of the first reference to it.)
             for &(id, w, h) in &boxes[..view.len] {
                 // (A reference that is resolved is not the one the image is wanted at.)
@@ -3530,6 +3541,9 @@ impl Images {
                 }
             }
             shrink_vec(&mut self.in_view);
+            // (What is left in it is the resolved ones: it is kept empty, and its room.)
+            urls.clear();
+            self.view_urls = urls;
         }
     }
 
@@ -4319,6 +4333,10 @@ impl Images {
             n = n
                 .saturating_add(table_bytes(self.urls.capacity(), size_of::<Arc<str>>()))
                 .saturating_add(table_bytes(
+                    self.view_urls.capacity(),
+                    size_of::<Arc<str>>(),
+                ))
+                .saturating_add(table_bytes(
                     self.deferred.capacity(),
                     size_of::<(Arc<str>, (usize, usize))>(),
                 ))
@@ -4551,6 +4569,7 @@ impl Images {
             // Nothing is wanted of the old document's URLs now (`attach` follows with the new
             // one's).
             self.urls = std::collections::HashSet::new();
+            self.view_urls = std::collections::HashSet::new();
             self.prune_urls(None);
         }
     }
