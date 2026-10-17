@@ -29,7 +29,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
 - The system theme comes from the desktop portal's `color-scheme` (Plasma's and GNOME's dark
   mode, followed live, and back to winit and `GTK_THEME` when the preference is withdrawn), which
   say nothing on Wayland. Only the portal's own broadcasts count (not a signal another client addresses to VOMD), none
-  is missed while starting (a signal that disagrees with the first read is settled by reading again),
+  is missed while starting (the first read is reported at once; a signal that disagrees with it is settled by one more read, never more),
   and the bus going away also returns to winit and `GTK_THEME`.
 - The scrollbar also shows while the pointer is over its column.
 - Budgets checked in CI (`cargo xtask budgets`): binary size, cold and warm start, idle RSS,

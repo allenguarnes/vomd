@@ -182,22 +182,29 @@ fn reads_the_preference_and_follows_changes() {
 
 /// The signals are asked for before the setting is read. One that arrives while a reply is
 /// awaited (the `AddMatch` one, then the `ReadOne` one) isn't known to be newer than the read:
-/// if it disagrees the setting is read again, and that answer, the portal's current value, wins.
+/// the read is reported at once, and if the signal disagrees the setting is read once more, its
+/// answer, the portal's current value, reported if it differs.
 #[test]
-fn a_change_while_starting_is_settled_by_reading_again() {
-    // (signal during AddMatch, signal during ReadOne, what each ReadOne returns in turn, the
-    // number of reads made, result)
-    for (during_add, during_read, reads, made, first) in [
+fn a_change_while_starting_is_settled_by_reading_once_more() {
+    // (signal during AddMatch, signal during the first ReadOne, what each ReadOne returns in
+    // turn, the number of reads made, what is reported)
+    for (during_add, during_read, reads, made, expected) in [
         // The signal is older than the read (the portal changed again before it was delivered).
-        (Some(1), None, [2, 2], 2, Some(false)),
-        (Some(1), Some(0), [2, 0], 2, None),
+        (Some(1), None, [2, 2], 2, vec![Some(false), None]),
+        (Some(1), Some(0), [2, 0], 2, vec![Some(false), None, None]),
         // The read is older than the signal.
-        (None, Some(2), [1, 2], 2, Some(false)),
+        (
+            None,
+            Some(2),
+            [1, 2],
+            2,
+            vec![Some(true), Some(false), None],
+        ),
         // The read, taken again, holds the newer value.
-        (None, Some(2), [1, 1], 2, Some(true)),
+        (None, Some(2), [1, 1], 2, vec![Some(true), None]),
         // Agreeing, or nothing buffered: one read.
-        (Some(1), None, [1, 2], 1, Some(true)),
-        (None, None, [2, 1], 1, Some(false)),
+        (Some(1), None, [1, 2], 1, vec![Some(true), None]),
+        (None, None, [2, 1], 1, vec![Some(false), None]),
     ] {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
@@ -225,8 +232,52 @@ fn a_change_while_starting_is_settled_by_reading_again() {
         let mut seen = Vec::new();
         run(Bus::over(stream).expect("connected"), |v| seen.push(v));
         let case = format!("{during_add:?} {during_read:?} {reads:?}");
-        assert_eq!(seen, [first, None], "{case}");
+        assert_eq!(seen, expected, "{case}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            made,
+            "{case}"
+        );
     }
+}
+
+/// A portal that contradicts every answer (a conflicting signal before each reply) can't keep
+/// the thread reading or hold back the first value: the first read is reported before any
+/// further call, at most one more read follows, and then the signals are followed.
+#[test]
+fn startup_reconciliation_is_bounded() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let stream = fake_bus_nth(
+        move |serial, member| match member {
+            "ReadOne" => {
+                counted.fetch_add(1, SeqCst);
+                vec![
+                    bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(2, KEY)),
+                    bus_msg(RETURN, serial, "", "v", &variant_u(1, 0)),
+                ]
+            }
+            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+        },
+        "ReadOne",
+        // Bounded: the bus ends after the second read, the last one allowed.
+        2,
+        vec![bus_msg(
+            SIGNAL,
+            0,
+            "SettingChanged",
+            "ssv",
+            &changed(2, KEY),
+        )],
+    );
+    let mut seen = Vec::new();
+    run(Bus::over(stream).expect("connected"), |v| {
+        seen.push((v, calls.load(SeqCst)));
+    });
+    // The first value arrives with one read made, the signal after the reads is followed, and
+    // the end of the bus is reported.
+    assert_eq!(seen, [(Some(true), 1), (Some(false), 2), (None, 2)]);
 }
 
 /// A signal addressed to this connection is delivered whatever the match rule says, so any

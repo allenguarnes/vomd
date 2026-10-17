@@ -35,18 +35,22 @@ pub fn watch(mut f: impl FnMut(Option<bool>)) {
 }
 
 fn run(mut bus: Bus, mut f: impl FnMut(Option<bool>)) {
-    // Subscribe before reading, so a change between the two isn't missed. A signal that arrives
-    // while waiting for a reply isn't known to be newer than the reply (the bus may deliver
-    // them in either order), so one that disagrees with the read is settled by reading again.
+    // Subscribe before reading, so a change between the two isn't missed, and report the first
+    // read at once: the window waits for it.
     let watching = bus.add_match();
-    let mut value = bus.read_setting();
-    while let Some(seen) = bus.changed.take() {
-        if seen == value {
-            break;
-        }
-        value = bus.read_setting();
-    }
+    let value = bus.read_setting();
     f(value);
+    // A signal that arrived while waiting for a reply isn't known to be newer than the read (the
+    // bus may deliver them in either order), so one that disagrees with it is settled by reading
+    // once more. Once only: a portal that keeps contradicting its answers mustn't keep the
+    // thread reading. What arrives during that read, and after, is followed in order.
+    let disagrees = bus.changed.take().is_some_and(|seen| seen != value);
+    if watching && disagrees {
+        let again = bus.read_setting();
+        if again != value && !bus.dead {
+            f(again);
+        }
+    }
     // (A read that failed midway leaves the stream unusable: `follow` sees `dead`.)
     if watching {
         bus.follow(&mut f);
