@@ -113,7 +113,30 @@ fn fake_bus_nth(
     nth: usize,
     after: Vec<Vec<u8>>,
 ) -> UnixStream {
-    let (client, mut server) = UnixStream::pair().unwrap();
+    let (client, server) = UnixStream::pair().unwrap();
+    serve(server, answer, end, nth, after);
+    client
+}
+
+/// A fake bus that never ends the connection itself: it answers every call, and shutting the
+/// returned handle closes the connection. For tests that watch what is reported while the
+/// connection stays open.
+fn open_bus(
+    answer: impl Fn(u32, &str) -> Vec<Vec<u8>> + Send + 'static,
+) -> (UnixStream, UnixStream) {
+    let (client, server) = UnixStream::pair().unwrap();
+    let closer = server.try_clone().unwrap();
+    serve(server, answer, "", 1, Vec::new());
+    (client, closer)
+}
+
+fn serve(
+    mut server: UnixStream,
+    answer: impl Fn(u32, &str) -> Vec<Vec<u8>> + Send + 'static,
+    end: &'static str,
+    nth: usize,
+    after: Vec<Vec<u8>>,
+) {
     std::thread::spawn(move || {
         let mut auth = Vec::new();
         let mut b = [0u8];
@@ -133,7 +156,10 @@ fn fake_bus_nth(
                 assert_eq!(rule, MATCH_RULE);
             }
             for m in answer(serial, &member) {
-                server.write_all(&m).unwrap();
+                // The client may have gone: the connection is being closed.
+                if server.write_all(&m).is_err() {
+                    return;
+                }
             }
             ends += usize::from(member == end);
             if member == end && ends == nth {
@@ -144,7 +170,6 @@ fn fake_bus_nth(
             }
         }
     });
-    client
 }
 
 #[test]
@@ -180,104 +205,132 @@ fn reads_the_preference_and_follows_changes() {
     assert_eq!(seen, [Some(true), Some(false), None, Some(true), None]);
 }
 
-/// The signals are asked for before the setting is read. One that arrives while a reply is
-/// awaited (the `AddMatch` one, then the `ReadOne` one) isn't known to be newer than the read:
-/// the read is reported at once, and if the signal disagrees the setting is read once more, its
-/// answer, the portal's current value, reported if it differs.
-#[test]
-fn a_change_while_starting_is_settled_by_reading_once_more() {
-    // (signal during AddMatch, signal during the first ReadOne, what each ReadOne returns in
-    // turn, the number of reads made, what is reported)
-    for (during_add, during_read, reads, made, expected) in [
-        // The signal is older than the read (the portal changed again before it was delivered).
-        (Some(1), None, [2, 2], 2, vec![Some(false), None]),
-        (Some(1), Some(0), [2, 0], 2, vec![Some(false), None, None]),
-        // The read is older than the signal.
-        (
-            None,
-            Some(2),
-            [1, 2],
-            2,
-            vec![Some(true), Some(false), None],
-        ),
-        // The read, taken again, holds the newer value.
-        (None, Some(2), [1, 1], 2, vec![Some(true), None]),
-        // Agreeing, or nothing buffered: one read.
-        (Some(1), None, [1, 2], 1, vec![Some(true), None]),
-        (None, None, [2, 1], 1, vec![Some(false), None]),
-    ] {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = calls.clone();
-        let stream = fake_bus_nth(
-            move |serial, member| {
-                let signal = |v| bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(v, KEY));
-                let ok = bus_msg(RETURN, serial, "", "", &[]);
-                match member {
-                    "AddMatch" => during_add.map(signal).into_iter().chain([ok]).collect(),
-                    "ReadOne" => {
-                        let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let read = bus_msg(RETURN, serial, "", "v", &variant_u(reads[n % 2], 0));
-                        // Only the first read is overtaken by a signal.
-                        let before = if n == 0 { during_read } else { None };
-                        before.map(signal).into_iter().chain([read]).collect()
-                    }
-                    _ => vec![ok],
-                }
-            },
-            "ReadOne",
-            // The bus is closed after the last read the case should make.
-            made,
-            Vec::new(),
-        );
-        let mut seen = Vec::new();
-        run(Bus::over(stream).expect("connected"), |v| seen.push(v));
-        let case = format!("{during_add:?} {during_read:?} {reads:?}");
-        assert_eq!(seen, expected, "{case}");
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            made,
-            "{case}"
-        );
-    }
+fn signal(v: u32) -> Vec<u8> {
+    bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(v, KEY))
 }
 
-/// A portal that contradicts every answer (a conflicting signal before each reply) can't keep
-/// the thread reading or hold back the first value: the first read is reported before any
-/// further call, at most one more read follows, and then the signals are followed.
+fn read_reply(serial: u32, v: u32) -> Vec<u8> {
+    bus_msg(RETURN, serial, "", "v", &variant_u(v, 0))
+}
+
+/// The portal's signals and its reply come in the order it sent them, and it answers from the
+/// setting its signals announce, so the reply is at least as new as any signal before it: it
+/// wins over them (during `AddMatch`, and during `ReadOne`), with one read made.
 #[test]
-fn startup_reconciliation_is_bounded() {
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    let calls = std::sync::Arc::new(AtomicUsize::new(0));
-    let counted = calls.clone();
-    let stream = fake_bus_nth(
+fn the_reply_supersedes_earlier_signals() {
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = reads.clone();
+    let stream = fake_bus(
         move |serial, member| match member {
+            "AddMatch" => vec![signal(1), bus_msg(RETURN, serial, "", "", &[])],
             "ReadOne" => {
-                counted.fetch_add(1, SeqCst);
-                vec![
-                    bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(2, KEY)),
-                    bus_msg(RETURN, serial, "", "v", &variant_u(1, 0)),
-                ]
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![signal(0), signal(1), read_reply(serial, 2)]
             }
             _ => vec![bus_msg(RETURN, serial, "", "", &[])],
         },
         "ReadOne",
-        // Bounded: the bus ends after the second read, the last one allowed.
-        2,
-        vec![bus_msg(
-            SIGNAL,
-            0,
-            "SettingChanged",
-            "ssv",
-            &changed(2, KEY),
-        )],
+        Vec::new(),
     );
     let mut seen = Vec::new();
-    run(Bus::over(stream).expect("connected"), |v| {
-        seen.push((v, calls.load(SeqCst)));
+    run(Bus::over(stream).expect("connected"), |v| seen.push(v));
+    // The read value first, no callback from the signals before it, then the end of the bus.
+    assert_eq!(seen, [Some(false), None]);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A signal behind the reply, even one delivered in the same batch, is newer and applied, in
+/// order.
+#[test]
+fn signals_after_the_reply_are_applied_in_order() {
+    let stream = fake_bus(
+        |serial, member| match member {
+            "ReadOne" => vec![
+                signal(2),
+                read_reply(serial, 1),
+                signal(2),
+                signal(0),
+                signal(1),
+            ],
+            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+        },
+        "ReadOne",
+        vec![signal(2)],
+    );
+    let mut seen = Vec::new();
+    run(Bus::over(stream).expect("connected"), |v| seen.push(v));
+    assert_eq!(
+        seen,
+        [Some(true), Some(false), None, Some(true), Some(false), None]
+    );
+}
+
+/// Changes before and after a read that interleave (dark, light, dark): what is reported
+/// settles on the portal's last state, and stays there on an idle open connection, with no
+/// more reads and no callback from a dropped signal.
+#[test]
+fn interleaved_changes_settle_on_the_last_state() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let (stream, closer) = open_bus(move |serial, member| match member {
+        "ReadOne" => {
+            counted.fetch_add(1, SeqCst);
+            // Light, then dark, before the reply, which holds dark; light and dark again after.
+            vec![
+                signal(2),
+                signal(1),
+                read_reply(serial, 1),
+                signal(2),
+                signal(1),
+            ]
+        }
+        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
     });
-    // The first value arrives with one read made, the signal after the reads is followed, and
-    // the end of the bus is reported.
-    assert_eq!(seen, [(Some(true), 1), (Some(false), 2), (None, 2)]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        run(Bus::over(stream).expect("connected"), |v| {
+            tx.send(v).unwrap()
+        });
+    });
+    let wait = Duration::from_secs(5);
+    let got: Vec<_> = (0..3).map(|_| rx.recv_timeout(wait).unwrap()).collect();
+    assert_eq!(got, [Some(true), Some(false), Some(true)]);
+    // Nothing more while the connection is open: converged, not just ended.
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(reads.load(SeqCst), 1);
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(wait), Ok(None));
+    watcher.join().unwrap();
+}
+
+/// A portal that sends a conflicting signal before every reply can't make the thread read
+/// again: one read, whatever arrives, and nothing reported for the signal before it.
+#[test]
+fn a_contradicting_portal_causes_one_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let (stream, closer) = open_bus(move |serial, member| match member {
+        "ReadOne" => {
+            counted.fetch_add(1, SeqCst);
+            vec![signal(2), read_reply(serial, 1)]
+        }
+        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        run(Bus::over(stream).expect("connected"), |v| {
+            tx.send(v).unwrap()
+        });
+    });
+    let wait = Duration::from_secs(5);
+    assert_eq!(rx.recv_timeout(wait), Ok(Some(true)));
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+    assert_eq!(reads.load(SeqCst), 1);
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(wait), Ok(None));
+    watcher.join().unwrap();
 }
 
 /// A signal addressed to this connection is delivered whatever the match rule says, so any
@@ -380,7 +433,6 @@ fn oversized_messages_end_the_connection() {
         stream: client,
         serial: 0,
         dead: false,
-        changed: None,
     };
     assert!(bus.recv().is_err());
 }

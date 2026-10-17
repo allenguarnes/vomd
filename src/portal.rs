@@ -35,23 +35,17 @@ pub fn watch(mut f: impl FnMut(Option<bool>)) {
 }
 
 fn run(mut bus: Bus, mut f: impl FnMut(Option<bool>)) {
-    // Subscribe before reading, so a change between the two isn't missed, and report the first
-    // read at once: the window waits for it.
+    // Subscribe before reading, so no change falls between the two. The bus keeps one sender's
+    // messages in order, and the portal updates its setting before it emits `SettingChanged`
+    // and answers a read from that setting, so the reply is at least as new as every signal that
+    // arrived before it (`call` drops those), and one that arrives after it is newer (`follow`
+    // applies it). One read, no reconciliation. (A portal that answers after emitting a later
+    // signal from another thread would be one change behind until the next: bounded, and it
+    // corrects itself.)
     let watching = bus.add_match();
     let value = bus.read_setting();
+    // The first value, reported at once: the window waits for it.
     f(value);
-    // A signal that arrived while waiting for a reply isn't known to be newer than the read (the
-    // bus may deliver them in either order), so one that disagrees with it is settled by reading
-    // once more. Once only: a portal that keeps contradicting its answers mustn't keep the
-    // thread reading. What arrives during that read, and after, is followed in order.
-    let disagrees = bus.changed.take().is_some_and(|seen| seen != value);
-    if watching && disagrees {
-        let again = bus.read_setting();
-        if again != value && !bus.dead {
-            f(again);
-        }
-    }
-    // (A read that failed midway leaves the stream unusable: `follow` sees `dead`.)
     if watching {
         bus.follow(&mut f);
         // The bus went away: a value it last gave no longer holds, use the other sources.
@@ -84,8 +78,6 @@ struct Bus {
     serial: u32,
     /// A write or read failed, perhaps midway through a message: the stream is not used again.
     dead: bool,
-    /// The newest `SettingChanged` seen while waiting for a reply, not yet reported.
-    changed: Option<Option<bool>>,
 }
 
 /// How long the login and `Hello` may take. Later calls and the signals wait without a limit:
@@ -126,7 +118,6 @@ impl Bus {
             stream,
             serial: 0,
             dead: false,
-            changed: None,
         };
         let hello = bus.call(BUS, "/org/freedesktop/DBus", BUS, "Hello", "", &[])?;
         if hello.kind != RETURN {
@@ -163,17 +154,21 @@ impl Bus {
         added.is_some_and(|m| m.kind == RETURN)
     }
 
-    /// Hand each new value to `f`, until the connection ends. Blocks without waking in between.
+    /// Hand each new value to `f`, until the connection ends (or has failed). Blocks without
+    /// waking in between.
     fn follow(&mut self, mut f: impl FnMut(Option<bool>)) {
-        while let Ok(msg) = self.recv() {
+        while !self.dead
+            && let Ok(msg) = self.recv()
+        {
             if let Some(value) = setting_changed(&msg) {
                 f(value);
             }
         }
     }
 
-    /// Call a method and wait for its reply (or error), skipping other messages. `None` once the
-    /// connection has failed, and from then on.
+    /// Call a method and wait for its reply (or error). Anything else that arrives first,
+    /// `SettingChanged` included, is dropped: the reply is not older than a signal the portal
+    /// sent before it (see `run`). `None` once the connection has failed, and from then on.
     fn call(
         &mut self,
         dest: &str,
@@ -197,11 +192,7 @@ impl Bus {
                 {
                     return Some(reply);
                 }
-                Ok(other) => {
-                    if let Some(value) = setting_changed(&other) {
-                        self.changed = Some(value);
-                    }
-                }
+                Ok(_) => {}
                 Err(_) => self.dead = true,
             }
         }
