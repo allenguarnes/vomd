@@ -213,123 +213,189 @@ fn read_reply(serial: u32, v: u32) -> Vec<u8> {
     bus_msg(RETURN, serial, "", "v", &variant_u(v, 0))
 }
 
-/// The portal's signals and its reply come in the order it sent them, and it answers from the
-/// setting its signals announce, so the reply is at least as new as any signal before it: it
-/// wins over them (during `AddMatch`, and during `ReadOne`), with one read made.
+type Reads = std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>;
+
+/// Note a `ReadOne` in `reads`; the number of reads so far.
+fn note(reads: &Reads) -> usize {
+    let mut r = reads.lock().unwrap();
+    r.push(std::time::Instant::now());
+    r.len()
+}
+
+/// Run `watch` on an open connection, with a channel of what it reports.
+fn watch_open(
+    stream: UnixStream,
+) -> (
+    std::sync::mpsc::Receiver<Option<bool>>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        run(Bus::over(stream).expect("connected"), |v| {
+            tx.send(v).unwrap()
+        });
+    });
+    (rx, watcher)
+}
+
+const WAIT: Duration = Duration::from_secs(5);
+
+/// A signal that arrives while `AddMatch` is answered is older than the read that follows it:
+/// no re-read, and nothing reported for it.
 #[test]
-fn the_reply_supersedes_earlier_signals() {
-    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+fn a_signal_before_the_read_is_older_than_it() {
+    let reads = Reads::default();
     let counted = reads.clone();
-    let stream = fake_bus(
-        move |serial, member| match member {
-            "AddMatch" => vec![signal(1), bus_msg(RETURN, serial, "", "", &[])],
-            "ReadOne" => {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                vec![signal(0), signal(1), read_reply(serial, 2)]
-            }
-            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
-        },
-        "ReadOne",
-        Vec::new(),
-    );
-    let mut seen = Vec::new();
-    run(Bus::over(stream).expect("connected"), |v| seen.push(v));
-    // The read value first, no callback from the signals before it, then the end of the bus.
-    assert_eq!(seen, [Some(false), None]);
-    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let (stream, closer) = open_bus(move |serial, member| match member {
+        "AddMatch" => vec![signal(1), bus_msg(RETURN, serial, "", "", &[])],
+        "ReadOne" => {
+            note(&counted);
+            vec![read_reply(serial, 2)]
+        }
+        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+    });
+    let (rx, watcher) = watch_open(stream);
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(false)));
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(reads.lock().unwrap().len(), 1);
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(WAIT), Ok(None));
+    watcher.join().unwrap();
 }
 
-/// A signal behind the reply, even one delivered in the same batch, is newer and applied, in
-/// order.
+/// The reviewer's scenario: the portal's frontend answers on a worker thread, so a newer signal
+/// (dark) can overtake an older reply (light). The reply is reported at once, and a re-read
+/// after the first delay finds dark, with no more reads once it is undisturbed.
 #[test]
-fn signals_after_the_reply_are_applied_in_order() {
-    let stream = fake_bus(
-        |serial, member| match member {
-            "ReadOne" => vec![
-                signal(2),
-                read_reply(serial, 1),
-                signal(2),
-                signal(0),
-                signal(1),
-            ],
-            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+fn a_signal_that_overtook_the_reply_is_settled_by_a_re_read() {
+    let reads = Reads::default();
+    let counted = reads.clone();
+    let (stream, closer) = open_bus(move |serial, member| match member {
+        "ReadOne" => match note(&counted) {
+            1 => vec![signal(1), read_reply(serial, 2)],
+            _ => vec![read_reply(serial, 1)],
         },
-        "ReadOne",
-        vec![signal(2)],
-    );
-    let mut seen = Vec::new();
-    run(Bus::over(stream).expect("connected"), |v| seen.push(v));
-    assert_eq!(
-        seen,
-        [Some(true), Some(false), None, Some(true), Some(false), None]
-    );
+        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+    });
+    let (rx, watcher) = watch_open(stream);
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(false)));
+    let first = std::time::Instant::now();
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(true)));
+    assert!(first.elapsed() >= Duration::from_millis(45));
+    // Settled: nothing more on the open connection, and no third read.
+    assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+    let at = reads.lock().unwrap().clone();
+    assert_eq!(at.len(), 2);
+    assert!(at[1] - at[0] >= Duration::from_millis(45));
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(WAIT), Ok(None));
+    watcher.join().unwrap();
 }
 
-/// Changes before and after a read that interleave (dark, light, dark): what is reported
-/// settles on the portal's last state, and stays there on an idle open connection, with no
-/// more reads and no callback from a dropped signal.
+/// A signal before a reply that is the newer of the two (light, whose own signal follows the
+/// reply): the re-read confirms the reply, nothing wrong is reported, and it ends there.
 #[test]
-fn interleaved_changes_settle_on_the_last_state() {
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+fn a_reply_newer_than_the_signal_is_confirmed() {
+    let reads = Reads::default();
+    let counted = reads.clone();
+    let (stream, closer) = open_bus(move |serial, member| match member {
+        "ReadOne" => match note(&counted) {
+            1 => vec![signal(1), read_reply(serial, 2), signal(2)],
+            _ => vec![read_reply(serial, 2)],
+        },
+        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+    });
+    let (rx, watcher) = watch_open(stream);
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(false)));
+    assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+    assert_eq!(reads.lock().unwrap().len(), 2);
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(WAIT), Ok(None));
+    watcher.join().unwrap();
+}
+
+/// A portal that sends a conflicting signal before every reply gets no storm: the reads are
+/// spaced by the doubling delay (50, 100, 200, 400 ms), so about five in the first second.
+#[test]
+fn a_contradicting_portal_is_read_with_a_growing_delay() {
+    let reads = Reads::default();
     let counted = reads.clone();
     let (stream, closer) = open_bus(move |serial, member| match member {
         "ReadOne" => {
-            counted.fetch_add(1, SeqCst);
-            // Light, then dark, before the reply, which holds dark; light and dark again after.
+            note(&counted);
+            vec![signal(2), read_reply(serial, 1)]
+        }
+        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+    });
+    let started = std::time::Instant::now();
+    let (rx, watcher) = watch_open(stream);
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(true)));
+    std::thread::sleep(Duration::from_millis(1000).saturating_sub(started.elapsed()));
+    let at = reads.lock().unwrap().clone();
+    assert!((4..=5).contains(&at.len()), "{} reads", at.len());
+    for (i, pair) in at.windows(2).enumerate() {
+        let least = Duration::from_millis(50 << i);
+        assert!(pair[1] - pair[0] >= least - Duration::from_millis(5), "{i}");
+    }
+    // The reads all say dark and no signal is applied: nothing more was reported.
+    assert!(rx.try_recv().is_err());
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(WAIT), Ok(None));
+    watcher.join().unwrap();
+}
+
+/// No signal during the read: one read, and no timer afterwards, on an idle open connection.
+#[test]
+fn an_undisturbed_read_is_the_only_one() {
+    let reads = Reads::default();
+    let counted = reads.clone();
+    let (stream, closer) = open_bus(move |serial, member| match member {
+        "ReadOne" => {
+            note(&counted);
+            vec![read_reply(serial, 1)]
+        }
+        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+    });
+    let (rx, watcher) = watch_open(stream);
+    assert_eq!(rx.recv_timeout(WAIT), Ok(Some(true)));
+    assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+    assert_eq!(reads.lock().unwrap().len(), 1);
+    closer.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(rx.recv_timeout(WAIT), Ok(None));
+    watcher.join().unwrap();
+}
+
+/// Signals after the reply, even in the same batch, are applied in order with no extra read;
+/// ones before it that end on the reply's value don't disturb it, and are not reported.
+#[test]
+fn signals_after_the_reply_are_applied_in_order() {
+    let reads = Reads::default();
+    let counted = reads.clone();
+    let (stream, closer) = open_bus(move |serial, member| match member {
+        "ReadOne" => {
+            note(&counted);
+            // Light, then dark, before the reply, which holds dark; light, none, dark, dark
+            // after.
             vec![
                 signal(2),
                 signal(1),
                 read_reply(serial, 1),
                 signal(2),
+                signal(0),
+                signal(1),
                 signal(1),
             ]
         }
         _ => vec![bus_msg(RETURN, serial, "", "", &[])],
     });
-    let (tx, rx) = std::sync::mpsc::channel();
-    let watcher = std::thread::spawn(move || {
-        run(Bus::over(stream).expect("connected"), |v| {
-            tx.send(v).unwrap()
-        });
-    });
-    let wait = Duration::from_secs(5);
-    let got: Vec<_> = (0..3).map(|_| rx.recv_timeout(wait).unwrap()).collect();
-    assert_eq!(got, [Some(true), Some(false), Some(true)]);
+    let (rx, watcher) = watch_open(stream);
+    let got: Vec<_> = (0..4).map(|_| rx.recv_timeout(WAIT).unwrap()).collect();
+    assert_eq!(got, [Some(true), Some(false), None, Some(true)]);
     // Nothing more while the connection is open: converged, not just ended.
-    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
-    assert_eq!(reads.load(SeqCst), 1);
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(reads.lock().unwrap().len(), 1);
     closer.shutdown(std::net::Shutdown::Both).unwrap();
-    assert_eq!(rx.recv_timeout(wait), Ok(None));
-    watcher.join().unwrap();
-}
-
-/// A portal that sends a conflicting signal before every reply can't make the thread read
-/// again: one read, whatever arrives, and nothing reported for the signal before it.
-#[test]
-fn a_contradicting_portal_causes_one_read() {
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    let reads = std::sync::Arc::new(AtomicUsize::new(0));
-    let counted = reads.clone();
-    let (stream, closer) = open_bus(move |serial, member| match member {
-        "ReadOne" => {
-            counted.fetch_add(1, SeqCst);
-            vec![signal(2), read_reply(serial, 1)]
-        }
-        _ => vec![bus_msg(RETURN, serial, "", "", &[])],
-    });
-    let (tx, rx) = std::sync::mpsc::channel();
-    let watcher = std::thread::spawn(move || {
-        run(Bus::over(stream).expect("connected"), |v| {
-            tx.send(v).unwrap()
-        });
-    });
-    let wait = Duration::from_secs(5);
-    assert_eq!(rx.recv_timeout(wait), Ok(Some(true)));
-    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
-    assert_eq!(reads.load(SeqCst), 1);
-    closer.shutdown(std::net::Shutdown::Both).unwrap();
-    assert_eq!(rx.recv_timeout(wait), Ok(None));
+    assert_eq!(rx.recv_timeout(WAIT), Ok(None));
     watcher.join().unwrap();
 }
 
@@ -433,6 +499,7 @@ fn oversized_messages_end_the_connection() {
         stream: client,
         serial: 0,
         dead: false,
+        raced: None,
     };
     assert!(bus.recv().is_err());
 }
@@ -501,6 +568,6 @@ fn a_failed_read_ends_the_connection() {
     assert_eq!(bus.read_setting(), None);
     assert!(bus.dead);
     let mut seen = Vec::new();
-    bus.follow(|v| seen.push(v));
+    bus.follow(None, |v| seen.push(v));
     assert!(seen.is_empty());
 }

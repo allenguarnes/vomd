@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -35,23 +35,28 @@ pub fn watch(mut f: impl FnMut(Option<bool>)) {
 }
 
 fn run(mut bus: Bus, mut f: impl FnMut(Option<bool>)) {
-    // Subscribe before reading, so no change falls between the two. The bus keeps one sender's
-    // messages in order, and the portal updates its setting before it emits `SettingChanged`
-    // and answers a read from that setting, so the reply is at least as new as every signal that
-    // arrived before it (`call` drops those), and one that arrives after it is newer (`follow`
-    // applies it). One read, no reconciliation. (A portal that answers after emitting a later
-    // signal from another thread would be one change behind until the next: bounded, and it
-    // corrects itself.)
+    // Subscribe before reading, so no change falls between the two. The portal's signals reach
+    // us in the order it sent them, so the last one is the latest change, and one that arrives
+    // after a reply is newer than what the reply was read from and is simply applied. A signal
+    // that arrives before the reply is the one case that can't be ordered: the portal's frontend
+    // answers a read on a worker thread, so the reply may be older than a signal it overtook, or
+    // newer than it. `follow` settles that by reading again, after a delay that grows while
+    // reads keep being disturbed.
     let watching = bus.add_match();
     let value = bus.read_setting();
     // The first value, reported at once: the window waits for it.
     f(value);
     if watching {
-        bus.follow(&mut f);
+        bus.follow(value, &mut f);
         // The bus went away: a value it last gave no longer holds, use the other sources.
         f(None);
     }
 }
+
+/// The wait before the first re-read of a read that a signal raced, doubled each time the next
+/// is raced again, up to the limit.
+const REREAD: Duration = Duration::from_millis(50);
+const REREAD_MAX: Duration = Duration::from_secs(5);
 
 /// The signals wanted: `color-scheme` changes, from the portal only (the bus matches the name
 /// against its owner, so no other client can pass one off as the portal's broadcast). The bus
@@ -78,6 +83,9 @@ struct Bus {
     serial: u32,
     /// A write or read failed, perhaps midway through a message: the stream is not used again.
     dead: bool,
+    /// The last `SettingChanged` that arrived while the latest `read_setting` waited for its
+    /// reply: it may be older or newer than the value read.
+    raced: Option<Option<bool>>,
 }
 
 /// How long the login and `Hello` may take. Later calls and the signals wait without a limit:
@@ -118,6 +126,7 @@ impl Bus {
             stream,
             serial: 0,
             dead: false,
+            raced: None,
         };
         let hello = bus.call(BUS, "/org/freedesktop/DBus", BUS, "Hello", "", &[])?;
         if hello.kind != RETURN {
@@ -128,8 +137,15 @@ impl Bus {
         Some(bus)
     }
 
-    /// The current `color-scheme`.
+    /// The current `color-scheme`; `None` too when it couldn't be read.
     fn read_setting(&mut self) -> Option<bool> {
+        self.read().flatten()
+    }
+
+    /// The current `color-scheme`, or `None` if it couldn't be read. Notes in `raced` the last
+    /// change signalled while waiting for the reply.
+    fn read(&mut self) -> Option<Option<bool>> {
+        self.raced = None;
         let args = [NAMESPACE, KEY];
         let mut reply = self.call(PORTAL, PORTAL_PATH, SETTINGS, "ReadOne", "ss", &args)?;
         if reply.kind == ERROR {
@@ -138,7 +154,13 @@ impl Bus {
         if reply.kind != RETURN {
             return None;
         }
-        Reader::new(&reply.body).variant_u32(0).and_then(scheme)
+        Some(Reader::new(&reply.body).variant_u32(0).and_then(scheme))
+    }
+
+    /// Whether a signal raced the last read and said something else than its `value`: either
+    /// could be the newer.
+    fn disturbed(&self, value: Option<bool>) -> bool {
+        self.raced.is_some_and(|signalled| signalled != value)
     }
 
     /// Ask for `SettingChanged` on `color-scheme`; whether the bus agreed.
@@ -154,21 +176,85 @@ impl Bus {
         added.is_some_and(|m| m.kind == RETURN)
     }
 
-    /// Hand each new value to `f`, until the connection ends (or has failed). Blocks without
-    /// waking in between.
-    fn follow(&mut self, mut f: impl FnMut(Option<bool>)) {
-        while !self.dead
-            && let Ok(msg) = self.recv()
-        {
-            if let Some(value) = setting_changed(&msg) {
-                f(value);
+    /// Hand each change from `last` on to `f`, until the connection ends (or has failed).
+    /// Signals are applied in order. If one raced the read that gave `last`, read again after
+    /// `REREAD`, and if one races that read too, after twice as long, and so on up to
+    /// `REREAD_MAX`: at most one read per period, and none once a read goes undisturbed. Then
+    /// it blocks without waking.
+    fn follow(&mut self, mut last: Option<bool>, mut f: impl FnMut(Option<bool>)) {
+        let mut delay = REREAD;
+        let mut due = self.disturbed(last).then(|| Instant::now() + delay);
+        while !self.dead {
+            if let Some(at) = due
+                && !self.ready(at)
+            {
+                due = None;
+                // A failed read leaves `last` as it was and ends the chain.
+                if let Some(value) = self.read() {
+                    if value != last {
+                        last = value;
+                        f(value);
+                    }
+                    if self.disturbed(value) {
+                        delay = (delay * 2).min(REREAD_MAX);
+                        due = Some(Instant::now() + delay);
+                    } else {
+                        delay = REREAD;
+                    }
+                }
+                continue;
+            }
+            match self.recv() {
+                Ok(msg) => {
+                    if let Some(value) = setting_changed(&msg)
+                        && value != last
+                    {
+                        last = value;
+                        f(value);
+                    }
+                }
+                Err(_) => self.dead = true,
             }
         }
     }
 
-    /// Call a method and wait for its reply (or error). Anything else that arrives first,
-    /// `SettingChanged` included, is dropped: the reply is not older than a signal the portal
-    /// sent before it (see `run`). `None` once the connection has failed, and from then on.
+    /// Wait until a message has started to arrive (or the connection has ended or failed) or
+    /// `at` has passed; whether a message is there to read. Peeks with a timeout instead of
+    /// reading with one, which could expire inside a message and leave the stream midway.
+    fn ready(&mut self, at: Instant) -> bool {
+        loop {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            if self.stream.set_read_timeout(Some(left)).is_err() {
+                self.dead = true;
+                return true;
+            }
+            let peeked = peek(&self.stream);
+            if self.stream.set_read_timeout(None).is_err() {
+                self.dead = true;
+                return true;
+            }
+            match peeked {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return false;
+                }
+                // Data, the end of the stream or a failure: `recv` takes it from here.
+                _ => return true,
+            }
+        }
+    }
+
+    /// Call a method and wait for its reply (or error). Anything else that arrives first is
+    /// dropped; the last `SettingChanged` among it is kept in `raced`, for `follow` to settle.
+    /// `None` once the connection has failed, and from then on.
     fn call(
         &mut self,
         dest: &str,
@@ -192,7 +278,11 @@ impl Bus {
                 {
                     return Some(reply);
                 }
-                Ok(_) => {}
+                Ok(other) => {
+                    if let Some(value) = setting_changed(&other) {
+                        self.raced = Some(value);
+                    }
+                }
                 Err(_) => self.dead = true,
             }
         }
@@ -249,6 +339,18 @@ impl Bus {
 
 unsafe extern "C" {
     fn getuid() -> u32;
+    fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
+}
+
+/// `UnixStream::peek` is not stable: wait for a byte (up to the stream's read timeout) without
+/// taking it.
+fn peek(stream: &UnixStream) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    const MSG_PEEK: i32 = 2;
+    let mut byte = 0u8;
+    // SAFETY: a valid descriptor, and a buffer of the one byte promised.
+    let n = unsafe { recv(stream.as_raw_fd(), &mut byte, 1, MSG_PEEK) };
+    usize::try_from(n).map_err(|_| io::Error::last_os_error())
 }
 
 /// One `unix:` entry of a bus address: `path=` or (Linux) `abstract=`, %-escaped.
