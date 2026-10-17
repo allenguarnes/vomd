@@ -2347,11 +2347,21 @@ pub fn set_room_probe(probe: RoomProbe) {
 #[cfg(feature = "remote-images")]
 const REQUEST_PER_REMOTE: usize = 128;
 
-/// How many images in view the viewport is noted for ([`Images::note_viewport`]), at most: the list
+/// How many images in view the viewport is noted for ([`Images::view_of`]), at most: the list
 /// of the remote ones (`Images::in_view`) and the places in the list of slots are 128 KB and 360 KB
 /// at most. A window shows a few dozen; one with more has the rest wait for room as an image out
 /// of view does.
 const VIEW_MAX: usize = 4096;
+
+/// The images in view in a request ([`Images::view_of`]): how many of its boxes are, how many
+/// distinct images they are (a place each in the list of slots), and the distinct remote URLs
+/// among them (taken out of the set as [`Images::in_view`] is made of them).
+struct View {
+    len: usize,
+    places: usize,
+    #[cfg(feature = "remote-images")]
+    urls: std::collections::HashSet<Arc<str>>,
+}
 
 /// What a document of `images` images, `remote` of them remote, costs to keep in [`Images`]: a
 /// [`Src`] each, and a place in the set of URLs for a remote one. It is the whole of what grows
@@ -2912,10 +2922,15 @@ impl Images {
         // room for, so that what it can't evict is not counted as room: asked in the other order
         // the protection took the room away and the request, refused, returned with nothing asked
         // for, and an image admitted to be decoded alone sat in the cache with no job.
+        // (The images in view are decided once, here, and by this alone: every place below
+        // that asks whether an image is in view, this request's and the admission of a body's,
+        // goes by the same set.)
+        let view = self.view_of(boxes, on_screen);
+        let on_screen = view.len;
         self.protect_wanted(boxes, on_screen);
         // (The viewport is the whole of what the window shows, whichever of the boxes this request
         // is made for; what the request keeps is kept while the room for its lists is made.)
-        self.note_viewport(boxes, on_screen);
+        self.note_viewport(boxes, view);
         let running = self.results_running();
         let mut most = usize::MAX;
         let fit = loop {
@@ -3383,7 +3398,45 @@ impl Images {
         fit
     }
 
-    /// Note the viewport, whole: the images in view (the first `on_screen` of `boxes`, at most
+    /// The images in view: the leading boxes of `boxes` (at most the first `on_screen`) that hold
+    /// at most [`VIEW_MAX`] images, a remote image counted once however many times the document
+    /// refers to it (4,096 references to one URL are one image). The first box that would be
+    /// image number `VIEW_MAX + 1` ends the view: that box and the ones after are not in view,
+    /// for every purpose, so a body that comes for one of them is held or dropped by the rule for
+    /// what is near and not in view (dropped for room, it is fetched again when there is room,
+    /// not at every request), never by that for what is in view in one place and not in view in
+    /// another (a viewport of references to one URL followed by a heavy image fetched it at
+    /// every request, 784 times in 8 s).
+    fn view_of(&self, boxes: &[(u32, u32, u32)], on_screen: usize) -> View {
+        let shown = on_screen.min(boxes.len());
+        let mut view = View {
+            len: shown,
+            places: 0,
+            #[cfg(feature = "remote-images")]
+            urls: std::collections::HashSet::new(),
+        };
+        for (n, b) in boxes[..shown].iter().enumerate() {
+            let src = self.src(b.0);
+            match src {
+                Src::None => continue,
+                #[cfg(feature = "remote-images")]
+                Src::Remote(url) if view.urls.contains(url) => continue,
+                _ => {}
+            }
+            if view.places == VIEW_MAX {
+                view.len = n;
+                break;
+            }
+            view.places += 1;
+            #[cfg(feature = "remote-images")]
+            if let Src::Remote(url) = src {
+                view.urls.insert(url.clone());
+            }
+        }
+        view
+    }
+
+    /// Note the viewport, whole: the images in view (`view`, [`Images::view_of`]: at most
     /// [`VIEW_MAX`]) are wanted whether or not this request has the room to ask for all of them (a
     /// request is made for as many boxes as fit, [`Images::request_fit`], and the rest are asked
     /// for by the next), so the list of the remote ones is made of all of them ([`Images::in_view`]:
@@ -3394,34 +3447,29 @@ impl Images {
     /// more than a request may take when the budget is full of what a window paints). These two are the
     /// window's own, the size of what it shows: the room for them is made first and they are made
     /// whatever the answer, as the pixels they are for are painted whatever the budget.
-    fn note_viewport(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) {
-        let view = &boxes[..on_screen.min(boxes.len())];
-        let view = &view[..view.len().min(VIEW_MAX)];
-        let places = view
-            .iter()
-            .filter(|b| !matches!(self.src(b.0), Src::None))
-            .count();
-        let bytes = self.cache.reserve_bytes(places);
+    #[cfg_attr(not(feature = "remote-images"), allow(unused_variables))]
+    fn note_viewport(&mut self, boxes: &[(u32, u32, u32)], view: View) {
+        let bytes = self.cache.reserve_bytes(view.places);
         if bytes > 0 {
             self.make_room("request: the viewport", bytes);
         }
-        self.cache.set_floor(places);
+        self.cache.set_floor(view.places);
         #[cfg(feature = "remote-images")]
         {
-            let remote = view
-                .iter()
-                .filter(|b| matches!(self.src(b.0), Src::Remote(_)))
-                .count();
+            let mut urls = view.urls;
             self.in_view.clear();
-            if remote > self.in_view.capacity() {
+            if urls.len() > self.in_view.capacity() {
                 self.make_room(
                     "request: the viewport",
-                    remote.saturating_mul(size_of::<(Arc<str>, u32, u32)>()),
+                    urls.len().saturating_mul(size_of::<(Arc<str>, u32, u32)>()),
                 );
-                self.in_view.reserve_exact(remote);
+                self.in_view.reserve_exact(urls.len());
             }
-            for &(id, w, h) in view {
-                if let Src::Remote(url) = self.src(id) {
+            // (Each URL is listed once, with the box of the first reference to it.)
+            for &(id, w, h) in &boxes[..view.len] {
+                if let Src::Remote(url) = self.src(id)
+                    && urls.remove(url)
+                {
                     let (w, h) = clamp_box(w, h);
                     let url = url.clone();
                     self.in_view.push((url, w, h));

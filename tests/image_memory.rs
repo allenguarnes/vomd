@@ -2659,6 +2659,109 @@ fn two_thousand_remote_images_beside_a_bitmap_are_all_decoded() {
     remote_beside_a_bitmap(2_000);
 }
 
+/// A real `View` (1920 x 2160, driven by the events a window gets) of `refs` references to one
+/// remote 1 x 1 PNG followed by one remote baseline 3200 x 2400 JPEG whose box is in view: both
+/// decode, no URL is fetched more than twice, and the wakes are no more than the work done
+/// (round 15). The references are one image, but the viewport's cap (`VIEW_MAX` = 4,096) was
+/// counted in boxes by the list of what is in view and not by the request, which took the JPEG
+/// (box 4,097) for an image in view while the admission of its body, which went by the list,
+/// took it for one that is not: its body was dropped for room as one near the viewport, and
+/// fetched again by the next request, which did not defer it as it does one near: 784 fetches
+/// and 785 wakes in 8 s, and only the PNG decoded.
+#[cfg(feature = "remote-images")]
+fn references_beside_a_heavy_image(refs: usize) {
+    let _serial = serial();
+    let dir = scratch(&format!("refs-{refs}"));
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    std::fs::write(serve.join("tiny.png"), zero_png(1, 1, 0, 8, false, 1 << 20)).unwrap();
+    std::fs::write(
+        serve.join("big.jpg"),
+        jpeg_variant(
+            &fixture("wide.jpg"),
+            0xC0,
+            3200,
+            2400,
+            &[0x22, 0x11, 0x11],
+            3,
+        ),
+    )
+    .unwrap();
+    fake_curl(&dir, &serve);
+    let mut src = "![t](http://127.0.0.1/tiny.png) ".repeat(refs);
+    src.push_str("![j](http://127.0.0.1/big.jpg)");
+    let fonts = vomd::fonts::Fonts::new().unwrap();
+    let (w, h) = (1920u32, 2160u32);
+    let mut view = vomd::view::View::with_base(
+        fonts,
+        Doc::parse(&src),
+        None,
+        (w, h),
+        1.0,
+        Some(dir.clone()),
+    );
+    view.set_remote_policy(vomd::settings::RemoteImages::Always);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let woken = wakes.clone();
+    view.set_image_wake(Arc::new(move || {
+        woken.fetch_add(1, Relaxed);
+    }));
+    let mut buf = vec![0; w as usize * h as usize];
+    let (mut seen, mut redraw) = (0, true);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(30) && view.image_stats().decoded < 2 {
+        let now = Instant::now();
+        if redraw {
+            view.paint(&mut buf, w as usize, now);
+        }
+        redraw = view.tick(now, Some(now)).redraw;
+        std::thread::sleep(Duration::from_millis(2));
+        let n = wakes.load(Relaxed);
+        if n != seen {
+            seen = n;
+            redraw |= view.poll_images(Instant::now());
+        }
+    }
+    let stats = view.image_stats();
+    let (most, runs) = curl_per_url(&dir);
+    let wakes = wakes.load(Relaxed);
+    println!(
+        "{refs} references and a heavy image: {stats:?}, {runs} curl runs (most for one URL {most}), {wakes} wakes, {:?}",
+        t.elapsed()
+    );
+    drop(view);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(
+        stats.decoded, 2,
+        "both images decode ({runs} curl runs, {wakes} wakes)"
+    );
+    assert!(most <= 2, "a URL was fetched {most} times");
+    assert!(
+        wakes <= (stats.decodes + stats.fetched) * 5 / 4 + 64,
+        "{wakes} wakes for {} decodes and {} fetches",
+        stats.decodes,
+        stats.fetched
+    );
+}
+
+#[cfg(feature = "remote-images")]
+#[test]
+fn references_below_the_viewport_cap_beside_a_heavy_image_both_load() {
+    references_beside_a_heavy_image(4_095);
+}
+
+#[cfg(feature = "remote-images")]
+#[test]
+fn references_at_the_viewport_cap_beside_a_heavy_image_both_load() {
+    references_beside_a_heavy_image(4_096);
+}
+
+#[cfg(feature = "remote-images")]
+#[test]
+fn references_above_the_viewport_cap_beside_a_heavy_image_both_load() {
+    references_beside_a_heavy_image(4_500);
+}
+
 /// The sites that make room ([`vomd::image::set_room_probe`]), in the order the counts are kept.
 #[cfg(feature = "remote-images")]
 const ROOM_SITES: [&str; 8] = [

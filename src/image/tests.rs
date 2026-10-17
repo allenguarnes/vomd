@@ -3423,3 +3423,47 @@ fn a_decode_running_when_the_fetchers_would_start_holds_them_off() {
     assert!(!images.remote.paused());
     assert_eq!(starts.load(Ordering::SeqCst), 3);
 }
+
+/// The images in view are decided by one function ([`Images::view_of`], round 15): at most
+/// `VIEW_MAX` images, a URL counted once however often the document refers to it, and the first
+/// box past the cap ends the view (it and the ones after are not in view for any purpose).
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_view_counts_each_remote_image_once_and_ends_at_the_cap() {
+    let boxes = |n: usize| (1..=n as u32).map(|id| (id, 10, 10)).collect::<Vec<_>>();
+    let view = |text: &str, n: usize, on_screen: usize| {
+        let doc = Doc::parse(text);
+        let mut layout = Layout::new(&doc, crate::layout::Params::default());
+        let mut images = Images::default();
+        images.attach(&doc, &mut layout);
+        let view = images.view_of(&boxes(n), on_screen);
+        (view.len, view.places, view.urls.len())
+    };
+    // 5,000 references to one URL and then another: two images, all in view.
+    let mut text = "![t](http://127.0.0.1/a.png) ".repeat(5_000);
+    text.push_str("![j](http://127.0.0.1/b.jpg)");
+    assert_eq!(view(&text, 5_001, 5_001), (5_001, 2, 2));
+    // (Only the first `on_screen` boxes are looked at.)
+    assert_eq!(view(&text, 5_001, 100), (100, 1, 1));
+    // VIEW_MAX distinct images are in view, and the one after them is not.
+    let distinct = |n: usize| {
+        (0..n)
+            .map(|i| format!("![t](http://127.0.0.1/{i}.png) "))
+            .collect::<String>()
+    };
+    assert_eq!(
+        view(&distinct(VIEW_MAX), VIEW_MAX, VIEW_MAX),
+        (VIEW_MAX, VIEW_MAX, VIEW_MAX)
+    );
+    assert_eq!(
+        view(&distinct(VIEW_MAX + 1), VIEW_MAX + 1, VIEW_MAX + 1),
+        (VIEW_MAX, VIEW_MAX, VIEW_MAX)
+    );
+    // A repeat of one in view beyond the cap's box is not what ends it, the next new one is.
+    let mut text = distinct(VIEW_MAX - 1);
+    text.push_str("![t](http://127.0.0.1/0.png) ![t](http://127.0.0.1/last.png) ![t](http://127.0.0.1/over.png)");
+    assert_eq!(
+        view(&text, VIEW_MAX + 2, VIEW_MAX + 2),
+        (VIEW_MAX + 1, VIEW_MAX, VIEW_MAX)
+    );
+}
