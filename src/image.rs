@@ -1218,6 +1218,11 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // | the decode's own allocations               | the job's cost, `Cache::reserve`           | -                                           |
 // | `Worker::spawn`, `Pool::spawn`, watchdog   | constants (`WORKER_FIXED`, `PENDING_COST`);| -                                           |
 // | threads, the channel                       | stacks are not the allocator's             |                                             |
+// | anything made from a document's `src` or   | the length is judged first (`MAX_SRC`):    | -                                           |
+// | URL (round 12: a lowercased scheme, a      | `fetchable` and `local_path` copy nothing  | a longer one is refused: alt text           |
+// | decoded or joined path, a `format!`)       | of what is longer, and read the scheme's   | (not fetched, not a file)                   |
+// |                                            | bytes (`has_http_scheme`); a path is made  |                                             |
+// |                                            | only beside the room `path_scratch` has    |                                             |
 // | `memory_report`                            | diagnostics for failing tests only         | -                                           |
 
 /// What a cached image belongs to: an image of the current document (by id), or a remote URL,
@@ -1434,7 +1439,14 @@ impl Cache {
         })
     }
 
+    #[cfg(test)]
     fn insert(&mut self, key: Key, data: Data) {
+        self.insert_as(key, data, true);
+    }
+
+    /// [`Cache::insert`]; `current`: whether the pixels are for the current document (a result for
+    /// one that has gone is cached as not painted).
+    fn insert_as(&mut self, key: Key, data: Data, current: bool) {
         // One slot per image and size (and one for a URL's bytes).
         let same = |s: &Slot| {
             s.key == key
@@ -1459,9 +1471,11 @@ impl Cache {
         // fetched body counts as used when something is made of it ([`Cache::bytes_of`]), not
         // before: it may belong to an image far from the viewport, and mustn't push out
         // what is being looked at.
+        // (Pixels decoded for a document that has gone are wanted by nothing yet: the next request
+        // for one that has the image keeps them, and until then anything may have the room.)
         let used = match data {
-            Data::Pixels(_) => self.frame,
-            Data::Bytes(_) => 0,
+            Data::Pixels(_) if current => self.frame,
+            _ => 0,
         };
         let slot = Slot { key, data, used };
         // Room is made before the slot is in, so it can't be the one evicted.
@@ -2025,6 +2039,9 @@ pub struct Images {
     /// document that is still running holds what they need. Every image shows its alt text
     /// meanwhile, and the poll that finds the room makes them ([`Images::build_pending`]).
     unbuilt: bool,
+    /// The frame the tables were last tried for while they waited: a request in a later one asks
+    /// the window to try again (what the old document painted is evictable from then on).
+    unbuilt_tried: u64,
     /// Results with pixels taken so far ([`Stats::decodes`]).
     decodes: usize,
     tx: Sender<Done>,
@@ -2151,6 +2168,19 @@ const REQUEST_PER_BOX: usize = 3 * (size_of::<Job>() + size_of::<Key>());
 const REQUEST_PER_REMOTE_BOX: usize =
     3 * size_of::<(Arc<str>, u32, u32)>() + 6 * size_of::<Arc<str>>();
 
+/// What a request can be made for ([`Images::request_fit`]).
+#[derive(Default)]
+struct Fit {
+    /// How many of the boxes, most wanted first.
+    boxes: usize,
+    /// What the request allocates at most for them.
+    allowance: usize,
+    /// How many of those are not decoded yet, and may be asked for: the work that was charged.
+    work: usize,
+    /// How many of those are local images (each has an entry in the table of the files' sizes).
+    local: usize,
+}
+
 /// Whether the tables of a document can be made ([`Images::admit_tables`]).
 enum Tables {
     /// They fit, and the room for them is made.
@@ -2212,6 +2242,7 @@ impl Default for Images {
             cache: Cache::new(CACHE_BYTES),
             extra: 0,
             unbuilt: false,
+            unbuilt_tried: 0,
             decodes: 0,
             tx,
             rx,
@@ -2331,6 +2362,7 @@ impl Images {
             Tables::Now => self.build_tables(doc, layout, true),
             Tables::Later => {
                 self.unbuilt = true;
+                self.unbuilt_tried = self.cache.frame;
                 self.build_tables(doc, layout, false);
             }
             Tables::Never => self.build_tables(doc, layout, false),
@@ -2474,7 +2506,10 @@ impl Images {
                 self.build_tables(doc, layout, true);
                 true
             }
-            Tables::Later => false,
+            Tables::Later => {
+                self.unbuilt_tried = self.cache.frame;
+                false
+            }
             Tables::Never => {
                 // Whatever was in the way is gone and it still doesn't fit: it is not coming.
                 self.unbuilt = false;
@@ -2554,6 +2589,27 @@ impl Images {
         #[cfg(not(feature = "remote-images"))]
         let remote = true;
         worker && remote && self.retired.iter().all(Worker::idle_of)
+    }
+
+    /// Whether image `id` is still to be shown: it is a file, or a remote image that remote images
+    /// being on can fetch and that has not failed (so it is decoded, or will be, and when nothing
+    /// is left to do it is decoded: the tests that look for work that never happens).
+    #[doc(hidden)]
+    pub fn is_waiting(&self, id: u32) -> bool {
+        match self.src(id) {
+            Src::None => false,
+            Src::File(_) => true,
+            #[cfg(feature = "remote-images")]
+            Src::Remote(url) => self.remote.on && self.remote.size(url) != Some(None),
+            #[cfg(not(feature = "remote-images"))]
+            Src::Remote(_) => false,
+        }
+    }
+
+    /// Whether the tables of the document are waiting for a decode ([`Images::attach`]).
+    #[doc(hidden)]
+    pub fn tables_waiting(&self) -> bool {
+        self.unbuilt
     }
 
     /// What has been loaded (see [`Stats`]).
@@ -2662,7 +2718,17 @@ impl Images {
     /// window's next request, woken by the last of them, finds it so.
     pub fn request(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) {
         // Without decoders there's nothing to ask for (and the worker isn't built in).
-        if !cfg!(feature = "images") || self.unbuilt {
+        if !cfg!(feature = "images") {
+            return;
+        }
+        if self.unbuilt {
+            // A frame is a change of state that can make the tables buildable (what the old
+            // document painted may be evicted from it on, and nothing else wakes the window for
+            // that): once for each, the poll tries again, and a repaint follows if it does.
+            if self.unbuilt_tried != self.cache.frame {
+                self.unbuilt_tried = self.cache.frame;
+                (self.wake)();
+            }
             return;
         }
         // The bookkeeping is paid for out of the same budget, and what this request builds beside
@@ -2677,13 +2743,13 @@ impl Images {
             self.forget_evicted();
             self.trim_records();
         }
-        let (fit, allowance) = self.request_fit(boxes);
-        let (boxes, on_screen) = (&boxes[..fit], on_screen.min(fit));
+        let fit = self.request_fit(boxes, on_screen);
+        let (boxes, on_screen) = (&boxes[..fit.boxes], on_screen.min(fit.boxes));
+        let (allowance, local) = (fit.allowance, fit.local);
         self.extra = allowance;
-        let local = boxes
-            .iter()
-            .filter(|b| matches!(self.src(b.0), Src::File(_)))
-            .count();
+        // (The work the allowance is for: an image evicted since was cached when it was worked
+        // out, and is asked for by the next request.)
+        let mut work = fit.work;
         // What the request will keep is not what is evicted for the room it needs.
         self.protect_wanted(boxes, on_screen);
         let made = allowance == 0 || self.make_room("request", 0);
@@ -2701,8 +2767,13 @@ impl Images {
         if local > 0 {
             if self.costs.len() > 2 * local + 16 {
                 let mut kept = std::collections::HashMap::with_capacity(local);
-                for &(id, ..) in boxes {
-                    if let Some(info) = self.costs.remove(&id) {
+                for &(id, w, h) in boxes {
+                    // (Only what is asked for needs its entry: a cached image's is not looked at.)
+                    if kept.len() < local
+                        && let Some(key) = self.key(id)
+                        && !self.cache.has(&key, clamp_box(w, h).0, clamp_box(w, h).1)
+                        && let Some(info) = self.costs.remove(&id)
+                    {
                         kept.insert(id, info);
                     }
                 }
@@ -2714,7 +2785,11 @@ impl Images {
         #[cfg(feature = "remote-images")]
         {
             self.in_view.clear();
-            self.in_view.reserve_exact(on_screen);
+            let view = boxes[..on_screen]
+                .iter()
+                .filter(|b| matches!(self.src(b.0), Src::Remote(_)))
+                .count();
+            self.in_view.reserve_exact(view);
         }
         let mut jobs = Vec::new();
         #[cfg(feature = "remote-images")]
@@ -2801,6 +2876,11 @@ impl Images {
                 self.cache.touch(&key, w, h);
                 continue;
             }
+            // The allowance is for as much work as was worked out.
+            if work == 0 {
+                continue;
+            }
+            work -= 1;
             // (Only a remote image can be asked for twice, by two ids with one URL.)
             if matches!(key, Key::Remote(_))
                 && jobs
@@ -3030,34 +3110,56 @@ impl Images {
     /// it made ([`Images::make_room`]); boxes beyond what the budget could ever have room for are
     /// not asked for (a window's few dozen always are: the number is for a request of thousands of
     /// tiny images beside a bitmap that fills the budget).
-    fn request_fit(&mut self, boxes: &[(u32, u32, u32)]) -> (usize, usize) {
+    ///
+    /// Only the work a request does is charged: a box already decoded at its size costs nothing
+    /// (it is touched, and for a remote one in view an entry of the list of those), so a prefix of
+    /// cached images never uses up what the later ones need, and each request goes on where the
+    /// last had to stop: the images it asked for are cached by the next, and cost nothing then.
+    fn request_fit(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) -> Fit {
         let limit = self.room_limit();
         let entry = size_of::<(u32, Option<FileInfo>)>();
         let base = self.base.as_ref().map_or(0, |b| b.as_os_str().len());
-        let (mut local, mut paths, mut scratch, mut remote) = (0usize, 0usize, 0usize, 0usize);
-        let mut fit = (0, 0);
-        for (k, &(id, ..)) in boxes.iter().enumerate() {
-            match self.src(id) {
-                Src::File(src) => {
-                    local += 1;
-                    paths += src.len().min(MAX_SRC) + base + STR_OVERHEAD;
-                    scratch = scratch.max(self.path_scratch(src));
+        let (mut work, mut local, mut paths, mut scratch) = (0usize, 0usize, 0usize, 0usize);
+        let (mut remote, mut remote_view) = (0usize, 0usize);
+        let mut fit = Fit::default();
+        for (k, &(id, w, h)) in boxes.iter().enumerate() {
+            if let Some(key) = self.key(id) {
+                let (w, h) = clamp_box(w, h);
+                let cached = self.cache.has(&key, w, h);
+                match self.src(id) {
+                    // (The list of those in view is made once, for as many as there are.)
+                    Src::Remote(_) if cached => remote_view += usize::from(k < on_screen),
+                    Src::Remote(_) => {
+                        work += 1;
+                        remote += 1;
+                    }
+                    Src::File(src) if !cached => {
+                        work += 1;
+                        local += 1;
+                        paths += src.len().min(MAX_SRC) + base + STR_OVERHEAD;
+                        scratch = scratch.max(self.path_scratch(src));
+                    }
+                    _ => {}
                 }
-                Src::Remote(_) => remote += 1,
-                Src::None => {}
             }
-            #[cfg(not(feature = "remote-images"))]
-            let _ = remote;
             #[cfg(feature = "remote-images")]
-            let remote_bytes = remote.saturating_mul(REQUEST_PER_REMOTE_BOX);
+            let remote_bytes = remote
+                .saturating_mul(REQUEST_PER_REMOTE_BOX)
+                .saturating_add(remote_view.saturating_mul(3 * size_of::<(Arc<str>, u32, u32)>()));
             #[cfg(not(feature = "remote-images"))]
-            let remote_bytes = 0;
-            let costs = if local == 0 {
+            let remote_bytes = {
+                let _ = (remote, remote_view);
+                0
+            };
+            // (A table that has room for them as it is allocates nothing; one that has not is
+            // made again, with at least what it holds and more.)
+            let need = self.costs.len().saturating_add(local);
+            let costs = if local == 0 || need <= self.costs.capacity() {
                 0
             } else {
-                table_bytes(self.costs.len().saturating_add(local), entry)
+                table_bytes(need.max(self.costs.capacity().saturating_add(1)), entry)
             };
-            let bytes = (k + 1)
+            let bytes = work
                 .saturating_mul(REQUEST_PER_BOX)
                 .saturating_add(remote_bytes)
                 .saturating_add(costs)
@@ -3067,7 +3169,12 @@ impl Images {
             if bytes > limit.max(REQUEST_FREE) {
                 break;
             }
-            fit = (k + 1, bytes);
+            fit = Fit {
+                boxes: k + 1,
+                allowance: bytes,
+                work,
+                local,
+            };
         }
         fit
     }
@@ -3183,7 +3290,7 @@ impl Images {
                         }
                         self.decodes += 1;
                         self.charge_bookkeeping();
-                        self.store(key.clone(), Data::Pixels(b))
+                        self.store(key.clone(), Data::Pixels(b), doc_gen == self.doc_gen)
                     }
                     None => false,
                 };
@@ -3607,7 +3714,7 @@ impl Images {
         }
         match (keep, taken) {
             (true, Some(bytes)) => {
-                if self.store(Key::Remote(url.clone()), Data::Bytes(bytes)) {
+                if self.store(Key::Remote(url.clone()), Data::Bytes(bytes), true) {
                     if self.in_view.iter().any(|(u, ..)| *u == url) {
                         self.cache.bytes_of(&url);
                     }
@@ -3903,12 +4010,12 @@ impl Images {
     /// whatever the answer: the pixels painted in a frame are the one exception to the budget,
     /// and the list of them is the size of their number, which a window cannot make
     /// more than a few hundred.
-    fn store(&mut self, key: Key, data: Data) -> bool {
+    fn store(&mut self, key: Key, data: Data, current: bool) -> bool {
         let growth = self.cache.growth();
         if growth > 0 && !self.make_room("slot list", growth) && growth > SLOTS_FREE {
             return false;
         }
-        self.cache.insert(key, data);
+        self.cache.insert_as(key, data, current);
         true
     }
 

@@ -1360,9 +1360,7 @@ impl Builder {
     }
 
     fn push_image(&mut self, src: String) -> u32 {
-        // Schemes are case-insensitive (`HTTPS://`).
-        let scheme = src.get(..8).unwrap_or(&src).to_ascii_lowercase();
-        let remote = scheme.starts_with("http://") || scheme.starts_with("https://");
+        let remote = has_http_scheme(&src);
         let start = self.doc.text.len() as u32;
         let src = src.into();
         push_id(&mut self.doc.images, ImageRef { src, remote, start })
@@ -2162,6 +2160,14 @@ fn decode_entities(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Whether `s` begins with `http://` or `https://`, in any case (schemes are case-insensitive).
+/// Looks at the bytes of the scheme only: no copy of `s`, however long it is.
+pub(crate) fn has_http_scheme(s: &str) -> bool {
+    let b = s.as_bytes();
+    let scheme = |p: &[u8]| b.len() >= p.len() && b[..p.len()].eq_ignore_ascii_case(p);
+    scheme(b"http://") || scheme(b"https://")
 }
 
 #[cfg(test)]

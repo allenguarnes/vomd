@@ -125,9 +125,10 @@ pub enum Error {
 /// what it is given: a URL of megabytes would cost them each its length three times over, which
 /// nothing counts, and no server takes one), and no spaces or control characters.
 pub fn fetchable(url: &str) -> bool {
-    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    // The length first, and no copy of the scheme: a URL of megabytes is never copied or read
+    // past what it takes to say no.
     url.len() <= image::MAX_SRC
-        && (lower.starts_with("http://") || lower.starts_with("https://"))
+        && crate::doc::has_http_scheme(url)
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
