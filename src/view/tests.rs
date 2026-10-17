@@ -794,6 +794,50 @@ mod with_fonts {
         assert!(!v.expire(deadline + Duration::from_secs(10)));
     }
 
+    /// The pointer over the scrollbar's column shows it, holds it while it stays (no timer),
+    /// and on leaving it lingers and fades as after a scroll. Elsewhere the pointer doesn't.
+    #[test]
+    fn hovering_the_scrollbar_column_shows_it() {
+        let t0 = Instant::now();
+        let mut v = view(&paras(200), 600, 400);
+        settle(&mut v);
+        let thumb = v.thumb_at(0.0).unwrap();
+        let x = f64::from(thumb.x1 - 1);
+        let mut buf = vec![0; 600 * 400];
+        let thumb_px = |buf: &[u32]| (0..400).any(|y| buf[y * 600 + 595] != LIGHT.bg);
+        // Over the text: nothing.
+        assert!(!v.hover_at(100.0, 300.0, t0));
+        assert_eq!(v.deadline(), None);
+        // Over the column, even far from the thumb: shown and held.
+        assert!(v.hover_at(x, 300.0, t0), "appears");
+        assert!(!v.hover_at(x, 310.0, t0), "already showing");
+        assert_eq!(v.deadline(), None, "held, no timer");
+        let late = t0 + Duration::from_secs(60);
+        assert!(!v.expire(late));
+        v.paint(&mut buf, 600, late);
+        assert!(thumb_px(&buf), "still shown while hovered");
+        // While hovered, a press on the track jumps there, as on a visible scrollbar.
+        assert!(v.press(x, 300.0, late));
+        v.release(late);
+        // Leaving lets it linger, then hide.
+        assert!(!v.hover_at(100.0, 300.0, late));
+        let deadline = v.deadline().unwrap();
+        assert!(deadline > late);
+        assert!(!v.expire(deadline - Duration::from_millis(1)));
+        assert!(v.expire(deadline));
+        v.paint(&mut buf, 600, deadline);
+        assert!(!thumb_px(&buf), "hidden after leaving");
+        // Leaving the window over it does the same.
+        assert!(v.hover_at(x, 300.0, deadline));
+        assert!(!v.hover_end());
+        assert!(v.deadline().is_some());
+        // A document that doesn't scroll has no scrollbar to show.
+        let mut short = view("Short.", 600, 400);
+        settle(&mut short);
+        assert!(!short.hover_at(595.0, 200.0, t0));
+        assert_eq!(short.deadline(), None);
+    }
+
     /// A one-pixel scroll moves exactly one pixel far down a tall document (f64 anchors).
     #[test]
     fn pixel_scroll_deep_in_a_tall_document() {

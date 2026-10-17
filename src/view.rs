@@ -385,6 +385,8 @@ pub struct View {
     system_dark: bool,
     fade: ScrollbarFade,
     drag: Option<Drag>,
+    /// The pointer is over the scrollbar's column: it shows, and stays until the pointer leaves.
+    over_bar: bool,
     /// Characters already handed to a fallback scan, over all documents shown (the
     /// system fonts are scanned once per character, not once per reload).
     tried: HashSet<char>,
@@ -473,6 +475,7 @@ impl View {
             system_dark: false,
             fade: ScrollbarFade::default(),
             drag: None,
+            over_bar: false,
             tried: HashSet::new(),
             msg_missing: BTreeSet::new(),
             zoom_pixels: 0.0,
@@ -826,19 +829,27 @@ impl View {
         taken
     }
 
+    /// The scrollbar's thumb if (`x`, `y`) is in its column: the thumb and its margin to the
+    /// right edge, a few pixels wider to the left so the thin thumb is easy to hit, below the
+    /// toolbar. `None` when the document doesn't scroll.
+    fn bar_column(&self, x: f64, y: f64) -> Option<render::Thumb> {
+        let t = self.thumb_at(self.scroll())?;
+        let slack = f64::from(t.x1 - t.x0);
+        (x >= f64::from(t.x0) - slack && y >= f64::from(self.top_inset)).then_some(t)
+    }
+
+    /// The scrollbar is held on screen: dragged, or under the pointer.
+    fn bar_held(&self) -> bool {
+        self.drag.is_some() || self.over_bar
+    }
+
     fn press_scrollbar(&mut self, x: f64, y: f64, now: Instant) -> bool {
-        let Some(t) = self.thumb_at(self.scroll()) else {
+        let Some(t) = self.bar_column(x, y) else {
             return false;
         };
-        // The column is the thumb and its margin to the right edge, a few pixels wider to the
-        // left so the thin thumb is easy to hit.
-        let slack = f64::from(t.x1 - t.x0);
-        if x < f64::from(t.x0) - slack || y < f64::from(self.top_inset) {
-            return false;
-        }
         let (y0, y1) = (f64::from(t.y0), f64::from(t.y1));
         let on_thumb = (y0..y1).contains(&y);
-        if !on_thumb && !self.fade.visible(now) {
+        if !on_thumb && !self.fade.visible(now) && !self.over_bar {
             return false;
         }
         let grab = if on_thumb { y - y0 } else { (y1 - y0) / 2.0 };
@@ -930,6 +941,7 @@ impl View {
         let bar = self.toolbar.pointer(&ctx, x, y, now);
         let free = self.drag.is_none() && !self.toolbar.covers(&ctx, x, y);
         let link = if free { self.link_at(x, y) } else { None };
+        let bar = bar | self.set_over_bar(free && self.bar_column(x, y).is_some(), now);
         let blocked = cfg!(feature = "remote-images")
             && free
             && self
@@ -943,7 +955,20 @@ impl View {
     /// repaint).
     pub fn hover_end(&mut self) -> bool {
         let note = std::mem::take(&mut self.hover_blocked);
-        self.hover.take().is_some() | self.toolbar.leave() | note
+        let bar = self.set_over_bar(false, Instant::now());
+        self.hover.take().is_some() | self.toolbar.leave() | note | bar
+    }
+
+    /// The pointer went over the scrollbar's column (`over`) or left it. Entering shows the
+    /// scrollbar, held while the pointer stays; leaving lets it linger and fade as after a
+    /// scroll. Returns true if the scrollbar appeared (repaint).
+    fn set_over_bar(&mut self, over: bool, now: Instant) -> bool {
+        if std::mem::replace(&mut self.over_bar, over) == over {
+            return false;
+        }
+        let shown = self.fade.visible(now) || self.drag.is_some();
+        self.fade.poke(now);
+        over && !shown
     }
 
     /// The target of the hovered link, as written in the document.
@@ -1051,7 +1076,7 @@ impl View {
                 render::paint_images(&mut frame, vp, &self.layout, &mut self.images, theme);
                 self.images_dirty = true;
             }
-            if self.fade.visible(now) || self.drag.is_some() {
+            if self.fade.visible(now) || self.bar_held() {
                 let total = self.layout.total_height();
                 render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
             }
@@ -1278,7 +1303,7 @@ impl View {
 
     /// When the event loop must wake for the scrollbar (`None`: never).
     pub fn deadline(&self) -> Option<Instant> {
-        let fade = if self.drag.is_some() {
+        let fade = if self.bar_held() {
             None
         } else {
             self.fade.deadline()
@@ -1298,7 +1323,7 @@ impl View {
     /// Hide the scrollbar or show the toolbar's tooltip if its time is up. Returns true if the
     /// window needs a repaint.
     pub fn expire(&mut self, now: Instant) -> bool {
-        let fade = self.drag.is_none() && self.fade.expire(now);
+        let fade = !self.bar_held() && self.fade.expire(now);
         let pulse = self.pulse.is_some_and(|t| now >= t);
         if pulse {
             self.pulse = None;
@@ -1330,7 +1355,7 @@ impl View {
                 self.request_images();
             }
         }
-        let showing = self.message.is_none() && (self.drag.is_some() || self.fade.visible(now));
+        let showing = self.message.is_none() && (self.bar_held() || self.fade.visible(now));
         let thumb = showing.then(|| self.thumb_at(self.scroll()));
         let measured = measure_until.is_none_or(|t| self.idle(t));
         redraw |= thumb.is_some_and(|before| before != self.thumb_at(self.scroll()));

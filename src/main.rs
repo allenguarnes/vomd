@@ -37,6 +37,48 @@ enum UserEvent {
     Families(Vec<(bool, String, Option<Family>)>),
     /// An image was decoded or fetched.
     Images,
+    /// The desktop's dark preference from the portal (`None`: none, or no portal).
+    #[cfg_attr(
+        not(all(unix, not(any(target_os = "macos", target_os = "ios")))),
+        allow(dead_code)
+    )]
+    SystemDark(Option<bool>),
+}
+
+/// How long the first window waits for the portal's dark preference before painting with
+/// what winit or `GTK_THEME` say (a later answer still applies). It usually takes ~1 ms.
+const PORTAL_WAIT: Duration = Duration::from_millis(50);
+
+/// The portal's first answer, set once by its thread (outer `None`: not yet), which then
+/// unparks the main thread.
+type FirstDark = Arc<Mutex<Option<Option<bool>>>>;
+
+/// Ask the portal for the desktop's dark preference on a thread of its own and follow it: the
+/// first answer is kept for the first frame and, like every change after it, sent to the
+/// event loop.
+fn watch_dark(proxy: EventLoopProxy<UserEvent>) -> Option<FirstDark> {
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+    {
+        let first = FirstDark::default();
+        let (theirs, main) = (first.clone(), std::thread::current());
+        std::thread::spawn(move || {
+            vomd::portal::watch(|dark| {
+                if let Ok(mut slot) = theirs.lock()
+                    && slot.is_none()
+                {
+                    *slot = Some(dark);
+                    main.unpark();
+                }
+                let _ = proxy.send_event(UserEvent::SystemDark(dark));
+            });
+        });
+        Some(first)
+    }
+    #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
+    {
+        drop(proxy);
+        None
+    }
 }
 
 /// The document as read and parsed off the main thread.
@@ -97,6 +139,10 @@ struct App {
     view: Option<View>,
     gfx: Option<Gfx>,
     proxy: EventLoopProxy<UserEvent>,
+    /// The portal's first dark preference, waited for by the first window.
+    portal_first: Option<FirstDark>,
+    /// The portal gave a preference: it wins over winit's theme.
+    portal_dark: bool,
     /// A fallback font scan is running.
     scanning: bool,
     /// A redraw was asked for and not yet painted.
@@ -527,10 +573,24 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = p.send_event(UserEvent::Images);
             }
         }));
-        view.set_system_dark(match window.theme() {
+        let portal = self.portal_first.take().and_then(|first| {
+            let until = Instant::now() + PORTAL_WAIT;
+            loop {
+                if let Some(dark) = *first.lock().ok()? {
+                    break dark;
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break None;
+                }
+                std::thread::park_timeout(left);
+            }
+        });
+        self.portal_dark = portal.is_some();
+        view.set_system_dark(portal.unwrap_or_else(|| match window.theme() {
             Some(t) => t == Theme::Dark,
             None => platform::fallback_dark(),
-        });
+        }));
         self.view = Some(view);
         self.gfx = Some(Gfx { window, surface });
         self.apply(&prefs);
@@ -575,6 +635,14 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
             }
+            UserEvent::SystemDark(dark) => {
+                self.portal_dark |= dark.is_some();
+                if let (Some(view), Some(dark)) = (self.view.as_mut(), dark)
+                    && view.set_system_dark(dark)
+                {
+                    self.redraw();
+                }
+            }
         }
         // New faces change line breaks and heights, and so what's under the pointer.
         self.update_hover();
@@ -603,7 +671,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw();
             }
             WindowEvent::ThemeChanged(theme) => {
-                if view.set_system_dark(theme == Theme::Dark) {
+                if !self.portal_dark && view.set_system_dark(theme == Theme::Dark) {
                     self.redraw();
                 }
             }
@@ -809,6 +877,8 @@ fn main() {
         view: None,
         gfx: None,
         proxy: event_loop.create_proxy(),
+        portal_first: watch_dark(event_loop.create_proxy()),
+        portal_dark: false,
         scanning: false,
         redraw_pending: Cell::new(false),
         stamp: None,
