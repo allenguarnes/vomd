@@ -74,6 +74,9 @@ fn respond(mut s: TcpStream, status: &str, headers: &str, body: &[u8]) {
     let _ = s.write_all(body);
 }
 
+/// What `/slow` waits for.
+static SLOW_GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
 /// Requests for the glob test's paths.
 static GLOB_HITS: AtomicUsize = AtomicUsize::new(0);
 
@@ -121,7 +124,11 @@ fn serve(s: TcpStream, port: u16) {
         // Doesn't say (the connection's end ends it): the pipe is cut while reading.
         "/big-stream" => respond(s, "200 OK", "", &[0u8; 4096]),
         "/slow" => {
-            std::thread::sleep(Duration::from_secs(4));
+            // Held until the test says (or half a minute, so the thread ends): a fetch that
+            // gets the image from it was not cut by its time cap.
+            let (open, cv) = &SLOW_GATE;
+            let held = open.lock().unwrap();
+            let _ = cv.wait_timeout_while(held, Duration::from_secs(30), |o| !*o);
             respond(s, "200 OK", &len(png.len()), &png);
         }
         p if p.starts_with("/glob") => {
@@ -200,12 +207,16 @@ fn reading_stops_at_the_size_cap() {
     let fake = dir.join("curl");
     std::fs::write(&fake, "#!/bin/sh\nexec yes\n").unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let t = Instant::now();
-    let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", SMALL, &|_| {
-        true
-    });
-    assert_eq!(got, Err(Error::TooLarge));
-    assert!(t.elapsed() < Duration::from_secs(5));
+    // (A script just written may be busy to exec while another test's thread forks, `ETXTBSY`:
+    // that spawn fails at once, and is tried again. A `yes` that is never stopped would not end.)
+    let got = (0..50)
+        .map(|_| {
+            fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", SMALL, &|_| {
+                true
+            })
+        })
+        .find(|got| *got != Err(Error::Failed));
+    assert_eq!(got, Some(Err(Error::TooLarge)));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -250,13 +261,11 @@ fn fetching_follows_the_rules() {
     // HTTP errors fail.
     assert_eq!(fetch(&url("/missing"), SMALL), Err(Error::Failed));
     // The time cap.
-    let t = Instant::now();
+    // (A server that doesn't answer until it is told to: the fetch ends by its time cap, and
+    // never has the image.)
     assert_eq!(fetch(&url("/slow"), SMALL), Err(Error::Failed));
-    assert!(
-        t.elapsed() < Duration::from_millis(3500),
-        "{:?}",
-        t.elapsed()
-    );
+    *SLOW_GATE.0.lock().unwrap() = true;
+    SLOW_GATE.1.notify_all();
     // Only images are kept.
     assert!(fetch(&url("/page.html"), SMALL).is_ok());
     assert_eq!(
@@ -443,14 +452,21 @@ fn a_curl_that_overstays_is_killed() {
     std::fs::write(&fake, "#!/bin/sh\nexec sleep 60\n").unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let limits = Limits { secs: 1, ..SMALL };
-    let t = Instant::now();
-    let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", limits, &|_| {
-        true
-    });
+    // A script just written may be busy to exec while another test's thread forks (`ETXTBSY`):
+    // such a spawn fails at once, and is tried again.
+    let (got, took) = (0..50)
+        .find_map(|_| {
+            let t = Instant::now();
+            let got = fetch_with(fake.to_str().unwrap(), "https://x.y/a.png", limits, &|_| {
+                true
+            });
+            (t.elapsed() > Duration::from_millis(500)).then(|| (got, t.elapsed()))
+        })
+        .expect("a curl that was run");
     assert_eq!(got, Err(Error::Failed));
-    let took = t.elapsed();
+    // Killed after its time and the grace (a 60 s sleep would show), however slow the machine.
     assert!(
-        took >= Duration::from_secs(1) && took < Duration::from_secs(8),
+        took >= Duration::from_secs(1) && took < Duration::from_secs(45),
         "{took:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -496,7 +512,7 @@ impl Probe {
 fn until(what: &str, mut cond: impl FnMut() -> bool) {
     let t = Instant::now();
     while !cond() {
-        assert!(t.elapsed() < Duration::from_secs(10), "timed out: {what}");
+        assert!(t.elapsed() < Duration::from_secs(60), "timed out: {what}");
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -505,6 +521,72 @@ fn urls(n: usize) -> Vec<Arc<str>> {
     (0..n)
         .map(|i| format!("https://x.y/{i}.png").into())
         .collect()
+}
+
+/// Held off, the fetchers start nothing (a pool started while held off included), a fetch that
+/// needs more credit gives up and is queued again at the front, and one that has what it needs
+/// is waited for; let go, everything is fetched, once each but the one that gave up.
+#[test]
+fn held_off_fetchers_start_nothing_and_give_up_what_wants_more() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wake: Wake = Arc::new(|| {});
+    let starts = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let fetcher: Fetcher = {
+        let (starts, gate) = (starts.clone(), gate.clone());
+        Arc::new(move |url, grant| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            // The first URL takes credit, waits at the gate, and asks for more.
+            if url.ends_with("/0.png") {
+                assert!(grant(STEP) || starts.load(Ordering::SeqCst) > 1);
+                let (open, cv) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                if !grant(STEP) {
+                    return Err(Error::Yielded);
+                }
+            }
+            Ok((Arc::new(png()), 2, 1))
+        })
+    };
+    let mut r = Remote {
+        on: true,
+        fetcher,
+        ..Remote::default()
+    };
+    // The pool is started while held off: nothing starts.
+    r.pause(true);
+    r.fetch(urls(5), tx.clone(), wake.clone());
+    assert!(r.paused() && r.busy());
+    assert_eq!(r.transfers(), (0, 0));
+    // Let go: the first URL starts and holds credit at the gate; held off again, it asks for more
+    // when the gate opens, and gives up: that URL is queued again, nothing else starts.
+    r.pause(false);
+    until("the first fetch holds credit", || r.inflight() >= STEP);
+    r.pause(true);
+    let before = starts.load(Ordering::SeqCst);
+    {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+    until("the fetch gave up", || r.transfers().0 == 0);
+    // Whatever the other threads did before they were held off is over: none starts now.
+    assert!(r.busy(), "its URL is queued again");
+    let started = starts.load(Ordering::SeqCst);
+    assert!(started >= before);
+    // Let go: all five are fetched.
+    r.pause(false);
+    let mut got = 0;
+    while got < 5 {
+        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(60)) else {
+            panic!("a result");
+        };
+        assert!(r.fetched(&url, result).is_some());
+        got += 1;
+    }
+    until("idle", || !r.busy());
 }
 
 /// At most [`FETCHERS`] fetches run at once and none runs twice, however the queue is replaced
@@ -545,7 +627,7 @@ fn the_fetchers_never_exceed_their_number_or_repeat_a_url() {
     probe.release();
     let mut got: Vec<Arc<str>> = Vec::new();
     while got.len() < FETCHERS {
-        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(10)) else {
+        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(60)) else {
             panic!("a fetch result");
         };
         assert!(result.is_ok());
@@ -553,9 +635,11 @@ fn the_fetchers_never_exceed_their_number_or_repeat_a_url() {
         r.fetch(vec![url.clone()], tx.clone(), wake.clone());
         got.push(url);
     }
-    std::thread::sleep(Duration::from_millis(100));
+    // (The wake follows each result: a result is seen before its wake is called.)
+    until("every result woke the window", || {
+        woken.load(Ordering::SeqCst) == FETCHERS
+    });
     assert_eq!(probe.started(), FETCHERS, "nothing fetched twice");
-    assert_eq!(woken.load(Ordering::SeqCst), FETCHERS);
     // Taken, they can be fetched again (an evicted image); the rest of the queue goes on.
     for url in &got {
         assert!(r.fetched(url, Ok((Arc::new(png()), 2, 1))).is_some());
@@ -563,7 +647,7 @@ fn the_fetchers_never_exceed_their_number_or_repeat_a_url() {
     r.fetch(all[FETCHERS..].to_vec(), tx.clone(), wake.clone());
     let mut seen = got.len();
     while seen < 10 {
-        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(10)) else {
+        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(60)) else {
             panic!("a fetch result");
         };
         r.fetched(&url, result);
@@ -605,10 +689,13 @@ fn bodies_waiting_for_the_main_thread_are_bounded() {
     };
     let all = urls(16);
     r.fetch(all.clone(), tx.clone(), Arc::new(|| {}));
-    std::thread::sleep(Duration::from_millis(400));
-    // Nothing is taken: the 12 MiB are spent by finished bodies, and whatever else is reading
-    // waits for credit or has given it up (to be fetched again once there is some).
-    let (held, mut waiting) = (r.inflight(), rx.try_iter().collect::<Vec<_>>());
+    // Nothing is taken: the 12 MiB are spent by finished bodies (3 at most), and whatever else
+    // is reading waits for credit or has given it up (to be fetched again once there is some).
+    // (How many are finished by the time this looks depends on how the four interleaved.)
+    until("a body is finished", || r.transfers().1 >= 1);
+    let mut waiting = vec![rx.recv_timeout(Duration::from_secs(60)).expect("a result")];
+    waiting.extend(rx.try_iter());
+    let held = r.inflight();
     assert!(held <= FETCH_BYTES, "{held} held");
     assert!(
         (1..=3).contains(&waiting.len()),
@@ -621,7 +708,7 @@ fn bodies_waiting_for_the_main_thread_are_bounded() {
     while taken.len() < 16 {
         let done = match waiting.pop() {
             Some(done) => done,
-            None => rx.recv_timeout(Duration::from_secs(10)).expect("a result"),
+            None => rx.recv_timeout(Duration::from_secs(60)).expect("a result"),
         };
         let Done::Fetched { url, result } = done else {
             panic!("a fetch result");
@@ -671,7 +758,7 @@ fn fetchers_waiting_on_each_other_are_let_through() {
     r.fetch(urls(6), tx.clone(), Arc::new(|| {}));
     let mut got = std::collections::HashSet::new();
     while got.len() < 6 {
-        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(20)) else {
+        let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(60)) else {
             panic!("deadlocked after {} of 6", got.len());
         };
         assert!(r.inflight() <= FETCH_BYTES, "{} held", r.inflight());
@@ -712,9 +799,9 @@ fn a_fetch_that_gives_up_after_stopping_is_not_queued_again() {
     r.stop();
     *gate.0.lock().unwrap() = true;
     gate.1.notify_all();
-    std::thread::sleep(Duration::from_millis(100));
+    // It gave up, and is not queued again: the pool has nothing (it would have started it again).
+    until("nothing is queued or running", || !r.busy());
     assert_eq!(log.lock().unwrap().len(), 1);
-    assert!(!r.busy());
 }
 
 /// The same with a real `curl` and bodies of 4 MiB from a local server: 16 URLs, results not
@@ -736,9 +823,13 @@ fn real_bodies_stop_at_the_budget() {
         .map(|i| format!("http://127.0.0.1:{port}/big/{i}").into())
         .collect();
     r.fetch(all, tx.clone(), Arc::new(|| {}));
-    std::thread::sleep(Duration::from_millis(1500));
+    // Bodies finish as credit allows (4.25 MiB each, at most two of the 12 MiB, and no more while
+    // they wait): the first to be done waits for the main thread, with whatever else is done by
+    // then, never more than three.
+    until("a body is finished", || r.transfers().1 >= 1);
+    let mut waiting = vec![rx.recv_timeout(Duration::from_secs(60)).expect("a result")];
+    waiting.extend(rx.try_iter());
     assert!(r.inflight() <= FETCH_BYTES, "{} held", r.inflight());
-    let mut waiting: Vec<_> = rx.try_iter().collect();
     assert!(
         (1..=3).contains(&waiting.len()),
         "{} waiting",
@@ -749,7 +840,7 @@ fn real_bodies_stop_at_the_budget() {
     while taken < 16 {
         let done = match waiting.pop() {
             Some(done) => done,
-            None => rx.recv_timeout(Duration::from_secs(20)).expect("a result"),
+            None => rx.recv_timeout(Duration::from_secs(60)).expect("a result"),
         };
         let Done::Fetched { url, result } = done else {
             panic!("a fetch result");
@@ -784,8 +875,16 @@ fn results_waiting_for_the_main_thread_are_bounded_in_number() {
     };
     let all = urls(2000);
     r.fetch(all.clone(), tx.clone(), Arc::new(|| {}));
-    std::thread::sleep(Duration::from_millis(500));
-    let mut waiting: Vec<_> = rx.try_iter().collect();
+    // No fetch starts while `PENDING_MAX` results wait: the ones being read finish, and that is
+    // all (each result is in the channel when `transfers` counts it, within a moment).
+    until("the results wait", || {
+        let (reading, untaken) = r.transfers();
+        reading == 0 && untaken >= PENDING_MAX
+    });
+    let n = r.transfers().1;
+    let mut waiting: Vec<_> = (0..n)
+        .map(|_| rx.recv_timeout(Duration::from_secs(60)).expect("a result"))
+        .collect();
     assert!(
         (PENDING_MAX..PENDING_MAX + FETCHERS).contains(&waiting.len()),
         "{} results waiting",
@@ -795,7 +894,7 @@ fn results_waiting_for_the_main_thread_are_bounded_in_number() {
     while taken.len() < all.len() {
         let done = match waiting.pop() {
             Some(done) => done,
-            None => rx.recv_timeout(Duration::from_secs(10)).expect("a result"),
+            None => rx.recv_timeout(Duration::from_secs(60)).expect("a result"),
         };
         let Done::Fetched { url, result } = done else {
             panic!("a fetch result");

@@ -1583,14 +1583,15 @@ fn missing_characters_queue_in_log_time() {
         prev = l.set_ops;
     }
     // The shifts of a sorted vector are cheap per element, so only a very long run shows them:
-    // 600,000 characters took over ten seconds that way.
+    // 600,000 characters took over ten seconds that way. The set is a tree, which no shifting
+    // is in (the type says so, which no clock does), and the operations stay linear.
     let mut l = Layout::new(&doc, params(900.0, 1.0));
-    let t = Instant::now();
+    let _tree: &std::collections::BTreeSet<char> = &l.missing;
     for c in chars(600_000) {
         l.report_missing(&[c]);
     }
     assert_eq!(l.take_missing().len(), 600_000);
-    assert!(t.elapsed().as_secs_f64() < 4.0, "{:?}", t.elapsed());
+    assert!(l.set_ops <= 4 * 600_000, "{} set operations", l.set_ops);
     // Through the layout: one distinct CJK character per paragraph, descending.
     let src: String = (0..2000u32)
         .map(|i| format!("{}\n\n", char::from_u32(0x4E00 + 1999 - i).unwrap()))

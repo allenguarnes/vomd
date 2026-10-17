@@ -199,7 +199,7 @@ fn navigation_refuses_what_is_not_a_regular_file() {
                 let _ = tx.send(read_input(&Input::File(path), Origin::Navigation));
             });
             let err = rx
-                .recv_timeout(std::time::Duration::from_secs(10))
+                .recv_timeout(std::time::Duration::from_secs(60))
                 .expect("reading a FIFO blocked")
                 .unwrap_err();
             assert!(err.contains("not a regular file"), "{err}");
@@ -247,7 +247,7 @@ fn the_argument_may_be_a_pipe_or_a_device() {
             let _ = tx.send(read_input(&Input::File(path), Origin::Argument));
         });
         let read = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("reading a FIFO with a writer blocked");
         assert_eq!(read.unwrap(), ("# piped\n".to_owned(), None));
         writer.join().unwrap().unwrap();
@@ -1921,7 +1921,7 @@ mod with_fonts {
     fn wait_images(v: &mut View, done: impl Fn(&View) -> bool) {
         let t = Instant::now();
         while !done(v) {
-            assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+            assert!(t.elapsed() < Duration::from_secs(60), "timed out");
             if v.poll_images(Instant::now()) {
                 frame(v, Instant::now());
             }
@@ -1956,7 +1956,7 @@ mod with_fonts {
             if buf.contains(&0x119933) {
                 break;
             }
-            assert!(t.elapsed() < Duration::from_secs(20), "never painted");
+            assert!(t.elapsed() < Duration::from_secs(60), "never painted");
             v.tick(Instant::now(), Some(Instant::now()));
             std::thread::sleep(Duration::from_millis(5));
         }

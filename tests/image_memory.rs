@@ -1,4 +1,4 @@
-//! What decoding images allocates, counted (review rounds 3 to 7): in a test binary of
+//! What decoding images allocates, counted (review rounds 3 to 8): in a test binary of
 //! its own, with a counting allocator, so nothing else runs while it counts: each test takes
 //! [`serial`] first, and the others wait without allocating.
 #![cfg(feature = "images")]
@@ -546,11 +546,18 @@ fn jpeg_variant(base: &[u8], marker: u8, w: u16, h: u16, comps: &[u8], ns: usize
 }
 
 /// A `curl` first on `PATH` that serves the files of `serve` (`http://127.0.0.1/NAME?...` is
-/// `serve/NAME`; a name with no file is a failure) and logs the URLs it is asked for in
+/// `serve/NAME`; a name with no file is a failure; a name that starts with `slow` is served and
+/// then held open for 5 seconds, as a transfer that doesn't end) and logs the URLs it is asked for in
 /// `dir/curl.log`: nothing is fetched from anywhere. The tests run one at a time, so setting
 /// `PATH` is safe.
 #[cfg(feature = "remote-images")]
 fn fake_curl(dir: &Path, serve: &Path) {
+    fake_curl_hold(dir, serve, "5");
+}
+
+/// [`fake_curl`] with `hold` as the seconds a `slow` name is held open for.
+#[cfg(feature = "remote-images")]
+fn fake_curl_hold(dir: &Path, serve: &Path, hold: &str) {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -558,8 +565,10 @@ fn fake_curl(dir: &Path, serve: &Path) {
     std::fs::write(
         &curl,
         format!(
-            "#!/bin/sh\nfor u; do :; done\necho \"$u\" >> '{}'\nf=${{u##*/}}\nf=${{f%%\\?*}}\nexec cat '{}'/\"$f\"\n",
+            "#!/bin/sh\nfor u; do :; done\necho \"$u\" >> '{}'\nf=${{u##*/}}\nf=${{f%%\\?*}}\ncase $f in slow*) cat '{}'/\"$f\"; exec sleep {};; esac\nexec cat '{}'/\"$f\"\n",
             dir.join("curl.log").display(),
+            serve.display(),
+            hold,
             serve.display()
         ),
     )
@@ -989,6 +998,231 @@ fn the_reservation_covers_what_decoding_allocates() {
     println!("{count} decodes within their reservation; the least room: {least:?}");
 }
 
+/// A valid 795 × 10,000 gray PNG: shown at its natural size its bitmap is 31.8 MB, which a
+/// 33.5 MB budget has room for only if nothing else is held beside it.
+#[cfg(feature = "remote-images")]
+fn tall_png() -> Vec<u8> {
+    zero_png(795, 10_000, 0, 8, false, 1 << 20)
+}
+
+/// A decode that fits the budget but not beside the fetchers' reserve is held back until the
+/// downloads have drained: a valid baseline 4000 × 2000 JPEG (a reservation of 27.5 MB) for a
+/// 300 × 150 box, fetched while three other transfers each hold 3,932,160 bytes and their pipes
+/// open for 5 seconds. It was let in alone, beside what they held: 36,838,378 bytes live over the
+/// start in a 33,554,432 budget (24,842,622 now; a debug build). The fetchers are a `curl` in
+/// front of the real one on `PATH`.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_decode_that_does_not_fit_waits_for_the_downloads() {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("alone");
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    let big = jpeg_variant(
+        &fixture("wide.jpg"),
+        0xC0,
+        4000,
+        2000,
+        &[0x22, 0x11, 0x11],
+        3,
+    );
+    let reserved = vomd::image::decode_reservation(&big, 300, 150).unwrap();
+    assert!(reserved > 20 << 20 && reserved < CACHE_BYTES, "{reserved}");
+    std::fs::write(serve.join("big.jpg"), &big).unwrap();
+    for i in 0..3 {
+        std::fs::write(
+            serve.join(format!("slow{i}.png")),
+            png_padded(100, 3_932_160),
+        )
+        .unwrap();
+    }
+    fake_curl(&dir, &serve);
+    let src = "![a](http://127.0.0.1/big.jpg) ![b](http://127.0.0.1/slow0.png) \
+               ![c](http://127.0.0.1/slow1.png) ![d](http://127.0.0.1/slow2.png)";
+    let doc = Doc::parse(src);
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    let start = mark();
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let boxes = [(1, 300, 150)];
+    images.begin_frame();
+    images.request(&boxes, 1);
+    // The transfers have read their 3.75 MiB each (they are held open, not slow to start).
+    let t = Instant::now();
+    while images.fetch_held() < 3 * 3_932_160 {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "the transfers did not start"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &boxes,
+        1,
+        Duration::from_millis(2),
+        |i| i.stats().decoded == 1,
+    );
+    assert!(images.pixels(1, 300, 150).is_some());
+    let over = peak_over(start);
+    println!("a decode beside three downloads: {over} bytes live over the start at most");
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Records kept for cached URLs go when their last slot is evicted: 20,000 distinct one-pixel
+/// remote images cached, and then a document with a valid 795 × 10,000 PNG at its natural size,
+/// which evicts them all. `sizes` kept its 20,000 URLs, their strings and its table: 35,064,224
+/// bytes live over the start at most in a 33,554,432 budget, 34,231,019 after the decode (debug
+/// build; 32,321,766 and 31,805,759 now).
+#[cfg(feature = "remote-images")]
+#[test]
+fn evicting_the_last_slot_of_a_url_forgets_its_record() {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("evict-sizes");
+    std::fs::write(dir.join("tall.png"), tall_png()).unwrap();
+    let pixel = zero_png(1, 1, 0, 8, false, 1 << 20);
+    let before = mark();
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    images.set_test_body(Arc::new(move |_| Some(pixel.clone())));
+    images.set_base(Some(dir.clone()));
+    {
+        let src: String = (0..20_000)
+            .map(|i| format!("![p](http://127.0.0.1/{i}) "))
+            .collect();
+        let doc = Doc::parse(&src);
+        let mut layout = PageLayout::new(&doc, Params::default());
+        images.attach(&doc, &mut layout);
+        images.set_remote(true, &doc, &mut layout);
+        frames(
+            &mut images,
+            &doc,
+            &mut layout,
+            &[],
+            0,
+            Duration::from_millis(1),
+            |i| i.stats().fetched == 20_000,
+        );
+    }
+    // Their fetches are over: nothing is queued. Then another document.
+    let doc = Doc::parse("![t](tall.png)");
+    let mut layout = PageLayout::new(&doc, Params::default());
+    images.forget_remote();
+    images.attach(&doc, &mut layout);
+    mark();
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[(1, 795, 10_000)],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    assert!(images.pixels(1, 795, 10_000).is_some());
+    let over = peak_over(before);
+    let after = live().saturating_sub(before);
+    println!(
+        "20,000 cached URLs, then a bitmap of 31.8 MB: {over} bytes live over the start at most, {after} after"
+    );
+    assert_eq!(images.stats().fetched, 0, "no record of them is left");
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    assert!(after <= CACHE_BYTES, "{after} bytes live after");
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Stopping the fetch queue gives back its room: 100,000 distinct remote URLs queued behind
+/// four fetches that don't return, fetching stopped, the fetches failed, and then a document
+/// with the same local PNG: the queue's 1.6 MB stayed allocated with nothing counting it,
+/// 34,418,492 bytes live over the start at most in a 33,554,432 budget (33,902,487 after; a debug
+/// build, 32,321,568 and 31,805,563 now).
+#[cfg(feature = "remote-images")]
+#[test]
+fn stopping_the_fetch_queue_gives_back_its_room() {
+    let _serial = serial();
+    use std::sync::atomic::AtomicBool;
+    use vomd::render::Pixels;
+    let dir = scratch("stop-queue");
+    std::fs::write(dir.join("tall.png"), tall_png()).unwrap();
+    let before = mark();
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = release.clone();
+    images.set_test_body(Arc::new(move |_| {
+        while !gate.load(Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        None
+    }));
+    images.set_base(Some(dir.clone()));
+    {
+        let src: String = (0..100_000)
+            .map(|i| format!("![p](http://127.0.0.1/{i}) "))
+            .collect();
+        let doc = Doc::parse(&src);
+        let mut layout = PageLayout::new(&doc, Params::default());
+        images.attach(&doc, &mut layout);
+        images.set_remote(true, &doc, &mut layout);
+        images.begin_frame();
+        images.request(&[], 0);
+        // The four fetchers have their URLs; the rest waits in the queue.
+        images.set_remote(false, &doc, &mut layout);
+        release.store(true, Relaxed);
+        frames(
+            &mut images,
+            &doc,
+            &mut layout,
+            &[],
+            0,
+            Duration::from_millis(1),
+            |i| i.stats().fetched + i.stats().failed >= 4,
+        );
+    }
+    let doc = Doc::parse("![t](tall.png)");
+    let mut layout = PageLayout::new(&doc, Params::default());
+    images.forget_remote();
+    images.attach(&doc, &mut layout);
+    mark();
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[(1, 795, 10_000)],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    assert!(images.pixels(1, 795, 10_000).is_some());
+    let over = peak_over(before);
+    let after = live().saturating_sub(before);
+    println!(
+        "100,000 URLs queued and stopped, then a bitmap of 31.8 MB: {over} bytes live over the start at most, {after} after"
+    );
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    assert!(after <= CACHE_BYTES, "{after} bytes live after");
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[cfg(feature = "remote-images")]
 mod mix {
     use super::*;
@@ -1001,6 +1235,12 @@ mod mix {
     /// jobs and the boxes of a request, the threads' bookkeeping. They are some tens of KB (the
     /// largest seen is printed with `--nocapture`); this is 256 KiB.
     const SLACK: usize = 256 << 10;
+
+    /// What a heavy image's decode holds, its reservation and the file it reads from, at most:
+    /// with the 3 MiB painted in a frame and the bookkeeping it is within the budget, so that
+    /// one that can't be run beside the fetchers is held to it too, as one bigger than the cache
+    /// is not (see [`FIT`]).
+    const HEAVY: usize = 29 << 20;
 
     /// The mix never has more painted in a frame than this (a window full of images may go over the
     /// budget), nor an image whose decode holds more than `FIT` besides its result: a
@@ -1052,6 +1292,28 @@ mod mix {
     /// Whether decoding `bytes` holds no more than [`FIT`] besides its result.
     fn fits(bytes: &[u8]) -> bool {
         vomd::image::decode_reservation(bytes, 700, 700).is_some_and(|c| c + bytes.len() <= FIT)
+    }
+
+    /// A valid image that decodes with 3 MiB to [`HEAVY`] (29 MiB) held, the sizes cameras make: baseline
+    /// and progressive JPEGs, an interlaced 16-bit PNG. (Decoded to a box of a few hundred pixels,
+    /// the result is small: what is held is the source's frame.) Its natural size is returned.
+    fn heavy_image(rng: &mut Rng) -> (Vec<u8>, u32, u32) {
+        let (wide, prog) = (fixture("wide.jpg"), fixture("progressive.jpg"));
+        loop {
+            let (mut w, mut h) = (rng.range(900, 4_200), rng.range(700, 3_000));
+            let bytes = match rng.below(4) {
+                0 | 1 => jpeg_variant(&wide, 0xC0, w as u16, h as u16, &[0x22, 0x11, 0x11], 3),
+                2 => jpeg_variant(&prog, 0xC2, w as u16, h as u16, &[0x22, 0x11, 0x11], 3),
+                _ => {
+                    (w, h) = (w.min(1_800), h.min(1_200));
+                    zero_png(w, h, 6, 16, true, 1 << 20)
+                }
+            };
+            let held = vomd::image::decode_reservation(&bytes, 600, 400).unwrap() + bytes.len();
+            if (3 << 20..=HEAVY).contains(&held) {
+                return (bytes, w, h);
+            }
+        }
     }
 
     /// The bytes of an image of a random kind and shape, smaller until it [`fits`] (or isn't an
@@ -1129,7 +1391,8 @@ mod mix {
     }
 
     /// The files of one run: `dir/local` for the local images, `dir/srv` for what the fake `curl`
-    /// serves (which may be padded with up to 2 MiB after the image, a name without a file failing),
+    /// serves (which may be padded with up to 2 MiB after the image, 4 MiB in the heavy profiles, a name
+    /// without a file failing),
     /// 12 of each.
     struct Pool {
         local: Vec<Asset>,
@@ -1137,6 +1400,8 @@ mod mix {
     }
 
     fn make_pool(rng: &mut Rng, dir: &Path, profile: u64) -> Pool {
+        // 6 and 7: some of the images are heavy, and some transfers are held open.
+        let heavy = profile >= 6;
         let (local_dir, srv) = (dir.join("local"), dir.join("srv"));
         std::fs::create_dir_all(&local_dir).unwrap();
         std::fs::create_dir_all(&srv).unwrap();
@@ -1145,7 +1410,11 @@ mod mix {
             remote: Vec::new(),
         };
         for i in 0..12 {
-            let (bytes, w, h) = random_image(rng, profile);
+            let (bytes, w, h) = if heavy && rng.percent(40) {
+                heavy_image(rng)
+            } else {
+                random_image(rng, profile)
+            };
             let ext = if bytes.starts_with(&[0xFF, 0xD8]) {
                 "jpg"
             } else {
@@ -1156,20 +1425,32 @@ mod mix {
             pool.local.push(Asset { name, w, h });
         }
         for i in 0..12 {
-            let (mut bytes, w, h) = random_image(rng, profile);
+            let (mut bytes, w, h) = if heavy && rng.percent(40) {
+                heavy_image(rng)
+            } else {
+                random_image(rng, profile)
+            };
             let ext = if bytes.starts_with(&[0xFF, 0xD8]) {
                 "jpg"
             } else {
                 "png"
             };
-            let name = format!("r{i}.{ext}");
+            // A transfer held open for a while after its bytes are all there (`fake_curl`).
+            let slow = if heavy && rng.percent(30) { "slow" } else { "" };
+            let name = format!("{slow}r{i}.{ext}");
             if rng.percent(15) {
                 // Not there: the fetch fails.
                 pool.remote.push(Asset { name, w: 0, h: 0 });
                 continue;
             }
-            if rng.percent(60) {
-                bytes.resize(bytes.len() + rng.below(2 << 20) as usize, 0);
+            if heavy && !slow.is_empty() {
+                // What a transfer held open has read: the fetchers hold it for as long.
+                bytes.resize(bytes.len() + (3 << 20) + rng.below(1 << 20) as usize, 0);
+            } else if rng.percent(60) {
+                bytes.resize(
+                    bytes.len() + rng.below(if heavy { 4 << 20 } else { 2 << 20 }) as usize,
+                    0,
+                );
             }
             std::fs::write(srv.join(&name), &bytes).unwrap();
             pool.remote.push(Asset { name, w, h });
@@ -1191,10 +1472,12 @@ mod mix {
         let alone = rng.percent(50);
         let count = if profile == 3 {
             rng.range(20, 60)
+        } else if profile >= 6 {
+            rng.range(2, 14)
         } else {
             rng.range(2, 30)
         };
-        let remote = [50, 50, 90, 50, 0, 100][profile as usize];
+        let remote = [50, 50, 90, 50, 0, 100, 50, 90][profile as usize];
         for i in 0..count {
             let asset = if !rng.percent(remote) {
                 let a = pool.local[rng.below(12) as usize].clone();
@@ -1243,10 +1526,11 @@ mod mix {
         let before = live();
         let dir = scratch(&format!("mix{seed}"));
         // 0: a mix, 1: big pictures, 2: mostly remote, 3: many tiny ones, 4: big and all local
-        // (the whole budget is theirs), 5: big and all remote.
-        let profile = seed % 6;
+        // (the whole budget is theirs), 5: big and all remote, 6: heavy images (decodes of 3 to
+        // 29 MiB) and transfers held open, local and remote, 7: the same, mostly remote.
+        let profile = seed % 8;
         let pool = make_pool(&mut rng, &dir, profile);
-        fake_curl(&dir, &dir.join("srv"));
+        fake_curl_hold(&dir, &dir.join("srv"), "0.3");
         let mut images = Images::default();
         images.set_policy(vomd::settings::RemoteImages::Always);
         images.set_base(Some(dir.join("local")));
@@ -1267,6 +1551,8 @@ mod mix {
         let mut log: Vec<String> = Vec::new();
         let (mut top, mut zoom, mut remote) = (0usize, 1.0f32, false);
         let mut peak = 0usize;
+        // The boxes of the last frame, and how many were in view.
+        let mut last: (Vec<(u32, u32, u32)>, usize) = (Vec::new(), 0);
         let open = |images: &mut Images, state: &mut (Page, Doc, PageLayout), page: Page| {
             let doc = Doc::parse(&page.src);
             let mut layout = PageLayout::new(&doc, Params::default());
@@ -1365,6 +1651,7 @@ mod mix {
                     let _ = images.pixels(id, w, h);
                 }
                 images.request(&boxes, in_view.min(boxes.len()));
+                last = (boxes, in_view);
             }
             if what != "slow poll" {
                 let pace = [0u64, 0, 1, 2, 5, 16][rng.below(6) as usize];
@@ -1376,13 +1663,42 @@ mod mix {
             if over > CACHE_BYTES + SLACK {
                 let recent: Vec<_> = log.iter().rev().take(14).rev().cloned().collect();
                 panic!(
-                    "seed {seed}: {over} bytes live over the start after step {step}, {} allowed ({:?})\nrecent steps:\n{}",
+                    "seed {seed}: {over} bytes live over the start after step {step}, {} allowed ({:?}; {})\nrecent steps:\n{}",
                     CACHE_BYTES + SLACK,
                     images.stats(),
+                    images.memory_report(),
                     recent.join("\n")
                 );
             }
         }
+        // What the last frame asked for gets done, in the budget, whatever was held back on the
+        // way (a transfer held off for a decode, a body that waits): nothing is stuck for good.
+        let t = Instant::now();
+        let (page, doc, layout) = &mut state;
+        let _ = page;
+        while !images.is_idle() {
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "seed {seed}: stuck with nothing more asked for: {:?}\n{}",
+                images.stats(),
+                log.iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            images.begin_frame();
+            images.request(&last.0, last.1);
+            std::thread::sleep(Duration::from_millis(2));
+            images.poll(doc, layout);
+            peak = peak.max(peak_over(start));
+        }
+        assert!(
+            peak <= CACHE_BYTES + SLACK,
+            "seed {seed}: {peak} bytes live over the start while the last frame was done"
+        );
         // Everything is let go, and nothing is left: the threads end and take what they hold
         // with them.
         let stats = images.stats();

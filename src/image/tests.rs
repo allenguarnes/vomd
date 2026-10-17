@@ -239,7 +239,7 @@ fn probing_reads_only_regular_files() {
         let t = Instant::now();
         assert_eq!(probe_file(&fifo), None);
         assert_eq!(read_file(&fifo, usize::MAX), None);
-        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(t.elapsed() < Duration::from_secs(30));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -777,7 +777,7 @@ fn fetched_bytes_are_evictable_and_what_fetchers_hold_counts() {
     let body = |n: usize| Data::Bytes(Arc::new(vec![0u8; n]));
     let url = |n: u32| Key::Remote(format!("https://x.y/{n}.png").into());
     // A slot of a body of 100 bytes costs this (the URLs are 17 bytes).
-    let one = 100 + SLOT_OVERHEAD + 17;
+    let one = 100 + SLOT_OVERHEAD + str_bytes("https://x.y/1.png");
     let mut c = Cache::new(one * 5 / 2);
     c.frame = 5;
     c.insert(url(1), body(100));
@@ -804,7 +804,10 @@ fn fetched_bytes_are_evictable_and_what_fetchers_hold_counts() {
     // A body bigger than the room isn't evicted by arriving: it is the only one.
     c.fetching = 0;
     c.insert(url(5), body(3 * one));
-    assert_eq!(c.bytes, 3 * one + SLOT_OVERHEAD + 17);
+    assert_eq!(
+        c.bytes,
+        3 * one + SLOT_OVERHEAD + str_bytes("https://x.y/5.png")
+    );
 }
 
 /// A buffer costs what it is allocated, not what it holds, and every slot costs a little more
@@ -822,7 +825,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
     };
     assert_eq!(
         slot(Data::Bytes(Arc::new(loose))).cost(),
-        (256 << 10) + SLOT_OVERHEAD + url.len()
+        (256 << 10) + SLOT_OVERHEAD + str_bytes(&url)
     );
     let mut pixels = Vec::with_capacity(100);
     pixels.push(0u32);
@@ -850,7 +853,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
     }
     assert_eq!(c.slots.len(), 12_288);
     assert!(
-        c.bytes >= 12_288 * (69 + SLOT_OVERHEAD),
+        c.bytes >= 12_288 * (69 + SLOT_OVERHEAD + STR_OVERHEAD),
         "{} charged",
         c.bytes
     );
@@ -927,7 +930,7 @@ fn the_cache_is_made_room_for_the_fetchers_before_they_start() {
 fn wait(images: &mut Images, doc: &Doc, layout: &mut Layout, done: impl Fn(&mut Images) -> bool) {
     let t = Instant::now();
     while !done(images) {
-        assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+        assert!(t.elapsed() < Duration::from_secs(60), "timed out");
         images.poll(doc, layout);
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -970,7 +973,7 @@ fn a_documents_local_images_load() {
     assert_eq!(images.pixels(1, 30, 20).unwrap().data[0], 0xFF00_00FF);
     let t = Instant::now();
     while layout.image_size(2) != Some(ImageSize::Alt) {
-        assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+        assert!(t.elapsed() < Duration::from_secs(60), "timed out");
         images.poll(&doc, &mut layout);
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -994,16 +997,6 @@ fn boxes_of(layout: &Layout) -> Vec<(u32, u32, u32)> {
             (b.b.id, size(b.b.width), size(b.b.ascent + b.b.descent))
         })
         .collect()
-}
-
-/// How many results arrive over `rounds` polls, 20 ms apart.
-fn arrivals(images: &mut Images, doc: &Doc, layout: &mut Layout, rounds: u32) -> u32 {
-    let mut n = 0;
-    for _ in 0..rounds {
-        std::thread::sleep(Duration::from_millis(20));
-        n += u32::from(images.poll(doc, layout));
-    }
-    n
 }
 
 /// A tall, narrow image's box is decoded at exactly its size, so what was decoded is what is
@@ -1033,10 +1026,11 @@ fn a_tall_images_box_is_found_once_decoded() {
     wait(&mut images, &doc, &mut layout, |i| {
         i.cache.has(&Key::Local(1), w, h)
     });
-    // Asked for again, as every frame does: nothing is queued, nothing arrives.
+    // Asked for again, as every frame does: nothing is queued (so nothing can arrive).
     images.begin_frame();
     images.request(&boxes, 1);
-    assert_eq!(arrivals(&mut images, &doc, &mut layout, 5), 0);
+    assert!(images.is_idle(), "the box found is not decoded again");
+    assert!(!images.poll(&doc, &mut layout));
     use crate::render::Pixels;
     assert!(images.pixels(id, w, h).is_some());
     let _ = std::fs::remove_dir_all(&dir);
@@ -1066,22 +1060,16 @@ fn images_beyond_the_cache_are_not_decoded_over_and_over() {
     images.cache.cap = images.cost(4, 100, 100) + 100_000;
     // Image 1 in view, the others a screen away.
     let boxes = [(1, 100, 100), (2, 100, 100), (3, 100, 100), (4, 100, 100)];
-    // A frame per result: results straddle frames, as the decodes of big images do.
-    let mut settled = 0;
+    // A frame per result: results straddle frames, as the decodes of big images do. It is
+    // settled when a frame asks for nothing the cache doesn't have (the next would be the same).
     for frame in 0..60 {
         images.begin_frame();
         let _ = images.pixels(1, 100, 100);
         images.request(&boxes, 1);
-        let t = Instant::now();
-        let mut arrived = false;
-        while !arrived && t.elapsed() < Duration::from_millis(40) {
-            std::thread::sleep(Duration::from_millis(1));
-            arrived = images.poll(&doc, &mut layout);
-        }
-        settled = if arrived { 0 } else { settled + 1 };
-        if settled >= 5 {
+        if images.is_idle() {
             break;
         }
+        wait(&mut images, &doc, &mut layout, |i| i.is_idle());
         assert!(frame < 59, "still decoding after {frame} frames");
     }
     let has = |i, images: &Images| images.cache.has(&Key::Local(i), 100, 100);
@@ -1435,7 +1423,7 @@ fn the_worker_waits_for_its_result_to_be_taken() {
     images.request(&[(1, 40, 30), (2, 40, 30), (3, 40, 30)], 3);
     let t = Instant::now();
     while woken() == 0 {
-        assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+        assert!(t.elapsed() < Duration::from_secs(60), "timed out");
         std::thread::sleep(Duration::from_millis(2));
     }
     // Nobody polls: the first result waits, charged, and the others aren't started.
@@ -1585,7 +1573,18 @@ fn bodies_of_images_in_view_wait_for_room_instead_of_piling_up() {
         std::thread::sleep(Duration::from_millis(30));
         let held = images.cache.bytes + images.remote.inflight();
         peak = peak.max(held);
-        assert!(held <= CACHE_BYTES, "{held} bytes held in all");
+        assert!(
+            held <= CACHE_BYTES,
+            "{held} bytes held in all: cache {} inflight {} fetching {} reserve {} overhead {} paused {} exclusive {:?} waiting {}",
+            images.cache.bytes,
+            images.remote.inflight(),
+            images.cache.fetching,
+            images.cache.reserve,
+            images.cache.overhead,
+            images.remote.paused(),
+            images.exclusive,
+            images.waiting.len()
+        );
         let before = images.stats();
         images.poll(&doc, &mut layout);
         waited = waited.max(before.waiting);
@@ -1660,7 +1659,7 @@ fn a_body_is_let_in_alone_when_nothing_can_make_room() {
         if images.stats().decoded == N as usize {
             break;
         }
-        assert!(t.elapsed() < Duration::from_secs(30), "stuck");
+        assert!(t.elapsed() < Duration::from_secs(60), "stuck");
     }
     for id in 1..=N {
         assert!(images.pixels(id, 40, 30).is_some(), "image {id}");
@@ -1709,28 +1708,34 @@ fn a_body_dropped_for_lack_of_room_is_not_fetched_in_a_loop() {
     images.attach(&doc, &mut layout);
     images.set_remote(true, &doc, &mut layout);
     let both = [(1, 720, 6000), (2, 40, 30)];
-    // Frames at 16 ms, the first image the only one in view, until `done`.
-    let mut frames = |images: &mut Images, boxes: &[(u32, u32, u32)], on_screen, ms: u64| {
-        let t = Instant::now();
-        while t.elapsed() < Duration::from_millis(ms) {
-            images.begin_frame();
-            images.request(boxes, on_screen);
-            std::thread::sleep(Duration::from_millis(16));
-            images.poll(&doc, &mut layout);
-            if let Some(b) = images.pixels(1, 720, 6000) {
-                let _ = b;
-            }
-        }
-    };
-    frames(&mut images, &both, 1, 3000);
-    let n = fetches.load(Ordering::SeqCst);
-    assert!(n <= 2, "the body was fetched {n} times in 3 s");
-    assert!(images.pixels(1, 720, 6000).is_some());
+    let url: Arc<str> = "https://x.y/r.png".into();
+    // The tall image decodes, and the body is fetched and dropped for lack of room (its cost is
+    // kept): the state the window is in until something changes.
+    drive(&mut images, &doc, &mut layout, &both, 1, |i| {
+        i.pixels(1, 720, 6000).is_some() && i.deferred.contains_key(&url) && i.is_idle()
+    });
+    let n0 = fetches.load(Ordering::SeqCst);
+    assert!(n0 <= 2, "the body was fetched {n0} times");
+    // However often the window paints and polls from here, nothing is fetched (the pool is
+    // idle when the last frame is over: a fetch asked for in it would show).
+    for _ in 0..300 {
+        images.begin_frame();
+        images.request(&both, 1);
+        images.poll(&doc, &mut layout);
+        assert!(images.pixels(1, 720, 6000).is_some());
+    }
+    drive(&mut images, &doc, &mut layout, &both, 1, |i| i.is_idle());
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        n0,
+        "fetched again with nothing changed"
+    );
     assert!(images.pixels(2, 40, 30).is_none());
     assert_eq!(images.stats().waiting, 0);
     // Scrolled into view, it loads.
-    frames(&mut images, &both, 2, 1000);
-    assert!(images.pixels(2, 40, 30).is_some(), "{:?}", images.stats());
+    drive(&mut images, &doc, &mut layout, &both, 2, |i| {
+        i.pixels(2, 40, 30).is_some()
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1772,35 +1777,36 @@ fn a_dropped_body_is_fetched_again_when_room_is_made() {
     images.remote.set_fetcher(fetcher);
     images.attach(&doc, &mut layout);
     images.set_remote(true, &doc, &mut layout);
-    let run = |images: &mut Images, layout: &mut Layout, boxes: &[(u32, u32, u32)], on, ms| {
-        let t = Instant::now();
-        while t.elapsed() < Duration::from_millis(ms) {
-            images.begin_frame();
-            images.request(boxes, on);
-            std::thread::sleep(Duration::from_millis(16));
-            images.poll(&doc, layout);
-        }
-    };
-    run(
-        &mut images,
-        &mut layout,
-        &[(1, 720, 6000), (2, 40, 30), (3, 40, 30)],
-        1,
-        2000,
+    let urls: [Arc<str>; 2] = ["https://x.y/r.png".into(), "https://x.y/s.png".into()];
+    let with_tall = [(1, 720, 6000), (2, 40, 30), (3, 40, 30)];
+    // Both bodies are fetched and dropped for lack of room, and nothing more is fetched from then
+    // on however often the window paints and polls.
+    drive(&mut images, &doc, &mut layout, &with_tall, 1, |i| {
+        i.pixels(1, 720, 6000).is_some()
+            && urls.iter().all(|u| i.deferred.contains_key(u))
+            && i.is_idle()
+    });
+    let n0 = fetches.load(Ordering::SeqCst);
+    assert!(n0 <= 4, "{n0} fetches of two bodies that don't fit");
+    for _ in 0..300 {
+        images.begin_frame();
+        images.request(&with_tall, 1);
+        images.poll(&doc, &mut layout);
+    }
+    drive(&mut images, &doc, &mut layout, &with_tall, 1, |i| {
+        i.is_idle()
+    });
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        n0,
+        "fetched again with nothing changed"
     );
-    let n = fetches.load(Ordering::SeqCst);
-    assert!(n <= 4, "{n} fetches of two bodies that don't fit");
     assert!(images.pixels(2, 40, 30).is_none() && images.pixels(3, 40, 30).is_none());
     // Scrolled past the tall image: it is out of the boxes, and what was dropped is wanted.
-    run(
-        &mut images,
-        &mut layout,
-        &[(2, 40, 30), (3, 40, 30)],
-        1,
-        2000,
-    );
-    assert!(images.pixels(2, 40, 30).is_some(), "{:?}", images.stats());
-    assert!(images.pixels(3, 40, 30).is_some(), "{:?}", images.stats());
+    let past = [(2, 40, 30), (3, 40, 30)];
+    drive(&mut images, &doc, &mut layout, &past, 1, |i| {
+        i.pixels(2, 40, 30).is_some() && i.pixels(3, 40, 30).is_some()
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1824,7 +1830,7 @@ fn a_body_a_job_holds_keeps_its_charge() {
     assert!(charged >= 40_000);
     c.evict_for(100_000);
     assert_eq!(c.bytes, charged, "not evicted");
-    assert!(!c.room_for(80_000, 0), "not counted as room");
+    assert!(!c.room_for(80_000, 0, 0), "not counted as room");
     assert!(!c.would_fit(80_000, 0, 0, 0), "nor as room it would make");
     // A body for the same URL doesn't replace it.
     c.insert(Key::Remote(a.clone()), Data::Bytes(Arc::new(vec![1u8; 10])));
@@ -1833,7 +1839,7 @@ fn a_body_a_job_holds_keeps_its_charge() {
     // The job is done with it: now it is the first to go.
     drop(job);
     assert!(c.would_fit(80_000, 0, 0, 0));
-    assert!(c.room_for(80_000, 0));
+    assert!(c.room_for(80_000, 0, 0));
     assert!(c.peek_bytes(&a).is_none());
     assert_eq!(c.bytes, 0);
 }
@@ -1855,7 +1861,7 @@ fn the_worker_lets_go_of_a_body_before_it_sends_the_result() {
     }]);
     let Ok(Done::Decoded {
         bitmap, worker: w, ..
-    }) = rx.recv_timeout(Duration::from_secs(10))
+    }) = rx.recv_timeout(Duration::from_secs(60))
     else {
         panic!("a result");
     };
@@ -1955,7 +1961,7 @@ fn settle(images: &mut Images, doc: &Doc, layout: &mut Layout) {
         if done && images.waiting.is_empty() && images.worker.as_ref().is_none_or(Worker::idle) {
             break;
         }
-        assert!(t.elapsed() < Duration::from_secs(20), "stuck");
+        assert!(t.elapsed() < Duration::from_secs(60), "stuck");
     }
 }
 
@@ -2177,7 +2183,7 @@ fn a_remote_decode_failure_is_retried_when_the_document_is_opened_again() {
                 images.request(&[(1, 40, 30)], 1);
                 std::thread::sleep(Duration::from_millis(3));
                 images.poll(doc, layout);
-                assert!(t.elapsed() < Duration::from_secs(20), "stuck");
+                assert!(t.elapsed() < Duration::from_secs(60), "stuck");
             }
         };
     let src = "![x](https://x.y/cut.png)";
@@ -2225,4 +2231,552 @@ fn a_remote_decode_failure_is_retried_when_the_document_is_opened_again() {
         fetches.load(Ordering::SeqCst) >= 2 && i.remote.size(&url) == Some(None)
     });
     assert_eq!(fetches.load(Ordering::SeqCst), 2);
+}
+
+// ---- Decodes that don't fit beside the fetchers (review round 8) ----------------
+
+/// A valid baseline JPEG of `w` × `h` pixels as far as its headers go (`wide.jpg`'s frame header
+/// with another size: the decoder makes what it can of the scan data, and pads).
+#[cfg(feature = "remote-images")]
+fn big_jpeg(w: u16, h: u16) -> Vec<u8> {
+    let mut jpeg = fixture("wide.jpg");
+    let sof = jpeg.windows(2).position(|p| p == [0xFF, 0xC0]).unwrap();
+    jpeg[sof + 5..sof + 7].copy_from_slice(&h.to_be_bytes());
+    jpeg[sof + 7..sof + 9].copy_from_slice(&w.to_be_bytes());
+    jpeg
+}
+
+/// Frame (`begin_frame`, `request`, poll) until `done`, which is told what `poll` said; a
+/// deadline of a minute only stops a test that is stuck.
+#[cfg(feature = "remote-images")]
+fn drive(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut Layout,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
+    mut done: impl FnMut(&mut Images) -> bool,
+) {
+    let t = Instant::now();
+    while !done(images) {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "stuck: {:?} {}",
+            images.stats(),
+            images.memory_report()
+        );
+        images.begin_frame();
+        images.request(boxes, on_screen);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(doc, layout);
+    }
+}
+
+/// Fetchers wait at a gate until it is opened.
+#[cfg(feature = "remote-images")]
+struct Gate(Mutex<bool>, Condvar);
+
+#[cfg(feature = "remote-images")]
+impl Gate {
+    fn new() -> Arc<Gate> {
+        Arc::new(Gate(Mutex::new(false), Condvar::new()))
+    }
+
+    fn wait(&self) {
+        let mut open = self.0.lock().unwrap();
+        while !*open {
+            open = self.1.wait(open).unwrap();
+        }
+    }
+
+    fn open(&self) {
+        *self.0.lock().unwrap() = true;
+        self.1.notify_all();
+    }
+}
+
+/// A fetcher that counts the URLs it starts, takes credit for 3.75 MiB (so three fit in what
+/// the pool may hold, and the fourth waits for credit), holds it at `gate`, and brings `body`.
+#[cfg(feature = "remote-images")]
+fn holding_fetcher(
+    gate: &Arc<Gate>,
+    starts: &Arc<std::sync::atomic::AtomicUsize>,
+    body: Vec<u8>,
+) -> crate::remote::Fetcher {
+    holding_fetcher_counting(gate, starts, &Arc::default(), body)
+}
+
+/// [`holding_fetcher`] that also counts the transfers that hold their credit at the gate.
+#[cfg(feature = "remote-images")]
+fn holding_fetcher_counting(
+    gate: &Arc<Gate>,
+    starts: &Arc<std::sync::atomic::AtomicUsize>,
+    holding: &Arc<std::sync::atomic::AtomicUsize>,
+    body: Vec<u8>,
+) -> crate::remote::Fetcher {
+    use crate::remote::{Error, STEP};
+    let (gate, starts, holding) = (gate.clone(), starts.clone(), holding.clone());
+    // One transfer takes its credit at a time, so that it is the first three that hold 3.75 MiB
+    // each, and the fourth that waits for credit, whichever thread runs first.
+    let turn = Arc::new(Mutex::new(()));
+    Arc::new(move |_, grant| {
+        starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let taking = turn.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..15 {
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+        }
+        drop(taking);
+        holding.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        gate.wait();
+        Ok((Arc::new(body.clone()), 40, 30))
+    })
+}
+
+/// A local decode that doesn't fit beside what the fetchers may hold (a 4000 × 2000 JPEG is held
+/// for 24.5 MB, and they are given 14 MB of the 33.5) is not started while they hold anything:
+/// they are held off (nothing starts, the one waiting for credit gives up), it is handed to the
+/// worker when they have nothing, and they go on when its result is taken, the ones that were
+/// queued included.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_local_decode_that_does_not_fit_waits_for_the_fetchers_and_holds_them_off() {
+    use crate::render::Pixels;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = scratch("heavy-local");
+    std::fs::write(dir.join("big.jpg"), big_jpeg(4000, 2000)).unwrap();
+    let mut src = String::from("![j](big.jpg) ");
+    src += &(0..6)
+        .map(|i| format!("![r](https://x.y/{i}.png) "))
+        .collect::<String>();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let (gate, starts) = (Gate::new(), Arc::new(AtomicUsize::new(0)));
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 2, 255]);
+    images
+        .remote
+        .set_fetcher(holding_fetcher(&gate, &starts, png));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    // Three transfers hold 3.75 MiB each at the gate, the fourth waits for credit.
+    drive(&mut images, &doc, &mut layout, &[], 0, |i| {
+        starts.load(Ordering::SeqCst) == 4 && i.remote.inflight() >= 3 * 15 * (256 << 10)
+    });
+    // The image comes into view: the decode is held back, and the fetchers are held off.
+    let boxes = [(1, 300, 150)];
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.remote.paused() && i.remote.transfers().0 == 3
+    });
+    assert!(images.worker.is_none(), "nothing was handed to the worker");
+    assert_eq!(images.stats().decodes, 0);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        4,
+        "the one that gave up is not restarted"
+    );
+    // The transfers end: the decode goes, and nothing starts until its result is taken.
+    gate.open();
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        // Only a poll takes the result, and lets the fetchers go on: until it has, none started.
+        let decoded = i.stats().decodes > 0;
+        assert!(
+            decoded || starts.load(Ordering::SeqCst) == 4,
+            "a fetch started during the decode"
+        );
+        decoded
+    });
+    assert!(images.pixels(1, 300, 150).is_some());
+    // Then they go on: the one that gave up and the two that were queued.
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().fetched == 6 && i.is_idle()
+    });
+    assert!(
+        starts.load(Ordering::SeqCst) >= 7,
+        "{} fetches started",
+        starts.load(Ordering::SeqCst)
+    );
+    assert!(!images.remote.paused() && images.exclusive.is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The same for a fetched body: the 4000 × 2000 JPEG of a remote image in view arrives while
+/// three transfers hold their credit. It waits (not in the cache, nothing decoding) while they
+/// do, with them held off, is let in alone when they are over, and they go on after its decode.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_body_that_does_not_fit_waits_for_the_fetchers_and_is_let_in_alone() {
+    use crate::render::Pixels;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let jpeg = big_jpeg(4000, 2000);
+    let mut src = String::from("![j](https://x.y/big.jpg) ");
+    src += &(0..6)
+        .map(|i| format!("![r](https://x.y/slow{i}.png) "))
+        .collect::<String>();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let (gate, starts) = (Gate::new(), Arc::new(AtomicUsize::new(0)));
+    let held = Arc::new(AtomicUsize::new(0));
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 3, 255]);
+    let holding = holding_fetcher_counting(&gate, &starts, &held, png);
+    {
+        let (starts, held) = (starts.clone(), held.clone());
+        images
+            .remote
+            .set_fetcher(Arc::new(move |url: &str, grant: crate::remote::Grant| {
+                if url.ends_with("big.jpg") {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    assert!(grant(256 << 10));
+                    // The body arrives when three transfers hold their credit.
+                    while held.load(Ordering::SeqCst) < 3 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok((Arc::new(jpeg.clone()), 4000, 2000))
+                } else {
+                    holding(url, grant)
+                }
+            }));
+    }
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let boxes = [(1, 300, 150)];
+    // The body arrives, and waits; the transfers still hold their credit.
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().waiting == 1 && i.remote.paused() && i.remote.transfers().0 == 3
+    });
+    for _ in 0..20 {
+        images.begin_frame();
+        images.request(&boxes, 1);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    let url: Arc<str> = "https://x.y/big.jpg".into();
+    assert_eq!(images.stats().waiting, 1);
+    assert!(
+        images.cache.peek_bytes(&url).is_none(),
+        "not let in beside them"
+    );
+    assert_eq!(images.stats().decodes, 0);
+    // (The fetcher the JPEG left free may have started a fifth, which waited for credit, and gave
+    // up: nothing starts from here.)
+    let before = starts.load(Ordering::SeqCst);
+    assert!((4..=5).contains(&before), "{before} fetches started");
+    // They end; it is let in, decoded, and nothing starts until its result is taken.
+    gate.open();
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        let decoded = i.stats().decodes > 0;
+        assert!(
+            decoded || starts.load(Ordering::SeqCst) == before,
+            "a fetch started before the decode was over"
+        );
+        decoded
+    });
+    assert!(images.pixels(1, 300, 150).is_some());
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().fetched == 7 && i.is_idle()
+    });
+    // (The one that gave up started again, and so may others that wanted credit at once.)
+    assert!(
+        starts.load(Ordering::SeqCst) >= 8,
+        "{} fetches started",
+        starts.load(Ordering::SeqCst)
+    );
+    assert!(!images.remote.paused() && images.exclusive.is_none());
+}
+
+/// Two bodies that can only be decoded alone, both in view, both wait, with the fetchers held
+/// off, and are let in one after the other: no deadlock, whatever else waits. With bodies of
+/// 3 MiB the second doesn't fit beside the first's decode, so it is let go and fetched again.
+#[cfg(feature = "remote-images")]
+#[test]
+fn two_bodies_that_can_only_be_decoded_alone_both_get_their_turn() {
+    use crate::render::Pixels;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for padding in [0usize, 3 << 20] {
+        let mut jpeg = big_jpeg(4000, 2000);
+        jpeg.resize(jpeg.len() + padding, 0);
+        let doc = Doc::parse("![a](https://x.y/a.jpg) ![b](https://x.y/b.jpg)");
+        let mut layout = Layout::new(&doc, crate::layout::Params::default());
+        let mut images = Images::default();
+        images.set_policy(crate::settings::RemoteImages::Always);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let count = starts.clone();
+        images
+            .remote
+            .set_fetcher(Arc::new(move |_: &str, grant: crate::remote::Grant| {
+                count.fetch_add(1, Ordering::SeqCst);
+                for _ in 0..jpeg.len().div_ceil(256 << 10) {
+                    if !grant(256 << 10) {
+                        return Err(crate::remote::Error::Yielded);
+                    }
+                }
+                Ok((Arc::new(jpeg.clone()), 4000, 2000))
+            }));
+        images.attach(&doc, &mut layout);
+        images.set_remote(true, &doc, &mut layout);
+        let boxes = [(1, 300, 150), (2, 300, 150)];
+        drive(&mut images, &doc, &mut layout, &boxes, 2, |i| {
+            i.stats().decoded == 2
+        });
+        assert!(images.pixels(1, 300, 150).is_some() && images.pixels(2, 300, 150).is_some());
+        let n = starts.load(Ordering::SeqCst);
+        assert_eq!(n, if padding == 0 { 2 } else { 3 }, "padding {padding}");
+        drive(&mut images, &doc, &mut layout, &boxes, 2, |i| i.is_idle());
+        assert!(!images.remote.paused() && images.exclusive.is_none());
+    }
+}
+
+/// What was held back is let go of when the image goes out of view: the fetchers go on.
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_fetchers_go_on_when_the_decode_held_back_is_no_longer_wanted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = scratch("heavy-away");
+    std::fs::write(dir.join("big.jpg"), big_jpeg(4000, 2000)).unwrap();
+    let doc = Doc::parse("![j](big.jpg) ![a](https://x.y/a.png) ![b](https://x.y/b.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let (gate, starts) = (Gate::new(), Arc::new(AtomicUsize::new(0)));
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 4, 255]);
+    images
+        .remote
+        .set_fetcher(holding_fetcher(&gate, &starts, png));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    drive(&mut images, &doc, &mut layout, &[], 0, |_| {
+        starts.load(Ordering::SeqCst) == 2
+    });
+    let boxes = [(1, 300, 150)];
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.remote.paused()
+    });
+    // Scrolled away: nothing wants it.
+    images.begin_frame();
+    images.request(&[], 0);
+    assert!(!images.remote.paused(), "the fetchers go on");
+    gate.open();
+    drive(&mut images, &doc, &mut layout, &[], 0, |i| {
+        i.stats().fetched == 2 && i.is_idle()
+    });
+    assert_eq!(images.stats().decodes, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A body let in alone whose image is gone before its decode is asked for (another document
+/// opens) doesn't keep the fetchers held off.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_body_let_in_alone_does_not_hold_the_fetchers_if_nothing_asks_for_it() {
+    let jpeg = big_jpeg(4000, 2000);
+    let doc = Doc::parse("![j](https://x.y/big.jpg)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    images
+        .remote
+        .set_fetcher(Arc::new(move |_: &str, grant: crate::remote::Grant| {
+            assert!(grant(256 << 10));
+            Ok((Arc::new(jpeg.clone()), 4000, 2000))
+        }));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let boxes = [(1, 300, 150)];
+    // Fetched and waiting, nothing else asked for (no `request` after the first).
+    images.begin_frame();
+    images.request(&boxes, 1);
+    let t = Instant::now();
+    while images.exclusive.is_none() {
+        assert!(t.elapsed() < Duration::from_secs(60), "stuck");
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    assert!(images.awaiting && images.remote.paused());
+    // Another document: the image is not wanted.
+    let other = Doc::parse("nothing here");
+    let mut other_layout = Layout::new(&other, crate::layout::Params::default());
+    images.forget_remote();
+    images.attach(&other, &mut other_layout);
+    images.begin_frame();
+    images.request(&[], 0);
+    assert!(images.exclusive.is_none() && !images.remote.paused());
+}
+
+/// A removed slot's URL has no record left unless the document has it: its size, its string
+/// and the room its table has.
+#[cfg(feature = "remote-images")]
+#[test]
+fn evicting_the_last_slot_of_a_url_forgets_what_is_kept_for_it() {
+    let doc = Doc::parse("![k](https://x.y/kept.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.attach(&doc, &mut layout);
+    let url = |n: &str| -> Arc<str> { format!("https://x.y/{n}.png").into() };
+    for name in ["kept", "a", "b"] {
+        let u = url(name);
+        let body: Bytes = Arc::new(vec![0u8; 64]);
+        images
+            .remote
+            .take_fetched(&u, Ok((body.clone(), 4, 4)))
+            .unwrap();
+        images
+            .cache
+            .insert(Key::Remote(u.clone()), Data::Bytes(body));
+    }
+    // Pixels at two sizes for `b`: one is evicted, the URL still has a slot.
+    for w in [4, 8] {
+        images.cache.insert(
+            Key::Remote(url("b")),
+            Data::Pixels(Bitmap {
+                width: w,
+                height: 1,
+                data: vec![0; w as usize],
+            }),
+        );
+    }
+    assert_eq!(images.remote.counts(), (3, 0));
+    images.cache.frame += 1;
+    let a = images
+        .cache
+        .slots
+        .iter()
+        .position(|s| s.key == Key::Remote(url("a")))
+        .unwrap();
+    images.cache.remove(a);
+    let pixels = images
+        .cache
+        .slots
+        .iter()
+        .position(|s| s.pixels().is_some_and(|b| b.width == 8))
+        .unwrap();
+    images.cache.remove(pixels);
+    images.forget_evicted();
+    assert_eq!(
+        images.remote.size(&url("a")),
+        None,
+        "no slot left, not the document's"
+    );
+    assert_eq!(
+        images.remote.size(&url("b")),
+        Some(Some((4, 4))),
+        "a slot is left"
+    );
+    assert_eq!(images.remote.size(&url("kept")), Some(Some((4, 4))));
+    // The document's own survives its last slot.
+    let kept = images
+        .cache
+        .slots
+        .iter()
+        .position(|s| s.key == Key::Remote(url("kept")))
+        .unwrap();
+    images.cache.remove(kept);
+    images.forget_evicted();
+    assert_eq!(
+        images.remote.size(&url("kept")),
+        Some(Some((4, 4))),
+        "the document's"
+    );
+    assert!(images.cache.dropped.is_empty());
+}
+
+/// Everything long-lived of the image code is in what the budget holds back, by its capacity,
+/// and goes out of it with the room: a document with thousands of images, a fetch queue of as
+/// many URLs, and then another document.
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_bookkeeping_is_charged_by_capacity_and_given_back() {
+    let n = 5_000;
+    let src: String = (0..n)
+        .map(|i| format!("![p](https://x.y/{i}.png) "))
+        .collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let gate = Gate::new();
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let png = png_bytes(4, 4, |_, _| [0, 0, 0, 255]);
+    images
+        .remote
+        .set_fetcher(holding_fetcher(&gate, &starts, png));
+    let empty = images.bookkeeping_bytes();
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    images.request(&[], 0);
+    // The list of sources, their strings, the set of URLs, what a request builds for each of
+    // them, and the queue (4 are being fetched).
+    let busy = images.bookkeeping_bytes();
+    assert!(
+        busy >= empty + n * (size_of::<Src>() + 16 + 16 + 24) + n * 16,
+        "{busy} bytes for {n} images"
+    );
+    assert_eq!(images.cache.overhead, busy, "what the cache holds back");
+    // Stopping gives the queue's buffer back, not just its elements.
+    let queue = images.remote.bookkeeping_bytes();
+    images.set_remote(false, &doc, &mut layout);
+    assert!(
+        images.remote.bookkeeping_bytes() + (n - 8) * 16 <= queue,
+        "{} of {queue} left after the queue was stopped",
+        images.remote.bookkeeping_bytes()
+    );
+    gate.open();
+    // Another document: what the first had is gone, and what is charged is next to nothing.
+    let other = Doc::parse("![x](a.png)");
+    let mut other_layout = Layout::new(&other, crate::layout::Params::default());
+    images.forget_remote();
+    images.attach(&other, &mut other_layout);
+    drive(&mut images, &other, &mut other_layout, &[], 0, |i| {
+        i.is_idle()
+    });
+    images.request(&[], 0);
+    let after = images.bookkeeping_bytes();
+    assert!(after < busy / 10, "{after} bytes of {busy} left");
+    assert_eq!(images.cache.overhead, after);
+}
+
+/// A decode that is running when the fetchers would start (remote images turned on, another
+/// document opened) and doesn't fit beside what they may hold holds them off, and they start
+/// when its result is taken: the decode was handed over when nothing was fetched, and four
+/// transfers took their 12 MiB beside it (a 19.4 MB decode, 34.3 MB live in a 33.5 MB budget).
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_decode_running_when_the_fetchers_would_start_holds_them_off() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let doc = Doc::parse("![a](https://x.y/a.png) ![b](https://x.y/b.png) ![c](https://x.y/c.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let count = starts.clone();
+    images
+        .remote
+        .set_fetcher(Arc::new(move |_: &str, _: crate::remote::Grant| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok((Arc::new(png_bytes(4, 4, |_, _| [0, 0, 0, 255])), 4, 4))
+        }));
+    // A decode of 20 MB is running (as a job handed over earlier would be).
+    images.worker = Some(Worker::spawn(images.tx.clone(), images.wake.clone()));
+    let shared = images.worker.as_ref().unwrap().shared.clone();
+    shared.0.lock().unwrap().busy = Some((Key::Local(9), 10, 10, 20 << 20));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    images.begin_frame();
+    images.request(&[], 0);
+    assert!(images.remote.paused(), "held off while it runs");
+    // (The pool was started held off: nothing is fetched while it is.)
+    assert!(images.remote.busy());
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    // Its result is taken: they start.
+    Worker::taken(&shared);
+    drive(&mut images, &doc, &mut layout, &[], 0, |i| {
+        i.stats().fetched == 3 && i.is_idle()
+    });
+    assert!(!images.remote.paused());
+    assert_eq!(starts.load(Ordering::SeqCst), 3);
 }

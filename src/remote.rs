@@ -29,6 +29,12 @@
 //! image in view piling up, protected from eviction, while the decoder works through them. A
 //! JPEG's metadata is cut out of its body where it is, before it is kept
 //! (`image::shed_jpeg_metadata`), and the buffer is cut to size after that.
+//!
+//! A decode that doesn't fit beside that reserve (a 4000 × 2000 JPEG holds 24 MB while it runs)
+//! has the fetchers held off ([`Remote::pause`]): nothing starts, nothing takes more credit (a
+//! transfer that needs more gives up as it does when all wait, and is queued again at the front),
+//! and what has the credit it needs finishes, so that once the results are taken they hold
+//! nothing, and the decode has the budget beside it; they go on when its result is taken.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -260,6 +266,9 @@ pub(crate) fn cut_to_size(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+/// What gives a URL's bytes in tests (`None`: it fails): see [`Remote::set_test_body`].
+pub type TestBody = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
 /// A fetched image: its bytes and natural size.
 pub(crate) type Fetched = Result<(Bytes, u32, u32), Error>;
 
@@ -268,7 +277,12 @@ pub(crate) type Fetcher = Arc<dyn Fn(&str, Grant) -> Fetched + Send + Sync>;
 
 /// Fetch a remote image: its bytes and natural size, if it's a PNG or JPEG.
 fn fetch_image(url: &str, grant: Grant) -> Fetched {
-    let mut bytes = fetch_with("curl", url, LIMITS, grant)?;
+    let bytes = fetch_with("curl", url, LIMITS, grant)?;
+    image_of(bytes)
+}
+
+/// A body as fetched, taken as a remote image: see [`fetch_image`].
+fn image_of(mut bytes: Vec<u8>) -> Fetched {
     // A JPEG's metadata is cut out of the body where it is, so the cache doesn't keep it and the
     // decoder never sees it. The buffer is cut to size after (its credit goes with it, as the
     // body is what is left: a 300 KB JPEG that is 178 bytes without its metadata must not stay a
@@ -300,6 +314,9 @@ struct Active {
 
 struct Queue {
     urls: Vec<Arc<str>>,
+    /// What the strings of `urls` hold ([`image::str_bytes`] of each), kept as it changes: the
+    /// URLs are shared with the document's, until the document goes.
+    urls_str: usize,
     /// Not queued again while here, however often the queue is replaced or fetching stopped
     /// ([`Pool::done`] removes a URL).
     active: Vec<Active>,
@@ -307,6 +324,10 @@ struct Queue {
     wake: Wake,
     /// Fetching was stopped (and not asked for since): a fetch that gave up isn't queued again.
     stopped: bool,
+    /// Nothing starts and nothing takes more credit while this is on ([`Remote::pause`]): what is
+    /// being read goes on (and is waited for) or gives up, so the fetchers can be made to hold
+    /// nothing.
+    paused: bool,
     quit: bool,
 }
 
@@ -325,13 +346,15 @@ struct Pool {
 }
 
 impl Pool {
-    fn spawn(tx: Sender<Done>, wake: Wake, fetch: Fetcher) -> Pool {
+    fn spawn(tx: Sender<Done>, wake: Wake, fetch: Fetcher, paused: bool) -> Pool {
         let queue = Queue {
             urls: Vec::new(),
+            urls_str: 0,
             active: Vec::new(),
             next_seq: 0,
             wake,
             stopped: false,
+            paused,
             quit: false,
         };
         let shared = Arc::new((Mutex::new(queue), Condvar::new()));
@@ -355,8 +378,9 @@ impl Pool {
                 // Nothing starts while the credit is spent, or while a fetch waits for it: a
                 // `curl` left waiting for credit would time out, and one that starts only to
                 // give up again (see `grant`) would be fetched over and over. Nor while
-                // `PENDING_MAX` results wait to be taken.
+                // `PENDING_MAX` results wait to be taken, or while paused.
                 while (q.urls.is_empty()
+                    || q.paused
                     || q.held() >= FETCH_BYTES
                     || q.active.iter().any(|a| a.blocked)
                     || q.active.iter().filter(|a| !a.reading).count() >= PENDING_MAX)
@@ -368,6 +392,7 @@ impl Pool {
                     return;
                 }
                 let url = q.urls.remove(0);
+                q.urls_str -= image::str_bytes(&url);
                 let seq = q.next_seq;
                 q.next_seq += 1;
                 q.active.push(Active {
@@ -386,10 +411,18 @@ impl Pool {
                 // started, and the main thread has nothing to take.
                 let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
                 q.active.retain(|a| a.seq != seq);
+                image::shrink_vec(&mut q.active);
                 if !q.stopped {
+                    q.urls_str += image::str_bytes(&url);
                     q.urls.insert(0, url);
                 }
                 cv.notify_all();
+                // Paused to have the fetchers hold nothing: whoever waits for that is told.
+                let wake = q.paused.then(|| q.wake.clone());
+                drop(q);
+                if let Some(wake) = wake {
+                    wake();
+                }
                 continue;
             }
             if tx.send(Done::Fetched { url, result }).is_err() {
@@ -410,6 +443,14 @@ impl Pool {
         let mut told = false;
         loop {
             if q.quit {
+                return false;
+            }
+            // Paused: nothing takes more credit, whatever it holds is given up.
+            if q.paused {
+                if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
+                    a.blocked = false;
+                }
+                cv.notify_all();
                 return false;
             }
             // Credit goes to the oldest that waits for it first, so the youngest can't keep
@@ -468,11 +509,41 @@ impl Pool {
     /// The main thread took the result for `url`: its credit is free.
     fn done(&self, url: &Arc<str>) {
         let (lock, cv) = &*self.shared;
-        lock.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .active
-            .retain(|a| a.url != *url);
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.active.retain(|a| a.url != *url);
+        image::shrink_vec(&mut q.active);
         cv.notify_all();
+    }
+
+    /// Fetches being read, and results fetched and not yet released (see [`Pool::done`]).
+    fn counts(&self) -> (usize, usize) {
+        let (lock, _) = &*self.shared;
+        let q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let reading = q.active.iter().filter(|a| a.reading).count();
+        (reading, q.active.len() - reading)
+    }
+
+    /// Hold the fetchers off (or let them go on): see [`Queue::paused`].
+    fn pause(&self, on: bool) {
+        let (lock, cv) = &*self.shared;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.paused = on;
+        cv.notify_all();
+    }
+
+    /// What the queue holds: its buffer, as allocated, and its URLs' strings. (The entries of
+    /// `active` and the results in the channel are in [`FETCH_RESERVE`]: at most `FETCHERS +
+    /// PENDING_MAX` of them, and the list is cut to size when it empties.)
+    fn bookkeeping(&self) -> usize {
+        let (lock, _) = &*self.shared;
+        let q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        image::vec_bytes(&q.urls).saturating_add(q.urls_str)
+    }
+
+    /// Bytes of bodies held: being read, or waiting to be taken.
+    fn held(&self) -> usize {
+        let (lock, _) = &*self.shared;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).held()
     }
 
     /// Bytes of bodies held: being read, or waiting to be taken.
@@ -496,16 +567,19 @@ impl Pool {
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         urls.retain(|u| !q.active.iter().any(|a| a.url == *u));
         q.stopped = false;
+        q.urls_str = urls.iter().map(|u| image::str_bytes(u)).sum();
         q.urls = urls;
         cv.notify_all();
     }
 
-    /// Drop the queue, and don't queue again what gives up.
+    /// Drop the queue, and don't queue again what gives up. The queue's buffer goes with it (a
+    /// `clear` would keep it: 100,000 URLs are 1.6 MB, which nothing would count).
     fn stop(&self) {
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.stopped = true;
-        q.urls.clear();
+        q.urls = Vec::new();
+        q.urls_str = 0;
         cv.notify_all();
     }
 
@@ -521,7 +595,8 @@ impl Drop for Pool {
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.quit = true;
-        q.urls.clear();
+        q.urls = Vec::new();
+        q.urls_str = 0;
         cv.notify_all();
     }
 }
@@ -537,10 +612,14 @@ pub struct Remote {
     /// Each URL fetched: its natural size, or `None` if it failed or isn't PNG or JPEG. Kept for
     /// the current document's URLs and those with a body or pixels cached (`Images::attach`).
     sizes: HashMap<Arc<str>, Option<(u32, u32)>>,
+    /// What the strings of `sizes` hold ([`image::str_bytes`] of each), kept as it changes.
+    sizes_str: usize,
     pool: Option<Pool>,
     fetcher: Fetcher,
     /// A fetcher was ever started.
     started: bool,
+    /// The fetchers are held off ([`Remote::pause`]), the pool that is started later too.
+    paused: bool,
 }
 
 impl Default for Remote {
@@ -550,9 +629,11 @@ impl Default for Remote {
             on: false,
             no_curl: false,
             sizes: HashMap::new(),
+            sizes_str: 0,
             pool: None,
             fetcher: Arc::new(fetch_image),
             started: false,
+            paused: false,
         }
     }
 }
@@ -594,7 +675,7 @@ impl Remote {
     pub(crate) fn take_fetched(&mut self, url: &Arc<str>, result: Fetched) -> Option<Bytes> {
         match result {
             Ok((bytes, w, h)) => {
-                self.sizes.insert(url.clone(), Some((w, h)));
+                self.record(url, Some((w, h)));
                 Some(bytes)
             }
             Err(Error::NoCurl) => {
@@ -605,9 +686,16 @@ impl Remote {
             // Nothing was found out: asked for again, as an image not fetched yet.
             Err(Error::Yielded) => None,
             Err(_) => {
-                self.sizes.insert(url.clone(), None);
+                self.record(url, None);
                 None
             }
+        }
+    }
+
+    /// What fetching found for `url`.
+    fn record(&mut self, url: &Arc<str>, size: Option<(u32, u32)>) {
+        if self.sizes.insert(url.clone(), size).is_none() {
+            self.sizes_str += image::str_bytes(url);
         }
     }
 
@@ -625,7 +713,26 @@ impl Remote {
         &mut self,
         mut keep: impl FnMut(&Arc<str>, Option<(u32, u32)>) -> bool,
     ) {
-        self.sizes.retain(|u, &mut size| keep(u, size));
+        let mut freed = 0;
+        self.sizes.retain(|u, &mut size| {
+            let k = keep(u, size);
+            if !k {
+                freed += image::str_bytes(u);
+            }
+            k
+        });
+        self.sizes_str -= freed;
+        image::shrink_map(&mut self.sizes);
+    }
+
+    /// Forget what fetching found for `urls` (their last slot in the cache was evicted, and the
+    /// document doesn't have them): the entries, their strings and the room the table has left.
+    pub(crate) fn forget_sizes<'a>(&mut self, urls: impl IntoIterator<Item = &'a Arc<str>>) {
+        for u in urls {
+            if self.sizes.remove(u).is_some() {
+                self.sizes_str -= image::str_bytes(u);
+            }
+        }
         image::shrink_map(&mut self.sizes);
     }
 
@@ -639,7 +746,7 @@ impl Remote {
 
     /// The image at `url` didn't decode: it shows its alt text from now on.
     pub(crate) fn failed(&mut self, url: &Arc<str>) {
-        self.sizes.insert(url.clone(), None);
+        self.record(url, None);
     }
 
     /// Fetch `urls`, most wanted first (duplicates are fetched once), replacing what the
@@ -654,9 +761,9 @@ impl Remote {
             return;
         }
         self.started = true;
-        let fetcher = &self.fetcher;
+        let (fetcher, paused) = (&self.fetcher, self.paused);
         self.pool
-            .get_or_insert_with(|| Pool::spawn(tx, wake, fetcher.clone()))
+            .get_or_insert_with(|| Pool::spawn(tx, wake, fetcher.clone(), paused))
             .set(urls);
     }
 
@@ -674,6 +781,53 @@ impl Remote {
         }
     }
 
+    /// Hold the fetchers off, or let them go on: while held off nothing starts and nothing takes
+    /// more credit (a transfer that has what it needs finishes, one that needs more gives up and
+    /// is queued again), so once every transfer is over and the results are taken, the fetchers
+    /// hold nothing ([`Remote::reserve_idle`]).
+    pub(crate) fn pause(&mut self, on: bool) {
+        self.paused = on;
+        if let Some(pool) = &self.pool {
+            pool.pause(on);
+        }
+    }
+
+    /// Fetches being read, and results fetched and not yet released ([`Remote::release`]): the
+    /// ones in the channel, the ones the cache is deciding on and the ones that wait.
+    pub(crate) fn transfers(&self) -> (usize, usize) {
+        self.pool.as_ref().map_or((0, 0), Pool::counts)
+    }
+
+    /// Whether the fetchers are held off ([`Remote::pause`]).
+    pub(crate) fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Bytes of bodies held: being read, or fetched and not released.
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.pool.as_ref().map_or(0, Pool::held)
+    }
+
+    /// What the fetchers hold while none is being read: the bodies of the results not released,
+    /// and the bookkeeping of each, which is all that is left of [`FETCH_RESERVE`].
+    pub(crate) fn reserve_idle(&self) -> usize {
+        let held = self.pool.as_ref().map_or(0, Pool::held);
+        held.saturating_add(self.transfers().1 * PENDING_COST)
+    }
+
+    /// What the table of sizes and the queue hold, besides the bodies: the capacity of each
+    /// buffer and its strings. The entries of the pool's list and the results in its channel
+    /// are in [`FETCH_RESERVE`].
+    pub(crate) fn bookkeeping_bytes(&self) -> usize {
+        let sizes = image::table_bytes(
+            self.sizes.capacity(),
+            size_of::<(Arc<str>, Option<(u32, u32)>)>(),
+        );
+        sizes
+            .saturating_add(self.sizes_str)
+            .saturating_add(self.pool.as_ref().map_or(0, Pool::bookkeeping))
+    }
+
     /// Bytes of bodies held outside the cache: being read, or waiting to be taken.
     #[cfg(test)]
     pub(crate) fn inflight(&self) -> usize {
@@ -689,6 +843,28 @@ impl Remote {
     #[cfg(test)]
     pub(crate) fn set_fetcher(&mut self, fetcher: Fetcher) {
         self.fetcher = fetcher;
+    }
+
+    /// Fetch with `body`, which gives the bytes of a URL (`None`: it fails), instead of `curl`:
+    /// credit is taken for the body as for a real one, and what is brought is made of it as a
+    /// fetched image is ([`image_of`]). For tests that count what fetching allocates, and need
+    /// more URLs than `curl` can be run for.
+    #[doc(hidden)]
+    pub fn set_test_body(&mut self, body: TestBody) {
+        self.fetcher = Arc::new(move |url, grant| {
+            let bytes = body(url).ok_or(Error::Failed)?;
+            let mut granted = 0;
+            while granted < bytes.len() {
+                if !grant(STEP) {
+                    return Err(Error::Yielded);
+                }
+                granted += STEP;
+            }
+            let mut held = Vec::with_capacity(granted);
+            held.extend_from_slice(&bytes);
+            drop(bytes);
+            image_of(held)
+        });
     }
 
     /// Whether any fetcher was ever started (tests: nothing touches the network unasked).

@@ -200,8 +200,9 @@ fn nested_mailto_names_are_bounded() {
     classify(&format!("https://example.com/{big}#{big}"), base());
     classify(&format!("sub/{big}.md#{big}"), base());
     classify(&format!("#{big}"), base());
+    // (Linear work takes milliseconds, quadratic work minutes: only a guard against that.)
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(2),
+        start.elapsed() < std::time::Duration::from_secs(60),
         "{:?}",
         start.elapsed()
     );
