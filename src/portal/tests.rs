@@ -31,6 +31,18 @@ fn read_call(s: &mut UnixStream) -> Option<(u32, String, Vec<u8>)> {
 /// A message from the bus: `kind`, replying to `reply_to` (0: none), with `member` (signals)
 /// and a body of signature `sig`.
 fn bus_msg(kind: u8, reply_to: u32, member: &str, sig: &str, body: &[u8]) -> Vec<u8> {
+    bus_msg_to(kind, reply_to, member, sig, body, "")
+}
+
+/// `bus_msg` addressed to `dest` (none if empty).
+fn bus_msg_to(
+    kind: u8,
+    reply_to: u32,
+    member: &str,
+    sig: &str,
+    body: &[u8],
+    dest: &str,
+) -> Vec<u8> {
     let mut m = Writer::default();
     m.0.extend_from_slice(&[b'l', kind, 0, 1]);
     m.u32(body.len() as u32);
@@ -47,6 +59,9 @@ fn bus_msg(kind: u8, reply_to: u32, member: &str, sig: &str, body: &[u8]) -> Vec
         m.field(1, "o", PORTAL_PATH);
         m.field(2, "s", SETTINGS);
         m.field(3, "s", member);
+    }
+    if !dest.is_empty() {
+        m.field(6, "s", dest);
     }
     if !sig.is_empty() {
         m.field(8, "g", sig);
@@ -88,6 +103,16 @@ fn fake_bus(
     end: &'static str,
     after: Vec<Vec<u8>>,
 ) -> UnixStream {
+    fake_bus_nth(answer, end, 1, after)
+}
+
+/// `fake_bus` that ends at the `nth` call of `end`.
+fn fake_bus_nth(
+    answer: impl Fn(u32, &str) -> Vec<Vec<u8>> + Send + 'static,
+    end: &'static str,
+    nth: usize,
+    after: Vec<Vec<u8>>,
+) -> UnixStream {
     let (client, mut server) = UnixStream::pair().unwrap();
     std::thread::spawn(move || {
         let mut auth = Vec::new();
@@ -101,6 +126,7 @@ fn fake_bus(
         let mut begin = [0u8; 7];
         server.read_exact(&mut begin).unwrap();
         assert_eq!(&begin, b"BEGIN\r\n");
+        let mut ends = 0;
         while let Some((serial, member, body)) = read_call(&mut server) {
             if member == "AddMatch" {
                 let rule = Reader::new(&body).str().unwrap().to_owned();
@@ -109,7 +135,8 @@ fn fake_bus(
             for m in answer(serial, &member) {
                 server.write_all(&m).unwrap();
             }
-            if member == end {
+            ends += usize::from(member == end);
+            if member == end && ends == nth {
                 for m in &after {
                     server.write_all(m).unwrap();
                 }
@@ -153,37 +180,85 @@ fn reads_the_preference_and_follows_changes() {
     assert_eq!(seen, [Some(true), Some(false), None, Some(true), None]);
 }
 
-/// The signals are asked for before the setting is read, and one that arrives while a reply
-/// is awaited (here the `AddMatch` one, then the `ReadOne` one) is newer than what is read.
+/// The signals are asked for before the setting is read. One that arrives while a reply is
+/// awaited (the `AddMatch` one, then the `ReadOne` one) isn't known to be newer than the read:
+/// if it disagrees the setting is read again, and that answer, the portal's current value, wins.
 #[test]
-fn a_change_while_starting_wins() {
-    for (during_add, during_read, read, first) in [
-        (Some(1), None, 2, Some(true)),
-        (None, Some(2), 1, Some(false)),
-        (Some(1), Some(0), 2, None),
-        (None, None, 2, Some(false)),
+fn a_change_while_starting_is_settled_by_reading_again() {
+    // (signal during AddMatch, signal during ReadOne, what each ReadOne returns in turn, the
+    // number of reads made, result)
+    for (during_add, during_read, reads, made, first) in [
+        // The signal is older than the read (the portal changed again before it was delivered).
+        (Some(1), None, [2, 2], 2, Some(false)),
+        (Some(1), Some(0), [2, 0], 2, None),
+        // The read is older than the signal.
+        (None, Some(2), [1, 2], 2, Some(false)),
+        // The read, taken again, holds the newer value.
+        (None, Some(2), [1, 1], 2, Some(true)),
+        // Agreeing, or nothing buffered: one read.
+        (Some(1), None, [1, 2], 1, Some(true)),
+        (None, None, [2, 1], 1, Some(false)),
     ] {
-        let stream = fake_bus(
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let stream = fake_bus_nth(
             move |serial, member| {
                 let signal = |v| bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(v, KEY));
                 let ok = bus_msg(RETURN, serial, "", "", &[]);
                 match member {
                     "AddMatch" => during_add.map(signal).into_iter().chain([ok]).collect(),
-                    "ReadOne" => during_read
-                        .map(signal)
-                        .into_iter()
-                        .chain([bus_msg(RETURN, serial, "", "v", &variant_u(read, 0))])
-                        .collect(),
+                    "ReadOne" => {
+                        let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let read = bus_msg(RETURN, serial, "", "v", &variant_u(reads[n % 2], 0));
+                        // Only the first read is overtaken by a signal.
+                        let before = if n == 0 { during_read } else { None };
+                        before.map(signal).into_iter().chain([read]).collect()
+                    }
                     _ => vec![ok],
                 }
             },
             "ReadOne",
+            // The bus is closed after the last read the case should make.
+            made,
             Vec::new(),
         );
         let mut seen = Vec::new();
         run(Bus::over(stream).expect("connected"), |v| seen.push(v));
-        assert_eq!(seen, [first, None], "{during_add:?} {during_read:?} {read}");
+        let case = format!("{during_add:?} {during_read:?} {reads:?}");
+        assert_eq!(seen, [first, None], "{case}");
     }
+}
+
+/// A signal addressed to this connection is delivered whatever the match rule says, so any
+/// client can send one: only the portal's broadcasts count, at startup and after.
+#[test]
+fn a_directed_signal_is_not_the_portals() {
+    let rogue = |v| {
+        bus_msg_to(
+            SIGNAL,
+            0,
+            "SettingChanged",
+            "ssv",
+            &changed(v, KEY),
+            ":1.99",
+        )
+    };
+    let stream = fake_bus(
+        move |serial, member| match member {
+            "AddMatch" => vec![rogue(1), bus_msg(RETURN, serial, "", "", &[])],
+            "ReadOne" => vec![rogue(1), bus_msg(RETURN, serial, "", "v", &variant_u(2, 0))],
+            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+        },
+        "ReadOne",
+        vec![
+            rogue(1),
+            bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(1, KEY)),
+            rogue(0),
+        ],
+    );
+    let mut seen = Vec::new();
+    run(Bus::over(stream).expect("connected"), |v| seen.push(v));
+    assert_eq!(seen, [Some(false), Some(true), None]);
 }
 
 /// Without the subscription there is nothing to follow or to end: the read is the answer.

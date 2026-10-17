@@ -35,11 +35,18 @@ pub fn watch(mut f: impl FnMut(Option<bool>)) {
 }
 
 fn run(mut bus: Bus, mut f: impl FnMut(Option<bool>)) {
-    // Subscribe before reading, so a change between the two isn't missed; one that arrives
-    // while waiting for a reply is newer than what the read may have seen, and wins.
+    // Subscribe before reading, so a change between the two isn't missed. A signal that arrives
+    // while waiting for a reply isn't known to be newer than the reply (the bus may deliver
+    // them in either order), so one that disagrees with the read is settled by reading again.
     let watching = bus.add_match();
-    let read = bus.read_setting();
-    f(bus.changed.take().unwrap_or(read));
+    let mut value = bus.read_setting();
+    while let Some(seen) = bus.changed.take() {
+        if seen == value {
+            break;
+        }
+        value = bus.read_setting();
+    }
+    f(value);
     // (A read that failed midway leaves the stream unusable: `follow` sees `dead`.)
     if watching {
         bus.follow(&mut f);
@@ -49,7 +56,9 @@ fn run(mut bus: Bus, mut f: impl FnMut(Option<bool>)) {
 }
 
 /// The signals wanted: `color-scheme` changes, from the portal only (the bus matches the name
-/// against its owner, so no other client can pass one off as the portal's).
+/// against its owner, so no other client can pass one off as the portal's broadcast). The bus
+/// delivers a signal addressed to this connection whatever the rule says; `setting_changed`
+/// refuses those, the portal broadcasting.
 const MATCH_RULE: &str = concat!(
     "type='signal',sender='org.freedesktop.portal.Desktop',",
     "interface='org.freedesktop.portal.Settings',member='SettingChanged',",
@@ -219,6 +228,7 @@ impl Bus {
             kind: fixed[1],
             reply_serial: 0,
             member: String::new(),
+            directed: false,
             body,
         };
         let mut r = Reader::new(&fields[..fields_len as usize]);
@@ -227,6 +237,10 @@ impl Bus {
             let code = r.byte().ok_or_else(bad)?;
             match (code, r.sig().ok_or_else(bad)?) {
                 (3, "s") => msg.member = r.str().ok_or_else(bad)?.to_owned(),
+                (6, "s") => {
+                    msg.directed = true;
+                    _ = r.str().ok_or_else(bad)?;
+                }
                 (5, "u") => msg.reply_serial = r.u32().ok_or_else(bad)?,
                 (_, "s" | "o") => _ = r.str().ok_or_else(bad)?,
                 (_, "g") => _ = r.sig().ok_or_else(bad)?,
@@ -293,12 +307,14 @@ struct Msg {
     kind: u8,
     reply_serial: u32,
     member: String,
+    /// Addressed to one connection (a destination field), not broadcast.
+    directed: bool,
     body: Vec<u8>,
 }
 
-/// The new value of a `SettingChanged` signal for `color-scheme`.
+/// The new value of a broadcast `SettingChanged` signal for `color-scheme`.
 fn setting_changed(msg: &Msg) -> Option<Option<bool>> {
-    if msg.kind != SIGNAL || msg.member != "SettingChanged" {
+    if msg.kind != SIGNAL || msg.directed || msg.member != "SettingChanged" {
         return None;
     }
     let mut r = Reader::new(&msg.body);
