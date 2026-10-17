@@ -589,6 +589,76 @@ fn held_off_fetchers_start_nothing_and_give_up_what_wants_more() {
     until("idle", || !r.busy());
 }
 
+/// A fetch that gave up for the pause is run again and is not given up for it again (round 14):
+/// each pause of the fetchers made the transfers that had not taken their first credit give up,
+/// and a request that replaced the queue forgot them, so a URL could be fetched as many times as
+/// the fetchers were held off (a viewport of 700 one-pixel images beside a bitmap that takes the
+/// budget: 346 runs more than there were URLs). The second run finishes under a pause, and the
+/// request that replaces the queue meanwhile keeps its place.
+#[test]
+fn a_fetch_given_up_for_the_pause_finishes_the_second_time() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wake: Wake = Arc::new(|| {});
+    let starts = Arc::new(AtomicUsize::new(0));
+    // The attempt that may go past the gate (each takes its first credit, waits there, and asks
+    // for more).
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let fetcher: Fetcher = {
+        let (starts, gate) = (starts.clone(), gate.clone());
+        Arc::new(move |_, grant| {
+            let n = starts.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(grant(STEP));
+            let (open, cv) = &*gate;
+            let mut open = open.lock().unwrap();
+            while *open < n {
+                open = cv.wait(open).unwrap();
+            }
+            drop(open);
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+            Ok((Arc::new(png()), 2, 1))
+        })
+    };
+    let open = |n: usize| {
+        *gate.0.lock().unwrap() = n;
+        gate.1.notify_all();
+    };
+    let mut r = Remote {
+        on: true,
+        fetcher,
+        ..Remote::default()
+    };
+    let url = urls(1);
+    r.fetch(url.clone(), tx.clone(), wake.clone());
+    until("the first run holds credit", || r.inflight() >= STEP);
+    // Held off, it asks for more and gives up.
+    r.pause(true);
+    open(1);
+    until("the first run gave up", || r.transfers().0 == 0);
+    assert!(r.busy(), "it is next in line");
+    // A request replaces the queue (the URL is still wanted): it is not forgotten, nor queued twice.
+    r.fetch(url.clone(), tx.clone(), wake.clone());
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "nothing starts while held off"
+    );
+    r.pause(false);
+    until("the second run holds credit", || {
+        starts.load(Ordering::SeqCst) == 2 && r.inflight() >= STEP
+    });
+    // Held off again: it goes on, and finishes.
+    r.pause(true);
+    open(2);
+    let Ok(Done::Fetched { url, result }) = rx.recv_timeout(Duration::from_secs(60)) else {
+        panic!("a result");
+    };
+    assert!(r.fetched(&url, result).is_some(), "the second run finished");
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    until("idle", || !r.busy());
+}
+
 /// At most [`FETCHERS`] fetches run at once and none runs twice, however the queue is replaced
 /// and however often fetching is stopped and started again meanwhile; what finished is told
 /// apart from what is still being fetched until the main thread takes it.

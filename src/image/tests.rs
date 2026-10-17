@@ -768,8 +768,194 @@ fn the_cache_evicts_the_least_recently_painted_first() {
     assert_eq!(c.pixels(&Key::Local(1), 8, 2).map(|b| b.width), Some(4));
     c.insert(Key::Local(1), bm(4));
     assert_eq!(c.slots.iter().filter(|s| s.key == Key::Local(1)).count(), 1);
+    // (Image 4 was only stored: nothing painted it, and the insert took it out to make room.)
+    assert!(!c.has(&Key::Local(4), 4, 1));
     c.retain(|s| s.key != Key::Local(1));
-    assert_eq!(c.bytes, 2 * one);
+    assert_eq!(c.bytes, one);
+}
+
+/// Only a frame that was drawn keeps pixels (round 14): a result that was stored and not painted,
+/// and pixels that were only touched (asked for, kept near the viewport), are evicted like any
+/// other when room is wanted; what a frame painted is not, until the next frame begins. (A result
+/// stored since the last paint was taken for pixels a window keeps: a request that followed, with
+/// no repaint, was run over the budget beside them.)
+#[test]
+fn only_a_frame_that_painted_pixels_keeps_them() {
+    let bm = |w: u32| {
+        Data::Pixels(Bitmap {
+            width: w,
+            height: 1,
+            data: vec![0; w as usize],
+        })
+    };
+    let one = 16 + SLOT_OVERHEAD;
+    let mut c = Cache::new(2 * one + 20);
+    c.frame = 1;
+    c.insert(Key::Local(1), bm(4));
+    c.insert(Key::Local(2), bm(4));
+    // Stored in this frame, asked for in it, and not painted: nothing is kept.
+    c.touch(&Key::Local(1), 4, 1);
+    assert_eq!(c.stuck(), 0);
+    assert_eq!(c.kept(), 0);
+    c.insert(Key::Local(3), bm(4));
+    assert_eq!(c.slots.len(), 2, "one of them made the room");
+    assert!(c.has(&Key::Local(3), 4, 1));
+    // Painted: kept, in this frame, even over the budget.
+    assert!(c.pixels(&Key::Local(3), 4, 1).is_some());
+    let other = if c.has(&Key::Local(1), 4, 1) { 1 } else { 2 };
+    assert!(c.pixels(&Key::Local(other), 4, 1).is_some());
+    c.insert(Key::Local(4), bm(4));
+    assert_eq!(c.kept(), 2 * one);
+    assert!(!c.room_for(10 * one, 0, 0), "nothing more can be made");
+    assert!(c.has(&Key::Local(3), 4, 1) && c.has(&Key::Local(other), 4, 1));
+    // The next frame begins: what was painted is evictable again.
+    c.frame += 1;
+    assert_eq!(c.kept(), 0);
+    c.evict_for(2 * one);
+    assert!(c.slots.is_empty());
+}
+
+/// Making room is for the room: an admission that would not fit however much is evicted evicts
+/// nothing (a body that waited for room took out the results nobody had painted yet, and its image
+/// was decoded again, again).
+#[test]
+fn room_that_cannot_be_made_is_not_made_by_evicting() {
+    let bm = |w: u32| {
+        Data::Pixels(Bitmap {
+            width: w,
+            height: 1,
+            data: vec![0; w as usize],
+        })
+    };
+    let one = 16 + SLOT_OVERHEAD;
+    let mut c = Cache::new(4 * one);
+    c.frame = 1;
+    c.insert(Key::Local(1), bm(4));
+    c.insert(Key::Local(2), bm(4));
+    c.reserve = 10 * one;
+    assert!(
+        !c.room_for(one, 0, 0),
+        "what is held is more than the budget"
+    );
+    assert_eq!(c.slots.len(), 2, "nothing was evicted for it");
+    c.reserve = 0;
+    assert!(c.room_for(3 * one, 0, 0));
+    assert_eq!(c.slots.len(), 1, "evicted for the room that is there now");
+}
+
+/// What a remote image's decode is taken to hold doesn't fall when its body is gone (round 14):
+/// with the body cached it is what the decoder holds (30 MB for a 3200 × 2400 JPEG to a box of
+/// 599 × 1748), without it the result alone (4.2 MB), and an image near the viewport was wanted
+/// without the body (it fits), fetched, found too big (it doesn't), and let go, and wanted without
+/// it again: the body of one URL was fetched 93 times in a window that did not change (seed 19 of
+/// the random mix, with only what a frame painted kept from eviction).
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_fetched_images_cost_is_the_same_without_its_body() {
+    use crate::remote::{Error, STEP};
+    let jpeg = big_jpeg(3200, 2400);
+    let doc = Doc::parse("![j](https://x.y/j.jpg)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let body = jpeg.clone();
+    images
+        .remote
+        .set_fetcher(Arc::new(move |_: &str, grant: crate::remote::Grant| {
+            for _ in 0..body.len().div_ceil(STEP) {
+                if !grant(STEP) {
+                    return Err(Error::Yielded);
+                }
+            }
+            Ok((Arc::new(body.clone()), 3200, 2400))
+        }));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    // Not fetched yet: nothing is known, and the cost is the result's.
+    assert_eq!(images.cost(1, 599, 1748), 599 * 1748 * 4);
+    drive(&mut images, &doc, &mut layout, &[(1, 599, 1748)], 1, |i| {
+        i.cache.peek_bytes(&"https://x.y/j.jpg".into()).is_some()
+    });
+    let with = images.cost(1, 599, 1748);
+    assert!(
+        with > 3200 * 2400 * 3,
+        "{with}: the frame of the JPEG is in it"
+    );
+    // The body goes (evicted, or never admitted): what is known of the URL stays.
+    images.cache.retain(|s| !matches!(s.data, Data::Bytes(_)));
+    assert!(
+        images
+            .cache
+            .peek_bytes(&"https://x.y/j.jpg".into())
+            .is_none()
+    );
+    let without = images.cost(1, 599, 1748);
+    assert!(
+        without >= with,
+        "{without} without the body, {with} with it"
+    );
+}
+
+/// The window's viewport is noted whole, whatever number of its boxes a request has the room for
+/// (round 14): a body for the 600th image in view was taken for one that is not in view when the
+/// request, cut to the 60 it had room to ask for, listed only those, and was dropped and fetched
+/// again with every request.
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_viewport_is_noted_whole_whatever_a_request_asks_for() {
+    const N: u32 = 600;
+    let src: String = (0..N)
+        .map(|i| format!("![t](https://x.y/{i}.png) "))
+        .collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    // Nothing of the budget is left over for what a request builds: it asks for few of the boxes.
+    images.cache.cap = 1 << 20;
+    let boxes: Vec<_> = (1..=N).map(|id| (id, 1, 1)).collect();
+    images.begin_frame();
+    images.request(&boxes, boxes.len());
+    assert_eq!(images.in_view.len(), N as usize);
+    // Only the first 100 are in view the next time, and the list is what is in view.
+    images.begin_frame();
+    images.request(&boxes, 100);
+    assert_eq!(images.in_view.len(), 100);
+}
+
+/// The list of slots has a place for each image in view beside what it holds (round 14): made
+/// for the viewport when it is asked for, whatever the room (the budget is full of what a window
+/// paints and a list that doubles beside the old one costs more than a request may take), and
+/// kept when slots go. A document of thousands of images that has few in view holds no more than
+/// those: nothing is charged for the document's.
+#[test]
+fn the_list_of_slots_has_a_place_for_each_image_in_view() {
+    const N: u32 = 300;
+    let src: String = (0..N).map(|_| "![a](/nowhere/a.png) ").collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.attach(&doc, &mut layout);
+    assert!(
+        images.cache.slots.capacity() < 16,
+        "a document's images are no places"
+    );
+    // No room at all, and all of them in view.
+    images.cache.cap = 1 << 10;
+    let boxes: Vec<_> = (1..=N).map(|id| (id, 4, 4)).collect();
+    images.begin_frame();
+    images.request(&boxes, boxes.len());
+    assert_eq!(images.cache.floor, N as usize);
+    assert!(images.cache.slots.capacity() >= N as usize);
+    // Fewer in view: that many, and the list is cut to them.
+    images.begin_frame();
+    images.request(&boxes, 10);
+    assert_eq!(images.cache.floor, 10);
+    images.cache.trim();
+    assert!(images.cache.slots.capacity() >= 10);
+    assert!(images.cache.slots.capacity() <= 2 * 10 + 16 + images.cache.expect);
 }
 
 /// A fetched body that arrives is not "painted this frame": one for an image far from the
@@ -826,6 +1012,8 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
         key: Key::Remote(url.clone()),
         data,
         used: 0,
+        painted: 0,
+        protect: false,
     };
     assert_eq!(
         slot(Data::Bytes(Arc::new(loose))).cost(),
@@ -842,7 +1030,9 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
         Slot {
             key: Key::Local(1),
             data: Data::Pixels(bitmap),
-            used: 0
+            used: 0,
+            painted: 0,
+            protect: false,
         }
         .cost(),
         400 + SLOT_OVERHEAD
@@ -1892,8 +2082,7 @@ fn a_body_is_let_in_alone_when_nothing_can_make_room() {
     let boxes: Vec<_> = (1..=N).map(|id| (id, 40, 30)).collect();
     let t = Instant::now();
     loop {
-        images.begin_frame();
-        images.request(&boxes, boxes.len());
+        frame(&mut images, &boxes, boxes.len());
         std::thread::sleep(Duration::from_millis(10));
         images.poll(&doc, &mut layout);
         let bodies = images
@@ -1971,8 +2160,7 @@ fn a_body_dropped_for_lack_of_room_is_not_fetched_in_a_loop() {
     // However often the window paints and polls from here, nothing is fetched (the pool is
     // idle when the last frame is over: a fetch asked for in it would show).
     for _ in 0..300 {
-        images.begin_frame();
-        images.request(&both, 1);
+        frame(&mut images, &both, 1);
         images.poll(&doc, &mut layout);
         assert!(
             images.pixels(1, 720, 6000).is_some(),
@@ -2045,8 +2233,7 @@ fn a_dropped_body_is_fetched_again_when_room_is_made() {
     let n0 = fetches.load(Ordering::SeqCst);
     assert!(n0 <= 4, "{n0} fetches of two bodies that don't fit");
     for _ in 0..300 {
-        images.begin_frame();
-        images.request(&with_tall, 1);
+        frame(&mut images, &with_tall, 1);
         images.poll(&doc, &mut layout);
     }
     drive(&mut images, &doc, &mut layout, &with_tall, 1, |i| {
@@ -2496,6 +2683,18 @@ fn big_jpeg(w: u16, h: u16) -> Vec<u8> {
 /// stays stuck for good, and this is how a test finds out, long before the deadline.
 #[cfg(feature = "remote-images")]
 const QUIET: Duration = Duration::from_secs(5);
+
+/// One frame of the window: begun, what is in view painted (a frame is what protects pixels from
+/// being evicted: nothing else does), the images near asked for.
+#[cfg(feature = "remote-images")]
+fn frame(images: &mut Images, boxes: &[(u32, u32, u32)], on_screen: usize) {
+    use crate::render::Pixels;
+    images.begin_frame();
+    for &(id, w, h) in boxes.iter().take(on_screen) {
+        let _ = images.pixels(id, w, h);
+    }
+    images.request(boxes, on_screen);
+}
 
 /// What the window does with images, and no more (`src/main.rs`): the viewport is
 /// new (`boxes`, the first `on_screen` in view), so a frame is painted (`begin_frame`, the

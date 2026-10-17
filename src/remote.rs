@@ -32,7 +32,8 @@
 //!
 //! A decode that doesn't fit beside that reserve (a 4000 × 2000 JPEG holds 24 MB while it runs)
 //! has the fetchers held off ([`Remote::pause`]): nothing starts, nothing takes more credit (a
-//! transfer that needs more gives up as it does when all wait, and is queued again at the front),
+//! transfer that needs more gives up as it does when all wait, and is queued again at the front,
+//! and is not given up for the pause again: a URL is run at most twice for the pause's sake),
 //! and what has the credit it needs finishes, so that once the results are taken they hold
 //! nothing, and the decode has the budget beside it; they go on when its result is taken.
 
@@ -314,6 +315,10 @@ struct Active {
     reading: bool,
     /// Waiting for credit.
     blocked: bool,
+    /// Started again after it gave up ([`Queue::requeue`]): the pause doesn't make it give up
+    /// again ([`Pool::grant`]), so a URL is never run more than twice for the pause's sake, however
+    /// often the fetchers are held off.
+    second: bool,
 }
 
 struct Queue {
@@ -321,7 +326,8 @@ struct Queue {
     /// The URLs of fetches that gave up (see [`Error::Yielded`]), next in line again: at most one
     /// for each fetcher, so the room for them is made with the queue and never grows. (Put at the
     /// front of `urls` they would grow its buffer, which is as big as the document's list, by
-    /// doubling it.)
+    /// doubling it.) A replaced queue ([`Pool::set`]) keeps the ones it still wants: a fetch that
+    /// gave up is not forgotten, with the second go that is its right, by a request.
     requeue: Vec<Arc<str>>,
     /// What the strings of `urls` and `requeue` hold ([`image::str_bytes`] of each), kept as it
     /// changes: the URLs are shared with the document's, until the document goes.
@@ -401,10 +407,11 @@ impl Pool {
                 if q.quit {
                     return;
                 }
-                let url = if q.requeue.is_empty() {
-                    q.urls.remove(0)
-                } else {
+                let second = !q.requeue.is_empty();
+                let url = if second {
                     q.requeue.remove(0)
+                } else {
+                    q.urls.remove(0)
                 };
                 q.urls_str -= image::str_bytes(&url);
                 let seq = q.next_seq;
@@ -415,6 +422,7 @@ impl Pool {
                     held: 0,
                     reading: true,
                     blocked: false,
+                    second,
                 });
                 (url, seq)
             };
@@ -461,8 +469,28 @@ impl Pool {
             if q.quit {
                 return false;
             }
-            // Paused: nothing takes more credit, whatever it holds is given up.
+            // Paused: nothing takes more credit, whatever it holds is given up. (Except a fetch
+            // that has been started again: it gave up once already, and a URL that is given up
+            // for every pause is fetched for ever. It finishes, if the credit it needs is there to
+            // be had at once: it never waits for credit while held off, which the decode that is
+            // waiting for the fetchers to hold nothing would wait for in turn.)
             if q.paused {
+                let second = q.active.iter().any(|a| a.seq == seq && a.second);
+                let older = q
+                    .active
+                    .iter()
+                    .any(|a| a.reading && a.blocked && a.seq < seq);
+                if second && q.held().saturating_add(n) <= FETCH_BYTES && !older {
+                    if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
+                        a.held += n;
+                        if std::mem::take(&mut a.blocked) {
+                            // (It may have been waiting for credit when the pause came: the
+                            // others that wait for it go on.)
+                            cv.notify_all();
+                        }
+                    }
+                    return true;
+                }
                 if let Some(a) = q.active.iter_mut().find(|a| a.seq == seq) {
                     a.blocked = false;
                 }
@@ -558,6 +586,35 @@ impl Pool {
             .saturating_add(q.urls_str)
     }
 
+    /// What the pool is doing, for the report of a test that failed.
+    fn state(&self) -> String {
+        let (lock, _) = &*self.shared;
+        let q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let active: Vec<String> = q
+            .active
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}#{}{}{}{} {}",
+                    a.url.rsplit('/').next().unwrap_or(""),
+                    a.seq,
+                    if a.reading { " reading" } else { " result" },
+                    if a.blocked { " blocked" } else { "" },
+                    if a.second { " second" } else { "" },
+                    a.held
+                )
+            })
+            .collect();
+        format!(
+            "pool: active [{}], {} queued, {} requeued, paused {}, stopped {}",
+            active.join(", "),
+            q.urls.len(),
+            q.requeue.len(),
+            q.paused,
+            q.stopped
+        )
+    }
+
     /// Bytes of bodies held: being read, or waiting to be taken.
     fn held(&self) -> usize {
         let (lock, _) = &*self.shared;
@@ -579,14 +636,20 @@ impl Pool {
         !q.urls.is_empty() || !q.requeue.is_empty() || !q.active.is_empty()
     }
 
-    /// Replace the queue with `urls` (not the ones being fetched).
+    /// Replace the queue with `urls` (not the ones being fetched). The fetches that gave up and
+    /// are still wanted stay next in line (they are in `urls` too, and are run once, from there).
     fn set(&self, mut urls: Vec<Arc<str>>) {
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
-        urls.retain(|u| !q.active.iter().any(|a| a.url == *u));
+        q.requeue.retain(|r| urls.iter().any(|u| u == r));
+        let q = &mut *q;
+        urls.retain(|u| !q.active.iter().any(|a| a.url == *u) && !q.requeue.contains(u));
         q.stopped = false;
-        q.requeue.clear();
-        q.urls_str = urls.iter().map(|u| image::str_bytes(u)).sum();
+        q.urls_str = urls
+            .iter()
+            .chain(q.requeue.iter())
+            .map(|u| image::str_bytes(u))
+            .sum();
         q.urls = urls;
         cv.notify_all();
     }
@@ -930,6 +993,12 @@ impl Remote {
             drop(bytes);
             image_of(held)
         });
+    }
+
+    /// What the pool is doing (the report of a test that failed).
+    #[doc(hidden)]
+    pub fn pool_state(&self) -> String {
+        self.pool.as_ref().map_or_else(String::new, Pool::state)
     }
 
     /// Whether any fetcher was ever started (tests: nothing touches the network unasked).

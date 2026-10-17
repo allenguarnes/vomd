@@ -2054,6 +2054,95 @@ mod with_fonts {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A result nobody has painted is no pixels a window keeps (round 14), through the window: a
+    /// local 1000 x 2000 PNG is decoded and its result taken after the last frame, and the window
+    /// does not repaint (Wayland, until the compositor calls back: the event loop runs, and
+    /// `tick` asks for the images again after the reader presses I). The 3200 x 2400 JPEG that
+    /// is fetched for the part of the document it is scrolled to doesn't fit beside the PNG's
+    /// 8 MB: the PNG's result was taken for painted, and the decode was run beside it, 1 MB over
+    /// the budget with nothing painted (34.6 MB of the image code's live bytes in 33.5). It is
+    /// evicted for the decode now.
+    #[cfg(feature = "remote-images")]
+    #[test]
+    fn a_result_nobody_painted_is_evicted_for_a_decode_in_a_window_that_has_not_repainted() {
+        use crate::remote::{Error, STEP};
+        let dir = std::env::temp_dir().join(format!("vomd-view-unpainted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = Vec::new();
+        {
+            let mut enc = ::png::Encoder::new(&mut png, 1000, 2000);
+            enc.set_color(::png::ColorType::Grayscale);
+            enc.set_compression(::png::Compression::Fast);
+            enc.write_header()
+                .unwrap()
+                .write_image_data(&vec![0u8; 1000 * 2000])
+                .unwrap();
+        }
+        std::fs::write(dir.join("p.png"), &png).unwrap();
+        // The fixture's JPEG, said to be 3200 x 2400.
+        let mut jpeg = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/wide.jpg"),
+        )
+        .unwrap();
+        let sof = jpeg.windows(2).position(|p| p == [0xFF, 0xC0]).unwrap();
+        jpeg[sof + 5..sof + 7].copy_from_slice(&2400u16.to_be_bytes());
+        jpeg[sof + 7..sof + 9].copy_from_slice(&3200u16.to_be_bytes());
+        let mut src = String::from("![p](p.png)\n\n");
+        src.extend((0..60).map(|i| format!("Text between them, line {i}.\n\n")));
+        src.push_str("![j](https://x.y/j.jpg)\n");
+        let mut v = View::with_base(
+            Fonts::new().unwrap(),
+            Doc::parse(&src),
+            None,
+            (1920, 1080),
+            1.0,
+            Some(dir.clone()),
+        );
+        v.set_text(Params::default().font_size, 160.0);
+        v.images.set_policy(crate::settings::RemoteImages::Always);
+        v.images
+            .remote
+            .set_fetcher(std::sync::Arc::new(move |_, grant| {
+                for _ in 0..jpeg.len().div_ceil(STEP) {
+                    if !grant(STEP) {
+                        return Err(Error::Yielded);
+                    }
+                }
+                Ok((std::sync::Arc::new(jpeg.clone()), 3200, 2400))
+            }));
+        v.ensure();
+        // The frame that asks for the PNG; its result is taken, and nothing is painted after.
+        frame(&mut v, Instant::now());
+        let t = Instant::now();
+        while v.image_stats().decodes < 1 {
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "the PNG never decoded"
+            );
+            v.poll_images(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(v.image_stats().decoded, 1);
+        // Scrolled to the JPEG, and the reader presses I until it is there: ticks and polls.
+        v.set_scroll(v.max_scroll());
+        let t = Instant::now();
+        while v.image_stats().decodes < 2 {
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "the JPEG never decoded: {}",
+                v.images.memory_report()
+            );
+            v.set_remote(true);
+            v.tick(Instant::now(), Some(Instant::now()));
+            v.poll_images(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The PNG's result went to make room: it was not painted, and nothing kept it.
+        let report = v.images.memory_report();
+        assert_eq!(v.image_stats().decoded, 1, "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A document's images are attached once when it is opened, base directory included.
     #[cfg(feature = "images")]
     #[test]

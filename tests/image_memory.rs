@@ -30,6 +30,21 @@ static BASE: AtomicUsize = AtomicUsize::new(0);
 static ALLOW: AtomicUsize = AtomicUsize::new(0);
 /// The first allocation of a run that took the image code's live bytes past [`BASE`] and
 /// [`ALLOW`], and where: for the report of a run that fails.
+/// What the mix was doing (its last step), for the report of a failure in a thread that doesn't
+/// know ([`room_probe`]).
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+static STEP: Mutex<String> = Mutex::new(String::new());
+/// The most times one URL was fetched in a viewport that did not change, over a run of the mix
+/// (the storm detector, [`mix::Epoch`]).
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+static MOST_FETCHES: AtomicUsize = AtomicUsize::new(0);
+/// The most times one URL may be fetched in a viewport that did not change: two, once for
+/// what the pause of the fetchers gave up (and a fetch that has been given up is not again) and
+/// once for the rest; three in the profiles with heavy images (bodies of 3 to 4 MB whose decodes
+/// run only alone, with the fetchers held off), where a body that came and was waiting is let go
+/// for the decode of another that runs alone, and is fetched again ([`mix::Epoch`]).
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+static FETCH_BOUND: AtomicUsize = AtomicUsize::new(2);
 static TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRIP: Mutex<String> = Mutex::new(String::new());
 
@@ -88,10 +103,17 @@ fn add(n: usize, tag: Tag) {
 /// let, since it is only made once and the flag is set.
 #[cold]
 fn trip(live: usize, limit: usize) {
+    // What the backtrace allocates is the driver's: the first one of a run reads and keeps the
+    // binary's debug information (34 MB), which, counted as the image code's, took every check
+    // after it past the budget (69 MB live), and hid the one that was the first.
+    let before = TAG.try_with(|t| t.replace(Tag::Driver));
     let trace = std::backtrace::Backtrace::force_capture();
     let text =
         format!("{live} bytes live, {limit} allowed, the allocation that took it there:\n{trace}");
     *TRIP.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    if let Ok(before) = before {
+        let _ = TAG.try_with(|t| t.set(before));
+    }
 }
 
 /// Where the first allocation past what is allowed was made, if one was, for a failure's message.
@@ -792,17 +814,46 @@ fn events(
 /// seconds, with nothing to wake for.)
 const QUIET: Duration = Duration::from_secs(20);
 
+/// Run `f` with what it allocates counted as the driver's, not the image code's (see [`Tag`]).
+fn driver<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "remote-images")]
+    return tagged(Tag::Driver, f);
+    #[cfg(not(feature = "remote-images"))]
+    f()
+}
+
+/// The bytes of the bitmaps a frame painted, each counted once whatever the number of boxes it
+/// was painted in (forty references to one cached 512 x 512 image are one bitmap of 1 MiB, not
+/// forty): by the identity of its buffer. (What the test keeps for it is the driver's, and no
+/// image's.)
+#[derive(Default)]
+struct Painting {
+    bytes: usize,
+    seen: std::collections::HashSet<usize>,
+}
+
+impl Painting {
+    fn add(&mut self, b: &vomd::image::Bitmap) {
+        if self.seen.insert(b.data.as_ptr() as usize) {
+            self.bytes += b.data.capacity() * size_of::<u32>();
+        }
+    }
+}
+
 /// One frame: what is in view painted, then the images asked for. Returns the bytes of the
 /// pixels painted (the cache may not evict them: they are what the budget may be gone over by).
 fn frame(images: &mut Images, boxes: &[(u32, u32, u32)], on_screen: usize) -> usize {
     use vomd::render::Pixels;
     images.begin_frame();
-    let mut painted = 0;
-    for &(id, w, h) in boxes.iter().take(on_screen) {
-        painted += images
-            .pixels(id, w, h)
-            .map_or(0, |b| b.data.capacity() * size_of::<u32>());
-    }
+    let painted = driver(|| {
+        let mut painted = Painting::default();
+        for &(id, w, h) in boxes.iter().take(on_screen) {
+            if let Some(b) = images.pixels(id, w, h) {
+                painted.add(b);
+            }
+        }
+        painted.bytes
+    });
     // (What is painted can't be evicted by what the request makes room: the allowance for it is
     // there before the request is.)
     ALLOW.fetch_max(painted, Relaxed);
@@ -2176,17 +2227,16 @@ fn undecoded_in_view(
     overhead: usize,
 ) -> Vec<String> {
     use vomd::render::Pixels;
-    let mut painted = 0usize;
+    let mut painted = Painting::default();
     let mut missing = Vec::new();
     for &(id, w, h) in boxes.iter().take(on_screen) {
         let (w, h) = vomd::image::clamp_box(w, h);
         match images.pixels(id, w, h) {
-            Some(b) if (b.width, b.height) == (w, h) => {
-                painted += b.data.capacity() * size_of::<u32>();
-            }
+            Some(b) if (b.width, b.height) == (w, h) => painted.add(b),
             _ => missing.push((id, w, h)),
         }
     }
+    let painted = painted.bytes;
     missing
         .into_iter()
         .filter_map(|(id, w, h)| {
@@ -2376,11 +2426,245 @@ fn a_request_refused_after_protecting_still_decodes_the_admitted_body() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// What the window does without a paint (round 14): a `request` for boxes and a `poll` for each
+/// wake, for `until` to hold or `deadline` to pass, the pixels never painted (a window on Wayland
+/// that has not had its frame callback runs its event loop, and so asks for images again, with
+/// no frame painted since: `View::tick`). Returns whether `until` held, and how many wakes it took.
+#[cfg(feature = "remote-images")]
+fn unpainted(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut PageLayout,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
+    deadline: Duration,
+    mut until: impl FnMut(&Images) -> bool,
+) -> bool {
+    let t = Instant::now();
+    let mut seen = images.wakes();
+    while !until(images) {
+        if t.elapsed() > deadline {
+            return false;
+        }
+        images.request(boxes, on_screen);
+        std::thread::sleep(Duration::from_millis(2));
+        if images.wakes() != seen {
+            seen = images.wakes();
+            images.poll(doc, layout);
+        }
+    }
+    true
+}
+
+/// Results nobody painted are not pixels a window keeps (round 14): a local 1000 × 2000 PNG was
+/// decoded and its result taken with no frame painted after it, and then remote images were
+/// turned on and the 1000 x 750 box of a valid 3200 x 2400 JPEG asked for before the next paint.
+/// The result of the PNG was marked as painted in the frame that was last begun, so it could not
+/// be evicted, and the decode that does not fit beside it was run over the budget (34,623,006
+/// bytes of the image code live over the start, 33,554,432 allowed, with no pixel painted): what
+/// is protected is what a frame painted, and the PNG goes to make room.
+#[cfg(feature = "remote-images")]
+#[test]
+fn results_nobody_painted_are_evictable() {
+    let _serial = serial();
+    let dir = scratch("unpainted");
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    std::fs::write(
+        dir.join("big.png"),
+        zero_png(1000, 2000, 0, 8, false, 1 << 20),
+    )
+    .unwrap();
+    let jpeg = jpeg_variant(
+        &fixture("wide.jpg"),
+        0xC0,
+        3200,
+        2400,
+        &[0x22, 0x11, 0x11],
+        3,
+    );
+    std::fs::write(serve.join("big.jpg"), &jpeg).unwrap();
+    fake_curl(&dir, &serve);
+    let doc = Doc::parse("![p](big.png) ![j](http://127.0.0.1/big.jpg)");
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    let start = image_live();
+    mark();
+    // The PNG is decoded and its result taken. Nothing is painted from here on.
+    assert!(unpainted(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[(1, 1000, 2000)],
+        1,
+        Duration::from_secs(60),
+        |i| i.stats().decodes >= 1
+    ));
+    images.poll(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    // The window scrolled to the JPEG: asked for, over and over, as the event loop does.
+    let done = unpainted(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[(2, 1000, 750)],
+        1,
+        Duration::from_secs(60),
+        |i| i.stats().decodes >= 2,
+    );
+    let over = image_step_over(start);
+    println!(
+        "a PNG decoded and not painted, then a JPEG: {over} bytes of the image code live over the start (of {CACHE_BYTES}), {:?}",
+        images.stats()
+    );
+    assert!(done, "the JPEG is decoded: {}", images.memory_report());
+    assert!(
+        over <= CACHE_BYTES + (64 << 10),
+        "{over} bytes live over the start, {CACHE_BYTES} allowed with nothing painted\n{}",
+        images.memory_report()
+    );
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// How many times the fake `curl` was run for each URL (the most of any one), and in all.
+#[cfg(feature = "remote-images")]
+fn curl_per_url(dir: &Path) -> (usize, usize) {
+    let log = std::fs::read_to_string(dir.join("curl.log")).unwrap_or_default();
+    let mut runs: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in log.lines() {
+        *runs.entry(line).or_default() += 1;
+    }
+    (
+        runs.values().copied().max().unwrap_or(0),
+        log.lines().count(),
+    )
+}
+
+/// A bitmap that takes the budget (835 x 10,000), painted with `n` remote 1 x 1 images at distinct
+/// URLs in view, driven by what the window does (a frame for the viewport, a poll for each wake, a
+/// frame if the poll says so): every one is decoded, and no URL is fetched more than twice, the
+/// wakes are no more than the work done (round 14). With 700 of them the slot list's replacement
+/// buffer for one more result did not fit the floor of a request's allowance, the prefix of
+/// the boxes asked for got shorter with each body that arrived, and their bodies were fetched
+/// again and again while the decodes before them were never reached: decoding stopped at 576 of
+/// 701, with 9,338 curl runs and 10,616 wakes after a minute, in a viewport that did not change.
+#[cfg(feature = "remote-images")]
+fn remote_beside_a_bitmap(n: usize) {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch(&format!("beside-{n}"));
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    std::fs::write(serve.join("tiny.png"), zero_png(1, 1, 0, 8, false, 1 << 20)).unwrap();
+    std::fs::write(
+        dir.join("big.png"),
+        zero_png(835, 10_000, 0, 8, false, 1 << 20),
+    )
+    .unwrap();
+    fake_curl(&dir, &serve);
+    let mut src = String::from("![b](big.png)");
+    src.extend((0..n).map(|i| format!(" ![t](http://127.0.0.1/tiny.png?{i})")));
+    let doc = Doc::parse(&src);
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    let mut all = vec![(1u32, 835u32, 10_000u32)];
+    all.extend((2..=n as u32 + 1).map(|id| (id, 1, 1)));
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &all[..1],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    images.set_remote(true, &doc, &mut layout);
+    let wakes = images.wakes();
+    // The viewport is the same from here on: a frame for it, then only what the threads do.
+    let mut seen = images.wakes();
+    frame(&mut images, &all, all.len());
+    let t = Instant::now();
+    let mut last = Instant::now();
+    let mut decodes = 0;
+    while images.stats().decoded + images.stats().failed < n + 1 {
+        // (No more than a minute with no decode taken: the worker goes through hundreds of
+        // images at the speed of a debug build, and a request for thousands takes a while.)
+        if t.elapsed() > Duration::from_secs(900) || last.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        if images.wakes() != seen {
+            seen = images.wakes();
+            if images.poll(&doc, &mut layout) {
+                frame(&mut images, &all, all.len());
+            }
+        }
+        if images.stats().decodes != decodes {
+            decodes = images.stats().decodes;
+            last = Instant::now();
+        }
+    }
+    let stats = images.stats();
+    let (per_url, runs) = curl_per_url(&dir);
+    let wakes = images.wakes() - wakes;
+    println!(
+        "835 x 10,000 painted with {n} remote one-pixel images: {} of {} decoded, {} failed, {runs} curl runs (at most {per_url} for a URL), {wakes} wakes",
+        stats.decoded,
+        n + 1,
+        stats.failed
+    );
+    assert_eq!(
+        (stats.decoded, stats.failed),
+        (n + 1, 0),
+        "{}",
+        images.memory_report()
+    );
+    assert!(per_url <= 2, "a URL was fetched {per_url} times");
+    // (The same bound as the mix's storm detector: a wake for each result to take and each
+    // transfer that ended, and a few for the room a request finds made.)
+    let work = stats.decodes + runs;
+    assert!(
+        wakes <= work + work / 4 + 64,
+        "{wakes} wakes for {} decodes and {runs} fetches",
+        stats.decodes
+    );
+    assert!(
+        all.iter()
+            .all(|&(id, w, h)| images.pixels(id, w, h).is_some())
+    );
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(feature = "remote-images")]
+#[test]
+fn seven_hundred_remote_images_beside_a_bitmap_are_all_decoded() {
+    remote_beside_a_bitmap(700);
+}
+
+/// (Six and a half minutes in a debug build, where a request for 2,000 boxes over 4,000 slots is
+/// 4 million comparisons of strings, and the window's frame of them as many again, a thousand
+/// times over: `cargo test --release --test image_memory -- --ignored two_thousand`.)
+#[cfg(feature = "remote-images")]
+#[test]
+#[ignore = "six minutes in a debug build; run in release: cargo test --release --test image_memory -- --ignored two_thousand"]
+fn two_thousand_remote_images_beside_a_bitmap_are_all_decoded() {
+    remote_beside_a_bitmap(2_000);
+}
+
 /// The sites that make room ([`vomd::image::set_room_probe`]), in the order the counts are kept.
 #[cfg(feature = "remote-images")]
-const ROOM_SITES: [&str; 7] = [
+const ROOM_SITES: [&str; 8] = [
     "attach: tables",
     "slot list",
+    "request: the viewport",
     "request",
     "request: decodes and fetchers",
     "pause released",
@@ -2412,13 +2696,15 @@ fn room_probe(site: &'static str, bytes: usize, granted: Option<bool>) {
         ROOM_CALLS[i.unwrap_or(ROOM_SITES.len())].fetch_add(1, Relaxed);
         assert!(
             live <= limit,
-            "make_room({site:?}, {bytes}) was called with {live} bytes of the image code live, {limit} allowed: something was allocated before its room was made\n{}",
+            "make_room({site:?}, {bytes}) was called with {live} bytes of the image code live, {limit} allowed: something was allocated before its room was made (during: {})\n{}",
+            STEP.lock().unwrap_or_else(|e| e.into_inner()),
             trip_report()
         );
     } else if granted == Some(true) {
         assert!(
             live + bytes <= limit,
-            "make_room({site:?}, {bytes}) said the room is made with {live} bytes of the image code live, {limit} allowed: its arithmetic leaves something out\n{}",
+            "make_room({site:?}, {bytes}) said the room is made with {live} bytes of the image code live, {limit} allowed: its arithmetic leaves something out (during: {})\n{}",
+            STEP.lock().unwrap_or_else(|e| e.into_inner()),
             trip_report()
         );
     }
@@ -2893,6 +3179,7 @@ mod mix {
     struct Watch {
         since: Instant,
         decodes: usize,
+        traced: Instant,
     }
 
     impl Watch {
@@ -2900,10 +3187,17 @@ mod mix {
             Watch {
                 since: Instant::now(),
                 decodes: 0,
+                traced: Instant::now(),
             }
         }
 
         fn ok(&mut self, images: &Images) -> bool {
+            if std::env::var_os("VOMD_IMAGE_TRACE").is_some()
+                && self.traced.elapsed() > Duration::from_secs(3)
+            {
+                self.traced = Instant::now();
+                eprintln!("  waiting: {:?} {}", images.stats(), images.memory_report());
+            }
             let decodes = images.stats().decodes;
             if decodes != self.decodes {
                 self.decodes = decodes;
@@ -2986,6 +3280,7 @@ mod mix {
         // nobody has taken when they are (10 and 11 leave polls out, and open and reload with
         // results waiting).
         let profile = seed % 12;
+        FETCH_BOUND.store(if (6..10).contains(&profile) { 3 } else { 2 }, Relaxed);
         #[cfg(debug_assertions)]
         vomd::image::set_room_probe(room_probe);
         let pool = tagged(Tag::Driver, || make_pool(&mut rng, &dir, profile));
@@ -3063,6 +3358,8 @@ mod mix {
         );
         // The wakes the window has taken a poll for.
         let mut seen = images.wakes();
+        // What the storm detector counts from: the last change of the viewport.
+        let mut epoch = Epoch::now(&dir, &images);
         let big = matches!(profile, 1 | 4 | 5);
         for step in 0..if big { 260 } else { 160 } {
             // The peak is looked at for each operation, with what is painted for it.
@@ -3084,6 +3381,7 @@ mod mix {
                 73..=80 => "slow poll",
                 81..=83 => "set_wake",
                 84..=93 => "poll",
+                94..=96 => "deferred redraw",
                 _ => "settle",
             };
             // Zooming is looked at once its images are there, now and then (the pictures at the
@@ -3093,7 +3391,16 @@ mod mix {
                 log.push(format!(
                     "{step}: {what} (top {top}, zoom {zoom}, remote {remote})"
                 ));
+                *STEP.lock().unwrap_or_else(|e| e.into_inner()) = log.last().cloned().unwrap();
+                if std::env::var_os("VOMD_IMAGE_TRACE").is_some() {
+                    eprintln!("seed {seed} {}", log.last().unwrap());
+                }
             });
+            // The viewport is the same through polls and settling, and what a step that changes
+            // it asks for is counted from it.
+            if !matches!(what, "poll" | "slow poll" | "settle") {
+                epoch = Epoch::now(&dir, &images);
+            }
             match what {
                 "scroll" => {
                     top =
@@ -3133,6 +3440,15 @@ mod mix {
                         images.set_remote(true, doc, layout);
                         remote = true;
                     }
+                }
+                "deferred redraw" => {
+                    // The reader presses I (or the window loads them by itself): the images are
+                    // asked for again, and the window's frame does not come at once (a Wayland
+                    // compositor that has not called back): the event loop runs, asks and polls,
+                    // with nothing painted, as `View::tick` does.
+                    let (_, doc, layout) = &mut state;
+                    images.set_remote(!remote, doc, layout);
+                    remote = !remote;
                 }
                 "set_wake" => images.set_wake(window()),
                 "slow poll" => std::thread::sleep(Duration::from_millis(rng.range(30, 90).into())),
@@ -3205,6 +3521,7 @@ mod mix {
                     // from the pressure the other view put on the cache.
                     let far = if top < n / 2 { n.saturating_sub(1) } else { 0 };
                     let away = tagged(Tag::Driver, || build(far, in_view, near));
+                    epoch = Epoch::now(&dir, &images);
                     painted.frame(&mut images, &away, in_view.min(away.len()));
                     last = (away, in_view);
                     drain(
@@ -3221,6 +3538,13 @@ mod mix {
                         &mut shown,
                         &log,
                     );
+                    // (What the window did while it was away was no storm either.)
+                    if let Err(why) = epoch.storm(&dir, &images) {
+                        panic!(
+                            "seed {seed}: {why} away from the view after step {step}\n{}",
+                            images.memory_report()
+                        );
+                    }
                 }
                 if flood || wide {
                     // The bitmap is cached first (in view: it is decoded at its size), and then
@@ -3271,6 +3595,8 @@ mod mix {
                 } else {
                     in_view
                 };
+                // (What is asked for from here is the viewport's, counted from now.)
+                epoch = Epoch::now(&dir, &images);
                 if flood {
                     // Asked for without a paint and not remembered: the next frame is the
                     // window's, and replaces what was queued.
@@ -3287,11 +3613,34 @@ mod mix {
                     last = (boxes, in_view);
                 }
             } else if what == "remote off and on" {
-                // Turning them on or off repaints the window (`View::set_remote` marks the images
-                // dirty and the outcome is a redraw), and the images are asked for again after the
-                // paint, as after every frame: a request is never made over results that were
-                // stored since the last paint and have not been painted, which a bare request
-                // would take for pixels kept by a window (and go over the budget for).
+                // Turning them on or off marks the images dirty, and the next tick asks for them
+                // again (`View::set_remote`, `View::tick`) before any frame is painted: a bare
+                // request, over results that were stored since the last paint and have not been
+                // painted, which are no pixels a window keeps (seed 78: 44.6 MB live over the
+                // start when the library took them for painted).
+                images.request(&last.0, last.1);
+            } else if what == "deferred redraw" {
+                // Ticks with nothing painted: a request, the threads at work, a poll for each
+                // wake whatever it says (the redraw it asks for is the one that has not come), and
+                // then the frame.
+                for _ in 0..rng.range(2, 6) {
+                    images.request(&last.0, last.1);
+                    std::thread::sleep(Duration::from_millis(rng.range(0, 12).into()));
+                    if images.wakes() != seen {
+                        seen = images.wakes();
+                        images.poll(doc, layout);
+                    }
+                    let over = image_step_over(img_start);
+                    (past, shown) = painted.note(over, past, shown);
+                    assert!(
+                        over <= CACHE_BYTES + SLACK + painted.step,
+                        "seed {seed}: {over} bytes of the image code's live over the start in a deferred redraw (nothing painted), {} allowed to be painted ({}); {:?}\n{}",
+                        painted.step,
+                        images.memory_report(),
+                        images.stats(),
+                        trip_report()
+                    );
+                }
                 painted.frame(&mut images, &last.0, last.1);
             }
             if what != "slow poll" {
@@ -3354,6 +3703,7 @@ mod mix {
                     &last,
                     &log,
                     &mut files,
+                    &epoch,
                 );
             }
             let allowed = CACHE_BYTES + SLACK + painted.step;
@@ -3422,6 +3772,7 @@ mod mix {
             &last,
             &log,
             &mut files,
+            &epoch,
         );
         let _ = start;
         drop(armed);
@@ -3443,6 +3794,77 @@ mod mix {
             "seed {seed}: the image code's live bytes were at most {past} past the budget ({shown} painted), {left} left after, {stats:?}"
         );
         past
+    }
+
+    /// What the storm detector counts from: where the viewport last changed (the viewport, remote
+    /// images on or off, a document opened, the wake replaced). In a viewport that does not change
+    /// the fetchers run each URL at most twice (once, and once more if a transfer gave up for the
+    /// pause: its second run is not given up for it again), and the window is woken no more often
+    /// than there was work: a result to take or a transfer that ended, with a little for the room
+    /// a request finds made. More is a storm, however well each request keeps to the budget.
+    struct Epoch {
+        /// The bytes of `curl.log` when it began.
+        log: u64,
+        wakes: usize,
+        decodes: usize,
+        /// Images that failed (a decode of bad data is a result to take too).
+        failed: usize,
+    }
+
+    impl Epoch {
+        fn now(dir: &Path, images: &Images) -> Epoch {
+            Epoch {
+                log: std::fs::metadata(dir.join("curl.log")).map_or(0, |m| m.len()),
+                wakes: images.wakes(),
+                decodes: images.stats().decodes,
+                failed: images.stats().failed,
+            }
+        }
+
+        /// Whether the wakes and fetches since were no storm.
+        fn storm(&self, dir: &Path, images: &Images) -> Result<(), String> {
+            let (fetches, per_url) = tagged(Tag::Driver, || {
+                let log = std::fs::read(dir.join("curl.log")).unwrap_or_default();
+                let log = String::from_utf8_lossy(log.get(self.log as usize..).unwrap_or(&[]))
+                    .into_owned();
+                let mut runs: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for line in log.lines() {
+                    *runs.entry(line).or_default() += 1;
+                }
+                let worst = runs
+                    .iter()
+                    .max_by_key(|(_, n)| **n)
+                    .map(|(u, n)| (u.to_string(), *n));
+                (log.lines().count(), worst)
+            });
+            if let Some((_, n)) = &per_url {
+                MOST_FETCHES.fetch_max(*n, Relaxed);
+            }
+            let bound = std::env::var("VOMD_IMAGE_FETCH_BOUND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| FETCH_BOUND.load(Relaxed));
+            if let Some((url, n)) = per_url
+                && n > bound
+            {
+                return Err(format!(
+                    "{url} was fetched {n} times in a viewport that did not change ({fetches} runs in all)"
+                ));
+            }
+            let stats = images.stats();
+            let wakes = images.wakes() - self.wakes;
+            // (A decode of data that is bad is a result to take, and the image fails: counted as
+            // work, and so is a fetch that failed, which is a run too: the more lenient of the two.)
+            let decodes = stats.decodes - self.decodes + stats.failed.saturating_sub(self.failed);
+            let work = decodes + fetches;
+            if wakes > work + work / 4 + 64 {
+                return Err(format!(
+                    "{wakes} wakes in a viewport that did not change, for {decodes} decodes (and failures) and {fetches} fetches"
+                ));
+            }
+            Ok(())
+        }
     }
 
     /// What the test knows of the files of a run, for the oracle of [`liveness`]: whether the
@@ -3478,6 +3900,22 @@ mod mix {
             v
         }
 
+        /// What the test knows of what decoding holds, from what it made (the file's bytes and its
+        /// natural size) and nothing of the library's arithmetic: at least the result and the
+        /// bytes it reads, and no more than those and the whole source frame (8 bytes a pixel, a
+        /// 16-bit interlaced PNG) and 2 MiB for the decoder's own: the reservation the exemption
+        /// of [`liveness`] goes by is between them, or it is the reservation that is wrong.
+        fn cross_check(&self, asset: &Asset, w: u32, h: u32, need: usize) {
+            let (result, file) = (w as usize * h as usize * 4, self.bytes(asset).len());
+            let most = result + file + asset.w as usize * asset.h as usize * 8 + (2 << 20);
+            assert!(
+                (result + file..=most).contains(&need),
+                "{}: decoding to {w} x {h} is reserved {need}, which is not between {} and {most}",
+                asset.name,
+                result + file
+            );
+        }
+
         /// What decoding the image to `w` x `h` holds, the bytes of the file it reads included.
         fn reserved(&self, asset: &Asset, w: u32, h: u32) -> usize {
             tagged(Tag::Driver, || {
@@ -3510,6 +3948,7 @@ mod mix {
         last: &(Vec<(u32, u32, u32)>, usize),
         log: &[String],
         files: &mut Files,
+        epoch: &Epoch,
     ) {
         use vomd::render::Pixels;
         let report = |images: &Images| {
@@ -3531,26 +3970,42 @@ mod mix {
             "seed {seed}: the tables of the document are not made and nothing is left to do {when}\n{}",
             report(images)
         );
+        // The viewport has not changed since the epoch began: what was done in it is no storm.
+        if let Err(why) = epoch.storm(&files.dir, images) {
+            panic!("seed {seed}: {why} {when}\n{}", report(images));
+        }
         // The least the document's own tables hold: a source each, and for a remote URL its places
         // in the sets and tables kept per URL.
-        let overhead = page.assets.len() * 24 + page.src.matches("http://").count() * 350;
+        // (Each distinct URL once, whatever the number of images that have it.)
+        let urls: std::collections::HashSet<&str> = page
+            .assets
+            .iter()
+            .filter(|a| a.remote)
+            .map(|a| a.name.as_str())
+            .collect();
+        let overhead = page.assets.len() * 24 + urls.len() * 350;
         if overhead * 2 > CACHE_BYTES {
             return;
         }
-        let mut painted = 0usize;
-        let mut missing = Vec::new();
-        for &(id, w, h) in last.0.iter().take(last.1) {
-            let (w, h) = vomd::image::clamp_box(w, h);
-            match images.pixels(id, w, h) {
-                Some(b) => {
-                    painted += b.data.capacity() * size_of::<u32>();
-                    if (b.width, b.height) != (w, h) {
-                        missing.push((id, w, h));
+        // (Each bitmap once, whatever the number of boxes it is painted in: a bitmap shared by
+        // forty boxes is not forty.)
+        let (painted, missing) = driver(|| {
+            let mut painting = Painting::default();
+            let mut missing = Vec::new();
+            for &(id, w, h) in last.0.iter().take(last.1) {
+                let (w, h) = vomd::image::clamp_box(w, h);
+                match images.pixels(id, w, h) {
+                    Some(b) => {
+                        painting.add(b);
+                        if (b.width, b.height) != (w, h) {
+                            missing.push((id, w, h));
+                        }
                     }
+                    None => missing.push((id, w, h)),
                 }
-                None => missing.push((id, w, h)),
             }
-        }
+            (painting.bytes, missing)
+        });
         for (id, w, h) in missing {
             let Some(asset) = page.assets.get(id as usize - 1) else {
                 continue;
@@ -3559,6 +4014,7 @@ mod mix {
                 continue;
             }
             let need = files.reserved(asset, w, h);
+            files.cross_check(asset, w, h, need);
             assert!(
                 painted + need + overhead > CACHE_BYTES,
                 "seed {seed}: image {id} ({}, {} x {}) is valid and in view at {w} x {h}, decoding it holds {need}, only {painted} is painted by the others and the tables hold {overhead} at least, and it is not decoded when nothing is left to do {when}\n{}",
@@ -3602,7 +4058,8 @@ mod mix {
             worst = worst.max(random_run(seed));
         }
         println!(
-            "worst: the image code's live bytes were {worst} past the budget, painted pixels taken off (of {SLACK} allowed)"
+            "worst: the image code's live bytes were {worst} past the budget, painted pixels taken off (of {SLACK} allowed); the most fetches of a URL in a viewport that did not change: {}",
+            MOST_FETCHES.load(Relaxed)
         );
         println!(
             "make_room calls, each held to the budget when made: {}",
