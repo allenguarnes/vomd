@@ -1067,9 +1067,10 @@ fn images_beyond_the_cache_are_not_decoded_over_and_over() {
     images.set_base(Some(dir.clone()));
     images.attach(&doc, &mut layout);
     // Room for three of them (40,000 bytes each, as boxes: a fourth would make 160,000 of
-    // them) beside the decode of another (its file, its result and what decoding holds). One that
+    // them) beside the decode of another (its file, its result and what decoding holds) and what
+    // the request needs while it runs (a few KB). One that
     // would cross the line is the one that isn't kept: the budget is not gone over by a box.
-    images.cache.cap = images.cost(4, 100, 100) + 130_000;
+    images.cache.cap = images.cost(4, 100, 100) + 140_000;
     // Image 1 in view, the others a screen away.
     let boxes = [(1, 100, 100), (2, 100, 100), (3, 100, 100), (4, 100, 100)];
     // A frame per result: results straddle frames, as the decodes of big images do. It is
@@ -1161,6 +1162,60 @@ fn a_document_whose_images_cost_more_than_the_budget_has_none() {
     assert_eq!(images.srcs.len(), 100);
     layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
     assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(30, 20)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A document whose tables fit the budget when nothing is decoding, but not beside a decode that is
+/// still running (the old document's, whose result nobody has taken), has them made by the poll
+/// that takes the decode's result: until then nothing is allocated for it and every image shows
+/// its alt text, and the decode is never held beside them.
+#[test]
+fn tables_that_do_not_fit_beside_a_decode_wait_for_it() {
+    let dir = scratch("later");
+    std::fs::write(
+        dir.join("a.png"),
+        png_bytes(30, 20, |_, _| [0, 0, 255, 255]),
+    )
+    .unwrap();
+    let old = Doc::parse("![o](a.png)");
+    let mut old_layout = Layout::new(&old, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.attach(&old, &mut old_layout);
+    // A decode that is running: the worker has a job it has not delivered, which holds 1 MB.
+    images.worker = Some(Worker::spawn(images.tx.clone(), images.wake.clone()));
+    let shared = images.worker.as_ref().unwrap().shared.clone();
+    shared.0.lock().unwrap().busy = Some((Key::Local(1), 30, 20, 1_000_000));
+    let src: String = (0..100).map(|_| "![p](a.png) ").collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    // Room for the tables and what is kept, and not for the decode beside them.
+    images.cache.cap = 1_000_000 + attach_bytes(100, 0) / 2;
+    images.attach(&doc, &mut layout);
+    assert!(images.unbuilt, "the tables wait");
+    assert!(
+        images.srcs.is_empty() && images.srcs.capacity() == 0,
+        "nothing made"
+    );
+    images.begin_frame();
+    images.request(&[(1, 30, 20)], 1);
+    assert!(images.srcs.is_empty());
+    assert_eq!(images.stats().decodes, 0);
+    // The decode is over and its result taken: the tables are made, the layout told.
+    Worker::taken(&shared);
+    assert!(images.poll(&doc, &mut layout), "the poll makes them");
+    assert!(!images.unbuilt);
+    assert_eq!(images.srcs.len(), 100);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
+    assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(30, 20)));
+    // One that wouldn't fit when nothing is decoding either is never made.
+    images.cache.cap = attach_bytes(100, 0) - 1;
+    images.attach(&doc, &mut layout);
+    assert!(
+        !images.unbuilt && images.srcs.is_empty(),
+        "no room even idle: alt text"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1851,7 +1906,12 @@ fn a_body_is_let_in_alone_when_nothing_can_make_room() {
         if images.stats().decoded == N as usize {
             break;
         }
-        assert!(t.elapsed() < Duration::from_secs(60), "stuck");
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "stuck: {:?} {}",
+            images.stats(),
+            images.memory_report()
+        );
     }
     for id in 1..=N {
         assert!(images.pixels(id, 40, 30).is_some(), "image {id}");
@@ -1904,7 +1964,7 @@ fn a_body_dropped_for_lack_of_room_is_not_fetched_in_a_loop() {
     // The tall image decodes, and the body is fetched and dropped for lack of room (its cost is
     // kept): the state the window is in until something changes.
     drive(&mut images, &doc, &mut layout, &both, 1, |i| {
-        i.pixels(1, 720, 6000).is_some() && i.deferred.contains_key(&url) && i.is_idle()
+        i.pixels(1, 720, 6000).is_some() && i.deferred_need(&url).is_some() && i.is_idle()
     });
     let n0 = fetches.load(Ordering::SeqCst);
     assert!(n0 <= 2, "the body was fetched {n0} times");
@@ -1914,7 +1974,11 @@ fn a_body_dropped_for_lack_of_room_is_not_fetched_in_a_loop() {
         images.begin_frame();
         images.request(&both, 1);
         images.poll(&doc, &mut layout);
-        assert!(images.pixels(1, 720, 6000).is_some());
+        assert!(
+            images.pixels(1, 720, 6000).is_some(),
+            "{}",
+            images.memory_report()
+        );
     }
     drive(&mut images, &doc, &mut layout, &both, 1, |i| i.is_idle());
     assert_eq!(
@@ -1975,7 +2039,7 @@ fn a_dropped_body_is_fetched_again_when_room_is_made() {
     // on however often the window paints and polls.
     drive(&mut images, &doc, &mut layout, &with_tall, 1, |i| {
         i.pixels(1, 720, 6000).is_some()
-            && urls.iter().all(|u| i.deferred.contains_key(u))
+            && urls.iter().all(|u| i.deferred_need(u).is_some())
             && i.is_idle()
     });
     let n0 = fetches.load(Ordering::SeqCst);
@@ -2302,8 +2366,11 @@ fn the_slot_list_gives_back_its_room() {
     {
         let mut m: std::collections::HashMap<u32, u32> = (0..5000).map(|n| (n, n)).collect();
         m.retain(|&n, _| n < 3);
-        shrink_map(&mut m);
+        fit_map(&mut m, 0);
         assert!(m.capacity() <= 2 * 3 + 16, "{}", m.capacity());
+        // With room for what a document will add, which is there whatever was pruned.
+        fit_map(&mut m, 100);
+        assert!(m.capacity() >= 103, "{}", m.capacity());
     }
 }
 
@@ -2938,7 +3005,7 @@ fn an_image_that_failed_is_not_decoded_again_for_the_body_still_held() {
         Key::Remote(url.clone()),
         Data::Bytes(Arc::new(png[..png.len() / 2].to_vec())),
     );
-    images.remote.failed(&url);
+    images.remote.failed(&url, true);
     let boxes = [(1, 40, 30), (2, 20, 15)];
     images.begin_frame();
     images.request(&boxes, 2);
@@ -3000,7 +3067,7 @@ fn evicting_the_last_slot_of_a_url_forgets_what_is_kept_for_it() {
         let body: Bytes = Arc::new(vec![0u8; 64]);
         images
             .remote
-            .take_fetched(&u, Ok((body.clone(), 4, 4)))
+            .take_fetched(&u, Ok((body.clone(), 4, 4)), true)
             .unwrap();
         images
             .cache

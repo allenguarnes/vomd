@@ -409,7 +409,7 @@ fn what_fetching_found_decides_the_layout() {
     let bytes: Bytes = Arc::new(png());
     assert!(r.fetched(&url, Ok((bytes, 2, 1))).is_some());
     assert_eq!(r.layout_size(&url), ImageSize::Pixels(2, 1));
-    r.failed(&url);
+    r.failed(&url, true);
     assert_eq!(r.layout_size(&url), ImageSize::Alt);
     let other: Arc<str> = "https://x.y/b.png".into();
     assert!(r.fetched(&other, Err(Error::NoCurl)).is_none());

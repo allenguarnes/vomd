@@ -120,11 +120,14 @@ pub enum Error {
     NotAnImage,
 }
 
-/// Whether `url` may be handed to `curl`: `http://` or `https://` (any case), and no spaces or
-/// control characters.
+/// Whether `url` may be handed to `curl`: `http://` or `https://` (any case), no longer than
+/// [`image::MAX_SRC`] (the copies `Command` makes of it, one for each fetcher, are the size of
+/// what it is given: a URL of megabytes would cost them each its length three times over, which
+/// nothing counts, and no server takes one), and no spaces or control characters.
 pub fn fetchable(url: &str) -> bool {
     let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
-    (lower.starts_with("http://") || lower.starts_with("https://"))
+    url.len() <= image::MAX_SRC
+        && (lower.starts_with("http://") || lower.starts_with("https://"))
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
@@ -314,8 +317,13 @@ struct Active {
 
 struct Queue {
     urls: Vec<Arc<str>>,
-    /// What the strings of `urls` hold ([`image::str_bytes`] of each), kept as it changes: the
-    /// URLs are shared with the document's, until the document goes.
+    /// The URLs of fetches that gave up (see [`Error::Yielded`]), next in line again: at most one
+    /// for each fetcher, so the room for them is made with the queue and never grows. (Put at the
+    /// front of `urls` they would grow its buffer, which is as big as the document's list, by
+    /// doubling it.)
+    requeue: Vec<Arc<str>>,
+    /// What the strings of `urls` and `requeue` hold ([`image::str_bytes`] of each), kept as it
+    /// changes: the URLs are shared with the document's, until the document goes.
     urls_str: usize,
     /// Not queued again while here, however often the queue is replaced or fetching stopped
     /// ([`Pool::done`] removes a URL).
@@ -349,6 +357,7 @@ impl Pool {
     fn spawn(tx: Sender<Done>, wake: Wake, fetch: Fetcher, paused: bool) -> Pool {
         let queue = Queue {
             urls: Vec::new(),
+            requeue: Vec::with_capacity(FETCHERS),
             urls_str: 0,
             active: Vec::new(),
             next_seq: 0,
@@ -379,7 +388,7 @@ impl Pool {
                 // `curl` left waiting for credit would time out, and one that starts only to
                 // give up again (see `grant`) would be fetched over and over. Nor while
                 // `PENDING_MAX` results wait to be taken, or while paused.
-                while (q.urls.is_empty()
+                while ((q.urls.is_empty() && q.requeue.is_empty())
                     || q.paused
                     || q.held() >= FETCH_BYTES
                     || q.active.iter().any(|a| a.blocked)
@@ -391,7 +400,11 @@ impl Pool {
                 if q.quit {
                     return;
                 }
-                let url = q.urls.remove(0);
+                let url = if q.requeue.is_empty() {
+                    q.urls.remove(0)
+                } else {
+                    q.requeue.remove(0)
+                };
                 q.urls_str -= image::str_bytes(&url);
                 let seq = q.next_seq;
                 q.next_seq += 1;
@@ -413,8 +426,10 @@ impl Pool {
                 q.active.retain(|a| a.seq != seq);
                 image::shrink_vec(&mut q.active);
                 if !q.stopped {
+                    // (At most one for each fetcher is ever in it: the room is made.)
+                    debug_assert!(q.requeue.len() < q.requeue.capacity());
                     q.urls_str += image::str_bytes(&url);
-                    q.urls.insert(0, url);
+                    q.requeue.push(url);
                 }
                 cv.notify_all();
                 // Paused to have the fetchers hold nothing: whoever waits for that is told.
@@ -537,7 +552,9 @@ impl Pool {
     fn bookkeeping(&self) -> usize {
         let (lock, _) = &*self.shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
-        image::vec_bytes(&q.urls).saturating_add(q.urls_str)
+        image::vec_bytes(&q.urls)
+            .saturating_add(image::vec_bytes(&q.requeue))
+            .saturating_add(q.urls_str)
     }
 
     /// Bytes of bodies held: being read, or waiting to be taken.
@@ -558,7 +575,7 @@ impl Pool {
     fn busy(&self) -> bool {
         let (lock, _) = &*self.shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
-        !q.urls.is_empty() || !q.active.is_empty()
+        !q.urls.is_empty() || !q.requeue.is_empty() || !q.active.is_empty()
     }
 
     /// Replace the queue with `urls` (not the ones being fetched).
@@ -567,6 +584,7 @@ impl Pool {
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         urls.retain(|u| !q.active.iter().any(|a| a.url == *u));
         q.stopped = false;
+        q.requeue.clear();
         q.urls_str = urls.iter().map(|u| image::str_bytes(u)).sum();
         q.urls = urls;
         cv.notify_all();
@@ -579,6 +597,7 @@ impl Pool {
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.stopped = true;
         q.urls = Vec::new();
+        q.requeue.clear();
         q.urls_str = 0;
         cv.notify_all();
     }
@@ -596,6 +615,7 @@ impl Drop for Pool {
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.quit = true;
         q.urls = Vec::new();
+        q.requeue.clear();
         q.urls_str = 0;
         cv.notify_all();
     }
@@ -664,7 +684,7 @@ impl Remote {
     /// fetchers' credit for it is free ([`Remote::release`]).
     #[cfg(test)]
     pub(crate) fn fetched(&mut self, url: &Arc<str>, result: Fetched) -> Option<Bytes> {
-        let bytes = self.take_fetched(url, result);
+        let bytes = self.take_fetched(url, result, true);
         self.release(url);
         bytes
     }
@@ -672,10 +692,19 @@ impl Remote {
     /// [`Remote::fetched`] without letting the credit go: the caller puts the bytes where they
     /// are charged (the cache) or frees them, and then calls [`Remote::release`], so the body is
     /// never allocated and uncounted at once.
-    pub(crate) fn take_fetched(&mut self, url: &Arc<str>, result: Fetched) -> Option<Bytes> {
+    ///
+    /// What is found is recorded for `url` only if `own` (it is the document's, and the table has
+    /// room for it: [`Remote::reserve_sizes`]); for another's, only a record there already is
+    /// brought up to date, and none is made.
+    pub(crate) fn take_fetched(
+        &mut self,
+        url: &Arc<str>,
+        result: Fetched,
+        own: bool,
+    ) -> Option<Bytes> {
         match result {
             Ok((bytes, w, h)) => {
-                self.record(url, Some((w, h)));
+                self.record(url, Some((w, h)), own);
                 Some(bytes)
             }
             Err(Error::NoCurl) => {
@@ -686,15 +715,20 @@ impl Remote {
             // Nothing was found out: asked for again, as an image not fetched yet.
             Err(Error::Yielded) => None,
             Err(_) => {
-                self.record(url, None);
+                self.record(url, None, own);
                 None
             }
         }
     }
 
-    /// What fetching found for `url`.
-    fn record(&mut self, url: &Arc<str>, size: Option<(u32, u32)>) {
-        if self.sizes.insert(url.clone(), size).is_none() {
+    /// What fetching found for `url`. The table never grows here: a record already there is
+    /// replaced, and a new one (`insert`: the document's URL) goes in the room made for the
+    /// document's URLs ([`Remote::fit_sizes`]), which is there by what the document's numbers say.
+    fn record(&mut self, url: &Arc<str>, size: Option<(u32, u32)>, insert: bool) {
+        if let Some(found) = self.sizes.get_mut(url) {
+            *found = size;
+        } else if insert {
+            self.sizes.insert(url.clone(), size);
             self.sizes_str += image::str_bytes(url);
         }
     }
@@ -722,18 +756,46 @@ impl Remote {
             k
         });
         self.sizes_str -= freed;
-        image::shrink_map(&mut self.sizes);
     }
 
     /// Forget what fetching found for `urls` (their last slot in the cache was evicted, and the
-    /// document doesn't have them): the entries, their strings and the room the table has left.
+    /// document doesn't have them): the entries and their strings. (The table keeps its room,
+    /// which is the document's: it is cut to size when the next one is attached,
+    /// [`Remote::fit_sizes`], and a smaller one is never made beside it here.)
     pub(crate) fn forget_sizes<'a>(&mut self, urls: impl IntoIterator<Item = &'a Arc<str>>) {
         for u in urls {
             if self.sizes.remove(u).is_some() {
                 self.sizes_str -= image::str_bytes(u);
             }
         }
-        image::shrink_map(&mut self.sizes);
+    }
+
+    /// Whether a record for `url` can be made without the table growing (it has one, or room:
+    /// the table is given the room for a document's URLs, [`Remote::fit_sizes`]).
+    pub(crate) fn has_room_for(&self, url: &Arc<str>) -> bool {
+        self.sizes.len() < self.sizes.capacity() || self.sizes.contains_key(url)
+    }
+
+    /// Whether the table of sizes has more than twice the room it needs for what it holds and
+    /// `extra` more URLs (and 16): see [`image::fit_map`].
+    pub(crate) fn sizes_oversized(&self, extra: usize) -> bool {
+        self.sizes.capacity() > 2 * self.sizes.len().saturating_add(extra) + 16
+    }
+
+    /// What a table of sizes with room for `extra` more URLs than it holds costs
+    /// ([`image::table_bytes`]): what a document of that many remote images is charged for it.
+    pub(crate) fn sizes_bytes_for(&self, extra: usize) -> usize {
+        image::table_bytes(
+            self.sizes.len().saturating_add(extra),
+            size_of::<(Arc<str>, Option<(u32, u32)>)>(),
+        )
+    }
+
+    /// Give the table of sizes room for `extra` more URLs (a document is attached, with that many
+    /// remote images: what is recorded after is only theirs), and cut it to what that needs if it
+    /// has more than twice. The one place it is made, beside the old, for the room made for it.
+    pub(crate) fn fit_sizes(&mut self, extra: usize) {
+        image::fit_map(&mut self.sizes, extra);
     }
 
     /// The URLs that failed or aren't PNG or JPEG (what [`Remote::size`] calls `Some(None)`).
@@ -744,9 +806,10 @@ impl Remote {
             .map(|(u, _)| u)
     }
 
-    /// The image at `url` didn't decode: it shows its alt text from now on.
-    pub(crate) fn failed(&mut self, url: &Arc<str>) {
-        self.record(url, None);
+    /// The image at `url` didn't decode: it shows its alt text from now on. (`own`: the URL is the
+    /// document's, see [`Remote::record`].)
+    pub(crate) fn failed(&mut self, url: &Arc<str>, own: bool) {
+        self.record(url, None, own);
     }
 
     /// Fetch `urls`, most wanted first (duplicates are fetched once), replacing what the
@@ -755,7 +818,8 @@ impl Remote {
         if self.no_curl || !self.on {
             return;
         }
-        let mut seen = std::collections::HashSet::new();
+        // (Made at the size it will be: one table, not one grown by doubling.)
+        let mut seen = std::collections::HashSet::with_capacity(urls.len());
         urls.retain(|u| seen.insert(u.clone()));
         if urls.is_empty() && self.pool.is_none() {
             return;
