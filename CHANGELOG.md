@@ -34,6 +34,8 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   read completes undisturbed), and the bus going away also returns to winit and `GTK_THEME`.
 - Wide layout: `W`, the toolbar's button (next to the theme's) or `wide = true` in
   `settings.ini` lets the text span the window instead of stopping at `line_width`; it is saved.
+  A change of the column's width (this, or resizing the window) rescales the heights not yet
+  measured by how the text rewraps, so the scrollbar is right while measuring goes on.
 - The scrollbar also shows while the pointer is over its column.
 - Budgets checked in CI (`cargo xtask budgets`): binary size, cold and warm start, idle RSS,
   idle CPU, 4K scroll frame time. Fuzz targets for the parser, layout and settings.

@@ -488,6 +488,36 @@ fn store_records_font_paths() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn store_saves_the_wide_toggle_and_keeps_comments() {
+    let dir = temp_dir("wide");
+    let path = dir.join("settings.ini");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = "# my settings\ntheme = dark\n\n# wide = false\nzoom = 120\n";
+    std::fs::write(&path, file).unwrap();
+    let mut st = Store::open(Some(path.clone()));
+    assert!(!st.prefs().wide);
+    st.set("wide", "true", Instant::now());
+    st.flush().unwrap();
+    // The template's commented default is replaced in place; the rest is untouched.
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# my settings\ntheme = dark\n\nwide = true\nzoom = 120\n"
+    );
+    // Read again by another run: the value is kept, and so are the comments.
+    let mut again = Store::open(Some(path.clone()));
+    assert!(again.prefs().wide);
+    assert_eq!(again.prefs().zoom, 120);
+    again.set("wide", "false", Instant::now());
+    again.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# my settings\ntheme = dark\n\nwide = false\nzoom = 120\n"
+    );
+    assert!(!Store::open(Some(path)).prefs().wide);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // ---- Parser details ---------------------------------------------------------------------------
 
 #[test]

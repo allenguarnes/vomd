@@ -21,15 +21,18 @@ thread_local! {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // The first byte picks the width (narrow ones wrap everything) and the scale.
-    let Some((&b, rest)) = data.split_first() else {
+    // The first two bytes pick the width (narrow ones wrap everything, wide ones pass the
+    // line width's cap), the scale and the wide layout.
+    let Some((&[b0, b1], rest)) = data.split_first_chunk() else {
         return;
     };
+    let b = u16::from_le_bytes([b0, b1]);
     let src = String::from_utf8_lossy(rest);
     let doc = Doc::parse(&src);
     let params = Params {
-        width: 8.0 + f32::from(b >> 1) * 6.0,
+        width: 8.0 + f32::from((b >> 2) % 3000),
         scale: if b & 1 == 0 { 1.0 } else { 2.0 },
+        wide: b & 2 != 0,
         ..Params::default()
     };
     FONTS.with(|fonts| {

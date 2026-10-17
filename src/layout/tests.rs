@@ -218,7 +218,7 @@ fn set_params_remeasures() {
         n.ensure(&doc, &fonts, Anchor::TOP, 800.0);
         n.total_height()
     };
-    l.set_params(params(500.0, 1.0));
+    l.set_params(&doc, params(500.0, 1.0));
     assert!(!l.complete());
     while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
     assert!((l.total_height() - narrow_total).abs() < 1e-2);
@@ -612,19 +612,19 @@ fn a_family_switch_after_a_param_change_leaves_no_stale_characters() {
     );
     let mut l = Layout::new(&doc, params(900.0, 1.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
-    l.set_params(params(900.0, 1.5));
+    l.set_params(&doc, params(900.0, 1.5));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     // Queued again by the remeasure with the defaults, not taken yet.
     assert!(fonts.set_family(false, Some(&jb_faces())));
     l.invalidate_all();
-    l.set_params(params(900.0, 2.0));
+    l.set_params(&doc, params(900.0, 2.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     assert_eq!(l.take_missing(), vec!['\u{E000}']);
     // Without a family change a relayout queues what is uncovered again, not what was before.
     let mut fonts = Fonts::new().unwrap();
     let mut l = Layout::new(&doc, params(900.0, 1.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
-    l.set_params(params(900.0, 1.5));
+    l.set_params(&doc, params(900.0, 1.5));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     let mut both = l.take_missing();
     both.sort_unstable();
@@ -1840,7 +1840,7 @@ fn images_are_boxes_of_their_size() {
     assert!(t.width >= 1.0 && t.width <= 3.0, "keeps its shape: {t:?}");
 
     // Twice the scale (HiDPI or zoom): twice the pixels.
-    l.set_params(params(900.0, 2.0));
+    l.set_params(&doc, params(900.0, 2.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 4000.0);
     assert_eq!(boxes(&l, 0)[0].b.width, 200.0);
     assert_eq!(boxes(&l, 0)[0].b.ascent, 100.0);
@@ -1972,4 +1972,66 @@ fn an_image_with_a_long_alt_text_is_one_box() {
     l.ensure(&doc, &fonts, Anchor::TOP, 100_000.0);
     assert_eq!(count(&l), 1);
     assert_eq!(boxes(&l, alt_chunks[0])[0].b.width, 10.0);
+}
+
+/// A wider column rescales the old heights by how the text rewraps in it, so the document
+/// doesn't seem several times too long until it is measured again.
+#[test]
+fn a_wider_column_rescales_the_estimates() {
+    let fonts = Fonts::new().unwrap();
+    let para = "Words that run on and on, wrapping at the edge of the column. ".repeat(12);
+    let doc = Doc::parse(&format!("{para}\n\n").repeat(200));
+    let normal = params(2560.0, 1.0);
+    let wide = Params {
+        wide: true,
+        ..normal
+    };
+    let mut l = complete(&doc, &fonts, normal);
+    let was = l.total_height();
+    let wide_total = complete(&doc, &fonts, wide).total_height();
+    assert!(was > wide_total * 2.5, "{was} vs {wide_total}");
+    l.set_params(&doc, wide);
+    assert!(!l.complete());
+    let estimate = l.total_height();
+    assert!(
+        (estimate / wide_total - 1.0).abs() < 0.25,
+        "{estimate} vs {wide_total}"
+    );
+    // The same for a window that gets wider.
+    let mut l = complete(&doc, &fonts, params(900.0, 1.0));
+    l.set_params(&doc, normal);
+    let narrow_estimate = l.total_height();
+    let exact = complete(&doc, &fonts, normal).total_height();
+    assert!(
+        (narrow_estimate / exact - 1.0).abs() < 0.25,
+        "{narrow_estimate} vs {exact}"
+    );
+}
+
+/// The wide layout in a window narrower than the cap changes nothing: the document isn't
+/// measured again.
+#[test]
+fn wide_in_a_narrow_window_keeps_the_measured_blocks() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("readme.md"));
+    let normal = params(600.0, 1.0);
+    let mut l = complete(&doc, &fonts, normal);
+    let total = l.total_height();
+    let wide = Params {
+        wide: true,
+        ..normal
+    };
+    l.set_params(&doc, wide);
+    assert_eq!(l.params(), wide);
+    assert!(l.complete(), "nothing was invalidated");
+    assert_eq!(l.total_height(), total);
+    // Where it does change the column, it measures again.
+    l.set_params(
+        &doc,
+        Params {
+            width: 3000.0,
+            ..wide
+        },
+    );
+    assert!(!l.complete());
 }

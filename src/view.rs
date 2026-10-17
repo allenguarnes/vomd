@@ -566,6 +566,15 @@ impl View {
         self.relayout();
     }
 
+    /// Zoom, base font size, line width and wide layout in one relayout: what the settings file
+    /// asks for at startup is measured once, not once for each.
+    pub fn set_layout(&mut self, zoom: u16, font_size: f32, line_width: f32, wide: bool) {
+        self.zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        self.text = (font_size, line_width);
+        self.wide = wide;
+        self.relayout();
+    }
+
     pub fn wide(&self) -> bool {
         self.wide
     }
@@ -686,13 +695,14 @@ impl View {
     }
 
     /// New layout parameters; the anchor keeps the reading position. The blocks around it are
-    /// measured at once: until they are, the heights are the old ones (scaled by the font size
-    /// only, nothing rewrapped), so a window that got narrower and taller would seem to end
-    /// above the position, and clamping against that would throw it away.
+    /// measured at once: until they are, the heights are the old ones (rescaled by their
+    /// estimates in the new column, nothing rewrapped), so a window that got narrower and taller
+    /// would seem to end above the position, and clamping against that would throw it away.
     fn relayout(&mut self) {
-        self.layout.set_params(params(
-            self.width, self.hidpi, self.zoom, self.text, self.wide,
-        ));
+        self.layout.set_params(
+            &self.doc,
+            params(self.width, self.hidpi, self.zoom, self.text, self.wide),
+        );
         self.ensure();
     }
 

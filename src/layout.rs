@@ -363,16 +363,50 @@ impl Layout {
     }
 
     /// New width, scale, or font settings: everything is remeasured (old heights remain as
-    /// estimates, scaled, so the scrollbar doesn't jump).
-    pub fn set_params(&mut self, params: Params) {
-        if params == self.params {
+    /// estimates, so the scrollbar doesn't jump): each is scaled by how much its estimate
+    /// changed with the column and the font size, as text rewraps in a new width, so a
+    /// window or the wide layout making the column several times wider doesn't leave the
+    /// document seeming that much longer until it is measured. Nothing happens, beyond
+    /// recording `params`, when the column and everything else laid out stay the same (the
+    /// wide layout in a window narrower than the cap).
+    pub fn set_params(&mut self, doc: &Doc, params: Params) {
+        let old_params = std::mem::replace(&mut self.params, params);
+        if params == old_params {
             return;
         }
-        let old_em = self.em;
-        self.params = params;
+        let old = (self.em, self.col_x, self.col_w);
         self.set_geometry();
-        let ratio = if old_em > 0.0 { self.em / old_em } else { 1.0 };
-        self.remeasure(ratio);
+        let same = Params {
+            wide: old_params.wide,
+            line_width: old_params.line_width,
+            ..params
+        } == old_params;
+        if same && old == (self.em, self.col_x, self.col_w) {
+            return;
+        }
+        let new = (self.em, self.col_x, self.col_w);
+        if old.2 == new.2 {
+            // The text wraps as before: only the font size scales the heights.
+            let ratio = if old.0 > 0.0 { new.0 / old.0 } else { 1.0 };
+            self.remeasure(ratio);
+            return;
+        }
+        // Estimates are cheap (no shaping), but still one pass over the text each.
+        (self.em, self.col_x, self.col_w) = old;
+        let before: Vec<f32> = (0..self.geoms.len())
+            .map(|i| self.estimate(doc, i))
+            .collect();
+        (self.em, self.col_x, self.col_w) = new;
+        for (i, before) in before.into_iter().enumerate() {
+            let after = self.estimate(doc, i);
+            let g = &mut self.geoms[i];
+            g.h = if before > 0.0 && g.h > 0.0 {
+                g.h * after / before
+            } else {
+                after
+            };
+        }
+        self.remeasure(1.0);
     }
 
     /// The faces text is set in changed (`font_sans` / `font_mono`): everything is remeasured.

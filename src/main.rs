@@ -231,15 +231,13 @@ impl App {
             return;
         };
         view.set_theme_mode(prefs.theme);
-        view.set_zoom(prefs.zoom);
+        view.set_layout(prefs.zoom, prefs.font_size, prefs.line_width, prefs.wide);
         view.set_remote_policy(prefs.remote_images);
         if view.toolbar_visible() != prefs.toolbar {
             view.set_toolbar(prefs.toolbar);
         }
         self.toolbar_shown = prefs.toolbar;
-        view.set_wide(prefs.wide);
         self.wide_set = prefs.wide;
-        view.set_text(prefs.font_size, prefs.line_width);
         for mono in [false, true] {
             let (family, cached) = if mono {
                 (&prefs.font_mono, &prefs.font_mono_path)

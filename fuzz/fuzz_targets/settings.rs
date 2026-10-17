@@ -16,6 +16,7 @@ const KEYS: &[&str] = &[
     "font_sans_path",
     "font_mono_path",
     "remote_images",
+    "wide",
     "window_width",
     "window_height",
 ];

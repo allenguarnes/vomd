@@ -1,9 +1,9 @@
 //! The toolbar: one slim bar docked at the top, never over the text.
 //!
-//! Left: Back. Right: remote images (only when the document has any), zoom (− 100% +), theme,
-//! wide layout, theme, reload, settings. Buttons for features that aren't built yet are absent. On narrow windows
-//! the right group collapses into a `⋯` button with a small dropdown, the one popup in the app:
-//! zoom first, then remote images, wide layout, theme, ...
+//! Left: Back. Right: remote images (only when the document has any), zoom (− 100% +), wide
+//! layout, theme, reload, settings. Buttons for features that aren't built yet are absent. On
+//! narrow windows the right group collapses into a `⋯` button with a small dropdown, the one
+//! popup in the app: zoom first, then remote images, wide layout, theme, ...
 //! A tooltip with the name and shortcut appears after 500 ms. Icons are glyphs of an embedded
 //! Lucide subset, drawn through the glyph cache, so they're crisp at every scale.
 //!
