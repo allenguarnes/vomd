@@ -81,6 +81,12 @@ fn watch_dark(proxy: EventLoopProxy<UserEvent>) -> Option<FirstDark> {
     }
 }
 
+/// Whether the system theme is dark: the portal's preference if it has one, else
+/// winit's theme, else what `GTK_THEME` says (`gtk`).
+fn system_dark(portal: Option<bool>, winit: Option<Theme>, gtk: impl FnOnce() -> bool) -> bool {
+    portal.unwrap_or_else(|| winit.map_or_else(gtk, |t| t == Theme::Dark))
+}
+
 /// The document as read and parsed off the main thread.
 struct Loaded {
     doc: Doc,
@@ -141,8 +147,8 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     /// The portal's first dark preference, waited for by the first window.
     portal_first: Option<FirstDark>,
-    /// The portal gave a preference: it wins over winit's theme.
-    portal_dark: bool,
+    /// The portal's dark preference, if it has one: it wins over winit's theme.
+    portal: Option<bool>,
     /// A fallback font scan is running.
     scanning: bool,
     /// A redraw was asked for and not yet painted.
@@ -586,11 +592,8 @@ impl ApplicationHandler<UserEvent> for App {
                 std::thread::park_timeout(left);
             }
         });
-        self.portal_dark = portal.is_some();
-        view.set_system_dark(portal.unwrap_or_else(|| match window.theme() {
-            Some(t) => t == Theme::Dark,
-            None => platform::fallback_dark(),
-        }));
+        self.portal = portal;
+        view.set_system_dark(system_dark(portal, window.theme(), platform::fallback_dark));
         self.view = Some(view);
         self.gfx = Some(Gfx { window, surface });
         self.apply(&prefs);
@@ -636,9 +639,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::SystemDark(dark) => {
-                self.portal_dark |= dark.is_some();
-                if let (Some(view), Some(dark)) = (self.view.as_mut(), dark)
-                    && view.set_system_dark(dark)
+                self.portal = dark;
+                if let (Some(view), Some(gfx)) = (self.view.as_mut(), self.gfx.as_ref())
+                    && view.set_system_dark(system_dark(
+                        dark,
+                        gfx.window.theme(),
+                        platform::fallback_dark,
+                    ))
                 {
                     self.redraw();
                 }
@@ -671,7 +678,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw();
             }
             WindowEvent::ThemeChanged(theme) => {
-                if !self.portal_dark && view.set_system_dark(theme == Theme::Dark) {
+                if view.set_system_dark(system_dark(
+                    self.portal,
+                    Some(theme),
+                    platform::fallback_dark,
+                )) {
                     self.redraw();
                 }
             }
@@ -878,7 +889,7 @@ fn main() {
         gfx: None,
         proxy: event_loop.create_proxy(),
         portal_first: watch_dark(event_loop.create_proxy()),
-        portal_dark: false,
+        portal: None,
         scanning: false,
         redraw_pending: Cell::new(false),
         stamp: None,
@@ -922,7 +933,8 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::same_family;
+    use super::{same_family, system_dark};
+    use winit::window::Theme;
 
     /// A family lookup in flight when the setting changes is ignored when it comes back: its
     /// result only counts while the family is still the wanted one (`Families` event).
@@ -938,5 +950,25 @@ mod tests {
             "back to the default meanwhile"
         );
         assert!(same_family(None, None));
+    }
+
+    /// The portal's preference wins while it has one and gives way when it is withdrawn
+    /// (GNOME's light style is `color-scheme` 0): the theme then follows winit, then `GTK_THEME`.
+    #[test]
+    fn the_portal_wins_only_while_it_has_a_preference() {
+        let gtk_dark = || true;
+        let gtk_light = || false;
+        // Dark Style on, then off: winit's theme (Wayland: none) and GTK_THEME decide again.
+        assert!(system_dark(Some(true), None, gtk_light));
+        assert!(!system_dark(None, None, gtk_light));
+        assert!(system_dark(None, None, gtk_dark));
+        assert!(!system_dark(None, Some(Theme::Light), gtk_dark));
+        // Light preference, then dark.
+        assert!(!system_dark(Some(false), Some(Theme::Dark), gtk_dark));
+        assert!(system_dark(Some(true), Some(Theme::Light), gtk_light));
+        // ThemeChanged: ignored with a portal preference, followed without one.
+        assert!(!system_dark(Some(false), Some(Theme::Dark), gtk_light));
+        assert!(system_dark(None, Some(Theme::Dark), gtk_light));
+        assert!(!system_dark(None, Some(Theme::Light), gtk_dark));
     }
 }

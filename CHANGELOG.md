@@ -26,7 +26,8 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
 - The app icon (an eye over the Markdown mark). The window's Wayland app ID and X11 `WM_CLASS` are
   `vomd`, so the desktop shows it for the window.
 - The system theme comes from the desktop portal's `color-scheme` (Plasma's and GNOME's dark
-  mode, followed live), not only winit and `GTK_THEME`, which say nothing on Wayland.
+  mode, followed live, and back to winit and `GTK_THEME` when the preference is withdrawn), which
+  say nothing on Wayland.
 - The scrollbar also shows while the pointer is over its column.
 - Budgets checked in CI (`cargo xtask budgets`): binary size, cold and warm start, idle RSS,
   idle CPU, 4K scroll frame time. Fuzz targets for the parser, layout and settings.

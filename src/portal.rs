@@ -32,6 +32,7 @@ pub fn watch(mut f: impl FnMut(Option<bool>)) {
         return;
     };
     f(bus.read_setting());
+    // (A read that failed midway leaves the stream unusable: `follow` sees `dead`.)
     bus.follow(f);
 }
 
@@ -47,7 +48,13 @@ fn scheme(value: u32) -> Option<bool> {
 struct Bus {
     stream: UnixStream,
     serial: u32,
+    /// A write or read failed, perhaps midway through a message: the stream is not used again.
+    dead: bool,
 }
+
+/// How long the login and `Hello` may take. Later calls and the signals wait without a limit:
+/// the portal may take seconds to start at login, and the thread has nothing else to do.
+const HANDSHAKE: Duration = Duration::from_secs(5);
 
 impl Bus {
     /// The session bus from `DBUS_SESSION_BUS_ADDRESS` (or `$XDG_RUNTIME_DIR/bus`),
@@ -64,8 +71,8 @@ impl Bus {
     }
 
     fn over(mut stream: UnixStream) -> Option<Bus> {
-        // A portal that never answers mustn't hold the thread for good.
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        // A bus that never answers mustn't hold the thread for good.
+        stream.set_read_timeout(Some(HANDSHAKE)).ok()?;
         // SAFETY: getuid takes nothing and can't fail.
         let uid = unsafe { getuid() };
         let mut auth = b"\0AUTH EXTERNAL ".to_vec();
@@ -79,9 +86,18 @@ impl Bus {
             return None;
         }
         stream.write_all(b"BEGIN\r\n").ok()?;
-        let mut bus = Bus { stream, serial: 0 };
+        let mut bus = Bus {
+            stream,
+            serial: 0,
+            dead: false,
+        };
         let hello = bus.call(BUS, "/org/freedesktop/DBus", BUS, "Hello", "", &[])?;
-        (hello.kind == RETURN).then_some(bus)
+        if hello.kind != RETURN {
+            return None;
+        }
+        // The portal may be started by the first call to it, which can take a while.
+        bus.stream.set_read_timeout(None).ok()?;
+        Some(bus)
     }
 
     /// The current `color-scheme`.
@@ -106,7 +122,7 @@ impl Bus {
             "arg0='org.freedesktop.appearance',arg1='color-scheme'"
         );
         let added = self.call(BUS, "/org/freedesktop/DBus", BUS, "AddMatch", "s", &[rule]);
-        if added.is_none_or(|m| m.kind != RETURN) || self.stream.set_read_timeout(None).is_err() {
+        if added.is_none_or(|m| m.kind != RETURN) {
             return;
         }
         while let Ok(msg) = self.recv() {
@@ -119,7 +135,8 @@ impl Bus {
         }
     }
 
-    /// Call a method and wait for its reply (or error), skipping other messages.
+    /// Call a method and wait for its reply (or error), skipping other messages. `None` once the
+    /// connection has failed, and from then on.
     fn call(
         &mut self,
         dest: &str,
@@ -129,23 +146,33 @@ impl Bus {
         sig: &str,
         args: &[&str],
     ) -> Option<Msg> {
+        if self.dead {
+            return None;
+        }
         self.serial += 1;
         let serial = self.serial;
         let msg = method_call(serial, dest, path, iface, member, sig, args);
-        self.stream.write_all(&msg).ok()?;
-        loop {
-            let reply = self.recv().ok()?;
-            if matches!(reply.kind, RETURN | ERROR) && reply.reply_serial == serial {
-                return Some(reply);
+        self.dead = self.stream.write_all(&msg).is_err();
+        while !self.dead {
+            match self.recv() {
+                Ok(reply)
+                    if matches!(reply.kind, RETURN | ERROR) && reply.reply_serial == serial =>
+                {
+                    return Some(reply);
+                }
+                Ok(_) => {}
+                Err(_) => self.dead = true,
             }
         }
+        None
     }
 
     fn recv(&mut self) -> io::Result<Msg> {
         let bad = || io::Error::from(io::ErrorKind::InvalidData);
         let mut fixed = [0u8; 16];
         self.stream.read_exact(&mut fixed)?;
-        // Messages come in the sender's byte order; every bus we run on is little-endian.
+        // Messages come in the sender's byte order: a big-endian one (a big-endian host's bus)
+        // ends the connection, which is no preference.
         if fixed[0] != b'l' {
             return Err(bad());
         }

@@ -194,6 +194,7 @@ fn oversized_messages_end_the_connection() {
     let mut bus = Bus {
         stream: client,
         serial: 0,
+        dead: false,
     };
     assert!(bus.recv().is_err());
 }
@@ -214,4 +215,50 @@ fn values_and_addresses() {
     assert!(open("unix:path=/nonexistent/vomd-test-bus").is_none());
     // Variants nested deeper than any portal sends are refused.
     assert_eq!(Reader::new(&variant_u(1, 5)).variant_u32(0), None);
+}
+
+/// Only the login and `Hello` have a time limit: a portal that takes longer to start must
+/// still be heard.
+#[test]
+fn the_portal_is_waited_for() {
+    let stream = fake_bus(
+        |serial, member| match member {
+            "ReadOne" => {
+                std::thread::sleep(Duration::from_millis(300));
+                vec![bus_msg(RETURN, serial, "", "v", &variant_u(1, 0))]
+            }
+            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+        },
+        Vec::new(),
+    );
+    let mut bus = Bus::over(stream).expect("connected");
+    assert_eq!(bus.stream.read_timeout().unwrap(), None);
+    assert_eq!(bus.read_setting(), Some(true));
+}
+
+/// A failed read can leave half a message behind: the stream isn't used again, so nothing
+/// after it is taken for a reply or a change.
+#[test]
+fn a_failed_read_ends_the_connection() {
+    let stream = fake_bus(
+        |serial, member| match member {
+            "ReadOne" => {
+                let mut huge = bus_msg(RETURN, serial, "", "", &[]);
+                huge[4..8].copy_from_slice(&(MAX_PART + 1).to_le_bytes());
+                // Whatever follows is a valid change that must not be seen.
+                vec![
+                    huge,
+                    bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(1, KEY)),
+                ]
+            }
+            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+        },
+        Vec::new(),
+    );
+    let mut bus = Bus::over(stream).expect("connected");
+    assert_eq!(bus.read_setting(), None);
+    assert!(bus.dead);
+    let mut seen = Vec::new();
+    bus.follow(|v| seen.push(v));
+    assert!(seen.is_empty());
 }

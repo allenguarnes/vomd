@@ -814,7 +814,9 @@ impl View {
 
     /// Mouse button pressed at (`x`, `y`). On the thumb it starts a drag, visible or not; on the
     /// rest of the scrollbar's track it centers the thumb there first, but only while the
-    /// scrollbar is showing, so links and other things under a hidden one stay clickable.
+    /// scrollbar is showing. Hovering the track's column shows it (before any press, since the
+    /// pointer moves there first), so only a press that arrives without a move, as from touch
+    /// or a script, still reaches a link under a hidden one.
     /// Returns true if it took the press.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
         let ctx = self.toolbar_ctx();
