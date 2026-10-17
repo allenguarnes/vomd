@@ -3436,6 +3436,8 @@ fn the_view_counts_each_remote_image_once_and_ends_at_the_cap() {
         let mut layout = Layout::new(&doc, crate::layout::Params::default());
         let mut images = Images::default();
         images.attach(&doc, &mut layout);
+        images.set_policy(crate::settings::RemoteImages::Always);
+        images.set_remote(true, &doc, &mut layout);
         let view = images.view_of(&boxes(n), on_screen);
         (view.len, view.places, view.urls.len())
     };
@@ -3466,4 +3468,56 @@ fn the_view_counts_each_remote_image_once_and_ends_at_the_cap() {
         view(&text, VIEW_MAX + 2, VIEW_MAX + 2),
         (VIEW_MAX + 1, VIEW_MAX, VIEW_MAX)
     );
+}
+
+/// An image that is resolved (decoded at its box, or not to be loaded at all) takes no place of
+/// the cap on the images in view, so the view advances past what has loaded (round 16): 4,500
+/// distinct images on one screen are in view 4,096 at a time, and the heavy one after them is in
+/// view once they have decoded.
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_view_advances_past_the_images_that_have_loaded() {
+    let distinct = |n: usize| {
+        (0..n)
+            .map(|i| format!("![t](http://127.0.0.1/{i}.png)"))
+            .collect::<String>()
+    };
+    let view = |n: usize, loaded: usize, remote: bool| {
+        let doc = Doc::parse(&distinct(n));
+        let mut layout = Layout::new(&doc, crate::layout::Params::default());
+        let mut images = Images::default();
+        images.attach(&doc, &mut layout);
+        images.set_policy(crate::settings::RemoteImages::Always);
+        images.set_remote(remote, &doc, &mut layout);
+        for id in 1..=loaded as u32 {
+            let Src::Remote(url) = images.src(id).clone() else {
+                unreachable!()
+            };
+            let one = Data::Pixels(Bitmap {
+                width: 1,
+                height: 1,
+                data: vec![0],
+            });
+            images.cache.insert(Key::Remote(url), one);
+        }
+        let boxes: Vec<_> = (1..=n as u32).map(|id| (id, 1, 1)).collect();
+        let view = images.view_of(&boxes, n);
+        (view.len, view.places, view.urls.len())
+    };
+    // None loaded: the cap ends the view; the first VIEW_MAX loaded: the rest are in view.
+    assert_eq!(
+        view(VIEW_MAX + 404, 0, true),
+        (VIEW_MAX, VIEW_MAX, VIEW_MAX)
+    );
+    assert_eq!(
+        view(VIEW_MAX + 404, VIEW_MAX, true),
+        (VIEW_MAX + 404, 404, 404)
+    );
+    // The cap is of the ones still to load: 4,000 loaded and 4,200 to go end it 4,096 on.
+    assert_eq!(
+        view(8_200, 4_000, true),
+        (4_000 + VIEW_MAX, VIEW_MAX, VIEW_MAX)
+    );
+    // With remote images off none of them is to be loaded: none is wanted.
+    assert_eq!(view(VIEW_MAX + 404, 0, false), (VIEW_MAX + 404, 0, 0));
 }

@@ -3399,21 +3399,47 @@ impl Images {
     }
 
     /// The images in view: the leading boxes of `boxes` (at most the first `on_screen`) that hold
-    /// at most [`VIEW_MAX`] images, a remote image counted once however many times the document
-    /// refers to it (4,096 references to one URL are one image). The first box that would be
-    /// image number `VIEW_MAX + 1` ends the view: that box and the ones after are not in view,
-    /// for every purpose, so a body that comes for one of them is held or dropped by the rule for
+    /// at most [`VIEW_MAX`] images *still to be loaded*, a remote image counted once however many
+    /// times the document refers to it (4,096 references to one URL are one image). An image
+    /// that is resolved ([`Images::resolved`]: decoded at its box, or shown as its alt text for
+    /// good) has nothing left to ask for and takes no place of the cap, so the view advances past
+    /// what has loaded: 4,500 distinct images that all fit a screen are admitted 4,096 at a time,
+    /// the next ones as those decode (an image that was beyond the cap was never admitted, and a
+    /// heavy one after 4,500 small ones stayed unloaded for good). It only advances as images
+    /// resolve, each of which is an event (a decode or a failure taken), so a request that
+    /// changes nothing leaves the view as it was. The first box that would be unresolved image
+    /// number `VIEW_MAX + 1` ends the view: that box and the ones after are not in view, for
+    /// every purpose, so a body that comes for one of them is held or dropped by the rule for
     /// what is near and not in view (dropped for room, it is fetched again when there is room,
     /// not at every request), never by that for what is in view in one place and not in view in
     /// another (a viewport of references to one URL followed by a heavy image fetched it at
     /// every request, 784 times in 8 s).
-    fn view_of(&self, boxes: &[(u32, u32, u32)], on_screen: usize) -> View {
+    ///
+    /// The set of URLs is made once, with the room for the most it can hold (the remote boxes of
+    /// the view, at most `VIEW_MAX`), which is charged ([`Images::extra`]) before it is allocated
+    /// and until [`Images::note_viewport`] has dropped it.
+    fn view_of(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) -> View {
         let shown = on_screen.min(boxes.len());
+        #[cfg(feature = "remote-images")]
+        let urls = {
+            let remote = if self.remote.on {
+                boxes[..shown]
+                    .iter()
+                    .filter(|b| matches!(self.src(b.0), Src::Remote(_)))
+                    .take(VIEW_MAX)
+                    .count()
+            } else {
+                0
+            };
+            self.extra = table_bytes(remote, size_of::<Arc<str>>());
+            self.charge_bookkeeping();
+            std::collections::HashSet::with_capacity(remote)
+        };
         let mut view = View {
             len: shown,
             places: 0,
             #[cfg(feature = "remote-images")]
-            urls: std::collections::HashSet::new(),
+            urls,
         };
         for (n, b) in boxes[..shown].iter().enumerate() {
             let src = self.src(b.0);
@@ -3423,17 +3449,42 @@ impl Images {
                 Src::Remote(url) if view.urls.contains(url) => continue,
                 _ => {}
             }
+            if self.resolved(b.0, b.1, b.2) {
+                continue;
+            }
             if view.places == VIEW_MAX {
                 view.len = n;
                 break;
             }
             view.places += 1;
             #[cfg(feature = "remote-images")]
-            if let Src::Remote(url) = src {
+            if let Src::Remote(url) = self.src(b.0) {
                 view.urls.insert(url.clone());
             }
         }
         view
+    }
+
+    /// Whether image `id` at the box `w` × `h` has nothing left to ask for: it is decoded at that
+    /// size, or it can't be shown (its alt text is, for good: a remote image whose fetch or decode
+    /// failed while the document is open, one with remote images off, or one with no source).
+    /// Only these leave the set of the images in view ([`Images::view_of`]); an image evicted is
+    /// to be loaded again, and is in it again.
+    fn resolved(&self, id: u32, w: u32, h: u32) -> bool {
+        let Some(key) = self.key(id) else {
+            return true;
+        };
+        if let Key::Remote(url) = &key {
+            #[cfg(feature = "remote-images")]
+            if self.remote.on && self.remote.size(url) != Some(None) {
+                let (w, h) = clamp_box(w, h);
+                return self.cache.has(&key, w, h);
+            }
+            let _ = url;
+            return true;
+        }
+        let (w, h) = clamp_box(w, h);
+        self.cache.has(&key, w, h)
     }
 
     /// Note the viewport, whole: the images in view (`view`, [`Images::view_of`]: at most
@@ -3467,7 +3518,10 @@ impl Images {
             }
             // (Each URL is listed once, with the box of the first reference to it.)
             for &(id, w, h) in &boxes[..view.len] {
+                // (A reference that is resolved is not the one the image is wanted at.)
                 if let Src::Remote(url) = self.src(id)
+                    && urls.contains(url)
+                    && !self.resolved(id, w, h)
                     && urls.remove(url)
                 {
                     let (w, h) = clamp_box(w, h);

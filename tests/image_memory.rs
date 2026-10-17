@@ -2762,6 +2762,110 @@ fn references_above_the_viewport_cap_beside_a_heavy_image_both_load() {
     references_beside_a_heavy_image(4_500);
 }
 
+/// A real `View` (1920 x 2160, driven by the events a window gets) of `n` distinct remote 1 x 1
+/// PNGs, with no space between them so that they all fit the screen, followed by one remote
+/// baseline 3200 x 2400 JPEG whose box is in view too (round 16): every one decodes, however
+/// many are in view. The cap of the images in view (`VIEW_MAX` = 4,096) counted the ones that
+/// had loaded as well as the ones to come, so the JPEG, box 4,501, was never in view: its body
+/// was fetched once and dropped as one near the viewport, its decode could not pass the
+/// admission of one near, and nothing scrolled or zoomed (they all fit) or reloaded it: 4,500 of
+/// 4,501 decoded for good. The PNGs are loaded in batches by the documents of 32 first (the
+/// images stay cached when the next document is opened), which brings the case to the state the
+/// full document reaches and keeps the test short.
+#[cfg(feature = "remote-images")]
+fn distinct_images_beside_a_heavy_image(n: u32) {
+    let _serial = serial();
+    let dir = scratch(&format!("distinct-{n}"));
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    std::fs::write(serve.join("tiny.png"), zero_png(1, 1, 0, 8, false, 1 << 20)).unwrap();
+    std::fs::write(
+        serve.join("big.jpg"),
+        jpeg_variant(
+            &fixture("wide.jpg"),
+            0xC0,
+            3200,
+            2400,
+            &[0x22, 0x11, 0x11],
+            3,
+        ),
+    )
+    .unwrap();
+    fake_curl(&dir, &serve);
+    let tiny = |i: u32| format!("![t](http://127.0.0.1/tiny.png?{i})");
+    let mut src: String = (0..n).map(tiny).collect();
+    src.push_str("![j](http://127.0.0.1/big.jpg)");
+    let fonts = vomd::fonts::Fonts::new().unwrap();
+    let (w, h) = (1920u32, 2160u32);
+    let mut view = vomd::view::View::with_base(
+        fonts,
+        Doc::parse(&tiny(0)),
+        None,
+        (w, h),
+        1.0,
+        Some(dir.clone()),
+    );
+    view.set_remote_policy(vomd::settings::RemoteImages::Always);
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let woken = wakes.clone();
+    view.set_image_wake(Arc::new(move || {
+        woken.fetch_add(1, Relaxed);
+    }));
+    let mut buf = vec![0; w as usize * h as usize];
+    let mut seen = 0;
+    // Drive the window (a first frame, then the events it gets) until `done`, at most `limit`.
+    let mut drive =
+        |view: &mut vomd::view::View, limit: u64, done: &dyn Fn(&vomd::view::View) -> bool| {
+            let mut redraw = true;
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(limit) && !done(view) {
+                let now = Instant::now();
+                if redraw {
+                    view.paint(&mut buf, w as usize, now);
+                }
+                redraw = view.tick(now, Some(now)).redraw;
+                std::thread::sleep(Duration::from_millis(1));
+                let count = wakes.load(Relaxed);
+                if count != seen {
+                    seen = count;
+                    redraw |= view.poll_images(Instant::now());
+                }
+            }
+        };
+    for begin in (0..n).step_by(32) {
+        let end = (begin + 32).min(n);
+        let part: String = (begin..end).map(tiny).collect();
+        view.open(Doc::parse(&part), None);
+        drive(&mut view, 15, &|v| v.image_stats().decoded >= end as usize);
+        assert_eq!(view.image_stats().decoded, end as usize, "batch {begin}");
+    }
+    view.open(Doc::parse(&src), None);
+    let t = Instant::now();
+    drive(&mut view, 60, &|v| v.image_stats().decoded > n as usize);
+    let stats = view.image_stats();
+    let (most, runs) = curl_per_url(&dir);
+    println!(
+        "{n} distinct images and a heavy image: {stats:?}, {runs} curl runs (most for one URL {most}), {} wakes, {:?}",
+        wakes.load(Relaxed),
+        t.elapsed()
+    );
+    drop(view);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(
+        stats.decoded,
+        n as usize + 1,
+        "every image in view decodes ({runs} curl runs)"
+    );
+    assert_eq!(stats.failed, 0);
+    assert!(most <= 2, "a URL was fetched {most} times");
+}
+
+#[cfg(feature = "remote-images")]
+#[test]
+fn distinct_images_above_the_viewport_cap_beside_a_heavy_image_all_load() {
+    distinct_images_beside_a_heavy_image(4_500);
+}
+
 /// The sites that make room ([`vomd::image::set_room_probe`]), in the order the counts are kept.
 #[cfg(feature = "remote-images")]
 const ROOM_SITES: [&str; 8] = [
