@@ -369,11 +369,12 @@ fn a_png_read_by_rows_decodes_like_its_whole_frame() {
 /// The image resampled by averaging the source area under each target pixel a column at a time
 /// first (the order before rows were reduced to the target width as they came), a whole frame.
 fn resampled_columns_first(frame: &Frame, w: u32, h: u32) -> Vec<u32> {
-    let (xs, ys) = (spans(frame.width, w), spans(frame.height, h));
+    let (xs, ys) = (Spans::new(frame.width, w), Spans::new(frame.height, h));
     let (sw, ch) = (frame.width as usize, frame.channels);
     let mut acc = vec![0f32; sw * 4];
     let mut data = Vec::new();
-    for (y0, wy) in &ys {
+    for t in 0..ys.len() {
+        let (y0, wy) = ys.get(t);
         acc.fill(0.0);
         for (k, &weight) in wy.iter().enumerate() {
             let row = &frame.data[(y0 + k) * frame.stride..];
@@ -385,7 +386,8 @@ fn resampled_columns_first(frame: &Frame, w: u32, h: u32) -> Vec<u32> {
                 a[3] += al;
             }
         }
-        for (x0, wx) in &xs {
+        for t in 0..xs.len() {
+            let (x0, wx) = xs.get(t);
             let mut px = [0f32; 4];
             for (k, &weight) in wx.iter().enumerate() {
                 for c in 0..4 {
@@ -1059,9 +1061,9 @@ fn images_beyond_the_cache_are_not_decoded_over_and_over() {
     let mut images = Images::default();
     images.set_base(Some(dir.clone()));
     images.attach(&doc, &mut layout);
-    // Room for three of them (40,000 bytes each) and the decode of another (its result and a
-    // few rows).
-    images.cache.cap = 140_000;
+    // Room for three of them (40,000 bytes each, as boxes: a fourth would make 120,000 of
+    // them) beside the decode of another (its file, its result and what decoding holds).
+    images.cache.cap = images.cost(4, 100, 100) + 100_000;
     // Image 1 in view, the others a screen away.
     let boxes = [(1, 100, 100), (2, 100, 100), (3, 100, 100), (4, 100, 100)];
     // A frame per result: results straddle frames, as the decodes of big images do.
@@ -1100,9 +1102,16 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
     let mut images = Images::default();
     images.set_base(Some(dir.clone()));
     images.attach(&doc, &mut layout);
-    // The JPEG is 600 × 200: a frame of 360,000 bytes of RGB, and its file.
+    // The JPEG is 600 × 200: a frame of 360,000 bytes of RGB, the metadata allowance, the rows of
+    // its 3 components (4:2:0, so MCUs of 16 rows, 608 pixels wide), the resampler's tables and
+    // rows, the result (600 × 200 pixels), and its file.
     let file = std::fs::metadata(dir.join("a.jpg")).unwrap().len() as usize;
-    assert_eq!(images.cost(1), 360_000 + file + JPEG_META_COST);
+    let decode = 360_000
+        + JPEG_META_COST
+        + 3 * 608 * 16 * JPEG_ROW_BYTES
+        + resample_cost(600, 200, 600, 200)
+        + 480_000;
+    assert_eq!(images.cost(1, 600, 200), file + decode);
     // Two other slots of 100,000 bytes beside it, in a cache that has no room for them and the
     // decode: one painted this frame.
     let slot = |n| {
@@ -1120,11 +1129,7 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
     images.begin_frame();
     let _ = images.pixels(3, 25_000, 1);
     images.request(&[(1, 600, 200)], 1);
-    // The frame, the metadata allowance, the file, and the result (600 × 200 pixels).
-    assert_eq!(
-        images.cache.reserve,
-        360_000 + JPEG_META_COST + file + 480_000
-    );
+    assert_eq!(images.cache.reserve, file + decode);
     assert!(
         !images.cache.has(&Key::Local(2), 25_000, 1),
         "evicted for the decode"
@@ -1464,8 +1469,9 @@ fn blocked_images_are_not_offered_without_curl() {
     assert!(!images.blocked(1));
 }
 
-/// A progressive JPEG's decoder holds every coefficient of the image as well as its RGB frame:
-/// both count in what a decode costs (a baseline JPEG's only the frame).
+/// A progressive JPEG's decoder holds every coefficient of the image as well as its RGB frame,
+/// and so does a baseline one whose first scan has some of its components only (it waits for the
+/// scans of the rest): both count in what a decode costs.
 #[test]
 fn progressive_jpegs_count_their_coefficients() {
     let info = |b: &[u8]| header_info(&mut &b[..]).unwrap();
@@ -1474,8 +1480,13 @@ fn progressive_jpegs_count_their_coefficients() {
     let p = info(&fixture("progressive.jpg"));
     assert_eq!(p.coefficients, 3 * 48 * 24 * 2);
     assert_eq!(
-        decode_cost(&p, false),
-        48 * 24 * 3 + 3 * 48 * 24 * 2 + JPEG_META_COST
+        decode_cost(&p, 48, 24),
+        48 * 24 * 3
+            + 3 * 48 * 24 * 2
+            + JPEG_META_COST
+            + 3 * 48 * 8 * JPEG_ROW_BYTES
+            + resample_cost(48, 24, 48, 24)
+            + 48 * 24 * 4
     );
     // A 4000 × 3000 phone photo saved progressive at 4:2:0: luma padded to 16-pixel MCUs
     // (4000 × 3008), chroma at half size each way.
@@ -1486,9 +1497,31 @@ fn progressive_jpegs_count_their_coefficients() {
     let p = info(&j);
     assert_eq!((p.w, p.h), (4000, 3000));
     assert_eq!(p.coefficients, (4000 * 3008 + 2 * 2000 * 1504) * 2);
-    // The same as baseline (SOF0): nothing but the frame.
+    // The rows of its three components, 4000 pixels padded to 4000 and 16 rows of MCU.
+    assert_eq!(p.mcu_rows, 3 * 4000 * 16 * JPEG_ROW_BYTES);
+    // The same as baseline (SOF0), its first scan (SOS) with all three components: nothing but
+    // the frame.
     j[3] = 0xC0;
-    assert_eq!(info(&j).coefficients, 0);
+    let scan = |ns: u8| {
+        let mut sos = vec![0xFF, 0xDA, 0, 6 + 2 * u16::from(ns) as u8, ns];
+        sos.extend((1..=ns).flat_map(|c| [c, 0]));
+        sos.extend([0, 63, 0]);
+        sos
+    };
+    let all = [j.clone(), scan(3)].concat();
+    assert_eq!(info(&all).coefficients, 0);
+    // A first scan with one of the three components: the decoder holds them all till the
+    // others have come.
+    let one = [j.clone(), scan(1)].concat();
+    assert_eq!(info(&one).coefficients, p.coefficients);
+    // The walk of the headers doesn't get to a scan: taken to be the larger.
+    assert_eq!(info(&j).coefficients, p.coefficients);
+    // Whatever comes between the frame and the scan is walked over, to the size the same.
+    let mut between = j.clone();
+    between.extend(segment(0xFE, b"a comment"));
+    between.extend(scan(3));
+    let b = info(&between);
+    assert_eq!((b.w, b.h, b.coefficients), (4000, 3000, 0));
 }
 
 /// Looking at a fetched image's bytes to cost its decode doesn't mark them painted, so an
@@ -1846,7 +1879,7 @@ fn a_file_that_changed_since_it_was_sized_is_refused() {
         h: 30,
         cost,
     };
-    let cost = file_cost(&path).unwrap() + 40 * 30 * 4;
+    let cost = file_info(&path).unwrap().cost(40, 30);
     assert!(decode_job(&job(cost)).is_some());
     std::fs::write(
         &path,
@@ -1855,7 +1888,7 @@ fn a_file_that_changed_since_it_was_sized_is_refused() {
     .unwrap();
     assert!(decode_job(&job(cost)).is_none(), "bigger than it was");
     // Charged for what it is now, it decodes.
-    let cost = file_cost(&path).unwrap() + 40 * 30 * 4;
+    let cost = file_info(&path).unwrap().cost(40, 30);
     assert!(decode_job(&job(cost)).is_some());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1982,4 +2015,214 @@ fn per_url_records_do_not_outlive_their_document() {
             "after {k}: {fetched} {failed}"
         );
     }
+}
+
+/// What [`Spans::new`] makes never has more weights than [`spans_weights`] says, so its buffer is
+/// the one it was made with (the capacity [`spans_cost`] charges): every size to 40, and the
+/// extremes a decode may meet.
+#[test]
+fn spans_stay_within_their_bound() {
+    let check = |src: u32, dst: u32| {
+        let s = Spans::new(src, dst);
+        assert!(
+            s.weights.len() <= spans_weights(src, dst),
+            "{src} to {dst}: {} weights",
+            s.weights.len()
+        );
+        assert_eq!(
+            s.weights.capacity(),
+            spans_weights(src, dst),
+            "{src} to {dst}"
+        );
+        assert_eq!(s.spans.capacity(), dst as usize + 1, "{src} to {dst}");
+        assert_eq!(s.len(), dst as usize);
+        // Every target pixel has at least one source pixel under it, weights that add up to
+        // one, and the first source pixel is in the image.
+        for t in 0..s.len() {
+            let (first, w) = s.get(t);
+            assert!(
+                !w.is_empty() && first < src as usize,
+                "{src} to {dst} at {t}"
+            );
+            let sum: f32 = w.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-3, "{src} to {dst} at {t}: {sum}");
+        }
+    };
+    for src in 1..=40 {
+        for dst in 1..=40 {
+            check(src, dst);
+        }
+    }
+    for (src, dst) in [
+        (MAX_SOURCE_SIDE, 1),
+        (MAX_SOURCE_SIDE, MAX_SIDE),
+        (1, MAX_SIDE),
+        (3, MAX_SIDE),
+        (MAX_SOURCE_SIDE, 7),
+        (MAX_SOURCE_SIDE, 16_383),
+        (16_383, MAX_SOURCE_SIDE.min(MAX_SIDE)),
+        (999, 1000),
+        (1001, 1000),
+    ] {
+        check(src, dst);
+    }
+}
+
+/// The slot list gives back the room slots left when they go: a new document dropping thousands of
+/// local images, or the cache evicting them, leaves a list the size of what is kept, not of the
+/// most it ever held (100,000 one-pixel images left 7 MB, beside a budget that was full of a
+/// bitmap).
+#[test]
+fn the_slot_list_gives_back_its_room() {
+    let tiny = |n: u32| {
+        Data::Pixels(Bitmap {
+            width: 1,
+            height: 1,
+            data: vec![n],
+        })
+    };
+    let mut c = Cache::new(usize::MAX);
+    for n in 0..5000 {
+        c.insert(Key::Local(n), tiny(n));
+    }
+    assert!(c.slots.capacity() >= 5000);
+    // A new document: only a few stay.
+    c.retain(|s| matches!(s.key, Key::Local(n) if n < 3));
+    assert_eq!(c.slots.len(), 3);
+    assert!(c.slots.capacity() <= 2 * 3 + 16, "{}", c.slots.capacity());
+    assert_eq!(c.bytes, c.slots.iter().map(Slot::cost).sum::<usize>());
+    // Eviction, one slot at a time, doesn't leave it either.
+    let mut c = Cache::new(usize::MAX);
+    for n in 0..5000 {
+        c.insert(Key::Local(n), tiny(n));
+    }
+    c.frame = 1;
+    c.cap = 100 * (4 + SLOT_OVERHEAD);
+    c.evict();
+    assert!(c.slots.len() <= 100, "{}", c.slots.len());
+    assert!(
+        c.slots.capacity() <= 2 * c.slots.len() + 16,
+        "{} slots in room for {}",
+        c.slots.len(),
+        c.slots.capacity()
+    );
+    // And so does a map pruned: what the sizes table and the deferred table keep is theirs.
+    #[cfg(feature = "remote-images")]
+    {
+        let mut m: std::collections::HashMap<u32, u32> = (0..5000).map(|n| (n, n)).collect();
+        m.retain(|&n, _| n < 3);
+        shrink_map(&mut m);
+        assert!(m.capacity() <= 2 * 3 + 16, "{}", m.capacity());
+    }
+}
+
+/// A body that didn't decode is dropped (a decode that still holds it makes it the first to go),
+/// so the image is fetched again when a document with it is opened again.
+#[test]
+fn a_body_that_did_not_decode_is_dropped() {
+    let url: Arc<str> = "https://x.y/a.png".into();
+    let mut c = Cache::new(CACHE_BYTES);
+    c.insert(Key::Remote(url.clone()), Data::Bytes(vec![0u8; 100].into()));
+    c.insert(
+        Key::Local(1),
+        Data::Pixels(Bitmap {
+            width: 1,
+            height: 1,
+            data: vec![0],
+        }),
+    );
+    c.frame = 3;
+    let held = c.bytes_of(&url).unwrap();
+    c.discard_bytes(&url);
+    assert!(c.peek_bytes(&url).is_some(), "a decode holds it");
+    assert_eq!(
+        c.slots
+            .iter()
+            .find(|s| s.key == Key::Remote(url.clone()))
+            .unwrap()
+            .used,
+        0
+    );
+    drop(held);
+    c.discard_bytes(&url);
+    assert!(c.peek_bytes(&url).is_none());
+    assert_eq!(c.slots.len(), 1, "the pixels of another image stay");
+    assert_eq!(c.bytes, c.slots.iter().map(Slot::cost).sum::<usize>());
+}
+
+/// A remote image whose body decodes to nothing (its header is sound, its data is cut short)
+/// shows its alt text while the document is open, a repaint and a reload included (no
+/// fetching in a loop), and is fetched again when the document is opened again.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_remote_decode_failure_is_retried_when_the_document_is_opened_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 1, 255]);
+    let cut = png[..png.len() - png.len() / 3].to_vec();
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let count = fetches.clone();
+    let mut images = Images::default();
+    images.remote.set_fetcher(Arc::new(move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok((Arc::new(cut.clone()), 40, 30))
+    }));
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let url: Arc<str> = "https://x.y/cut.png".into();
+    let failed = |images: &Images| images.remote.size(&url) == Some(None);
+    let frames =
+        |images: &mut Images, doc: &Doc, layout: &mut Layout, until: &dyn Fn(&Images) -> bool| {
+            let t = Instant::now();
+            while !until(images) {
+                images.begin_frame();
+                images.request(&[(1, 40, 30)], 1);
+                std::thread::sleep(Duration::from_millis(3));
+                images.poll(doc, layout);
+                assert!(t.elapsed() < Duration::from_secs(20), "stuck");
+            }
+        };
+    let src = "![x](https://x.y/cut.png)";
+    let doc = Doc::parse(src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    images.forget_remote();
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    frames(&mut images, &doc, &mut layout, &failed);
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert!(
+        images.cache.peek_bytes(&url).is_none(),
+        "the body is of no use"
+    );
+    // A repaint and a reload of the document: the failure is kept, nothing is fetched.
+    for _ in 0..20 {
+        images.begin_frame();
+        images.request(&[(1, 40, 30)], 1);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    images.attach(&doc, &mut layout);
+    for _ in 0..20 {
+        images.begin_frame();
+        images.request(&[(1, 40, 30)], 1);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    assert!(failed(&images));
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "a repaint and a reload fetch nothing"
+    );
+    // Another document, and back to the first: the image is tried again.
+    let other = Doc::parse("nothing here");
+    let mut other_layout = Layout::new(&other, crate::layout::Params::default());
+    images.forget_remote();
+    images.attach(&other, &mut other_layout);
+    assert_eq!(images.remote.size(&url), None, "the failure is forgotten");
+    images.forget_remote();
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    frames(&mut images, &doc, &mut layout, &|i| {
+        fetches.load(Ordering::SeqCst) >= 2 && i.remote.size(&url) == Some(None)
+    });
+    assert_eq!(fetches.load(Ordering::SeqCst), 2);
 }

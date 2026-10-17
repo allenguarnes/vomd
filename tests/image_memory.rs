@@ -1,12 +1,12 @@
-//! What decoding images allocates, counted (review round 3): in a test binary of its
-//! own, with a counting allocator, so nothing else runs while it counts. It is one test, run in
-//! steps one after another, for the same reason.
+//! What decoding images allocates, counted (review rounds 3 to 7): in a test binary of
+//! its own, with a counting allocator, so nothing else runs while it counts: each test takes
+//! [`serial`] first, and the others wait without allocating.
 #![cfg(feature = "images")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use vomd::doc::Doc;
@@ -48,6 +48,13 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// One test counts at a time.
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Live bytes now; the peak is counted from here.
 fn mark() -> usize {
@@ -154,7 +161,9 @@ fn pump(images: &mut Images, doc: &Doc, layout: &mut PageLayout, woken: &AtomicU
 /// A JPEG's metadata isn't kept by its decoder: 11 MiB of extended XMP (a file under the
 /// remote limit) took 24 MB over the file's own bytes; 450,000 tiny ICC segments (8 MiB) more,
 /// for an entry each.
+#[test]
 fn jpeg_metadata_is_not_kept() {
+    let _serial = serial();
     use vomd::render::Pixels;
     let plain = decode(&fixture("wide.jpg"), 300, 100).unwrap();
     let cases: [(&str, Vec<u8>); 2] = [
@@ -203,7 +212,9 @@ fn jpeg_metadata_is_not_kept() {
 /// A result nobody has taken yet is still charged: the worker starts no other decode until it
 /// is, so what pending results hold can't pile up beside a full cache (3 more results made
 /// while polling was delayed: 34.6 MB live over the start, in a 33.5 MB budget).
+#[test]
 fn pending_results_stay_in_the_budget() {
+    let _serial = serial();
     use vomd::render::Pixels;
     let dir = scratch("pending");
     std::fs::write(dir.join("wide.jpg"), fixture("wide.jpg")).unwrap();
@@ -274,8 +285,9 @@ fn png_padded(side: u32, total: usize) -> Vec<u8> {
 /// fetches are the system `curl`'s, a script in front of it on `PATH` that serves files of a
 /// scratch directory (nothing is fetched from anywhere).
 #[cfg(feature = "remote-images")]
+#[test]
 fn navigating_during_a_remote_decode_stays_in_the_budget() {
-    use std::os::unix::fs::PermissionsExt;
+    let _serial = serial();
     use vomd::render::Pixels;
     let dir = scratch("navigate");
     std::fs::write(dir.join("giant"), png_padded(6000, 11 << 20)).unwrap();
@@ -291,25 +303,7 @@ fn navigating_during_a_remote_decode_stays_in_the_budget() {
     }
     small.resize(small.len() + (4 << 20), 0);
     std::fs::write(dir.join("body"), small).unwrap();
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let curl = bin.join("curl");
-    std::fs::write(
-        &curl,
-        format!(
-            "#!/bin/sh\nfor u; do :; done\nf=${{u##*/}}\nf=${{f%%\\?*}}\nexec cat '{}'/\"$f\"\n",
-            dir.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    // Nothing else is running in this test binary: one test, run in steps.
-    unsafe { std::env::set_var("PATH", path) };
+    fake_curl(&dir, &dir);
 
     let first = Doc::parse("![x](http://127.0.0.1/giant)");
     let mut first_layout = PageLayout::new(&first, Params::default());
@@ -383,10 +377,1049 @@ fn navigating_during_a_remote_decode_stays_in_the_budget() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// ---- Images made for the tests ---------------------------------------------------------------
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in data {
+        c ^= u32::from(b);
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+fn png_chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
+    out.extend((data.len() as u32).to_be_bytes());
+    let mut body = ty.to_vec();
+    body.extend(data);
+    out.extend(&body);
+    out.extend(crc32(&body).to_be_bytes());
+}
+
+/// Bits put LSB first, as deflate has them.
+struct Bits {
+    out: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl Bits {
+    /// `n` bits of `v`, low first; `code`: a Huffman code, high bit first.
+    fn put(&mut self, v: u32, n: u32, code: bool) {
+        let v = if code {
+            (0..n).fold(0, |r, i| r | ((v >> i) & 1) << (n - 1 - i))
+        } else {
+            v
+        };
+        self.acc |= u64::from(v) << self.n;
+        self.n += n;
+        while self.n >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+}
+
+/// A zlib stream of `n` zero bytes: one fixed-Huffman block of matches of 258 bytes a step, so a
+/// PNG of any size is a few KB (the decoder doesn't check the Adler-32, but it is right).
+fn zlib_zeros(n: usize) -> Vec<u8> {
+    let mut b = Bits {
+        out: vec![0x78, 0x01],
+        acc: 0,
+        n: 0,
+    };
+    b.put(1, 1, false); // the last block,
+    b.put(1, 2, false); // with the fixed codes
+    let mut left = n;
+    if left > 0 {
+        b.put(0x30, 8, true); // a literal 0,
+        left -= 1;
+    }
+    while left >= 258 {
+        b.put(0xC5, 8, true); // then 258 more of it (length code 285),
+        b.put(0, 5, false); // a byte back
+        left -= 258;
+    }
+    for _ in 0..left {
+        b.put(0x30, 8, true);
+    }
+    b.put(0, 7, true); // the end of the block
+    if b.n > 0 {
+        b.put(0, 8 - b.n, false);
+    }
+    // The Adler-32 of zeros: 1 in the low half, the count in the high.
+    let mut out = b.out;
+    out.extend(((((n as u64 % 65_521) as u32) << 16) | 1).to_be_bytes());
+    out
+}
+
+/// A PNG of `w` × `h` zero bytes of `color` (PNG color type: 0 gray, 2 RGB, 4 gray + alpha, 6
+/// RGBA) and `depth`, Adam7 interlaced or not, its data in `IDAT` chunks of at most `idat` bytes.
+fn zero_png(w: u32, h: u32, color: u8, depth: u8, interlaced: bool, idat: usize) -> Vec<u8> {
+    let channels = match color {
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        _ => 1,
+    };
+    let row = |px: usize| 1 + (px * channels * usize::from(depth)).div_ceil(8);
+    let raw = if interlaced {
+        // Pass origins and steps; a pass with no pixels has no rows.
+        let passes = [
+            (0, 0, 8, 8),
+            (4, 0, 8, 8),
+            (0, 4, 4, 8),
+            (2, 0, 4, 4),
+            (0, 2, 2, 4),
+            (1, 0, 2, 2),
+            (0, 1, 1, 2),
+        ];
+        passes
+            .iter()
+            .map(|&(x0, y0, dx, dy): &(usize, usize, usize, usize)| {
+                let (pw, ph) = (
+                    (w as usize).saturating_sub(x0).div_ceil(dx),
+                    (h as usize).saturating_sub(y0).div_ceil(dy),
+                );
+                if pw > 0 && ph > 0 { ph * row(pw) } else { 0 }
+            })
+            .sum()
+    } else {
+        h as usize * row(w as usize)
+    };
+    let mut out = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10];
+    let mut ihdr = Vec::new();
+    ihdr.extend(w.to_be_bytes());
+    ihdr.extend(h.to_be_bytes());
+    ihdr.extend([depth, color, 0, 0, u8::from(interlaced)]);
+    png_chunk(&mut out, b"IHDR", &ihdr);
+    for c in zlib_zeros(raw).chunks(idat.max(1)) {
+        png_chunk(&mut out, b"IDAT", c);
+    }
+    png_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+/// `base` (a fixture) with its frame header replaced by one of `marker` (`0xC0` baseline, `0xC2`
+/// progressive), `w` × `h`, components sampled `comps` (H << 4 | V each), and its scan header by
+/// one of `ns` components; the scan data is the fixture's (a decoder reads what it can of it
+/// and goes on: what it allocates is allocated before it).
+fn jpeg_variant(base: &[u8], marker: u8, w: u16, h: u16, comps: &[u8], ns: usize) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xD8];
+    let mut i = 2;
+    while i < base.len() {
+        let m = base[i + 1];
+        let l = usize::from(u16::from_be_bytes([base[i + 2], base[i + 3]]));
+        if matches!(m, 0xC0 | 0xC2) {
+            out.extend([0xFF, marker]);
+            out.extend(((8 + 3 * comps.len()) as u16).to_be_bytes());
+            out.push(8);
+            out.extend(h.to_be_bytes());
+            out.extend(w.to_be_bytes());
+            out.push(comps.len() as u8);
+            for (k, &hv) in comps.iter().enumerate() {
+                out.extend([k as u8 + 1, hv, 0]);
+            }
+        } else if m == 0xDA {
+            out.extend([0xFF, 0xDA]);
+            out.extend(((6 + 2 * ns) as u16).to_be_bytes());
+            out.push(ns as u8);
+            for k in 0..ns {
+                out.extend([k as u8 + 1, 0]);
+            }
+            out.extend([0, 63, 0]);
+            out.extend(&base[i + 2 + l..]);
+            return out;
+        } else {
+            out.extend(&base[i..i + 2 + l]);
+        }
+        i += 2 + l;
+    }
+    out
+}
+
+/// A `curl` first on `PATH` that serves the files of `serve` (`http://127.0.0.1/NAME?...` is
+/// `serve/NAME`; a name with no file is a failure) and logs the URLs it is asked for in
+/// `dir/curl.log`: nothing is fetched from anywhere. The tests run one at a time, so setting
+/// `PATH` is safe.
+#[cfg(feature = "remote-images")]
+fn fake_curl(dir: &Path, serve: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let curl = bin.join("curl");
+    std::fs::write(
+        &curl,
+        format!(
+            "#!/bin/sh\nfor u; do :; done\necho \"$u\" >> '{}'\nf=${{u##*/}}\nf=${{f%%\\?*}}\nexec cat '{}'/\"$f\"\n",
+            dir.join("curl.log").display(),
+            serve.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    unsafe { std::env::set_var("PATH", path) };
+}
+
+/// How many times `fake_curl` was run so far.
+#[cfg(feature = "remote-images")]
+fn curl_runs(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("curl.log")).map_or(0, |log| log.lines().count())
+}
+
+/// Frame (`begin_frame`, `request` of `boxes`, the first `on_screen` in view) and poll every
+/// `every` until `done`.
+fn frames(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut PageLayout,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
+    every: Duration,
+    mut done: impl FnMut(&Images) -> bool,
+) {
+    let t = Instant::now();
+    while !done(images) {
+        assert!(
+            t.elapsed() < Duration::from_secs(120),
+            "stuck: {:?}",
+            images.stats()
+        );
+        images.begin_frame();
+        images.request(boxes, on_screen);
+        std::thread::sleep(every);
+        images.poll(doc, layout);
+    }
+}
+
+/// What resampling allocates is in what a decode is charged: a valid 1 × 65,535 PNG at the box
+/// layout may ask for (1 × 16,384) has 16,384 spans of weights of its own, which were not, and
+/// took a cache of evictable 300 × 100 bitmaps (a few hundred bytes short of full) 0.9 MB over
+/// the budget. The same for the other way round, an interlaced image, and JPEGs, a progressive
+/// one and one with its scans a component each.
 #[test]
-fn image_memory_stays_within_the_budget() {
-    jpeg_metadata_is_not_kept();
-    pending_results_stay_in_the_budget();
-    #[cfg(feature = "remote-images")]
-    navigating_during_a_remote_decode_stays_in_the_budget();
+fn resampling_is_in_the_decode_reservation() {
+    use vomd::render::Pixels;
+    let _serial = serial();
+    let wide = fixture("wide.jpg");
+    let prog = fixture("progressive.jpg");
+    /// What it is, its file's name, the file, and the box asked for.
+    type Case = (&'static str, &'static str, Vec<u8>, (u32, u32));
+    let cases: Vec<Case> = vec![
+        (
+            "tall PNG",
+            "t.png",
+            zero_png(1, 65_535, 0, 8, false, 1 << 20),
+            (1, 16_384),
+        ),
+        (
+            "wide PNG",
+            "t.png",
+            zero_png(65_535, 1, 0, 8, false, 1 << 20),
+            (16_384, 1),
+        ),
+        (
+            "tall RGBA PNG",
+            "t.png",
+            zero_png(3, 65_535, 6, 8, false, 1 << 20),
+            (3, 16_384),
+        ),
+        (
+            "tall interlaced PNG",
+            "t.png",
+            zero_png(2, 40_000, 6, 8, true, 1 << 20),
+            (2, 16_384),
+        ),
+        (
+            "wide interlaced PNG",
+            "t.png",
+            zero_png(40_000, 2, 6, 8, true, 1 << 20),
+            (16_384, 2),
+        ),
+        (
+            "tall JPEG",
+            "t.jpg",
+            jpeg_variant(&wide, 0xC0, 8, 65_535, &[0x11, 0x11, 0x11], 3),
+            (8, 16_384),
+        ),
+        (
+            "wide JPEG",
+            "t.jpg",
+            jpeg_variant(&wide, 0xC0, 20_000, 8, &[0x22, 0x11, 0x11], 3),
+            (16_384, 8),
+        ),
+        (
+            "tall progressive JPEG",
+            "t.jpg",
+            jpeg_variant(&prog, 0xC2, 8, 40_000, &[0x11, 0x11, 0x11], 3),
+            (8, 16_384),
+        ),
+        (
+            "tall JPEG, a scan a component",
+            "t.jpg",
+            jpeg_variant(&wide, 0xC0, 8, 40_000, &[0x11, 0x11, 0x11], 1),
+            (8, 16_384),
+        ),
+    ];
+    for (what, name, bytes, (bw, bh)) in cases {
+        let dir = scratch("resample");
+        std::fs::write(dir.join(name), &bytes).unwrap();
+        std::fs::write(dir.join("s.png"), zero_png(30, 10, 0, 8, false, 1 << 20)).unwrap();
+        // 278 small ones: 278 bitmaps of 300 × 100 fill the cache to within 90 KB.
+        let mut src: String = (0..278).map(|_| "![s](s.png) ").collect();
+        src += &format!("![t]({name})");
+        let (doc, mut layout, mut images) = images_for(&dir, &src);
+        let start = mark();
+        let small: Vec<_> = (1..=278).map(|id| (id, 300, 100)).collect();
+        frames(
+            &mut images,
+            &doc,
+            &mut layout,
+            &small,
+            278,
+            Duration::ZERO,
+            |i| i.stats().decoded == 278,
+        );
+        // Not painted any more: the tall one may evict them.
+        images.begin_frame();
+        let tall = [(279, bw, bh)];
+        frames(
+            &mut images,
+            &doc,
+            &mut layout,
+            &tall,
+            1,
+            Duration::from_millis(1),
+            |i| i.stats().decoded > 0 && i.stats().failed == 0 && i.stats().decodes >= 279,
+        );
+        assert!(images.pixels(279, bw, bh).is_some(), "{what}");
+        let over = peak_over(start);
+        println!("{what}: {over} bytes live over the start at most (of {CACHE_BYTES})");
+        assert!(
+            over <= CACHE_BYTES,
+            "{what}: {over} bytes live over the start, {CACHE_BYTES} allowed"
+        );
+        drop(images);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// Live bytes now.
+fn live() -> usize {
+    LIVE.load(Relaxed)
+}
+
+/// Removing slots gives back the room of the list they were in, not only their charge: 5,000
+/// one-pixel local images (each charged, a list with room for 8,192) and then another document
+/// with one bitmap that fills what the budget leaves: 100,000 of them left a list of 7.3 MB
+/// that nothing counted, and 37.3 MB of live allocations beside a budget of 33.5 MB. (The first
+/// document's own tables are gone too, so what is live after the switch is measured against what
+/// was live before anything, and has to be next to nothing.) `VOMD_TINY_SLOTS` makes it more.
+#[test]
+fn removed_slots_leave_no_room_behind() {
+    use vomd::render::Pixels;
+    let _serial = serial();
+    let n: usize = std::env::var("VOMD_TINY_SLOTS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(5_000);
+    let dir = scratch("slots");
+    std::fs::write(dir.join("p.png"), zero_png(1, 1, 0, 8, false, 1 << 20)).unwrap();
+    let src: String = (0..n).map(|_| "![p](p.png) ").collect();
+    let before = mark();
+    let (doc, mut layout, mut images) = images_for(&dir, &src);
+    let boxes: Vec<_> = (1..=n as u32).map(|id| (id, 1, 1)).collect();
+    // A window shows tens of images, not thousands: a request looks through the cache for every
+    // box, so they are asked for 25 at a time (those before them stay cached, not asked for).
+    for (k, chunk) in boxes.chunks(25).enumerate() {
+        let end = (k * 25 + chunk.len()).min(n);
+        frames(
+            &mut images,
+            &doc,
+            &mut layout,
+            chunk,
+            chunk.len(),
+            Duration::ZERO,
+            |i| i.stats().decoded >= end,
+        );
+    }
+    drop(boxes);
+    let tiny = peak_over(before);
+    println!("{n} one-pixel images: {tiny} bytes live over the start at most");
+    // Another document: they go.
+    let doc2 = Doc::parse("![b](p.png)");
+    let mut layout2 = PageLayout::new(&doc2, Params::default());
+    drop((doc, layout));
+    images.attach(&doc2, &mut layout2);
+    let residue = live().saturating_sub(before);
+    println!("{n} slots gone: {residue} bytes live over the start");
+    assert!(residue < 64 << 10, "{residue} bytes left behind");
+    // One bitmap of what is left of the budget (a box of 31 MB).
+    let side = 10_000u32;
+    let wide = (CACHE_BYTES - (CACHE_BYTES >> 5) - (1 << 20)) as u32 / 4 / side;
+    frames(
+        &mut images,
+        &doc2,
+        &mut layout2,
+        &[(1, wide, side)],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    assert!(images.pixels(1, wide, side).is_some());
+    let over = peak_over(before);
+    println!(
+        "then one bitmap of {wide} × {side}: {over} bytes live over the start at most (of {CACHE_BYTES})"
+    );
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start, {CACHE_BYTES} allowed"
+    );
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A remote image whose body has sound dimensions and cut-off data fails to decode: it shows its
+/// alt text while the document is open (a repaint, a reload: nothing is fetched again), and is
+/// fetched again when the document is opened again, which it wasn't: the body stayed cached and
+/// the failure with it, whatever documents came between, and the `curl` log had one line.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_failed_remote_decode_is_fetched_again_when_reopened() {
+    let _serial = serial();
+    let dir = scratch("reopen");
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    let png = zero_png(300, 200, 2, 8, false, 1 << 20);
+    std::fs::write(serve.join("cut.png"), &png[..png.len() - 40]).unwrap();
+    std::fs::write(serve.join("ok.png"), &png).unwrap();
+    fake_curl(&dir, &serve);
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    let open = |images: &mut Images, src: &str| {
+        let doc = Doc::parse(src);
+        let mut layout = PageLayout::new(&doc, Params::default());
+        // What `View::open` does.
+        images.forget_remote();
+        images.attach(&doc, &mut layout);
+        images.set_remote(true, &doc, &mut layout);
+        (doc, layout)
+    };
+    let (doc, mut layout) = open(&mut images, "![x](http://127.0.0.1/cut.png)");
+    let boxes = [(1, 300, 200)];
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &boxes,
+        1,
+        Duration::from_millis(2),
+        |i| i.stats().failed == 1,
+    );
+    assert_eq!(curl_runs(&dir), 1);
+    // Repainting and a reload of this document: it still shows its alt text, and nothing is
+    // fetched.
+    let still = |images: &mut Images, doc: &Doc, layout: &mut PageLayout, n: u32| {
+        for _ in 0..n {
+            images.begin_frame();
+            images.request(&boxes, 1);
+            std::thread::sleep(Duration::from_millis(3));
+            images.poll(doc, layout);
+        }
+    };
+    still(&mut images, &doc, &mut layout, 30);
+    images.attach(&doc, &mut layout);
+    still(&mut images, &doc, &mut layout, 30);
+    assert_eq!((images.stats().failed, curl_runs(&dir)), (1, 1));
+    // Another document (without it, and with another image), then this one again.
+    let (doc2, mut layout2) = open(&mut images, "nothing here ![y](http://127.0.0.1/ok.png)");
+    frames(
+        &mut images,
+        &doc2,
+        &mut layout2,
+        &boxes,
+        1,
+        Duration::from_millis(2),
+        |i| i.stats().decoded == 1,
+    );
+    assert_eq!(curl_runs(&dir), 2);
+    let (doc, mut layout) = open(&mut images, "![x](http://127.0.0.1/cut.png)");
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &boxes,
+        1,
+        Duration::from_millis(2),
+        |i| i.stats().failed == 1,
+    );
+    assert_eq!(curl_runs(&dir), 3, "fetched again");
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What decoding allocates, besides the file's bytes and the pixels it makes, is within
+/// `decode_reservation` for every shape, kind and box of a grid (a bigger one, which takes a
+/// minute, with `VOMD_FULL_GRID=1`): the formulas of `decode_cost`, checked against the
+/// decoders. Prints the least margin seen, which says how much room the constants have.
+#[test]
+fn the_reservation_covers_what_decoding_allocates() {
+    let _serial = serial();
+    let full = std::env::var("VOMD_FULL_GRID").is_ok();
+    let mut least = (usize::MAX, String::new());
+    let mut count = 0;
+    let mut check = |what: String, bytes: &[u8], (tw, th): (u32, u32)| {
+        let reserved = vomd::image::decode_reservation(bytes, tw, th).expect(&what);
+        let start = mark();
+        let bitmap = vomd::image::decode(bytes, tw, th);
+        let over = peak_over(start);
+        drop(bitmap);
+        let (tw, th) = vomd::image::clamp_box(tw, th);
+        let used = over.saturating_sub(4 * tw as usize * th as usize);
+        assert!(
+            used <= reserved,
+            "{what}: {used} bytes allocated, {reserved} reserved"
+        );
+        if reserved - used < least.0 {
+            least = (reserved - used, format!("{what}: {used} of {reserved}"));
+        }
+        count += 1;
+    };
+    let (colors, widths, heights): (&[(u8, u8)], &[u32], &[u32]) = if full {
+        (
+            &[(0, 8), (6, 8), (6, 16), (2, 8), (4, 16), (0, 16), (2, 16)],
+            &[1, 2, 100, 1000, 4000, 8192, 16_383, 32_767, 65_535],
+            &[1, 3, 20, 300, 3000],
+        )
+    } else {
+        (
+            &[(0, 8), (6, 16), (2, 8)],
+            &[1, 100, 12_000],
+            &[1, 20, 1_500],
+        )
+    };
+    for &(color, depth) in colors {
+        for &w in widths {
+            for &h in heights {
+                if u64::from(w) * u64::from(h) > 8_000_000 {
+                    continue;
+                }
+                for (interlaced, idat) in [(false, 32_768), (false, 1), (true, 1 << 20)] {
+                    let bytes = zero_png(w, h, color, depth, interlaced, idat);
+                    for target in [
+                        (1, 1),
+                        (300, 100),
+                        (w.min(16_384), h.min(16_384)),
+                        (1, h.min(16_384)),
+                        (w.min(16_384), 1),
+                    ] {
+                        let what = format!(
+                            "PNG {color}/{depth} {w}×{h} interlaced {interlaced} idat {idat} to {target:?}"
+                        );
+                        check(what, &bytes, target);
+                    }
+                }
+            }
+        }
+    }
+    let (wide, prog) = (fixture("wide.jpg"), fixture("progressive.jpg"));
+    let samplings: &[&[u8]] = if full {
+        &[
+            &[0x11],
+            &[0x11, 0x11, 0x11],
+            &[0x22, 0x11, 0x11],
+            &[0x21, 0x11, 0x11],
+            &[0x12, 0x11, 0x11],
+            &[0x41, 0x11, 0x11],
+            &[0x22, 0x22, 0x22],
+            &[0x44, 0x44, 0x44],
+            &[0x11, 0x11, 0x11, 0x11],
+            &[0x22, 0x11, 0x11, 0x22],
+            &[0x24, 0x11, 0x11],
+        ]
+    } else {
+        &[&[0x11], &[0x22, 0x11, 0x11], &[0x44, 0x44, 0x44]]
+    };
+    let dims: &[(u16, u16)] = if full {
+        &[
+            (1, 1),
+            (100, 50),
+            (4000, 8),
+            (65_535, 8),
+            (65_535, 16),
+            (300, 3000),
+            (8, 65_535),
+            (2000, 3000),
+        ]
+    } else {
+        &[(1, 1), (100, 50), (12_000, 8), (8, 12_000)]
+    };
+
+    for (base, marker) in [(&wide, 0xC0), (&prog, 0xC2)] {
+        for comps in samplings {
+            for &(w, h) in dims {
+                for ns in [comps.len(), 1] {
+                    let bytes = jpeg_variant(base, marker, w, h, comps, ns);
+                    for target in [
+                        (1, 1),
+                        (300, 100),
+                        (u32::from(w).min(16_384), u32::from(h).min(16_384)),
+                    ] {
+                        let what = format!(
+                            "JPEG {marker:#x} {comps:x?} {w}×{h} scan of {ns} to {target:?}"
+                        );
+                        check(what, &bytes, target);
+                    }
+                }
+            }
+        }
+    }
+    println!("{count} decodes within their reservation; the least room: {least:?}");
+}
+
+#[cfg(feature = "remote-images")]
+mod mix {
+    use super::*;
+
+    // ---- A random mix of operations -----------------------------------------------------------
+
+    /// What the mix may go over `CACHE_BYTES` by, live (review round 7): the allocations of
+    /// the test and the subsystem that are no image's memory, none of them charged: the page's
+    /// `Doc` and `Layout` (a few dozen images), the tables of a document's images, the queue of
+    /// jobs and the boxes of a request, the threads' bookkeeping. They are some tens of KB (the
+    /// largest seen is printed with `--nocapture`); this is 256 KiB.
+    const SLACK: usize = 256 << 10;
+
+    /// The mix never has more painted in a frame than this (a window full of images may go over the
+    /// budget), nor an image whose decode holds more than `FIT` besides its result: a
+    /// decode that holds the whole budget is let run alone and may go over it too.
+    const PAINTED: usize = 3 << 20;
+
+    /// What may be live after a run is over: what the threads and the standard library keep.
+    const LEFT: usize = 64 << 10;
+    const FIT: usize = 3 << 20;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        /// xorshift64*.
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn range(&mut self, lo: u32, hi: u32) -> u32 {
+            lo + self.below(u64::from(hi - lo) + 1) as u32
+        }
+
+        fn percent(&mut self, p: u64) -> bool {
+            self.below(100) < p
+        }
+    }
+
+    /// An image of the mix: its file's name and natural size (0 × 0: not an image).
+    #[derive(Clone)]
+    struct Asset {
+        name: String,
+        w: u32,
+        h: u32,
+    }
+
+    /// Whether decoding `bytes` holds no more than [`FIT`] besides its result.
+    fn fits(bytes: &[u8]) -> bool {
+        vomd::image::decode_reservation(bytes, 700, 700).is_some_and(|c| c + bytes.len() <= FIT)
+    }
+
+    /// The bytes of an image of a random kind and shape, smaller until it [`fits`] (or isn't an
+    /// image at all), and its natural size. Extreme sides, interlaced and 16-bit PNGs, baseline,
+    /// progressive and multi-scan JPEGs of every sampling, a JPEG with metadata, a PNG cut short.
+    fn random_image(rng: &mut Rng, profile: u64) -> (Vec<u8>, u32, u32) {
+        let (mut w, mut h) = match (profile, rng.below(8)) {
+            // Big pictures, so a page of them fills the cache.
+            (1 | 4 | 5, 0..=5) => (rng.range(400, 1_500), rng.range(300, 1_500)),
+            // Tiny ones, thousands of slots' worth of bookkeeping in a few.
+            (3, 0..=6) => (rng.range(1, 64), rng.range(1, 64)),
+            (_, 0 | 1) => (rng.range(16, 900), rng.range(16, 700)),
+            (_, 2) => (rng.range(1, 6), rng.range(2_000, 65_535)),
+            (_, 3) => (rng.range(2_000, 65_535), rng.range(1, 6)),
+            (_, 4) => (rng.range(500, 1_500), rng.range(500, 1_500)),
+            (_, 5) => (1, 65_535),
+            (_, 6) => (65_535, 1),
+            _ => (rng.range(1, 64), rng.range(1, 64)),
+        };
+        let kind = rng.below(12);
+        let color_depth = [(0, 8), (2, 8), (4, 8), (6, 8), (6, 16), (0, 16), (2, 16)];
+        let (color, depth) = color_depth[rng.below(7) as usize];
+        let interlaced = kind == 5;
+        let sampling: [&[u8]; 8] = [
+            &[0x11, 0x11, 0x11],
+            &[0x22, 0x11, 0x11],
+            &[0x21, 0x11, 0x11],
+            &[0x12, 0x11, 0x11],
+            &[0x41, 0x11, 0x11],
+            &[0x11],
+            &[0x11, 0x11, 0x11, 0x11],
+            &[0x22, 0x22, 0x22],
+        ];
+        let comps = sampling[rng.below(8) as usize];
+        let (wide, prog) = (fixture("wide.jpg"), fixture("progressive.jpg"));
+        loop {
+            let bytes = match kind {
+                0..=5 => zero_png(w, h, color, depth, interlaced, 1 << 20),
+                6 => jpeg_variant(
+                    &wide,
+                    0xC0,
+                    w.min(65_535) as u16,
+                    h.min(65_535) as u16,
+                    comps,
+                    comps.len(),
+                ),
+                7 => jpeg_variant(&prog, 0xC2, w as u16, h as u16, comps, comps.len()),
+                8 => jpeg_variant(&wide, 0xC0, w as u16, h as u16, comps, 1),
+                9 => {
+                    // The size is sound and the data is cut short.
+                    let png = zero_png(w, h, color, depth, false, 1 << 20);
+                    png[..png.len() - 20].to_vec()
+                }
+                10 => {
+                    // 600 × 200 with up to 3 MB of metadata, which is cut out.
+                    let total = rng.range(100_000, 3_000_000) as usize;
+                    return (jpeg_with(xmp(total)), 600, 200);
+                }
+                _ => {
+                    // Not an image.
+                    let n = rng.range(10, 5_000) as usize;
+                    return ((0..n).map(|_| rng.next() as u8).collect(), 0, 0);
+                }
+            };
+            if fits(&bytes) || (w <= 1 && h <= 1) {
+                return (bytes, w, h);
+            }
+            // Smaller on its longer side.
+            if w >= h {
+                w = (w / 2).max(1);
+            } else {
+                h = (h / 2).max(1);
+            }
+        }
+    }
+
+    /// The files of one run: `dir/local` for the local images, `dir/srv` for what the fake `curl`
+    /// serves (which may be padded with up to 2 MiB after the image, a name without a file failing),
+    /// 12 of each.
+    struct Pool {
+        local: Vec<Asset>,
+        remote: Vec<Asset>,
+    }
+
+    fn make_pool(rng: &mut Rng, dir: &Path, profile: u64) -> Pool {
+        let (local_dir, srv) = (dir.join("local"), dir.join("srv"));
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::create_dir_all(&srv).unwrap();
+        let mut pool = Pool {
+            local: Vec::new(),
+            remote: Vec::new(),
+        };
+        for i in 0..12 {
+            let (bytes, w, h) = random_image(rng, profile);
+            let ext = if bytes.starts_with(&[0xFF, 0xD8]) {
+                "jpg"
+            } else {
+                "png"
+            };
+            let name = format!("l{i}.{ext}");
+            std::fs::write(local_dir.join(&name), &bytes).unwrap();
+            pool.local.push(Asset { name, w, h });
+        }
+        for i in 0..12 {
+            let (mut bytes, w, h) = random_image(rng, profile);
+            let ext = if bytes.starts_with(&[0xFF, 0xD8]) {
+                "jpg"
+            } else {
+                "png"
+            };
+            let name = format!("r{i}.{ext}");
+            if rng.percent(15) {
+                // Not there: the fetch fails.
+                pool.remote.push(Asset { name, w: 0, h: 0 });
+                continue;
+            }
+            if rng.percent(60) {
+                bytes.resize(bytes.len() + rng.below(2 << 20) as usize, 0);
+            }
+            std::fs::write(srv.join(&name), &bytes).unwrap();
+            pool.remote.push(Asset { name, w, h });
+        }
+        pool
+    }
+
+    /// A document of the mix: its source, and the asset of each image (by id - 1).
+    struct Page {
+        src: String,
+        assets: Vec<Asset>,
+    }
+
+    fn random_page(rng: &mut Rng, pool: &Pool, profile: u64) -> Page {
+        let mut page = Page {
+            src: String::new(),
+            assets: Vec::new(),
+        };
+        let alone = rng.percent(50);
+        let count = if profile == 3 {
+            rng.range(20, 60)
+        } else {
+            rng.range(2, 30)
+        };
+        let remote = [50, 50, 90, 50, 0, 100][profile as usize];
+        for i in 0..count {
+            let asset = if !rng.percent(remote) {
+                let a = pool.local[rng.below(12) as usize].clone();
+                page.src += &format!("![i{i}]({})", a.name);
+                a
+            } else {
+                let a = pool.remote[rng.below(12) as usize].clone();
+                page.src += &format!("![i{i}](http://127.0.0.1/{})", a.name);
+                a
+            };
+            page.src += if alone { "\n\n" } else { " " };
+            page.assets.push(asset);
+        }
+        page
+    }
+
+    /// The box of image `asset` shown at `zoom` in a column 600 pixels wide, in at most `budget` bytes
+    /// of pixels (taken off it): what layout makes of its natural size (a stand-in), as small as
+    /// 1 × 1.
+    fn box_of(asset: &Asset, zoom: f32, budget: &mut usize) -> (u32, u32) {
+        let (w, h) = if asset.w == 0 {
+            (100.0, 100.0)
+        } else {
+            (asset.w as f32, asset.h as f32)
+        };
+        let scale = zoom * (600.0 / w).min(1.0);
+        let (mut bw, mut bh) = ((w * scale).round().max(1.0), (h * scale).round().max(1.0));
+        let bytes = bw * bh * 4.0;
+        if bytes > *budget as f32 {
+            let shrink = (*budget as f32 / bytes).sqrt();
+            bw = (bw * shrink).floor().max(1.0);
+            bh = (bh * shrink).floor().max(1.0);
+        }
+        *budget = budget.saturating_sub((bw * bh) as usize * 4);
+        (bw as u32, bh as u32)
+    }
+
+    /// One run of the mix for `seed`: documents opened and left, scrolling, zooming, frames polled
+    /// at every pace, remote images turned off and on, the wake replaced, reloads: and after each
+    /// operation the live bytes may not have gone over `CACHE_BYTES + SLACK`, except where
+    /// documented at [`PAINTED`] and [`FIT`] (what the mix builds can't). Returns the largest
+    /// number of bytes over the start there were.
+    fn random_run(seed: u64) -> usize {
+        use vomd::render::Pixels;
+        let mut rng = Rng::new(seed);
+        let before = live();
+        let dir = scratch(&format!("mix{seed}"));
+        // 0: a mix, 1: big pictures, 2: mostly remote, 3: many tiny ones, 4: big and all local
+        // (the whole budget is theirs), 5: big and all remote.
+        let profile = seed % 6;
+        let pool = make_pool(&mut rng, &dir, profile);
+        fake_curl(&dir, &dir.join("srv"));
+        let mut images = Images::default();
+        images.set_policy(vomd::settings::RemoteImages::Always);
+        images.set_base(Some(dir.join("local")));
+        let woken = Arc::new(AtomicUsize::new(0));
+        let wake = |woken: &Arc<AtomicUsize>| -> vomd::image::Wake {
+            let w = woken.clone();
+            Arc::new(move || {
+                w.fetch_add(1, Relaxed);
+            })
+        };
+        images.set_wake(wake(&woken));
+        // What the page, its layout and the boxes are, and where the window is.
+        let page0 = random_page(&mut rng, &pool, profile);
+        let doc = Doc::parse(&page0.src);
+        let layout = PageLayout::new(&doc, Params::default());
+        let mut state = (page0, doc, layout);
+        let start = mark();
+        let mut log: Vec<String> = Vec::new();
+        let (mut top, mut zoom, mut remote) = (0usize, 1.0f32, false);
+        let mut peak = 0usize;
+        let open = |images: &mut Images, state: &mut (Page, Doc, PageLayout), page: Page| {
+            let doc = Doc::parse(&page.src);
+            let mut layout = PageLayout::new(&doc, Params::default());
+            // What `View::open` does.
+            images.forget_remote();
+            images.attach(&doc, &mut layout);
+            *state = (page, doc, layout);
+        };
+        open(
+            &mut images,
+            &mut state,
+            random_page(&mut rng, &pool, profile),
+        );
+        let big = matches!(profile, 1 | 4 | 5);
+        for step in 0..if big { 260 } else { 160 } {
+            let n = state.0.assets.len();
+            let mut op = rng.below(100);
+            // A page of big pictures is kept long enough for its images to fill the cache.
+            if big && matches!(op, 60..=67) && rng.percent(85) {
+                op = 0;
+            }
+            let what = match op {
+                0..=39 => "frame",
+                40..=54 => "scroll",
+                55..=59 => "zoom",
+                60..=64 => "open",
+                65..=67 => "reload",
+                68..=72 => "remote off and on",
+                73..=80 => "slow poll",
+                81..=83 => "set_wake",
+                _ => "poll",
+            };
+            log.push(format!(
+                "{step}: {what} (top {top}, zoom {zoom}, remote {remote})"
+            ));
+            match what {
+                "scroll" => {
+                    top =
+                        (top as i64 + rng.range(0, 10) as i64 - 4).clamp(0, n as i64 - 1) as usize;
+                }
+                "zoom" => zoom = [0.5, 1.0, 1.0, 2.0][rng.below(4) as usize],
+                "open" => {
+                    let page = random_page(&mut rng, &pool, profile);
+                    open(&mut images, &mut state, page);
+                    (top, remote) = (0, false);
+                }
+                "reload" => {
+                    let (page, doc, layout) = &mut state;
+                    *doc = Doc::parse(&page.src);
+                    *layout = PageLayout::new(doc, Params::default());
+                    images.forget_remote();
+                    images.attach(doc, layout);
+                    remote = false;
+                }
+                "remote off and on" => {
+                    let (_, doc, layout) = &mut state;
+                    if remote {
+                        images.set_remote(false, doc, layout);
+                        remote = false;
+                    } else {
+                        images.set_remote(true, doc, layout);
+                        remote = true;
+                    }
+                }
+                "set_wake" => images.set_wake(wake(&woken)),
+                "slow poll" => std::thread::sleep(Duration::from_millis(rng.range(30, 90).into())),
+                _ => {}
+            }
+            // The window turns remote images on after a document's first frame, usually.
+            if !remote && matches!(what, "open" | "reload" | "frame") && rng.percent(60) {
+                let (_, doc, layout) = &mut state;
+                images.set_remote(true, doc, layout);
+                remote = true;
+            }
+            let (page, doc, layout) = &mut state;
+            let n = page.assets.len();
+            // Frame: paint what is in view, ask for the images near.
+            if matches!(
+                what,
+                "frame" | "scroll" | "zoom" | "open" | "reload" | "slow poll"
+            ) {
+                let in_view = rng.range(1, if profile == 3 { 40 } else { 6 }) as usize;
+                let near = rng.range(0, if matches!(profile, 1 | 4 | 5) { 14 } else { 8 }) as usize;
+                let mut budget = PAINTED;
+                let mut boxes = Vec::new();
+                for (k, id) in (top..n).enumerate().take(in_view + near) {
+                    let mut near_budget = if k < in_view { budget } else { 4 << 20 };
+                    let b = box_of(&page.assets[id], zoom, &mut near_budget);
+                    if k < in_view {
+                        budget = near_budget;
+                    }
+                    boxes.push((id as u32 + 1, b.0, b.1));
+                }
+                images.begin_frame();
+                for &(id, w, h) in boxes.iter().take(in_view) {
+                    let _ = images.pixels(id, w, h);
+                }
+                images.request(&boxes, in_view.min(boxes.len()));
+            }
+            if what != "slow poll" {
+                let pace = [0u64, 0, 1, 2, 5, 16][rng.below(6) as usize];
+                std::thread::sleep(Duration::from_millis(pace));
+            }
+            images.poll(doc, layout);
+            let over = peak_over(start);
+            peak = peak.max(over);
+            if over > CACHE_BYTES + SLACK {
+                let recent: Vec<_> = log.iter().rev().take(14).rev().cloned().collect();
+                panic!(
+                    "seed {seed}: {over} bytes live over the start after step {step}, {} allowed ({:?})\nrecent steps:\n{}",
+                    CACHE_BYTES + SLACK,
+                    images.stats(),
+                    recent.join("\n")
+                );
+            }
+        }
+        // Everything is let go, and nothing is left: the threads end and take what they hold
+        // with them.
+        let stats = images.stats();
+        drop((images, state, pool, log));
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = Instant::now();
+        while live() > before + LEFT && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let left = live().saturating_sub(before);
+        assert!(
+            left <= LEFT,
+            "seed {seed}: {left} bytes live after everything is dropped"
+        );
+        println!("seed {seed}: peak {peak} bytes over the start, {left} left after, {stats:?}");
+        peak
+    }
+
+    /// Which seeds to run: `VOMD_IMAGE_SEEDS=A..B` (or `N`: 0 to N), 3 by default.
+    fn seeds() -> std::ops::Range<u64> {
+        let var = std::env::var("VOMD_IMAGE_SEEDS").unwrap_or_default();
+        match var.split_once("..") {
+            Some((a, b)) => a.parse().unwrap()..b.parse().unwrap(),
+            None => 0..var.parse().unwrap_or(3),
+        }
+    }
+
+    /// A random mix of what the window does with images, local and remote (through
+    /// a fake `curl`), of every shape the decoders take, with the counting allocator watching the
+    /// live bytes: they stay within the budget and what documented here isn't image memory.
+    #[test]
+    fn a_random_mix_of_operations_stays_in_the_budget() {
+        let _serial = serial();
+        let mut worst = 0;
+        for seed in seeds() {
+            worst = worst.max(random_run(seed));
+        }
+        println!("worst: {worst} bytes over the start (of {CACHE_BYTES} + {SLACK})");
+    }
 }

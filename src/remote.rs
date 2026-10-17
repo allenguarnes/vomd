@@ -619,9 +619,22 @@ impl Remote {
         }
     }
 
-    /// Forget what fetching found for the URLs `keep` says no to.
-    pub(crate) fn retain_sizes(&mut self, mut keep: impl FnMut(&Arc<str>) -> bool) {
-        self.sizes.retain(|u, _| keep(u));
+    /// Forget what fetching found for the URLs `keep` says no to (it is given each URL and what
+    /// was found: `None` if it failed), and the room the table has left from them.
+    pub(crate) fn retain_sizes(
+        &mut self,
+        mut keep: impl FnMut(&Arc<str>, Option<(u32, u32)>) -> bool,
+    ) {
+        self.sizes.retain(|u, &mut size| keep(u, size));
+        image::shrink_map(&mut self.sizes);
+    }
+
+    /// The URLs that failed or aren't PNG or JPEG (what [`Remote::size`] calls `Some(None)`).
+    pub(crate) fn failed_urls(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.sizes
+            .iter()
+            .filter(|(_, s)| s.is_none())
+            .map(|(u, _)| u)
     }
 
     /// The image at `url` didn't decode: it shows its alt text from now on.

@@ -11,7 +11,7 @@
 // Without decoders nothing is ever queued: the worker and the cache are dead code.
 #![cfg_attr(not(feature = "images"), allow(dead_code))]
 
-use std::io::{BufRead, Read};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -73,14 +73,32 @@ pub fn header(r: &mut impl Read) -> Option<(Format, u32, u32)> {
     header_info(r).map(|h| (h.format, h.w, h.h))
 }
 
-/// What [`header`] reads, and the bytes of coefficients a progressive JPEG's decoder holds
-/// for the whole image (every component's samples as `i16`, padded to whole MCUs) on top of
-/// its frame of RGB (0 for a baseline JPEG, which decodes an MCU row at a time, and a PNG).
+/// What [`header`] reads, and what decoding the image will hold that its size alone doesn't say
+/// (see [`decode_cost`], which turns it into bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Header {
     format: Format,
     w: u32,
     h: u32,
+    /// PNG: Adam7, so the whole frame is decoded, not a row at a time. (Whether the file is
+    /// interlaced is the last byte of its `IHDR`.)
+    interlaced: bool,
+    /// PNG: bytes of a row of the data as stored, its filter byte included, the widest it can
+    /// be (16-bit RGBA) if the `IHDR` is cut short. 0 for a JPEG.
+    row: usize,
+    /// PNG: bytes a pixel has after the decoder's transformations (`normalize_to_color8`: 8 bits
+    /// a channel, and an alpha channel if a `tRNS` chunk follows, which isn't known yet, so
+    /// always one for an RGB or gray image); the whole frame of an interlaced PNG is this many
+    /// bytes a pixel. 0 for a JPEG.
+    out_channels: usize,
+    /// JPEG: the bytes of coefficients its decoder holds for the whole image (every
+    /// component's samples as `i16`, padded to whole MCUs): for a progressive JPEG, and for a
+    /// baseline one whose first scan doesn't hold all its components (the decoder then waits
+    /// for the rest of the scans before it makes pixels). 0 for a baseline JPEG that is
+    /// decoded an MCU row at a time, and for a PNG.
     coefficients: usize,
+    /// JPEG: the bytes of what the decoder keeps per MCU row (see [`JPEG_ROW_BYTES`]).
+    mcu_rows: usize,
 }
 
 fn header_info(r: &mut impl Read) -> Option<Header> {
@@ -97,53 +115,112 @@ fn header_info(r: &mut impl Read) -> Option<Header> {
             let be = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
             let (w, h) = (be(14), be(18));
             let ok = (1..=MAX_SOURCE_SIDE).contains(&w) && (1..=MAX_SOURCE_SIDE).contains(&h);
+            // Bit depth, color type, compression, filter and interlace method. A header cut
+            // here isn't a PNG the decoder reads, but it has a size: it is costed as the worst.
+            let mut rest = [16, 6, 0, 0, 1];
+            let _ = r.read_exact(&mut rest);
+            let (channels, out_channels) = match rest[1] {
+                0 => (1, 2),
+                2 => (3, 4),
+                3 => (1, 4),
+                4 => (2, 2),
+                _ => (4, 4),
+            };
+            let bits = usize::from(rest[0].clamp(1, 16)) * channels;
             ok.then_some(Header {
                 format: Format::Png,
                 w,
                 h,
+                interlaced: rest[4] == 1,
+                row: 1 + (w as usize * bits).div_ceil(8),
+                out_channels,
                 coefficients: 0,
+                mcu_rows: 0,
             })
         }
-        [0xFF, 0xD8] => jpeg_size(r).map(|(w, h, coefficients)| Header {
+        [0xFF, 0xD8] => jpeg_size(r).map(|j| Header {
             format: Format::Jpeg,
-            w,
-            h,
-            coefficients,
+            w: j.w,
+            h: j.h,
+            interlaced: false,
+            row: 0,
+            out_channels: 0,
+            coefficients: j.coefficients,
+            mcu_rows: j.mcu_rows,
         }),
         _ => None,
     }
 }
 
-/// The size in a JPEG's frame header, the segments after the start-of-image marker walked
-/// (and skipped) until it, and the coefficients its decoder holds (see [`Header`]). Every
-/// marker is taken to have a length, as the decoder does.
-fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32, usize)> {
-    let mut byte = || {
+/// What [`jpeg_size`] finds in a JPEG's headers.
+struct JpegSize {
+    w: u32,
+    h: u32,
+    coefficients: usize,
+    mcu_rows: usize,
+}
+
+/// A JPEG's segments read one after another from the start-of-image marker, within
+/// [`MAX_HEADER_SCAN`] bytes.
+struct JpegSegments<'a, R: Read> {
+    r: &'a mut R,
+    scanned: u64,
+}
+
+impl<R: Read> JpegSegments<'_, R> {
+    fn byte(&mut self) -> Option<u8> {
         let mut b = [0u8; 1];
-        r.read_exact(&mut b).ok().map(|_| b[0])
-    };
-    let mut scanned = 0u64;
-    loop {
-        if byte()? != 0xFF {
+        self.r.read_exact(&mut b).ok().map(|_| b[0])
+    }
+
+    /// The marker of the next segment, and the bytes of its payload (what its length says, less
+    /// the length itself: none for the end of the image, which has no length). Every marker is
+    /// taken to have a length, as the decoder does (TEM and RSTn have no segment in the
+    /// standard, but the decoder skips a length for them like for any marker it doesn't know:
+    /// the two must agree on where the frame header is, see `decode`).
+    fn next(&mut self) -> Option<(u8, u64)> {
+        if self.byte()? != 0xFF {
             return None;
         }
         // Any number of fill bytes may come before the marker.
         let mut marker = 0xFF;
         while marker == 0xFF {
-            marker = byte()?;
-            scanned += 1;
-            if scanned > MAX_HEADER_SCAN {
+            marker = self.byte()?;
+            self.scanned += 1;
+            if self.scanned > MAX_HEADER_SCAN {
                 return None;
             }
         }
-        // The image ended, or its data began, before any frame header. (TEM and RSTn have no
-        // segment in the standard, but the decoder skips a length for them like for any marker
-        // it doesn't know: the two must agree on where the frame header is, see `decode`.)
-        if matches!(marker, 0xD9 | 0xDA) {
+        if marker == 0xD9 {
+            return Some((marker, 0));
+        }
+        let len = u16::from_be_bytes([self.byte()?, self.byte()?]);
+        (len >= 2).then_some((marker, u64::from(len - 2)))
+    }
+
+    /// Read past `n` bytes of a payload.
+    fn skip(&mut self, n: u64) -> Option<()> {
+        self.scanned += n + 2;
+        if self.scanned > MAX_HEADER_SCAN {
             return None;
         }
-        let len = u16::from_be_bytes([byte()?, byte()?]);
-        if len < 2 {
+        for _ in 0..n {
+            self.byte()?;
+        }
+        Some(())
+    }
+}
+
+/// The size in a JPEG's frame header, the segments after the start-of-image marker walked
+/// (and skipped) until it, and what its decoder holds that the size doesn't say (see
+/// [`Header`]), which takes the first scan's header too (a walk that doesn't get there is
+/// taken to find a scan with fewer components, the larger cost).
+fn jpeg_size(r: &mut impl Read) -> Option<JpegSize> {
+    let mut seg = JpegSegments { r, scanned: 0 };
+    let (w, h, progressive, sampling) = loop {
+        let (marker, len) = seg.next()?;
+        // The image ended, or its data began, before any frame header.
+        if matches!(marker, 0xD9 | 0xDA) {
             return None;
         }
         // SOF0..SOF15, but not DHT (C4), JPG (C8) or DAC (CC).
@@ -152,13 +229,13 @@ fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32, usize)> {
             // quantization table of each component.
             let mut sof = [0u8; 6];
             for b in &mut sof {
-                *b = byte()?;
+                *b = seg.byte()?;
             }
             let h = u32::from(u16::from_be_bytes([sof[1], sof[2]]));
             let w = u32::from(u16::from_be_bytes([sof[3], sof[4]]));
             let mut sampling = Vec::with_capacity(usize::from(sof[5]));
             for _ in 0..sof[5] {
-                let (_, hv, _) = (byte()?, byte()?, byte()?);
+                let (_, hv, _) = (seg.byte()?, seg.byte()?, seg.byte()?);
                 sampling.push((u64::from(hv >> 4).max(1), u64::from(hv & 15).max(1)));
             }
             // A height of 0 is defined later in the data (DNL): not worth supporting.
@@ -167,32 +244,65 @@ fn jpeg_size(r: &mut impl Read) -> Option<(u32, u32, usize)> {
             }
             // SOF2, SOF6, SOF10 and SOF14 are progressive.
             let progressive = matches!(marker, 0xC2 | 0xC6 | 0xCA | 0xCE);
-            let coefficients = if progressive {
-                let hmax = sampling.iter().map(|s| s.0).max().unwrap_or(1);
-                let vmax = sampling.iter().map(|s| s.1).max().unwrap_or(1);
-                let (mw, mh) = (8 * hmax, 8 * vmax);
-                let (pw, ph) = (
-                    u64::from(w).div_ceil(mw) * mw,
-                    u64::from(h).div_ceil(mh) * mh,
-                );
-                let samples: u64 = sampling
-                    .iter()
-                    .map(|&(hc, vc)| pw * hc / hmax * (ph * vc / vmax))
-                    .sum();
-                usize::try_from(samples * 2).unwrap_or(usize::MAX)
-            } else {
-                0
-            };
-            return Some((w, h, coefficients));
+            // What the length says is left of the frame header.
+            let read = 6 + 3 * u64::from(sof[5]);
+            seg.scanned += read;
+            let rest = len.saturating_sub(read);
+            // (A frame header cut short here is the size all the same.)
+            let _ = seg.skip(rest);
+            break (w, h, progressive, sampling);
         }
-        let skip = u64::from(len - 2);
-        scanned += skip + 2;
-        if scanned > MAX_HEADER_SCAN {
-            return None;
+        seg.skip(len)?;
+    };
+    // On to the first scan: its header starts with the number of components in it.
+    let first_scan = loop {
+        match seg.next() {
+            Some((0xDA, len)) if len >= 1 => break seg.byte().map(usize::from),
+            Some((0xDA | 0xD9, _)) | None => break None,
+            Some((_, len)) => {
+                if seg.skip(len).is_none() {
+                    break None;
+                }
+            }
         }
-        for _ in 0..skip {
-            byte()?;
-        }
+    };
+    Some(jpeg_info(w, h, progressive, &sampling, first_scan))
+}
+
+/// [`JpegSize`] of a frame of `w` × `h` with components sampled `sampling` (H, V), whose first
+/// scan has `first_scan` of them (`None` if not known).
+fn jpeg_info(
+    w: u32,
+    h: u32,
+    progressive: bool,
+    sampling: &[(u64, u64)],
+    first_scan: Option<usize>,
+) -> JpegSize {
+    let hmax = sampling.iter().map(|s| s.0).max().unwrap_or(1);
+    let vmax = sampling.iter().map(|s| s.1).max().unwrap_or(1);
+    let (mw, mh) = (8 * hmax, 8 * vmax);
+    let (pw, ph) = (
+        u64::from(w).div_ceil(mw) * mw,
+        u64::from(h).div_ceil(mh) * mh,
+    );
+    // The decoder holds every coefficient when it can't make pixels from the first scan.
+    let all_in_first = first_scan.is_some_and(|n| n >= sampling.len());
+    let coefficients = if progressive || !all_in_first {
+        let samples: u64 = sampling
+            .iter()
+            .map(|&(hc, vc)| pw * hc / hmax * (ph * vc / vmax))
+            .sum();
+        usize::try_from(samples * 2).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    let mcu_rows = usize::try_from(sampling.len() as u64 * pw * mh * JPEG_ROW_BYTES as u64)
+        .unwrap_or(usize::MAX);
+    JpegSize {
+        w,
+        h,
+        coefficients,
+        mcu_rows,
     }
 }
 
@@ -305,40 +415,126 @@ fn read_file(path: &Path, limit: usize) -> Option<Vec<u8>> {
     (bytes.len() <= len).then_some(bytes)
 }
 
-/// What decoding an image holds besides the file's bytes and the result, at most: a JPEG's
-/// whole frame of RGB (nothing smaller is had from its decoder), the metadata it keeps
-/// ([`JPEG_META_COST`]) and, progressive, its
-/// coefficients, an interlaced PNG's whole frame, or a few rows of a PNG that isn't (read a
-/// row at a time).
-fn decode_cost(header: &Header, interlaced: bool) -> usize {
+/// What decoding an image to `w` × `h` holds at once while it runs, its result included but not
+/// the bytes it reads (a file's are in [`FileInfo::cost`], a fetched body's are the cache's):
+/// one formula for every path, read from the code of the decoders (`png` 0.18, `zune-jpeg`
+/// 0.5) and of [`resample_rows`], each term exact or an upper bound, nothing in it twice. With
+/// the source `sw` × `sh` pixels:
+///
+/// `cost = result + resample + source`
+///
+/// * `result = 4·w·h`: `resample_rows` makes its `Vec` of 4-byte pixels with exactly that
+///   capacity.
+/// * `resample = `[`resample_cost`]` = spans(sw, w) + spans(sh, h) + 32·w`: both axes' [`Spans`]
+///   are two flat buffers made with exactly the capacity [`spans_cost`] charges (see
+///   [`spans_weights`] for why the weights fit it), and `reduced` and `acc` are `w × 4` `f32`
+///   each. Nothing else is allocated by it, a row of the source being borrowed.
+/// * `source` for a PNG read by rows (not interlaced): [`PNG_FIXED`] plus [`PNG_ROW_FACTOR`]·`R`
+///   plus [`PNG_WIDTH_FACTOR`]·`sw`, `R` the stored row (filter byte included): the decoder's
+///   buffers, which [`PNG_ROW_FACTOR`] derives, and the chunk buffer, kept to `4·sw + 4 KB`
+///   by the `Limits` [`decode_png`] sets. The decoder is given no other chunk than the critical
+///   ones and `tRNS` ([`PngChunks`]).
+/// * `source` for an interlaced PNG, which is decoded whole: `out_channels·sw·sh` (the buffer
+///   `decode_png` makes of `output_buffer_size`) and the same working memory as for rows (an
+///   Adam7 pass's row is never longer than `R`).
+/// * `source` for a JPEG: `3·sw·sh` (the decoder's output, `output_buffer_size` of RGB,
+///   allocated whole and kept until resampled), [`Header::coefficients`] (the whole image's
+///   `i16` samples, padded to MCUs, when the decoder can't make pixels as the first scan is
+///   decoded: progressive, or the first scan with only some of the components),
+///   [`Header::mcu_rows`] (the buffers it keeps for one row of MCUs, by component: coefficients
+///   of the row, the two rows and the destination of upsampling, the scratch of its width: at
+///   most [`JPEG_ROW_BYTES`] for each pixel of a padded row and row of the MCU's height) and
+///   [`JPEG_META_COST`] (the segments it copies, bounded by [`shed_jpeg_metadata`]).
+///
+/// Every term is checked against what the decoders allocate, counted, in `tests/image_memory.rs`
+/// (every combination of color type, depth, interlacing, sampling, scans and shape tried there
+/// is under its charge) and by its random mixes.
+fn decode_cost(header: &Header, w: u32, h: u32) -> usize {
     let pixels = header.w as usize * header.h as usize;
-    match header.format {
+    let source = match header.format {
         Format::Jpeg => pixels
             .saturating_mul(3)
             .saturating_add(header.coefficients)
+            .saturating_add(header.mcu_rows)
             .saturating_add(JPEG_META_COST),
-        Format::Png if interlaced => pixels.saturating_mul(4),
-        Format::Png => header.w as usize * 32,
+        Format::Png => {
+            let frame = if header.interlaced {
+                pixels.saturating_mul(header.out_channels)
+            } else {
+                0
+            };
+            frame
+                .saturating_add(PNG_FIXED)
+                .saturating_add(PNG_ROW_FACTOR.saturating_mul(header.row))
+                .saturating_add(PNG_WIDTH_FACTOR.saturating_mul(header.w as usize))
+        }
+    };
+    source
+        .saturating_add(resample_cost(header.w, header.h, w, h))
+        .saturating_add(w as usize * h as usize * 4)
+}
+
+/// What a PNG's decoder holds however small the image is, at most: its inflate state (a few
+/// tables of 16 KB in all), its own structures, and the stream buffer's `Vec` growing to twice
+/// 128 KB and the rest of what [`PNG_ROW_FACTOR`] doesn't say.
+const PNG_FIXED: usize = 512 << 10;
+
+/// What a PNG's decoder holds for each byte of a stored row `R`, at most: its stream buffer
+/// (`UnfilteringBuffer`) is moved down when `max(128 KB, 4R)` bytes of rows have been used up and
+/// holds, with the row being read and 8 KB more, at most `max(128 KB, 4R) + 2R + 8 KB`, and
+/// the `Vec` is at most twice as big as it needs to be (`resize` doubles it): 8R + 4R beside
+/// the fixed 256 KB + 16 KB; and the row before the one worked on, which is copied when the row
+/// isn't whole yet (`R`), and one more for the allocator and what the estimate misses.
+const PNG_ROW_FACTOR: usize = 14;
+
+/// What a PNG's decoder holds for each pixel of the width: its output row (at most 4 bytes a
+/// pixel after `normalize_to_color8`, whatever the stored row: a 1-bit palette image is
+/// 1/8 byte a pixel stored, and 4 expanded), and the chunk buffer, which `Limits::bytes` (set
+/// in `decode_png`) keeps to 4 bytes a pixel and 4 KB (the largest palette and transparency
+/// chunks are 1 KB in all, anything longer is refused); and a row's worth more.
+const PNG_WIDTH_FACTOR: usize = 12;
+
+/// What the decoder of a JPEG holds per MCU row, per component and per pixel of the padded
+/// width and row of the MCU's height: the coefficients, the upsampling rows and the like of
+/// `zune-jpeg`, as `i16`s (see [`decode_cost`]).
+const JPEG_ROW_BYTES: usize = 16;
+
+/// A file's size, header and so what decoding it holds (`None`: see [`probe_file`]).
+#[derive(Clone, Copy, Debug)]
+struct FileInfo {
+    /// The file's bytes: they are read whole.
+    len: usize,
+    header: Header,
+}
+
+impl FileInfo {
+    /// What decoding the file to `w` × `h` holds all told, its own bytes included.
+    fn cost(&self, w: u32, h: u32) -> usize {
+        self.len.saturating_add(decode_cost(&self.header, w, h))
     }
 }
 
-/// [`decode_cost`] of a local file and the file's bytes (read whole), from its header (`None`:
-/// see [`probe_file`]).
-fn file_cost(path: &Path) -> Option<usize> {
+/// The size and header of a local file, from its header (`None`: see [`probe_file`]).
+fn file_info(path: &Path) -> Option<FileInfo> {
     let file = open_regular(path)?;
     let len = file.metadata().ok()?.len() as usize;
-    let mut r = std::io::BufReader::with_capacity(4096, file);
-    // The interlace method is the last byte of a PNG's `IHDR`.
-    let interlaced = r.fill_buf().ok()?.get(28) == Some(&1);
-    let header = header_info(&mut r)?;
-    Some(len.saturating_add(decode_cost(&header, interlaced)))
+    let header = header_info(&mut std::io::BufReader::with_capacity(4096, file))?;
+    Some(FileInfo { len, header })
 }
 
-/// [`decode_cost`] of an image already in memory.
+/// What decoding an image already in memory to `w` × `h` holds, its bytes not included.
 #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
-fn bytes_cost(bytes: &[u8]) -> Option<usize> {
-    let header = header_info(&mut &bytes[..])?;
-    Some(decode_cost(&header, bytes.get(28) == Some(&1)))
+fn bytes_cost(bytes: &[u8], w: u32, h: u32) -> Option<usize> {
+    Some(decode_cost(&header_info(&mut &bytes[..])?, w, h))
+}
+
+/// What decoding `bytes` to `w` × `h` (see [`clamp_box`]) holds at most besides the bytes and
+/// the pixels it returns (`None`: not an image [`decode`] reads), for tests that count what the
+/// decode allocates.
+#[doc(hidden)]
+pub fn decode_reservation(bytes: &[u8], w: u32, h: u32) -> Option<usize> {
+    let (w, h) = clamp_box(w, h);
+    Some(bytes_cost(bytes, w, h)?.saturating_sub(w as usize * h as usize * 4))
 }
 
 // ---- Decoding ---------------------------------------------------------------------------
@@ -542,9 +738,15 @@ pub(crate) fn shed_jpeg_metadata(buf: &mut Vec<u8>) -> bool {
 /// can be hundreds of MB, and the memory the allocator then keeps would sit beside a full cache.
 #[cfg(feature = "images")]
 fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
-    // What the decoder may allocate for itself: the palette and `tRNS` (the chunks it is given
-    // besides the pixels, see `PngChunks`) and a row of output. Not the pixels.
-    let limits = png::Limits { bytes: 1 << 20 };
+    let sw = header(&mut &bytes[..])?.1;
+    // What the decoder may allocate for itself, besides the buffers [`decode_cost`] counts by the
+    // stored row: the output row (at most 4 bytes a pixel of the source's width) and the palette
+    // and `tRNS` (the chunks it is given besides the pixels, see `PngChunks`: 768 and 256
+    // bytes). A chunk longer than that is read into a buffer that has no more room than this,
+    // and is refused. Not the pixels.
+    let limits = png::Limits {
+        bytes: sw as usize * 4 + 4096,
+    };
     let mut d = png::Decoder::new_with_limits(PngChunks::new(bytes), limits);
     d.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = d.read_info().ok()?;
@@ -715,20 +917,66 @@ fn resample(mut frame: Frame, w: u32, h: u32) -> Option<Bitmap> {
     resample_rows(&mut frame, size, channels, w, h)
 }
 
-/// For each target pixel along one axis, the source pixels under it: (first, weights).
-fn spans(src: u32, dst: u32) -> Vec<(usize, Vec<f32>)> {
-    let f = f64::from(src) / f64::from(dst);
-    (0..dst)
-        .map(|t| {
+/// For each target pixel along one axis, the source pixels under it and their weights, in two
+/// flat buffers made once, for the capacity [`spans_cost`] says.
+struct Spans {
+    /// For target pixel `t`: the first source pixel under it, and where its weights start in
+    /// `weights` (they end where the next target pixel's start; one more entry marks the end).
+    spans: Vec<(u32, u32)>,
+    weights: Vec<f32>,
+}
+
+impl Spans {
+    fn new(src: u32, dst: u32) -> Spans {
+        let f = f64::from(src) / f64::from(dst);
+        let mut spans = Vec::with_capacity(dst as usize + 1);
+        let mut weights = Vec::with_capacity(spans_weights(src, dst));
+        for t in 0..dst {
             let (a, b) = (f64::from(t) * f, f64::from(t + 1) * f);
             let first = a.floor() as usize;
             let last = (b.ceil() as usize).min(src as usize).max(first + 1);
-            let weights = (first..last)
-                .map(|s| ((b.min(s as f64 + 1.0) - a.max(s as f64)) / f).max(0.0) as f32)
-                .collect();
-            (first, weights)
-        })
-        .collect()
+            spans.push((first as u32, weights.len() as u32));
+            weights.extend(
+                (first..last)
+                    .map(|s| ((b.min(s as f64 + 1.0) - a.max(s as f64)) / f).max(0.0) as f32),
+            );
+        }
+        spans.push((src, weights.len() as u32));
+        debug_assert!(weights.len() <= spans_weights(src, dst));
+        Spans { spans, weights }
+    }
+
+    /// Target pixel `t`'s first source pixel and the weights from there on.
+    fn get(&self, t: usize) -> (usize, &[f32]) {
+        let ((first, from), (_, to)) = (self.spans[t], self.spans[t + 1]);
+        (first as usize, &self.weights[from as usize..to as usize])
+    }
+
+    fn len(&self) -> usize {
+        self.spans.len() - 1
+    }
+}
+
+/// The weights [`Spans::new`] makes for `src` pixels averaged to `dst`, at most. Target pixel
+/// `t` has the source pixels from `⌊t·f⌋` to `⌈(t+1)·f⌉` (`f` = `src / dst`, at least one, at most
+/// as far as `src`), so with `⌈x⌉ ≤ ⌊x⌋ + 1` all of them together are at most the sum of
+/// `⌊(t+1)·f⌋ − ⌊t·f⌋`, which is `⌊dst·f⌋ ≤ src` (plus rounding of the last, one), and
+/// `dst` more. Two more for each target pixel are kept for what `max(first + 1)` may add.
+fn spans_weights(src: u32, dst: u32) -> usize {
+    src as usize + 2 * dst as usize
+}
+
+/// What the span tables of one axis hold (see [`Spans`]).
+fn spans_cost(src: u32, dst: u32) -> usize {
+    (dst as usize + 1) * size_of::<(u32, u32)>() + spans_weights(src, dst) * size_of::<f32>()
+}
+
+/// What [`resample_rows`] holds besides the pixels it makes: the span tables of both axes, and
+/// the two rows of four floats a target pixel (`reduced` and `acc`).
+fn resample_cost(sw: u32, sh: u32, w: u32, h: u32) -> usize {
+    spans_cost(sw, w)
+        .saturating_add(spans_cost(sh, h))
+        .saturating_add(2 * w as usize * 4 * size_of::<f32>())
 }
 
 /// Resample an image of `sw` × `sh` pixels to `w` × `h` by averaging the source area under each
@@ -736,7 +984,8 @@ fn spans(src: u32, dst: u32) -> Vec<(usize, Vec<f32>)> {
 /// many pixels; enlarging (a HiDPI window) blends the one or two under each edge. Each source row
 /// is taken once, in order, and reduced to the target width at once, then summed into the target
 /// row under it (the one row of the next target row it shares is kept): the extra memory is two
-/// rows of the target width however wide the source is. `None` if the source ends early or its end is bad ([`Rows::finish`]).
+/// rows of the target width however wide the source is, and the span tables ([`resample_cost`]).
+/// `None` if the source ends early or its end is bad ([`Rows::finish`]).
 fn resample_rows(
     rows: &mut impl Rows,
     (sw, sh): (u32, u32),
@@ -745,12 +994,13 @@ fn resample_rows(
     h: u32,
 ) -> Option<Bitmap> {
     let sw_px = sw as usize;
-    let (xs, ys) = (spans(sw, w), spans(sh, h));
+    let (xs, ys) = (Spans::new(sw, w), Spans::new(sh, h));
     // The last source row, reduced to the target width: (its index, premultiplied sums).
     let mut reduced = (usize::MAX, vec![0f32; w as usize * 4]);
     let mut acc = vec![0f32; w as usize * 4];
     let mut data = Vec::with_capacity(w as usize * h as usize);
-    for (y0, wy) in &ys {
+    for t in 0..ys.len() {
+        let (y0, wy) = ys.get(t);
         acc.fill(0.0);
         for (k, &weight) in wy.iter().enumerate() {
             let y = y0 + k;
@@ -784,8 +1034,9 @@ fn resample_rows(
 
 /// One source row (`channels` bytes a pixel) averaged along its width into `out`, four floats
 /// (premultiplied r, g, b and alpha) per target pixel, by the `xs` spans.
-fn reduce_row(row: &[u8], channels: usize, xs: &[(usize, Vec<f32>)], out: &mut [f32]) {
-    for ((x0, wx), px) in xs.iter().zip(out.chunks_exact_mut(4)) {
+fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
+    for (t, px) in out.chunks_exact_mut(4).enumerate() {
+        let (x0, wx) = xs.get(t);
         px.fill(0.0);
         for (p, &weight) in row[x0 * channels..].chunks_exact(channels).zip(wx) {
             let (r, g, b, alpha) = match channels {
@@ -805,32 +1056,48 @@ fn reduce_row(row: &[u8], channels: usize, xs: &[(usize, Vec<f32>)], out: &mut [
 
 // ---- The cache ------------------------------------------------------------------------------
 
-// Memory accounting (review round 6): every allocation of the image and remote code,
-// who is charged for it, and until when. The rule is that a charge is released only after the
-// allocation is freed (or handed to something that is charged for it), never before.
+// Memory accounting (review rounds 6 and 7): every allocation of the image and remote
+// code, who is charged for it, and until when. The rules are that a charge is released only after
+// the allocation is freed (or handed to something that is charged for it), never before, and that
+// what is charged is what is held: the capacity of a buffer, not what is filled, and a container
+// that is long-lived is cut to size when it loses entries ([`shrink_vec`], [`shrink_map`]),
+// or its room is in the charge of the entries it can hold.
 //
-// | allocation                         | charged by                                  | from -> to                                              |
-// |------------------------------------|---------------------------------------------|---------------------------------------------------------|
-// | fetchers' read buffers (4 x 64 KB) | `FETCH_RESERVE`, static (`Cache::fetching`) | set aside while a fetch is queued, running or untaken    |
-// | body being read                    | pool credit (`Active::held`), 256 KB steps  | first grant -> `Remote::release`, after the cache has it |
-// | copy made by `cut_to_size`         | `FETCH_RESERVE` (`FETCHER_SLACK`)           | transient, per fetcher                                   |
-// | result untaken (channel, `waiting`)| credit (held = capacity); its bookkeeping   | finish -> release; no fetch starts at `PENDING_MAX`      |
-// |                                    | in `FETCH_RESERVE` (`PENDING_COST`)         |                                                         |
-// | cached body                        | `Cache::bytes` (`Slot::cost`)               | insert -> removal, and removal only when no job holds    |
-// |                                    |                                             | its `Arc` (`Slot::pinned`)                               |
-// | `Arc` clones of a body in jobs     | the slot, pinned while they live            | `bytes_of` -> queue replaced or cleared, or the running  |
-// |                                    |                                             | job's source dropped before its result is sent           |
-// | decode memory and its pixels,      | `Job::cost` in `Cache::reserve` (max of     | request that queues it -> `Worker::taken` after the      |
-// | local file bytes                   | queued + running, plus replaced workers')   | result is in the cache; a local file is checked against  |
-// |                                    |                                             | what it was charged for before it is read                |
-// | worker replaced by `set_wake`      | `Images::retired`                           | until its running job's result is taken                  |
-// | bitmap: in the channel             | the job's cost, until taken                 |                                                         |
-// | bitmap: in the cache               | `Cache::bytes` (capacity)                   | insert -> eviction (paint only borrows it)               |
-// | `Remote::sizes`, `Images::deferred`| slot overhead, for what has a slot; else    | pruned to the current document's URLs (and cached ones)  |
-// |                                    | pruned (`Images::prune_urls`)               | at `attach`/`forget_remote`; late results are bounded by |
-// |                                    |                                             | the pending limit                                        |
-// | `srcs`, `costs`, `urls`, `in_view`,| the document (its size is bounded by the    | replaced by the next document                            |
-// | the worker's queue                 | input limit and the boxes of one request)   |                                                         |
+// | allocation                          | charged by                                   | from -> to                                              |
+// |-------------------------------------|----------------------------------------------|---------------------------------------------------------|
+// | fetchers' read buffers (4 x 64 KB)  | `FETCH_RESERVE`, static (`Cache::fetching`)  | set aside while a fetch is queued, running or untaken    |
+// | body being read                     | pool credit (`Active::held`), 256 KB steps   | first grant -> `Remote::release`, after the cache has it |
+// | copy made by `cut_to_size`          | `FETCH_RESERVE` (`FETCHER_SLACK`)            | transient, per fetcher                                   |
+// | result untaken: channel message,    | credit (held = capacity); the rest in        | finish -> release; no fetch starts at `PENDING_MAX`      |
+// | pool entry (`Active`), `waiting`    | `FETCH_RESERVE` (`PENDING_COST` each, which  |                                                         |
+// |                                     | covers 2 x the `Vec`'s entries, ~100 B)      |                                                         |
+// | cached body                         | `Cache::bytes` (`Slot::cost`)                | insert -> removal, and removal only when no job holds    |
+// |                                     |                                              | its `Arc` (`Slot::pinned`)                               |
+// | `Arc` clones of a body in jobs      | the slot, pinned while they live             | `bytes_of` -> queue replaced or cleared, or the running  |
+// |                                     |                                              | job's source dropped before its result is sent           |
+// | decode: the decoder's working set,  | `Job::cost` = `FileInfo::cost` / `decode_cost` | request that queues it -> `Worker::taken` after the    |
+// | the resampler's tables and rows,    | in `Cache::reserve` (the largest of queued   | result is in the cache; a local file is checked against  |
+// | the frame, coefficients, metadata,  | and running, plus replaced workers'); the    | what it was charged for before it is read                |
+// | the result, a local file's bytes    | formulas are in `decode_cost`                |                                                         |
+// | worker replaced by `set_wake`       | `Images::retired`                            | until its running job's result is taken                  |
+// | bitmap in the channel / the cache   | the job's cost, until taken / `Slot::cost`   | insert -> eviction (paint only borrows it)               |
+// | `Cache::slots` (the list)           | `SLOT_OVERHEAD` per slot (its place and as   | `Cache::trim` after every removal                        |
+// |                                     | much again empty), which `trim` bounds       |                                                         |
+// | `Remote::sizes`, `Images::deferred` | `SLOT_OVERHEAD` for a URL that has a slot,   | pruned to the document's URLs (and the cached ones) at   |
+// | (tables, `Arc<str>` keys)           | else per document; `shrink_map` after prune  | `attach`/`forget_remote`; late results are bounded by    |
+// |                                     |                                              | the pending limit; a failure goes with its document      |
+// | `urls` (set), `srcs`, `costs`,      | the document (one entry per image, replaced  | replaced by the next document                            |
+// | the layout's and `Doc`'s image data | by the next: not charged, like the `Doc`)    |                                                         |
+// | `in_view`, `retired`                | `shrink_vec` after what clears or prunes them | at most the boxes of the last request / replaced workers |
+// | request: `boxes`, `jobs`, `fetch`,  | a screen's worth of boxes (not charged), no  | replaced by the next request                             |
+// | the worker's and the pool's queue   | more than the next request has               |                                                         |
+// | pool's `active`                     | `PENDING_COST` per entry (at most            | `Pool::done`                                             |
+// |                                     | `FETCHERS + PENDING_MAX` of them)            |                                                         |
+//
+// What is not charged, then, is the size of the document (per image) and of one request (per
+// box): the image budget is for pixels and bodies, as the `Doc` and `Layout` are no part of it.
+// `tests/image_memory.rs` runs random mixes of everything above and holds the live bytes of all
+// of it to the budget and 256 KiB (`SLACK` there) for what is no image's.
 //
 // Only the main thread clones a body, so an `Arc` count of 1 can't go up: a slot is evictable
 // exactly when it is unique.
@@ -857,11 +1124,14 @@ struct Slot {
     used: u64,
 }
 
-/// What a slot costs besides its buffer, at least: the slot, the `Arc` and `Vec` headers, the
-/// allocator's rounding, the key and the URL's entry in the sizes table (about 230 bytes, and
-/// the URL's own length is added), so thousands of tiny images can't pass through the budget as
+/// What a slot costs besides its buffer, at most (the charge is what is held, so it is this and
+/// not the least): its place in the slot list, which may be as much again empty
+/// ([`Cache::trim`] keeps it from more), the `Arc` and `Vec` headers of a body and the
+/// allocator's rounding, the `Arc<str>` of a URL (16 bytes besides the URL's own length, which
+/// is added) and its entry in the sizes table, which may have as many buckets again as it has
+/// entries (about 270 bytes in all), so thousands of tiny images can't pass through the budget as
 /// bookkeeping.
-const SLOT_OVERHEAD: usize = 256;
+const SLOT_OVERHEAD: usize = 384;
 
 impl Slot {
     /// What it holds: the buffer's allocated size (a `Vec` may hold more than it has filled, and
@@ -1043,6 +1313,7 @@ impl Cache {
             let s = self.slots.swap_remove(i);
             self.bytes -= s.cost();
         }
+        self.trim();
     }
 
     /// Make room for a body of `cost` that will be decoded for `decode` more than what is kept
@@ -1106,6 +1377,53 @@ impl Cache {
             }
             k
         });
+        self.trim();
+    }
+
+    /// A `Vec` keeps its capacity when it loses elements: the list of slots is cut to size once
+    /// it has twice what it needs and a little more, so what a slot costs ([`SLOT_OVERHEAD`]
+    /// covers the room for as many again) is all it can hold, and not what it once did (100,000
+    /// one-pixel images were 7 MB of empty list after a new document had dropped them, beside
+    /// a cache that counted none of it).
+    fn trim(&mut self) {
+        shrink_vec(&mut self.slots);
+    }
+
+    /// The fetched body for `url` didn't decode: it is of no use, and is dropped, so that
+    /// opening the document again fetches the image again. (One a decode still holds stays, first
+    /// to go: the decode's failure comes here again.)
+    #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+    fn discard_bytes(&mut self, url: &Arc<str>) {
+        let Some(i) = self.slots.iter().position(|s| {
+            matches!(s.data, Data::Bytes(_)) && matches!(&s.key, Key::Remote(u) if u == url)
+        }) else {
+            return;
+        };
+        if self.slots[i].pinned() {
+            self.slots[i].used = 0;
+            return;
+        }
+        let s = self.slots.swap_remove(i);
+        self.bytes -= s.cost();
+        self.trim();
+    }
+}
+
+/// Cut a `Vec` to the room it needs if it has twice that and 16 elements more (see
+/// [`Cache::trim`]): what a container left from removals is held until it grows again, so
+/// every long-lived one of the image code is trimmed after what removes from it.
+fn shrink_vec<T>(v: &mut Vec<T>) {
+    if v.capacity() > 2 * v.len() + 16 {
+        v.shrink_to(v.len());
+    }
+}
+
+/// [`shrink_vec`] for a map: [`Remote::sizes`] and [`Images::deferred`] are pruned to the
+/// document's URLs, which leaves their tables as big as they were.
+#[cfg(feature = "remote-images")]
+pub(crate) fn shrink_map<K: Eq + std::hash::Hash, V>(m: &mut std::collections::HashMap<K, V>) {
+    if m.capacity() > 2 * m.len() + 16 {
+        m.shrink_to_fit();
     }
 }
 
@@ -1270,12 +1588,16 @@ impl Drop for Worker {
 fn decode_job(job: &Job) -> Option<Bitmap> {
     match &job.source {
         Source::File(path) => {
-            // What the job is charged for, bar its result, is what the file was when its header
-            // was read: a file that is bigger now, or has another header, is refused (it
-            // shows its alt text) instead of decoded with memory nothing counted.
+            // What the job is charged for is what the file was when its header was read: a file
+            // that is bigger now, or has another header, is refused (it shows its alt text)
+            // instead of decoded with memory nothing counted.
             let held = job.cost.saturating_sub(job.w as usize * job.h as usize * 4);
             let mut bytes = read_file(path, held)?;
-            if bytes.len().saturating_add(bytes_cost(&bytes)?) > held {
+            if bytes
+                .len()
+                .saturating_add(bytes_cost(&bytes, job.w, job.h)?)
+                > job.cost
+            {
                 return None;
             }
             // The bytes are ours: a JPEG's metadata is cut out of them where they are.
@@ -1339,8 +1661,9 @@ pub struct Images {
     /// Bumped for every document: results for an older one are dropped.
     doc_gen: u64,
     srcs: Vec<Src>,
-    /// What decoding each local image holds (see [`decode_cost`]), once its header is read.
-    costs: Vec<Option<usize>>,
+    /// What each local image is (its file's size and header, for what decoding it holds: see
+    /// [`decode_cost`]), once its header is read: `Some(None)` if it can't be.
+    costs: Vec<Option<Option<FileInfo>>>,
     cache: Cache,
     /// Results with pixels taken so far ([`Stats::decodes`]).
     decodes: usize,
@@ -1351,11 +1674,11 @@ pub struct Images {
     /// Workers replaced by [`Images::set_wake`] that may still be decoding (or hold a result the
     /// main thread hasn't taken): what they hold is counted until they are idle.
     retired: Vec<Shared>,
-    /// The remote images in view when images were last asked for: a body that arrives for one
-    /// is kept while the cache has room for it (and is decoded next), any other may be evicted
-    /// at once.
+    /// The remote images in view when images were last asked for, with their boxes: a body that
+    /// arrives for one is kept while the cache has room for it (and is decoded next), any other
+    /// may be evicted at once.
     #[cfg(feature = "remote-images")]
-    in_view: Vec<Arc<str>>,
+    in_view: Vec<(Arc<str>, u32, u32)>,
     /// Bodies fetched for images in view that the cache had no room for ([`Images::admission`]):
     /// still held by the fetchers' credit, so they can't pile up while the decoder is behind.
     #[cfg(feature = "remote-images")]
@@ -1524,22 +1847,27 @@ impl Images {
         }
     }
 
-    /// What decoding image `id` holds while it runs, besides its result (0 if not known yet: a
-    /// remote image's bytes aren't fetched). Doesn't mark anything used.
-    fn cost(&mut self, id: u32) -> usize {
+    /// What decoding image `id` to `w` × `h` holds while it runs (see [`decode_cost`]), the bytes
+    /// of a local file and the result included; the bytes of a remote image are the cache's, and
+    /// not known until it is fetched (the result alone is counted till then). Doesn't mark
+    /// anything used.
+    fn cost(&mut self, id: u32, w: u32, h: u32) -> usize {
+        let result = w as usize * h as usize * 4;
         let i = id.checked_sub(1).map_or(usize::MAX, |i| i as usize);
         match self.src(id).clone() {
             Src::File(path) => match self.costs.get_mut(i) {
-                Some(c) => *c.get_or_insert_with(|| file_cost(&path).unwrap_or(0)),
-                None => 0,
+                Some(c) => c
+                    .get_or_insert_with(|| file_info(&path))
+                    .map_or(result, |info| info.cost(w, h)),
+                None => result,
             },
             #[cfg(feature = "remote-images")]
             Src::Remote(url) if self.remote.on => self
                 .cache
                 .peek_bytes(&url)
-                .and_then(|b| bytes_cost(b))
-                .unwrap_or(0),
-            _ => 0,
+                .and_then(|b| bytes_cost(b, w, h))
+                .unwrap_or(result),
+            _ => result,
         }
     }
 
@@ -1590,16 +1918,13 @@ impl Images {
             };
             #[cfg(feature = "remote-images")]
             if let (true, Key::Remote(url)) = (n < on_screen, &key) {
-                self.in_view.push(url.clone());
+                let (w, h) = clamp_box(w, h);
+                self.in_view.push((url.clone(), w, h));
             }
             let (w, h) = clamp_box(w, h);
             let cached = self.cache.has(&key, w, h);
             // The result is held beside the cache too, until it goes in.
-            let cost = if cached {
-                0
-            } else {
-                self.cost(id).saturating_add(w as usize * h as usize * 4)
-            };
+            let cost = if cached { 0 } else { self.cost(id, w, h) };
             let room = (self.cache.cap.saturating_sub(fetching))
                 .saturating_sub(reserve.max(retired.saturating_add(cost)));
             let over = n >= on_screen && wanted >= room;
@@ -1666,6 +1991,8 @@ impl Images {
                 fetching = self.fetch_reserve(true);
             }
         }
+        #[cfg(feature = "remote-images")]
+        shrink_vec(&mut self.in_view);
         self.cache.reserve = reserve;
         // The cache is made room for them before they are let start: they can't take more.
         self.cache.fetching = fetching;
@@ -1699,6 +2026,7 @@ impl Images {
     /// forgotten.
     fn retired_cost(&mut self) -> usize {
         self.retired.retain(|w| !Worker::idle_of(w));
+        shrink_vec(&mut self.retired);
         self.retired.iter().map(Worker::busy_cost_of).sum()
     }
 
@@ -1747,6 +2075,10 @@ impl Images {
                         #[cfg(feature = "remote-images")]
                         (None, Key::Remote(url)) => {
                             self.remote.failed(&url);
+                            // The body that didn't decode is of no use: with it gone, the
+                            // image is fetched again when a document with it is opened again
+                            // (the failure is kept while this one is open).
+                            self.cache.discard_bytes(&url);
                             self.sync_remote(doc, layout);
                         }
                         #[cfg(not(feature = "remote-images"))]
@@ -1796,11 +2128,22 @@ impl Images {
     /// ([`Remote::size`](crate::remote::Remote::size)) unless a body or pixels for the URL are
     /// cached (the slot is charged for the entry). Without this, a session through many documents
     /// would collect an entry for every URL ever seen. A failed URL of a document left is tried
-    /// again when it is opened again.
+    /// again when it is opened again: its record goes whatever is cached, and so does a body of
+    /// it that didn't decode (a cached body is taken for good, and would fail again).
     #[cfg(feature = "remote-images")]
     fn prune_urls(&mut self) {
         let urls = &self.urls;
         self.deferred.retain(|u, _| urls.contains(u));
+        shrink_map(&mut self.deferred);
+        let gone: Vec<Arc<str>> = self
+            .remote
+            .failed_urls()
+            .filter(|u| !urls.contains(*u))
+            .cloned()
+            .collect();
+        for url in &gone {
+            self.cache.discard_bytes(url);
+        }
         let cached: std::collections::HashSet<&Arc<str>> = self
             .cache
             .slots
@@ -1811,7 +2154,7 @@ impl Images {
             })
             .collect();
         self.remote
-            .retain_sizes(|u| urls.contains(u) || cached.contains(u));
+            .retain_sizes(|u, size| urls.contains(u) || (size.is_some() && cached.contains(u)));
     }
 
     /// Take a body that is not kept (no room, its image not in view), remembering what it would
@@ -1822,11 +2165,26 @@ impl Images {
         if let (Ok((bytes, ..)), true) = (&result, self.urls.contains(&url)) {
             let need = (
                 Slot::bytes_cost(&url, bytes),
-                bytes_cost(bytes).unwrap_or(0),
+                self.decode_estimate(&url, bytes),
             );
             self.deferred.insert(url.clone(), need);
         }
         self.take_fetched(url, result, false);
+    }
+
+    /// What decoding the body fetched for `url` will hold (see [`decode_cost`]), to see if there
+    /// is room for it: to the box of its image if that is in view, else to the size it has
+    /// (the box is known when it is asked for, and the reserve is made then).
+    #[cfg(feature = "remote-images")]
+    fn decode_estimate(&self, url: &Arc<str>, bytes: &Bytes) -> usize {
+        let Some(header) = header_info(&mut &bytes[..]) else {
+            return 0;
+        };
+        let (w, h) = match self.in_view.iter().find(|(u, ..)| u == url) {
+            Some(&(_, w, h)) => (w, h),
+            None => clamp_box(header.w, header.h),
+        };
+        decode_cost(&header, w, h)
     }
 
     /// Whether the body fetched for `url` can go to the cache now. One in view that doesn't fit
@@ -1837,10 +2195,10 @@ impl Images {
     #[cfg(feature = "remote-images")]
     fn admission(&mut self, url: &Arc<str>, bytes: &Bytes) -> Admit {
         let cost = Slot::bytes_cost(url, bytes);
-        let decode = bytes_cost(bytes).unwrap_or(0);
+        let decode = self.decode_estimate(url, bytes);
         if self.cache.room_for(cost, decode) {
             Admit::Yes
-        } else if !self.in_view.contains(url) {
+        } else if !self.in_view.iter().any(|(u, ..)| u == url) {
             Admit::Drop
         } else if self.worker.as_ref().is_none_or(Worker::idle) && !self.cache.holds_used_bytes() {
             Admit::Yes
@@ -1861,7 +2219,7 @@ impl Images {
             (true, Some(bytes)) => {
                 self.cache
                     .insert(Key::Remote(url.clone()), Data::Bytes(bytes));
-                if self.in_view.contains(&url) {
+                if self.in_view.iter().any(|(u, ..)| *u == url) {
                     self.cache.bytes_of(&url);
                 }
             }
@@ -1988,7 +2346,7 @@ impl Images {
             self.remote.stop();
             // Nothing is wanted of the old document's URLs now (`attach` follows with the new
             // one's).
-            self.urls.clear();
+            self.urls = std::collections::HashSet::new();
             self.prune_urls();
         }
     }
