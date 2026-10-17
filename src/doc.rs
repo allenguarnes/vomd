@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
+use std::sync::Arc;
 
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, BrokenLink, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
@@ -208,7 +209,9 @@ pub struct Heading {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageRef {
-    pub src: String,
+    /// Shared with the image code ([`crate::image::Images`]), which keeps the remote ones' URLs
+    /// as its own keys: one copy of a document's URLs, and it is the document's.
+    pub src: Arc<str>,
     pub remote: bool,
     /// Where its alt text starts in [`Doc::text`]: a long block is cut into chunks, and the one
     /// that has this offset is the one that holds the image.
@@ -1361,6 +1364,7 @@ impl Builder {
         let scheme = src.get(..8).unwrap_or(&src).to_ascii_lowercase();
         let remote = scheme.starts_with("http://") || scheme.starts_with("https://");
         let start = self.doc.text.len() as u32;
+        let src = src.into();
         push_id(&mut self.doc.images, ImageRef { src, remote, start })
     }
 

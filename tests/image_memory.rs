@@ -18,9 +18,27 @@ struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// What this thread has allocated less what it has freed (what it frees of another's
+    /// counts against it): [`built`] measures what a call makes by it, whatever the other
+    /// threads allocate meanwhile.
+    static MINE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn mine(n: isize) {
+    // (Not available while the thread's storage is being torn down: nothing is counted then.)
+    let _ = MINE.try_with(|m| m.set(m.get() + n));
+}
+
 fn add(n: usize) {
+    mine(n as isize);
     let live = LIVE.fetch_add(n, Relaxed) + n;
     PEAK.fetch_max(live, Relaxed);
+}
+
+fn sub(n: usize) {
+    mine(-(n as isize));
+    LIVE.fetch_sub(n, Relaxed);
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -33,14 +51,14 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.alloc_zeroed(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        LIVE.fetch_sub(l.size(), Relaxed);
+        sub(l.size());
         unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         if new >= l.size() {
             add(new - l.size());
         } else {
-            LIVE.fetch_sub(l.size() - new, Relaxed);
+            sub(l.size() - new);
         }
         unsafe { System.realloc(p, l, new) }
     }
@@ -54,6 +72,14 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// One test counts at a time.
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What `f` leaves allocated by this thread (what a page's `Doc` and `Layout` are, for one).
+#[cfg(feature = "remote-images")]
+fn built<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = MINE.with(|m| m.get());
+    let out = f();
+    (out, (MINE.with(|m| m.get()) - before).max(0) as usize)
 }
 
 /// Live bytes now; the peak is counted from here.
@@ -226,13 +252,13 @@ fn pending_results_stay_in_the_budget() {
         w.fetch_add(1, Relaxed);
     }));
     let start = mark();
-    // 29 images off screen, as many as fit.
-    images.request(&(1..=29).map(|id| (id, 900, 300)).collect::<Vec<_>>(), 0);
+    // 29 images off screen, as many as fit (one that would cross the line is not wanted).
+    images.request(&(1..=29).map(|id| (id, 900, 290)).collect::<Vec<_>>(), 0);
     pump(&mut images, &doc, &mut layout, &woken, 29);
-    assert!(images.pixels(29, 900, 300).is_some());
+    assert!(images.pixels(29, 900, 290).is_some());
     // Another frame: all of them can be evicted. Three more are wanted, and nobody polls.
     images.begin_frame();
-    images.request(&[(30, 900, 300), (31, 900, 300), (32, 900, 300)], 0);
+    images.request(&[(30, 900, 290), (31, 900, 290), (32, 900, 290)], 0);
     let t = Instant::now();
     while woken.load(Relaxed) < 30 {
         assert!(t.elapsed() < Duration::from_secs(60), "timed out");
@@ -555,7 +581,8 @@ fn fake_curl(dir: &Path, serve: &Path) {
     fake_curl_hold(dir, serve, "5");
 }
 
-/// [`fake_curl`] with `hold` as the seconds a `slow` name is held open for.
+/// [`fake_curl`] with `hold` as the seconds a `slow` name is held open for after all its bytes,
+/// and a `trickle` name between its halves (a transfer that still needs credit when it is held off).
 #[cfg(feature = "remote-images")]
 fn fake_curl_hold(dir: &Path, serve: &Path, hold: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -565,11 +592,11 @@ fn fake_curl_hold(dir: &Path, serve: &Path, hold: &str) {
     std::fs::write(
         &curl,
         format!(
-            "#!/bin/sh\nfor u; do :; done\necho \"$u\" >> '{}'\nf=${{u##*/}}\nf=${{f%%\\?*}}\ncase $f in slow*) cat '{}'/\"$f\"; exec sleep {};; esac\nexec cat '{}'/\"$f\"\n",
-            dir.join("curl.log").display(),
-            serve.display(),
-            hold,
-            serve.display()
+            "#!/bin/sh\nfor u; do :; done\necho \"$u\" >> '{log}'\nf=${{u##*/}}\nf=${{f%%\\?*}}\ncase $f in gated*) head -c 262144 /dev/zero; while [ ! -e '{gate}' ]; do sleep 0.02; done; printf x; exit 0;; esac\ncase $f in slow*) cat '{serve}'/\"$f\"; exec sleep {hold};; esac\ncase $f in trickle*) n=$(wc -c < '{serve}'/\"$f\"); h=$((n / 2)); head -c $h '{serve}'/\"$f\"; sleep {hold}; tail -c +$((h + 1)) '{serve}'/\"$f\"; exit 0;; esac\nexec cat '{serve}'/\"$f\"\n",
+            log = dir.join("curl.log").display(),
+            gate = dir.join("gate").display(),
+            serve = serve.display(),
+            hold = hold,
         ),
     )
     .unwrap();
@@ -588,8 +615,13 @@ fn curl_runs(dir: &Path) -> usize {
     std::fs::read_to_string(dir.join("curl.log")).map_or(0, |log| log.lines().count())
 }
 
-/// Frame (`begin_frame`, `request` of `boxes`, the first `on_screen` in view) and poll every
-/// `every` until `done`.
+/// What the window does with images, and no more (`src/main.rs`): a frame (`begin_frame`, the
+/// pixels in view painted, `request` of `boxes`, the first `on_screen` in view) for the viewport,
+/// then a poll for each wake the threads send, `every` after it came (a window that is slow to
+/// get to its events), and a frame again only if the poll says a repaint is needed. Nothing else
+/// asks for a frame, so a wake that was never sent leaves a state stuck, which fails after
+/// [`QUIET`] with nothing happening, and `done` (looked at after every wait, wake or not) never
+/// holds.
 fn frames(
     images: &mut Images,
     doc: &Doc,
@@ -597,19 +629,76 @@ fn frames(
     boxes: &[(u32, u32, u32)],
     on_screen: usize,
     every: Duration,
+    done: impl FnMut(&Images) -> bool,
+) {
+    drive(images, doc, layout, boxes, on_screen, every, true, done);
+}
+
+/// [`frames`] without the first frame: the viewport hasn't changed, only what the threads do
+/// makes anything happen.
+#[cfg(feature = "remote-images")]
+fn events(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut PageLayout,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
+    every: Duration,
+    done: impl FnMut(&Images) -> bool,
+) {
+    drive(images, doc, layout, boxes, on_screen, every, false, done);
+}
+
+/// How long the event loop that [`frames`] stands in for may have nothing to do (no wake, no
+/// frame) while what it waits for isn't there: a transition nothing told the window of stays
+/// stuck for good, and this is how a test finds out. (The fake `curl`s hold transfers open for
+/// seconds, with nothing to wake for.)
+const QUIET: Duration = Duration::from_secs(20);
+
+/// One frame: what is in view painted, then the images asked for.
+fn frame(images: &mut Images, boxes: &[(u32, u32, u32)], on_screen: usize) {
+    use vomd::render::Pixels;
+    images.begin_frame();
+    for &(id, w, h) in boxes.iter().take(on_screen) {
+        let _ = images.pixels(id, w, h);
+    }
+    images.request(boxes, on_screen);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut PageLayout,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
+    every: Duration,
+    first: bool,
     mut done: impl FnMut(&Images) -> bool,
 ) {
     let t = Instant::now();
+    let mut seen = images.wakes();
+    // What came while nothing was driving it was handled by the event loop meanwhile.
+    let polled = images.poll(doc, layout);
+    let (mut repaint, mut last) = (first || polled, Instant::now());
     while !done(images) {
         assert!(
-            t.elapsed() < Duration::from_secs(120),
-            "stuck: {:?}",
-            images.stats()
+            t.elapsed() < Duration::from_secs(120) && last.elapsed() < QUIET,
+            "stuck (a wake lost?): {:?}\n{}",
+            images.stats(),
+            images.memory_report()
         );
-        images.begin_frame();
-        images.request(boxes, on_screen);
+        if repaint {
+            repaint = false;
+            last = Instant::now();
+            frame(images, boxes, on_screen);
+        }
         std::thread::sleep(every);
-        images.poll(doc, layout);
+        if images.wakes() != seen {
+            seen = images.wakes();
+            last = Instant::now();
+            repaint = images.poll(doc, layout);
+        }
     }
 }
 
@@ -1000,7 +1089,6 @@ fn the_reservation_covers_what_decoding_allocates() {
 
 /// A valid 795 × 10,000 gray PNG: shown at its natural size its bitmap is 31.8 MB, which a
 /// 33.5 MB budget has room for only if nothing else is held beside it.
-#[cfg(feature = "remote-images")]
 fn tall_png() -> Vec<u8> {
     zero_png(795, 10_000, 0, 8, false, 1 << 20)
 }
@@ -1223,6 +1311,188 @@ fn stopping_the_fetch_queue_gives_back_its_room() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// ---- Review round 9 ------------------------------------------------------------------------
+
+/// A transfer that gives up because the fetchers were held off sends no result, only a wake, and a
+/// local decode held back for the fetchers is started when the last of them has: a `curl` that
+/// writes 262,144 bytes and waits at a gate for one more, a local 4000 × 2000 JPEG for a 300 × 150
+/// box asked for meanwhile (it is held back, and the fetchers held off), and then the gate opens:
+/// the transfer asks for credit it is refused, and the window gets one wake. Nothing else asks for
+/// a frame (`events`), so the decode starts only if that poll says a repaint is needed. It
+/// was never started: no transfer, no decode, a poll that said no a hundred times in a row, and
+/// the fetchers held off until something else asked for a frame.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_transfer_that_gives_up_for_the_pause_starts_the_decode_held_back_for_it() {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("held-yield");
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    let big = jpeg_variant(
+        &fixture("wide.jpg"),
+        0xC0,
+        4000,
+        2000,
+        &[0x22, 0x11, 0x11],
+        3,
+    );
+    std::fs::write(dir.join("big.jpg"), &big).unwrap();
+    fake_curl(&dir, &serve);
+    let doc = Doc::parse("![j](big.jpg) ![g](http://127.0.0.1/gated.png)");
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    // The transfer has its 256 KiB of credit and waits for more of the body.
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[],
+        0,
+        Duration::from_millis(2),
+        |i| i.fetch_held() >= 262_144,
+    );
+    // The image comes into view: the decode is held back, the fetchers are held off.
+    let boxes = [(1, 300, 150)];
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &boxes,
+        1,
+        Duration::from_millis(2),
+        |i| i.memory_report().contains("paused true"),
+    );
+    assert_eq!(images.stats().decodes, 0);
+    // The body goes on: the transfer is refused the credit and gives up.
+    std::fs::write(dir.join("gate"), b"").unwrap();
+    events(
+        &mut images,
+        &doc,
+        &mut layout,
+        &boxes,
+        1,
+        Duration::from_millis(2),
+        |i| i.stats().decodes > 0,
+    );
+    assert!(images.pixels(1, 300, 150).is_some());
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A document's remote URLs are its own strings, not image memory: 2,000 distinct URLs of 1,000
+/// characters, none of them fetched (remote images are off), and a valid 795 × 10,000 PNG (a
+/// reservation of 32,594,135 bytes, under the budget) asked for at its natural size. The code
+/// kept a copy of every URL, which the budget counted, and the decode was let run beside it:
+/// 34,471,848 bytes live over the start at most in a 33,554,432 budget (34,000,975 after; a debug
+/// build).
+#[test]
+fn a_documents_urls_are_the_documents_not_image_memory() {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("urls");
+    std::fs::write(dir.join("tall.png"), tall_png()).unwrap();
+    let mut src = String::from("![t](tall.png)");
+    for i in 0..2000 {
+        src += &format!(" ![u](http://127.0.0.1/{i}/{})", "a".repeat(1000));
+    }
+    let doc = Doc::parse(&src);
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    let start = mark();
+    images.attach(&doc, &mut layout);
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[(1, 795, 10_000)],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    assert!(images.pixels(1, 795, 10_000).is_some());
+    let over = peak_over(start);
+    let after = live().saturating_sub(start);
+    println!(
+        "2,000 long URLs and a bitmap of 31.8 MB: {over} bytes live over the start at most, {after} after"
+    );
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    assert!(after <= CACHE_BYTES, "{after} bytes live after");
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A decode that fits the budget by itself but not beside what the document's images cost to keep
+/// is refused, and its image shows its alt text, instead of being let in over the budget: the same
+/// PNG with 3,000 local images of 1,000-character paths (3.2 MB of paths kept, as many again
+/// copied by a request). It was let in alone whatever the total: 35,504,718 bytes live over the start at most
+/// in a 33,554,432 budget (3,192,439 now, the PNG not decoded; a debug build). One bigger than the budget by itself is another matter (it runs alone,
+/// and goes over by its own size).
+#[test]
+fn a_decode_the_bookkeeping_leaves_no_room_for_is_refused() {
+    let _serial = serial();
+    use vomd::layout::ImageSize;
+    use vomd::render::Pixels;
+    let dir = scratch("refuse");
+    std::fs::write(dir.join("tall.png"), tall_png()).unwrap();
+    let mut src = String::from("![t](tall.png)");
+    for i in 0..3000 {
+        src += &format!(" ![p]({}{i}.png)", "d".repeat(1000));
+    }
+    let doc = Doc::parse(&src);
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    let start = mark();
+    images.attach(&doc, &mut layout);
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[(1, 795, 10_000)],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1 || i.stats().failed >= 1,
+    );
+    let over = peak_over(start);
+    println!("a decode beside 3.2 MB of paths: {over} bytes live over the start at most");
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    assert_eq!(layout.image_size(1), Some(ImageSize::Alt), "refused");
+    assert!(images.pixels(1, 795, 10_000).is_none());
+    assert_eq!(images.stats().decodes, 0);
+    // Without the paths it is decoded, in the same budget.
+    let dir2 = scratch("refuse-alone");
+    std::fs::write(dir2.join("tall.png"), tall_png()).unwrap();
+    let doc = Doc::parse("![t](tall.png)");
+    let mut layout = PageLayout::new(&doc, Params::default());
+    images.set_base(Some(dir2.clone()));
+    images.attach(&doc, &mut layout);
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &[(1, 795, 10_000)],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    assert!(images.pixels(1, 795, 10_000).is_some());
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&dir2).unwrap();
+}
+
 #[cfg(feature = "remote-images")]
 mod mix {
     use super::*;
@@ -1436,14 +1706,23 @@ mod mix {
                 "png"
             };
             // A transfer held open for a while after its bytes are all there (`fake_curl`).
-            let slow = if heavy && rng.percent(30) { "slow" } else { "" };
+            let slow = if heavy && rng.percent(30) {
+                "slow"
+            } else if heavy && rng.percent(35) {
+                "trickle"
+            } else {
+                ""
+            };
             let name = format!("{slow}r{i}.{ext}");
             if rng.percent(15) {
                 // Not there: the fetch fails.
                 pool.remote.push(Asset { name, w: 0, h: 0 });
                 continue;
             }
-            if heavy && !slow.is_empty() {
+            if slow == "trickle" {
+                // More than the credit its first half takes, so the second half asks for more.
+                bytes.resize(bytes.len() + (2 << 20) + rng.below(2 << 20) as usize, 0);
+            } else if heavy && !slow.is_empty() {
                 // What a transfer held open has read: the fetchers hold it for as long.
                 bytes.resize(bytes.len() + (3 << 20) + rng.below(1 << 20) as usize, 0);
             } else if rng.percent(60) {
@@ -1477,7 +1756,7 @@ mod mix {
         } else {
             rng.range(2, 30)
         };
-        let remote = [50, 50, 90, 50, 0, 100, 50, 90][profile as usize];
+        let remote = [50, 50, 90, 50, 0, 100, 50, 90, 70, 20][profile as usize];
         for i in 0..count {
             let asset = if !rng.percent(remote) {
                 let a = pool.local[rng.below(12) as usize].clone();
@@ -1490,6 +1769,25 @@ mod mix {
             };
             page.src += if alone { "\n\n" } else { " " };
             page.assets.push(asset);
+        }
+        // 8 and 9: a document with hundreds of other images after them, with long URLs that can't
+        // be fetched (a space in one: refused at once, without a `curl`) or long local paths
+        // of files that aren't there: what a document costs to keep per image, in the budget
+        // beside the decodes of the heavy images above.
+        if profile >= 8 {
+            for i in 0..rng.range(100, 700) {
+                let pad = "u".repeat(rng.range(30, 300) as usize);
+                page.src += &if profile == 8 {
+                    format!(" ![x](<http://127.0.0.1/ {i} {pad}>)")
+                } else {
+                    format!(" ![x]({pad}{i}.png)")
+                };
+                page.assets.push(Asset {
+                    name: String::new(),
+                    w: 0,
+                    h: 0,
+                });
+            }
         }
         page
     }
@@ -1521,51 +1819,68 @@ mod mix {
     /// documented at [`PAINTED`] and [`FIT`] (what the mix builds can't). Returns the largest
     /// number of bytes over the start there were.
     fn random_run(seed: u64) -> usize {
-        use vomd::render::Pixels;
         let mut rng = Rng::new(seed);
         let before = live();
         let dir = scratch(&format!("mix{seed}"));
         // 0: a mix, 1: big pictures, 2: mostly remote, 3: many tiny ones, 4: big and all local
         // (the whole budget is theirs), 5: big and all remote, 6: heavy images (decodes of 3 to
-        // 29 MiB) and transfers held open, local and remote, 7: the same, mostly remote.
-        let profile = seed % 8;
+        // 29 MiB) and transfers held open, local and remote, 7: the same, mostly remote, 8 and 9: the
+        // same with hundreds more images after them, 8 with long URLs, 9 with long local paths.
+        let profile = seed % 10;
         let pool = make_pool(&mut rng, &dir, profile);
         fake_curl_hold(&dir, &dir.join("srv"), "0.3");
         let mut images = Images::default();
         images.set_policy(vomd::settings::RemoteImages::Always);
         images.set_base(Some(dir.join("local")));
-        let woken = Arc::new(AtomicUsize::new(0));
-        let wake = |woken: &Arc<AtomicUsize>| -> vomd::image::Wake {
-            let w = woken.clone();
-            Arc::new(move || {
-                w.fetch_add(1, Relaxed);
-            })
-        };
-        images.set_wake(wake(&woken));
+        // The window's wake, which the window answers with a poll (and a frame if the poll says
+        // so): a state nothing wakes it for stays unseen.
+        let window = || -> vomd::image::Wake { Arc::new(|| {}) };
+        images.set_wake(window());
         // What the page, its layout and the boxes are, and where the window is.
         let page0 = random_page(&mut rng, &pool, profile);
-        let doc = Doc::parse(&page0.src);
-        let layout = PageLayout::new(&doc, Params::default());
+        let ((doc, layout), first_mem) = built(|| {
+            let doc = Doc::parse(&page0.src);
+            let layout = PageLayout::new(&doc, Params::default());
+            (doc, layout)
+        });
         let mut state = (page0, doc, layout);
+        // What the pages' own memory (a `Doc` and its `Layout`) goes over the first's by, at most
+        // (the old page and the new are alive while the images are attached to the new one): it
+        // is no image's, and the allowance for it is measured, not guessed.
+        let (mut doc_mem, mut doc_extra) = (first_mem, 0usize);
         let start = mark();
         let mut log: Vec<String> = Vec::new();
         let (mut top, mut zoom, mut remote) = (0usize, 1.0f32, false);
         let mut peak = 0usize;
         // The boxes of the last frame, and how many were in view.
         let mut last: (Vec<(u32, u32, u32)>, usize) = (Vec::new(), 0);
-        let open = |images: &mut Images, state: &mut (Page, Doc, PageLayout), page: Page| {
-            let doc = Doc::parse(&page.src);
-            let mut layout = PageLayout::new(&doc, Params::default());
+        let open = |images: &mut Images,
+                    state: &mut (Page, Doc, PageLayout),
+                    mem: &mut (usize, usize),
+                    page: Page| {
+            let ((doc, mut layout), now) = built(|| {
+                let doc = Doc::parse(&page.src);
+                let layout = PageLayout::new(&doc, Params::default());
+                (doc, layout)
+            });
             // What `View::open` does.
             images.forget_remote();
             images.attach(&doc, &mut layout);
             *state = (page, doc, layout);
+            mem.1 = mem.1.max((mem.0 + now).saturating_sub(first_mem));
+            mem.0 = now;
         };
+        let mut mem = (doc_mem, doc_extra);
         open(
             &mut images,
             &mut state,
+            &mut mem,
             random_page(&mut rng, &pool, profile),
         );
+        (doc_mem, doc_extra) = mem;
+        let _ = doc_mem;
+        // The wakes the window has taken a poll for.
+        let mut seen = images.wakes();
         let big = matches!(profile, 1 | 4 | 5);
         for step in 0..if big { 260 } else { 160 } {
             let n = state.0.assets.len();
@@ -1583,7 +1898,8 @@ mod mix {
                 68..=72 => "remote off and on",
                 73..=80 => "slow poll",
                 81..=83 => "set_wake",
-                _ => "poll",
+                84..=93 => "poll",
+                _ => "settle",
             };
             log.push(format!(
                 "{step}: {what} (top {top}, zoom {zoom}, remote {remote})"
@@ -1596,11 +1912,16 @@ mod mix {
                 "zoom" => zoom = [0.5, 1.0, 1.0, 2.0][rng.below(4) as usize],
                 "open" => {
                     let page = random_page(&mut rng, &pool, profile);
-                    open(&mut images, &mut state, page);
+                    let mut m = (doc_mem, doc_extra);
+                    open(&mut images, &mut state, &mut m, page);
+                    (doc_mem, doc_extra) = m;
                     (top, remote) = (0, false);
                 }
                 "reload" => {
                     let (page, doc, layout) = &mut state;
+                    // (The page is the same: its memory is the same, and the old document's
+                    // strings are alive, as the images' sources, until they are attached again.)
+                    doc_extra = doc_extra.max((2 * doc_mem).saturating_sub(first_mem));
                     *doc = Doc::parse(&page.src);
                     *layout = PageLayout::new(doc, Params::default());
                     images.forget_remote();
@@ -1617,7 +1938,7 @@ mod mix {
                         remote = true;
                     }
                 }
-                "set_wake" => images.set_wake(wake(&woken)),
+                "set_wake" => images.set_wake(window()),
                 "slow poll" => std::thread::sleep(Duration::from_millis(rng.range(30, 90).into())),
                 _ => {}
             }
@@ -1632,7 +1953,7 @@ mod mix {
             // Frame: paint what is in view, ask for the images near.
             if matches!(
                 what,
-                "frame" | "scroll" | "zoom" | "open" | "reload" | "slow poll"
+                "frame" | "scroll" | "zoom" | "open" | "reload" | "slow poll" | "settle"
             ) {
                 let in_view = rng.range(1, if profile == 3 { 40 } else { 6 }) as usize;
                 let near = rng.range(0, if matches!(profile, 1 | 4 | 5) { 14 } else { 8 }) as usize;
@@ -1646,25 +1967,70 @@ mod mix {
                     }
                     boxes.push((id as u32 + 1, b.0, b.1));
                 }
-                images.begin_frame();
-                for &(id, w, h) in boxes.iter().take(in_view) {
-                    let _ = images.pixels(id, w, h);
-                }
-                images.request(&boxes, in_view.min(boxes.len()));
+                frame(&mut images, &boxes, in_view.min(boxes.len()));
                 last = (boxes, in_view);
+            } else if what == "remote off and on" {
+                // Turning them on or off asks for the images again without a repaint.
+                images.request(&last.0, last.1);
             }
             if what != "slow poll" {
                 let pace = [0u64, 0, 1, 2, 5, 16][rng.below(6) as usize];
                 std::thread::sleep(Duration::from_millis(pace));
             }
-            images.poll(doc, layout);
+            // The window handles what the threads woke it for: a poll for them, and a frame if the
+            // poll says so.
+            if images.wakes() != seen {
+                seen = images.wakes();
+                if images.poll(doc, layout) {
+                    frame(&mut images, &last.0, last.1);
+                }
+            }
+            // The reader stops and waits: what the last frame asked for is done by the threads
+            // and the window's polls alone, and the budget holds meanwhile.
+            if what == "settle" {
+                let t = Instant::now();
+                frame(&mut images, &last.0, last.1);
+                while !images.is_idle() {
+                    assert!(
+                        t.elapsed() < Duration::from_secs(60),
+                        "seed {seed}: stuck after step {step} with nothing more asked for: {:?} ({})\n{}",
+                        images.stats(),
+                        images.memory_report(),
+                        log.iter()
+                            .rev()
+                            .take(8)
+                            .rev()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                    if images.wakes() != seen {
+                        seen = images.wakes();
+                        if images.poll(doc, layout) {
+                            frame(&mut images, &last.0, last.1);
+                        }
+                    }
+                    {
+                        let over = peak_over(start);
+                        peak = peak.max(over);
+                        assert!(
+                            over <= CACHE_BYTES + SLACK + doc_extra,
+                            "seed {seed}: {over} bytes live over the start ({}); {:?}",
+                            images.memory_report(),
+                            images.stats()
+                        );
+                    }
+                }
+            }
+            let allowed = CACHE_BYTES + SLACK + doc_extra;
             let over = peak_over(start);
             peak = peak.max(over);
-            if over > CACHE_BYTES + SLACK {
+            if over > allowed {
                 let recent: Vec<_> = log.iter().rev().take(14).rev().cloned().collect();
                 panic!(
                     "seed {seed}: {over} bytes live over the start after step {step}, {} allowed ({:?}; {})\nrecent steps:\n{}",
-                    CACHE_BYTES + SLACK,
+                    allowed,
                     images.stats(),
                     images.memory_report(),
                     recent.join("\n")
@@ -1676,11 +2042,16 @@ mod mix {
         let t = Instant::now();
         let (page, doc, layout) = &mut state;
         let _ = page;
+        // One last frame, as the window paints after the last thing it was asked; then only
+        // what the threads wake it for (a state that is left only by a request nothing woke the
+        // window for is stuck for good, and a failure here).
+        frame(&mut images, &last.0, last.1);
         while !images.is_idle() {
             assert!(
                 t.elapsed() < Duration::from_secs(60),
-                "seed {seed}: stuck with nothing more asked for: {:?}\n{}",
+                "seed {seed}: stuck with nothing more asked for: {:?} ({})\n{}",
                 images.stats(),
+                images.memory_report(),
                 log.iter()
                     .rev()
                     .take(8)
@@ -1689,14 +2060,26 @@ mod mix {
                     .collect::<Vec<_>>()
                     .join("\n")
             );
-            images.begin_frame();
-            images.request(&last.0, last.1);
             std::thread::sleep(Duration::from_millis(2));
-            images.poll(doc, layout);
-            peak = peak.max(peak_over(start));
+            if images.wakes() != seen {
+                seen = images.wakes();
+                if images.poll(doc, layout) {
+                    frame(&mut images, &last.0, last.1);
+                }
+            }
+            {
+                let over = peak_over(start);
+                peak = peak.max(over);
+                assert!(
+                    over <= CACHE_BYTES + SLACK + doc_extra,
+                    "seed {seed}: {over} bytes live over the start ({}); {:?}",
+                    images.memory_report(),
+                    images.stats()
+                );
+            }
         }
         assert!(
-            peak <= CACHE_BYTES + SLACK,
+            peak <= CACHE_BYTES + SLACK + doc_extra,
             "seed {seed}: {peak} bytes live over the start while the last frame was done"
         );
         // Everything is let go, and nothing is left: the threads end and take what they hold

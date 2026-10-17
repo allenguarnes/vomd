@@ -1727,7 +1727,7 @@ fn ensure_builds_the_viewport_of_many_overestimated_rows() {
 
 /// Sizes for the image test documents: by file name.
 fn test_probe() -> ImageProbe {
-    Box::new(|img: &ImageRef| match img.src.as_str() {
+    Box::new(|img: &ImageRef| match &*img.src {
         "a.png" => ImageSize::Pixels(100, 50),
         "wide.png" => ImageSize::Pixels(2000, 1000),
         "tall.png" => ImageSize::Pixels(100, 1_000_000),

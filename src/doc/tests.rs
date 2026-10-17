@@ -917,7 +917,7 @@ fn id_spaces_are_not_capped_at_16_bits() {
     assert_eq!(doc.images.len(), N);
     let last = doc.spans.iter().rev().find(|s| s.image != 0).unwrap();
     assert_eq!(
-        doc.images[last.image as usize - 1].src,
+        &*doc.images[last.image as usize - 1].src,
         format!("i{}.png", N - 1)
     );
 }
@@ -976,7 +976,7 @@ fn html_attributes_are_parsed_by_boundaries() {
             .iter()
             .find(|s| s.image != 0)
             .map(|s| doc.span_text(s).to_owned());
-        (img.src, img.remote, alt.unwrap())
+        (img.src.to_string(), img.remote, alt.unwrap())
     };
     assert_eq!(
         src("<img src=https://example.com/a.png alt=pic>"),
@@ -1292,7 +1292,7 @@ fn segmented_parse_resolves_definitions_from_other_segments() {
     assert!(assert_same("definitions", &src, 400) > 3);
     let doc = Doc::parse_segments(&src, 400).unwrap();
     assert_eq!(&doc.links[..3], ["/first", "/second", "/first"]);
-    assert_eq!(doc.images[0].src, "i.png");
+    assert_eq!(&*doc.images[0].src, "i.png");
     // Definitions before their use, and after a heading.
     let src = format!("# Links\n[x]: /x\n\n{filler}Use [x].\n");
     assert!(assert_same("definitions after heading", &src, 400) > 3);
@@ -1825,7 +1825,7 @@ fn nested_images_keep_the_whole_outer_alt_text() {
     check_invariants(&doc);
     // Only the outer image is an image; the inner one contributes its alt text.
     assert_eq!(doc.images.len(), 1);
-    assert_eq!(doc.images[0].src, "outer.png");
+    assert_eq!(&*doc.images[0].src, "outer.png");
     let texts: Vec<_> = doc.spans.iter().map(|s| doc.span_text(s)).collect();
     assert_eq!(texts, ["outer inner end"]);
     assert_eq!(doc.spans[0].style & style::IMAGE, style::IMAGE);

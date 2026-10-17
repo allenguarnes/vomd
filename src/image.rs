@@ -13,6 +13,7 @@
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -1094,7 +1095,9 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // |                                     |                                              | its last slot is evicted (`forget_evicted`) or a late    |
 // |                                     |                                              | body is dropped; `shrink_map` after                      |
 // | `Images::deferred`, `urls`, `costs` | bookkeeping: `table_bytes` of the capacity   | replaced with the document; `deferred` pruned with it    |
-// | `srcs` (list, URL strings, paths)   | bookkeeping: capacity and `srcs_heap`        | replaced by the next document, the old one freed first   |
+// | `srcs` (list, local paths)          | bookkeeping: capacity and `srcs_heap`        | replaced by the next document, the old one freed first   |
+// | a remote image's URL in `srcs`      | not counted: the document's own string,      | the document's                                           |
+// |                                     | shared (`ImageRef::src` is an `Arc<str>`)    |                                                         |
 // | `in_view`, `retired`, `waiting`     | bookkeeping: capacity                        | `shrink_vec` after what clears or prunes them            |
 // | worker replaced by `set_wake`       | its decode in `retired_cost`; its queue and  | until its running job's result is taken                  |
 // |                                     | `WORKER_FIXED` in bookkeeping                |                                                         |
@@ -1106,7 +1109,8 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // | channel                             | `FETCHERS + PENDING_MAX` of them)            |                                                         |
 // | what a request builds: the lists of | the allowance of the request: `REQUEST_PER_  | replaced by the next request                             |
 // | URLs and the set that removes the   | REMOTE` for each remote image of the         |                                                         |
-// | duplicates, jobs and their paths    | document, 2 x `Job` for each box, the paths  |                                                         |
+// | duplicates, jobs and their paths    | document while remote images are on, 2 x     |                                                         |
+// |                                     | `Job` for each box, the paths                |                                                         |
 // | `Cache::fetching` while held off    | `Remote::reserve_idle`: the bodies not       | `sync_pause`, and set back to the static reserve, and the |
 // | and idle                            | released and their bookkeeping               | room made for it, before they go on                      |
 //
@@ -1823,6 +1827,9 @@ enum Admit {
     Drop,
     /// Held by the fetchers until there is room: its image is in view.
     Wait,
+    /// Not kept: its image is in view, and decoding it can't fit beside what the document's
+    /// images cost to keep. It shows its alt text.
+    Refuse,
 }
 
 /// The current document's images: where each comes from, the cache, and the threads that
@@ -1833,8 +1840,9 @@ pub struct Images {
     /// Bumped for every document: results for an older one are dropped.
     doc_gen: u64,
     srcs: Vec<Src>,
-    /// What the strings of `srcs` hold ([`str_bytes`] of each URL), and what the paths of its
-    /// files hold (a job copies one): kept from when `srcs` is made.
+    /// What the paths of `srcs` hold (the resolved copy each local image has), and what a job
+    /// copies of one: kept from when `srcs` is made. (A remote image's URL is the document's own
+    /// string, shared: it is the page's memory, as the `Doc` is, and not counted here.)
     srcs_heap: usize,
     paths_heap: usize,
     /// What each local image is (its file's size and header, for what decoding it holds: see
@@ -1847,6 +1855,10 @@ pub struct Images {
     tx: Sender<Done>,
     rx: Receiver<Done>,
     wake: Wake,
+    /// How many times the threads (and `request`) have called the wake, whoever it was given to:
+    /// a window that is woken polls once for them; the tests that stand in for its event loop
+    /// poll when this has gone up ([`Images::wakes`]).
+    wakes: Arc<AtomicUsize>,
     worker: Option<Worker>,
     /// Workers replaced by [`Images::set_wake`] that may still be decoding (or hold a result the
     /// main thread hasn't taken): what they hold is counted until they are idle.
@@ -1887,16 +1899,35 @@ pub struct Images {
     /// The last request had an image in view to decode that doesn't fit beside the fetchers.
     #[cfg(feature = "remote-images")]
     heavy_wanted: bool,
+    /// The first job the last request held back for the fetchers ([`Images::alone`]): a poll
+    /// that finds nothing in its way any more says so ([`Images::held_ready`]), since the
+    /// transfer that was in the way may have given up without a result to take.
+    #[cfg(feature = "remote-images")]
+    held: Option<Key>,
+    /// A poll said so since the last request: not said again before it.
+    #[cfg(feature = "remote-images")]
+    held_due: bool,
+    /// Images whose decode can't fit beside what the document's images cost to keep (see
+    /// [`Images::request`]): they show their alt text from the next poll.
+    refused: Vec<Key>,
     #[cfg(feature = "remote-images")]
     pub(crate) remote: crate::remote::Remote,
 }
 
 /// The URL of a remote key (the empty string for a local one).
-#[cfg(feature = "remote-images")]
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
 fn key_url(key: &Key) -> &str {
     match key {
         Key::Remote(url) => url,
         Key::Local(_) => "",
+    }
+}
+
+/// What the body a job reads costs in the cache (a local file's bytes are in the job's cost).
+fn body_cost(key: &Key, source: &Source) -> usize {
+    match source {
+        Source::File(_) => 0,
+        Source::Bytes(body) => Slot::bytes_cost(key_url(key), body),
     }
 }
 
@@ -1909,6 +1940,8 @@ const REQUEST_PER_REMOTE: usize = 128;
 impl Default for Images {
     fn default() -> Self {
         let (tx, rx) = channel();
+        let wakes: Arc<AtomicUsize> = Arc::default();
+        let counted = wakes.clone();
         Images {
             base: None,
             doc_gen: 0,
@@ -1920,7 +1953,10 @@ impl Default for Images {
             decodes: 0,
             tx,
             rx,
-            wake: Arc::new(|| {}),
+            wake: Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+            wakes,
             worker: None,
             retired: Vec::new(),
             #[cfg(feature = "remote-images")]
@@ -1940,6 +1976,11 @@ impl Default for Images {
             #[cfg(feature = "remote-images")]
             heavy_wanted: false,
             #[cfg(feature = "remote-images")]
+            held: None,
+            #[cfg(feature = "remote-images")]
+            held_due: false,
+            refused: Vec::new(),
+            #[cfg(feature = "remote-images")]
             remote: crate::remote::Remote::default(),
         }
     }
@@ -1952,9 +1993,23 @@ impl Images {
         if let Some(old) = self.worker.take() {
             self.retired.push(old.shared.clone());
         }
+        // Every call is counted, then passed on.
+        let wakes = self.wakes.clone();
+        let wake: Wake = Arc::new(move || {
+            wakes.fetch_add(1, Ordering::SeqCst);
+            wake();
+        });
         #[cfg(feature = "remote-images")]
         self.remote.set_wake(wake.clone());
         self.wake = wake;
+    }
+
+    /// How many times the wake has been called (by the threads, or by [`Images::request`]): a
+    /// window polls once for each wake it gets, so a state that is only reached by a poll
+    /// nothing asked for is a lost wake. For the tests that stand in for the event loop.
+    #[doc(hidden)]
+    pub fn wakes(&self) -> usize {
+        self.wakes.load(Ordering::SeqCst)
     }
 
     /// Fetch remote images from `body` instead of `curl` (see [`Remote::set_test_body`]).
@@ -1972,6 +2027,7 @@ impl Images {
     /// again (the files may have changed); remote ones stay cached by URL.
     pub fn attach(&mut self, doc: &Doc, layout: &mut Layout) {
         self.doc_gen += 1;
+        self.refused = Vec::new();
         self.cache.retain(|s| matches!(s.key, Key::Remote(_)));
         // The last document's tables go before the new one's are made: they are never both held.
         self.srcs = Vec::new();
@@ -1985,7 +2041,8 @@ impl Images {
             .iter()
             .map(|img| {
                 if img.remote {
-                    Src::Remote(img.src.as_str().into())
+                    // The document's own string: one copy of the URL, and it is the page's.
+                    Src::Remote(img.src.clone())
                 } else if cfg!(feature = "images") {
                     local_path(&img.src, self.base.as_deref()).map_or(Src::None, Src::File)
                 } else {
@@ -2001,8 +2058,7 @@ impl Images {
                     self.paths_heap += path.as_os_str().len() + STR_OVERHEAD;
                     self.srcs_heap += path.as_os_str().len() + STR_OVERHEAD;
                 }
-                Src::Remote(url) => self.srcs_heap += str_bytes(url),
-                Src::None => {}
+                Src::Remote(_) | Src::None => {}
             }
         }
         if let Some(w) = &self.worker {
@@ -2030,6 +2086,7 @@ impl Images {
             self.remote_images = self.urls.len();
             // Nothing is wanted of the new document yet: the first request says.
             self.heavy_wanted = false;
+            self.held = None;
             self.admit_waiting();
             self.prune_urls();
             self.sync_remote(doc, layout);
@@ -2071,8 +2128,17 @@ impl Images {
                 )
             })
             .collect();
+        let worker = self.worker.as_ref().map_or_else(String::new, |w| {
+            let (lock, _) = &*w.shared;
+            let q = lock.lock().unwrap_or_else(|e| e.into_inner());
+            format!(
+                "worker: {} queued, busy {:?}",
+                q.jobs.len(),
+                q.busy.as_ref().map(|b| (&b.0, b.3))
+            )
+        });
         format!(
-            "cache {} in {} slots ({}), decode {}, fetchers {}, bookkeeping {}, retired {}; {remote}",
+            "cache {} in {} slots ({}), decode {}, fetchers {}, bookkeeping {}, retired {}; {worker}; {remote}",
             c.bytes,
             c.slots.len(),
             slots.join(", "),
@@ -2213,18 +2279,21 @@ impl Images {
         // too: the jobs (a `Vec` doubles as it grows) and the paths they copy.
         #[cfg(feature = "remote-images")]
         self.forget_evicted();
-        self.charge_bookkeeping(
-            boxes
-                .len()
-                .saturating_mul(2 * size_of::<Job>())
-                .saturating_add(self.paths_heap),
-        );
+        let transient = boxes
+            .len()
+            .saturating_mul(2 * size_of::<Job>())
+            .saturating_add(self.paths_heap);
+        self.charge_bookkeeping(transient);
         let mut jobs = Vec::new();
         #[cfg(feature = "remote-images")]
         let mut fetch: Vec<Arc<str>> = Vec::new();
         #[cfg(feature = "remote-images")]
         let mut deferred: Vec<Arc<str>> = Vec::new();
         let mut wanted = 0usize;
+        // The bodies that decodes read are held in the cache beside them (a job's source is an
+        // `Arc` of the slot's bytes: [`Slot::pinned`]), so what is kept for the images near the
+        // viewport is kept beside them too.
+        let mut bodies = self.cache.pinned_cost();
         // Decodes of replaced workers still running hold memory beside the current worker's.
         let retired = self.retired_cost();
         let mut reserve = retired + self.worker.as_ref().map_or(0, Worker::busy_cost);
@@ -2232,7 +2301,7 @@ impl Images {
         #[cfg(feature = "remote-images")]
         let mut starting = self.unfetched();
         #[cfg(feature = "remote-images")]
-        let mut fetching = self.fetch_reserve(starting);
+        let fetching;
         #[cfg(not(feature = "remote-images"))]
         let fetching = 0;
         #[cfg(feature = "remote-images")]
@@ -2246,6 +2315,8 @@ impl Images {
         );
         #[cfg(feature = "remote-images")]
         let (mut heavy_wanted, mut heavy_chosen) = (false, false);
+        #[cfg(feature = "remote-images")]
+        let mut held: Option<Key> = None;
         for (n, &(id, w, h)) in boxes.iter().enumerate() {
             let Some(key) = self.key(id) else {
                 continue;
@@ -2259,11 +2330,30 @@ impl Images {
             let cached = self.cache.has(&key, w, h);
             // The result is held beside the cache too, until it goes in.
             let cost = if cached { 0 } else { self.cost(id, w, h) };
-            let room = (self.cache.cap.saturating_sub(fetching))
+            // What the fetchers are given whether they are held off now or not (a decision that
+            // followed the pause would flip with it: an image near that is decoded while they
+            // are held off, and evicted when they go on, and fetched and decoded again).
+            // (An image that has to be fetched first is judged with them running: it starts them.)
+            #[cfg(feature = "remote-images")]
+            let room_fetch = {
+                let fetches = !cached
+                    && matches!(self.src(id), Src::Remote(url)
+                        if self.remote.on
+                            && self.remote.size(url) != Some(None)
+                            && self.cache.peek_bytes(url).is_none());
+                self.fetch_static(self.remote.busy() || fetches, starting || fetches)
+            };
+            #[cfg(not(feature = "remote-images"))]
+            let room_fetch = 0;
+            let room = (self.cache.cap.saturating_sub(room_fetch))
                 .saturating_sub(self.cache.overhead)
+                .saturating_sub(bodies)
                 .saturating_sub(reserve.max(retired.saturating_add(cost)));
-            let over = n >= on_screen && wanted >= room;
-            wanted = wanted.saturating_add(w as usize * h as usize * 4);
+            // Kept only if it fits with the ones before it (one that crosses the line is the one
+            // that doesn't: the budget is not gone over by a box).
+            let bytes = w as usize * h as usize * 4;
+            let over = n >= on_screen && wanted.saturating_add(bytes) > room;
+            wanted = wanted.saturating_add(bytes);
             if over {
                 continue;
             }
@@ -2282,11 +2372,26 @@ impl Images {
             if heavy_chosen {
                 continue;
             }
+            #[cfg(feature = "remote-images")]
+            let mut fresh_body = false;
+            #[cfg(not(feature = "remote-images"))]
+            let fresh_body = false;
             let source = match self.src(id).clone() {
                 Src::File(path) => Source::File(path),
+                // One that failed (fetched, or decoded to nothing) is not tried again while the
+                // document is open, whatever body is still held: two jobs for it, another size
+                // each, pin its body for each other, and would fail one after the other for good.
+                #[cfg(feature = "remote-images")]
+                Src::Remote(url) if self.remote.on && self.remote.size(&url) == Some(None) => {
+                    continue;
+                }
                 #[cfg(feature = "remote-images")]
                 Src::Remote(url) if self.remote.on => match self.cache.peek_bytes(&url).cloned() {
-                    Some(bytes) => Source::Bytes(bytes),
+                    Some(bytes) => {
+                        // (A body no job holds yet is held by this one from now on.)
+                        fresh_body = Arc::strong_count(&bytes) == 2;
+                        Source::Bytes(bytes)
+                    }
                     None => {
                         // Not fetched yet, or its bytes were evicted: fetch it (again). One
                         // dropped for lack of room, whose image isn't in view, waits to see
@@ -2297,7 +2402,6 @@ impl Images {
                             } else {
                                 fetch.push(url);
                                 starting = true;
-                                fetching = self.fetch_reserve(true);
                             }
                         }
                         continue;
@@ -2305,6 +2409,17 @@ impl Images {
                 },
                 _ => continue,
             };
+            // A decode that fits the cache by itself but not beside what the document's images
+            // cost to keep (their sources, URLs and records) can't run in the budget at all, and
+            // is not tried: the image shows its alt text. (One bigger than the cache by itself is
+            // another matter: it runs alone, over the budget by its own size.)
+            let own = cost.saturating_add(body_cost(&key, &source));
+            if own <= self.cache.cap && !self.fits_bookkeeping(own, transient) {
+                if !self.refused.contains(&key) {
+                    self.refused.push(key);
+                }
+                continue;
+            }
             // A decode that doesn't fit beside what the fetchers may hold is run when they are
             // held off and hold nothing: the fetchers are told to stop now, and the job is
             // handed over by a request that finds them done (their last result wakes the window).
@@ -2330,6 +2445,7 @@ impl Images {
                     || self.cache.holds_used_bytes_but(own)
                     || !self.alone(kept, need, None)
                 {
+                    held.get_or_insert(key);
                     continue;
                 }
                 self.exclusive = Some(key.clone());
@@ -2341,6 +2457,9 @@ impl Images {
                 self.cache.bytes_of(url);
             }
             reserve = reserve.max(retired.saturating_add(cost));
+            if fresh_body {
+                bodies = bodies.saturating_add(body_cost(&key, &source));
+            }
             jobs.push(Job {
                 doc_gen: self.doc_gen,
                 key,
@@ -2371,6 +2490,8 @@ impl Images {
         {
             shrink_vec(&mut self.in_view);
             self.heavy_wanted = heavy_wanted;
+            self.held = held;
+            self.held_due = false;
             fetching = self.fetch_reserve(starting);
         }
         self.cache.reserve = reserve;
@@ -2409,6 +2530,10 @@ impl Images {
         if self.waiting_ready() {
             (self.wake)();
         }
+        // What can't run in the budget shows its alt text: the next poll does it.
+        if !self.refused.is_empty() {
+            (self.wake)();
+        }
         self.charge_bookkeeping(0);
     }
 
@@ -2429,7 +2554,9 @@ impl Images {
             return false;
         }
         self.charge_bookkeeping(0);
-        let mut any = false;
+        let mut any = self.show_refused(doc, layout);
+        #[cfg(feature = "remote-images")]
+        let paused = self.remote.paused();
         while let Ok(done) = self.rx.try_recv() {
             any = true;
             match done {
@@ -2497,12 +2624,52 @@ impl Images {
                 any = true;
                 self.sync_pause(false);
             }
+            // Whatever made work runnable without a result to take (a transfer that gave up for
+            // the pause, the pause let go) needs a frame for its request to find it so: this is
+            // the window's only way to know.
+            if paused && !self.remote.paused() {
+                any = true;
+            }
+            if self.held_ready() && !std::mem::replace(&mut self.held_due, true) {
+                any = true;
+            }
             self.forget_evicted();
             if any {
                 self.sync_remote(doc, layout);
             }
         }
         any
+    }
+
+    /// Images whose decode can't run in the budget ([`Images::refused`]) show their alt text.
+    /// Returns true if there were any (the window needs a repaint).
+    fn show_refused(&mut self, doc: &Doc, layout: &mut Layout) -> bool {
+        if self.refused.is_empty() {
+            return false;
+        }
+        for key in std::mem::take(&mut self.refused) {
+            match key {
+                Key::Local(id) => {
+                    if let Some(s) = id
+                        .checked_sub(1)
+                        .and_then(|i| self.srcs.get_mut(i as usize))
+                    {
+                        *s = Src::None;
+                    }
+                    layout.set_image(doc, id, ImageSize::Alt);
+                }
+                #[cfg(feature = "remote-images")]
+                Key::Remote(url) => {
+                    self.remote.failed(&url);
+                    self.cache.discard_bytes(&url);
+                }
+                #[cfg(not(feature = "remote-images"))]
+                Key::Remote(_) => {}
+            }
+        }
+        #[cfg(feature = "remote-images")]
+        self.sync_remote(doc, layout);
+        true
     }
 
     /// A fetch finished. Its body is admitted to the cache only if the cache has room for it
@@ -2524,7 +2691,16 @@ impl Images {
             Admit::Wait => self.waiting.push((url, result)),
             Admit::Yes => self.take_fetched(url, result, true),
             Admit::Drop => self.drop_fetched(url, result),
+            Admit::Refuse => self.refuse_fetched(url, result),
         }
+    }
+
+    /// Take a body whose image can't be decoded in the budget: it is not kept, and the image
+    /// shows its alt text (as it does when it fails to decode).
+    #[cfg(feature = "remote-images")]
+    fn refuse_fetched(&mut self, url: Arc<str>, result: crate::remote::Fetched) {
+        self.take_fetched(url.clone(), result, false);
+        self.remote.failed(&url);
     }
 
     /// Forget what is kept per URL that the current document doesn't have and nothing holds:
@@ -2600,6 +2776,14 @@ impl Images {
     fn admission(&mut self, url: &Arc<str>, bytes: &Bytes) -> Admit {
         let cost = Slot::bytes_cost(url, bytes);
         let decode = self.decode_estimate(url, bytes);
+        let in_view = self.in_view.iter().any(|(u, ..)| u == url);
+        // The decode of an image in view that fits the cache by itself but not beside the
+        // bookkeeping has no room to wait for (one bigger than the cache by itself is let in
+        // alone, `admit_alone`).
+        let own = cost.saturating_add(decode);
+        if in_view && own <= self.cache.cap && !self.fits_bookkeeping(own, 0) {
+            return Admit::Refuse;
+        }
         // Whatever the fetchers hold now (they may be held off, and hold nothing): a body let in
         // is protected, and stays when they are let go on, so it has to fit beside all they may take.
         if self
@@ -2607,7 +2791,7 @@ impl Images {
             .room_for(cost, decode, self.fetch_static(true, true))
         {
             Admit::Yes
-        } else if !self.in_view.iter().any(|(u, ..)| u == url) {
+        } else if !in_view {
             Admit::Drop
         } else {
             Admit::Wait
@@ -2819,6 +3003,10 @@ impl Images {
                     self.drop_fetched(url, result);
                     any = true;
                 }
+                Admit::Refuse => {
+                    self.refuse_fetched(url, result);
+                    any = true;
+                }
             }
         }
         any
@@ -2855,6 +3043,28 @@ impl Images {
                 .waiting
                 .iter()
                 .any(|(u, r)| matches!(r, Ok((b, ..)) if self.is_heavy(kept, u, b)))
+    }
+
+    /// Whether the decode the last request held back ([`Images::held`]) has nothing in its way
+    /// now, which a request (a frame) would find: no replaced worker is decoding, no other decode
+    /// runs alone, no body is kept for a decode, and the fetchers are held off and hold nothing
+    /// ([`Images::fetchers_idle`]). Nothing is changed. The ways each of these comes true all
+    /// send the window a result to take, except the last, which a transfer can bring about by
+    /// giving up: [`Images::poll`] says so when it does.
+    #[cfg(feature = "remote-images")]
+    fn held_ready(&mut self) -> bool {
+        let Some(key) = self.held.clone() else {
+            return false;
+        };
+        self.retired_cost();
+        let own = match &key {
+            Key::Remote(url) => Some(url),
+            Key::Local(_) => None,
+        };
+        self.retired.is_empty()
+            && self.exclusive.as_ref().is_none_or(|k| *k == key)
+            && !self.cache.holds_used_bytes_but(own)
+            && self.fetchers_idle()
     }
 
     /// What the cache sets aside for the fetchers: [`remote::FETCH_RESERVE`] if any are running or
@@ -2940,10 +3150,33 @@ impl Images {
                 ))
                 .saturating_add(vec_bytes(&self.in_view))
                 .saturating_add(vec_bytes(&self.waiting))
-                .saturating_add(self.remote.bookkeeping_bytes())
-                .saturating_add(self.remote_images.saturating_mul(REQUEST_PER_REMOTE));
+                .saturating_add(self.remote.bookkeeping_bytes());
+            // What a request builds for the fetchers is built only while they are wanted.
+            if self.remote.on {
+                n = n.saturating_add(self.remote_images.saturating_mul(REQUEST_PER_REMOTE));
+            }
         }
+        n = n.saturating_add(vec_bytes(&self.refused));
         n
+    }
+
+    /// Whether a decode of `own` bytes (with the body it reads) fits the budget by itself beside
+    /// what the document's images cost to keep, once everything that can be evicted is. The
+    /// bookkeeping includes the records of the slots (a slot list, the sizes of cached URLs), which
+    /// go with them, so the answer is the one after they have: a cache full of small images
+    /// doesn't make a big one's decode impossible, only a document that costs the room itself.
+    /// (Whatever was painted in this frame stays, and is not counted: it is the exception to the
+    /// budget, [`Images::alone`].) `false` means the decode can't run in the budget at all, and
+    /// the image is refused: shown as its alt text.
+    fn fits_bookkeeping(&mut self, own: usize, transient: usize) -> bool {
+        if self.cache.fits(0, 0, own, 0, 0) {
+            return true;
+        }
+        self.cache.evict_for(self.cache.cap);
+        #[cfg(feature = "remote-images")]
+        self.forget_evicted();
+        self.charge_bookkeeping(transient);
+        self.cache.fits(0, 0, own, 0, 0)
     }
 
     /// Set what the cache holds back for the bookkeeping to what it is now, and `transient` more

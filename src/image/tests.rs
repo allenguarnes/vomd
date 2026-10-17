@@ -926,13 +926,20 @@ fn the_cache_is_made_room_for_the_fetchers_before_they_start() {
     assert!(images.cache.bytes <= CACHE_BYTES);
 }
 
-/// Wait for `images` to hand over results until `done` holds (or fail after a while).
+/// Wait for `images` to hand over results until `done` holds (or fail after a while): a poll for
+/// each wake, as the window does (the first at once, for what came before).
 fn wait(images: &mut Images, doc: &Doc, layout: &mut Layout, done: impl Fn(&mut Images) -> bool) {
     let t = Instant::now();
+    let mut seen = images.wakes();
+    images.poll(doc, layout);
     while !done(images) {
         assert!(t.elapsed() < Duration::from_secs(60), "timed out");
+        if images.wakes() == seen {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        seen = images.wakes();
         images.poll(doc, layout);
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1055,9 +1062,10 @@ fn images_beyond_the_cache_are_not_decoded_over_and_over() {
     let mut images = Images::default();
     images.set_base(Some(dir.clone()));
     images.attach(&doc, &mut layout);
-    // Room for three of them (40,000 bytes each, as boxes: a fourth would make 120,000 of
-    // them) beside the decode of another (its file, its result and what decoding holds).
-    images.cache.cap = images.cost(4, 100, 100) + 100_000;
+    // Room for three of them (40,000 bytes each, as boxes: a fourth would make 160,000 of
+    // them) beside the decode of another (its file, its result and what decoding holds). One that
+    // would cross the line is the one that isn't kept: the budget is not gone over by a box.
+    images.cache.cap = images.cost(4, 100, 100) + 130_000;
     // Image 1 in view, the others a screen away.
     let boxes = [(1, 100, 100), (2, 100, 100), (3, 100, 100), (4, 100, 100)];
     // A frame per result: results straddle frames, as the decodes of big images do. It is
@@ -1948,21 +1956,14 @@ fn open_and_settle(images: &mut Images, src: &str) -> (Doc, Layout) {
 fn settle(images: &mut Images, doc: &Doc, layout: &mut Layout) {
     let n = doc.remote_image_count() as u32;
     let boxes: Vec<_> = (1..=n).map(|id| (id, 40, 30)).collect();
-    let t = Instant::now();
-    loop {
-        images.begin_frame();
-        images.request(&boxes, boxes.len());
-        std::thread::sleep(Duration::from_millis(3));
-        images.poll(doc, layout);
+    let n = boxes.len();
+    drive(images, doc, layout, &boxes, n, |images| {
         let done = images.srcs.iter().all(|s| match s {
             Src::Remote(url) => images.remote.size(url).is_some(),
             _ => true,
         });
-        if done && images.waiting.is_empty() && images.worker.as_ref().is_none_or(Worker::idle) {
-            break;
-        }
-        assert!(t.elapsed() < Duration::from_secs(60), "stuck");
-    }
+        done && images.waiting.is_empty() && images.worker.as_ref().is_none_or(Worker::idle)
+    });
 }
 
 /// What is kept per URL goes with the document that had it, so a session through many documents
@@ -2177,14 +2178,7 @@ fn a_remote_decode_failure_is_retried_when_the_document_is_opened_again() {
     let failed = |images: &Images| images.remote.size(&url) == Some(None);
     let frames =
         |images: &mut Images, doc: &Doc, layout: &mut Layout, until: &dyn Fn(&Images) -> bool| {
-            let t = Instant::now();
-            while !until(images) {
-                images.begin_frame();
-                images.request(&[(1, 40, 30)], 1);
-                std::thread::sleep(Duration::from_millis(3));
-                images.poll(doc, layout);
-                assert!(t.elapsed() < Duration::from_secs(60), "stuck");
-            }
+            drive(images, doc, layout, &[(1, 40, 30)], 1, |i| until(i));
         };
     let src = "![x](https://x.y/cut.png)";
     let doc = Doc::parse(src);
@@ -2246,8 +2240,19 @@ fn big_jpeg(w: u16, h: u16) -> Vec<u8> {
     jpeg
 }
 
-/// Frame (`begin_frame`, `request`, poll) until `done`, which is told what `poll` said; a
-/// deadline of a minute only stops a test that is stuck.
+/// How long the event loop that [`drive`] stands in for may sit with nothing to do while what it
+/// waits for is not there: a wake that was never sent (a transition nothing told the window of)
+/// stays stuck for good, and this is how a test finds out, long before the deadline.
+#[cfg(feature = "remote-images")]
+const QUIET: Duration = Duration::from_secs(5);
+
+/// What the window does with images, and no more (`src/main.rs`): the viewport is
+/// new (`boxes`, the first `on_screen` in view), so a frame is painted (`begin_frame`, the
+/// pixels in view painted, `request`); after that the threads wake it, and it polls for a wake
+/// (once for however many came), and paints a frame only if the poll says a repaint is needed.
+/// Nothing else asks for a frame: a result that is only reached by a request nothing woke the
+/// window for stays unreached, and `done` (looked at every millisecond, wake or not) never holds.
+/// Fails if it doesn't within [`QUIET`] of the last frame or wake, or in a minute.
 #[cfg(feature = "remote-images")]
 fn drive(
     images: &mut Images,
@@ -2255,20 +2260,52 @@ fn drive(
     layout: &mut Layout,
     boxes: &[(u32, u32, u32)],
     on_screen: usize,
+    done: impl FnMut(&mut Images) -> bool,
+) {
+    drive_from(true, images, doc, layout, boxes, on_screen, done);
+}
+
+/// [`drive`] with no frame for the viewport to start with (`first` false): it hasn't changed,
+/// and only what the threads do makes anything happen.
+#[cfg(feature = "remote-images")]
+fn drive_from(
+    first: bool,
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut Layout,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
     mut done: impl FnMut(&mut Images) -> bool,
 ) {
+    use crate::render::Pixels;
     let t = Instant::now();
+    let mut seen = images.wakes();
+    // What came while nothing was driving it was handled by the event loop meanwhile.
+    let polled = images.poll(doc, layout);
+    let (mut frame, mut last) = (first || polled, Instant::now());
     while !done(images) {
         assert!(
-            t.elapsed() < Duration::from_secs(60),
-            "stuck: {:?} {}",
+            t.elapsed() < Duration::from_secs(60) && last.elapsed() < QUIET,
+            "stuck (a wake lost?): {:?} {}",
             images.stats(),
             images.memory_report()
         );
-        images.begin_frame();
-        images.request(boxes, on_screen);
-        std::thread::sleep(Duration::from_millis(2));
-        images.poll(doc, layout);
+        if frame {
+            frame = false;
+            last = Instant::now();
+            images.begin_frame();
+            for &(id, w, h) in boxes.iter().take(on_screen) {
+                let _ = images.pixels(id, w, h);
+            }
+            images.request(boxes, on_screen);
+        }
+        if images.wakes() == seen {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        seen = images.wakes();
+        last = Instant::now();
+        frame = images.poll(doc, layout);
     }
 }
 
@@ -2378,9 +2415,10 @@ fn a_local_decode_that_does_not_fit_waits_for_the_fetchers_and_holds_them_off() 
         4,
         "the one that gave up is not restarted"
     );
-    // The transfers end: the decode goes, and nothing starts until its result is taken.
+    // The transfers end: the decode goes, and nothing starts until its result is taken. (No frame
+    // for the viewport: the window is woken for each result, and that is all that asks for one.)
     gate.open();
-    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+    drive_from(false, &mut images, &doc, &mut layout, &boxes, 1, |i| {
         // Only a poll takes the result, and lets the fetchers go on: until it has, none started.
         let decoded = i.stats().decodes > 0;
         assert!(
@@ -2400,6 +2438,73 @@ fn a_local_decode_that_does_not_fit_waits_for_the_fetchers_and_holds_them_off() 
         starts.load(Ordering::SeqCst)
     );
     assert!(!images.remote.paused() && images.exclusive.is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A transfer that gives up because the fetchers were held off sends no result, only a wake: a
+/// local decode held back for the fetchers is started when the last of them gives up, though
+/// nothing asks for a frame (review round 9). One transfer holds its credit at a gate, the
+/// image comes into view (the decode is held back, the fetchers held off), the gate opens and the
+/// transfer asks for more credit, which it is refused. The window gets one wake and polls: with
+/// nothing else asking for a frame the decode is started only if that poll says a repaint is
+/// needed (it was never started: zero transfers, zero decodes, a poll that said no a hundred
+/// times, and the fetchers held off for good).
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_transfer_that_gives_up_for_the_pause_starts_the_decode_held_back_for_it() {
+    use crate::remote::{Error, STEP};
+    use crate::render::Pixels;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = scratch("held-yield");
+    std::fs::write(dir.join("big.jpg"), big_jpeg(4000, 2000)).unwrap();
+    let doc = Doc::parse("![j](big.jpg) ![r](https://x.y/a.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let (gate, starts) = (Gate::new(), Arc::new(AtomicUsize::new(0)));
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 3, 255]);
+    {
+        let (gate, starts) = (gate.clone(), starts.clone());
+        images.remote.set_fetcher(Arc::new(move |_, grant| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+            gate.wait();
+            // One more byte than it was given credit for.
+            if !grant(STEP) {
+                return Err(Error::Yielded);
+            }
+            Ok((Arc::new(png.clone()), 40, 30))
+        }));
+    }
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    // The transfer has its credit and waits at the gate.
+    drive(&mut images, &doc, &mut layout, &[], 0, |i| {
+        starts.load(Ordering::SeqCst) == 1 && i.remote.inflight() == STEP
+    });
+    // The image comes into view: the decode is held back and the fetchers are held off.
+    let boxes = [(1, 300, 150)];
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.remote.paused()
+    });
+    assert!(images.worker.is_none(), "nothing was handed to the worker");
+    assert_eq!(images.remote.transfers(), (1, 0));
+    // The gate opens: the transfer asks for credit and gives up. The window is woken (once) and
+    // nothing else asks for a frame.
+    gate.open();
+    drive_from(false, &mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().decodes > 0
+    });
+    assert!(images.pixels(1, 300, 150).is_some());
+    // The fetchers go on when its result is taken: the transfer that gave up is fetched again.
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().fetched == 1 && i.is_idle()
+    });
+    assert!(!images.remote.paused() && images.exclusive.is_none());
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2466,9 +2571,10 @@ fn a_body_that_does_not_fit_waits_for_the_fetchers_and_is_let_in_alone() {
     // up: nothing starts from here.)
     let before = starts.load(Ordering::SeqCst);
     assert!((4..=5).contains(&before), "{before} fetches started");
-    // They end; it is let in, decoded, and nothing starts until its result is taken.
+    // They end; it is let in, decoded, and nothing starts until its result is taken. (No frame
+    // for the viewport: the window is woken for each result, and that is all that asks for one.)
     gate.open();
-    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+    drive_from(false, &mut images, &doc, &mut layout, &boxes, 1, |i| {
         let decoded = i.stats().decodes > 0;
         assert!(
             decoded || starts.load(Ordering::SeqCst) == before,
@@ -2567,6 +2673,93 @@ fn the_fetchers_go_on_when_the_decode_held_back_is_no_longer_wanted() {
     });
     assert_eq!(images.stats().decodes, 0);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The body case of the one above: the last transfer to end is one that gives up for the pause,
+/// with a body in view waiting for the fetchers to hold nothing. The window is woken for it and
+/// nothing else asks for a frame: the poll lets the body in ([`Images::admit_alone`]) and says
+/// a repaint is needed, which asks for its decode.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_body_that_waits_is_let_in_when_the_last_transfer_gives_up() {
+    use crate::remote::{Error, STEP};
+    use crate::render::Pixels;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let jpeg = big_jpeg(4000, 2000);
+    let doc = Doc::parse("![j](https://x.y/big.jpg) ![r](https://x.y/slow.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let (gate, held) = (Gate::new(), Arc::new(AtomicUsize::new(0)));
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 4, 255]);
+    {
+        let (gate, held) = (gate.clone(), held.clone());
+        images
+            .remote
+            .set_fetcher(Arc::new(move |url: &str, grant: crate::remote::Grant| {
+                if !grant(STEP) {
+                    return Err(Error::Yielded);
+                }
+                if url.ends_with("big.jpg") {
+                    // The body arrives while the other transfer holds its credit.
+                    while held.load(Ordering::SeqCst) < 1 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    return Ok((Arc::new(jpeg.clone()), 4000, 2000));
+                }
+                held.fetch_add(1, Ordering::SeqCst);
+                gate.wait();
+                if !grant(STEP) {
+                    return Err(Error::Yielded);
+                }
+                Ok((Arc::new(png.clone()), 40, 30))
+            }));
+    }
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let boxes = [(1, 300, 150)];
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().waiting == 1 && i.remote.paused() && i.remote.transfers() == (1, 1)
+    });
+    assert_eq!(images.stats().decodes, 0);
+    gate.open();
+    drive_from(false, &mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().decodes > 0
+    });
+    assert!(images.pixels(1, 300, 150).is_some());
+    drive(&mut images, &doc, &mut layout, &boxes, 1, |i| {
+        i.stats().fetched == 2 && i.is_idle()
+    });
+}
+
+/// An image that failed is not tried again while the document is open, whatever body of it is
+/// still held (found by the random mix, the first state it left stuck: a thread decoding for
+/// ever, 100% of a core): the image is in the document twice, in two sizes, and fails to decode.
+/// Its body is not let go while a job holds it, and each failing job found the other's queued,
+/// so the body stayed, and the next request made a job of it again, one size and then the
+/// other, for good.
+#[cfg(feature = "remote-images")]
+#[test]
+fn an_image_that_failed_is_not_decoded_again_for_the_body_still_held() {
+    let png = png_bytes(40, 30, |x, y| [x as u8, y as u8, 1, 255]);
+    let doc = Doc::parse("![a](https://x.y/cut.png) ![b](https://x.y/cut.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let url: Arc<str> = "https://x.y/cut.png".into();
+    // Its body is held (a job's, pinned) and it is known to have failed.
+    images.cache.insert(
+        Key::Remote(url.clone()),
+        Data::Bytes(Arc::new(png[..png.len() / 2].to_vec())),
+    );
+    images.remote.failed(&url);
+    let boxes = [(1, 40, 30), (2, 20, 15)];
+    images.begin_frame();
+    images.request(&boxes, 2);
+    assert!(images.worker.is_none(), "a job was made of it");
+    assert!(images.is_idle());
 }
 
 /// A body let in alone whose image is gone before its decode is asked for (another document
