@@ -1183,11 +1183,12 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // |                                            | + 4 KiB                                    |                                             |
 // | `take_done` / `drain_results`              | nothing is made: a result moves from the   | -                                           |
 // |                                            | channel to the cache (`store`) or is freed |                                             |
-// | `Cache::insert`: the slot list grows       | `store`: `make_room("slot list")` for the  | a list growth of 16 KiB (`SLOTS_FREE`) at   |
-// |                                            | new buffer; a body: `admission` adds it to | most goes in anyway (painted slots are the  |
-// |                                            | what it asks of `Cache::room_for`          | exception to the budget); more: the result |
-// |                                            |                                            | is dropped and its image shows its alt text;|
-// |                                            |                                            | a body is dropped or waits (`Admit`)        |
+// | `Cache::insert`: the slot list grows       | a request makes the room for the results it| a growth of 16 KiB (`SLOTS_FREE`) at most goes|
+// | (the places of the results of jobs)        | asks for before it asks (`reserve_slots`,   | in anyway (painted slots are the exception to|
+// |                                            | in its allowance; `Cache::expect` keeps it  | the budget); more: the request asks for fewer|
+// |                                            | from `trim`); `store`: `make_room("slot     | boxes (no room *now* fails no image), a      |
+// |                                            | list")` for what came beside them           | result with no place is dropped and asked for|
+// |                                            |                                            | again, a body waits (in view) or is deferred |
 // | `Cache::dropped`, `Cache::remove`          | the slot freed first, a URL is 16 bytes of | - (net memory only falls)                   |
 // |                                            | the 112 or more that it was                |                                             |
 // | `Cache::trim`, `shrink_vec`                | a realloc to less allocates nothing        | -                                           |
@@ -1195,9 +1196,9 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // | `prune_urls`: the set of cached URLs       | `make_room("prune: the cached URLs")`      | the records of other documents stay (they   |
 // |                                            |                                            | are charged), and are looked at again       |
 // | `request`: `costs` table, `jobs`, `refused`| `request_fit` works out all of it, boxes   | the boxes that don't fit are not asked for  |
-// | `in_view`, the lists of URLs, the paths of | most wanted first; `make_room("request")`  | (a later request asks); `REQUEST_FREE`      |
-// | jobs, a path and a file's header in        | before any is made, with the images it is  | (16 KiB) is let whatever the room is        |
-// | progress, `Remote::fetch`'s set and queue  | about to keep protected (`protect_wanted`) |                                             |
+// | `in_view`, the lists of URLs, the paths of | most wanted first; `make_room("request")`  | (a later request asks); `REQUEST_FREE` +    |
+// | jobs, a path and a file's header in        | before any is made, the images it is about | `SLOTS_FREE` (32 KiB) is let whatever the   |
+// | progress, `Remote::fetch`'s set and queue  | to keep protected first (`protect_wanted`) | room is; refused: asked again for fewer     |
 // | the decodes a request queues (worker)      | `make_room("request: decodes and           | each decode was judged to fit (`fits_       |
 // |                                            | fetchers")` with their reserve set, before | bookkeeping, `alone`): one that doesn't is  |
 // |                                            | `Worker::set`                              | refused or run alone with the fetchers held |
@@ -1322,6 +1323,11 @@ struct Cache {
     /// The URLs of the remote slots removed since [`Images::forget_evicted`] last looked: what is
     /// kept of a URL that has no slot left, and isn't the document's, is forgotten.
     dropped: Vec<Arc<str>>,
+    /// Results the worker may still send back (jobs queued or running): each takes a slot, and
+    /// the list of slots was given the room for them when they were asked for
+    /// ([`Images::request`]), so a result is never turned away for want of a place to go.
+    /// [`Cache::trim`] keeps that room.
+    expect: usize,
     frame: u64,
 }
 
@@ -1335,6 +1341,7 @@ impl Cache {
             fetching: 0,
             overhead: 0,
             dropped: Vec::new(),
+            expect: 0,
             frame: 0,
         }
     }
@@ -1670,7 +1677,31 @@ impl Cache {
     /// one-pixel images were 7 MB of empty list after a new document had dropped them, beside
     /// a cache that counted none of it).
     fn trim(&mut self) {
-        shrink_vec(&mut self.slots);
+        // (The places of the results to come are kept: see [`Cache::expect`].)
+        let keep = self.slots.len().saturating_add(self.expect);
+        if self.slots.capacity() > 2 * keep + 16 {
+            self.slots.shrink_to(keep);
+        }
+    }
+
+    /// Give the list of slots the room for `results` more slots at once, if it has not got it:
+    /// the buffer is made as large as it will be needed, beside the old one, which is charged
+    /// until it is freed (the room for it is the request's allowance, [`Images::request_fit`]).
+    fn reserve_slots(&mut self, results: usize) {
+        let need = self.slots.len().saturating_add(results);
+        if results > 0 && need > self.slots.capacity() {
+            self.slots.reserve_exact(results);
+        }
+    }
+
+    /// What [`Cache::reserve_slots`] allocates for `results`: the new buffer, or nothing.
+    fn reserve_bytes(&self, results: usize) -> usize {
+        let need = self.slots.len().saturating_add(results);
+        if results > 0 && need > self.slots.capacity() {
+            need.saturating_mul(size_of::<Slot>())
+        } else {
+            0
+        }
     }
 
     /// The fetched body for `url` didn't decode: it is of no use, and is dropped, so that
@@ -2179,6 +2210,9 @@ struct Fit {
     work: usize,
     /// How many of those are local images (each has an entry in the table of the files' sizes).
     local: usize,
+    /// How many of those may become jobs now (a local image, or a remote one whose body is in the
+    /// cache): each takes a slot when its result comes, and the list is given the room for them.
+    results: usize,
 }
 
 /// Whether the tables of a document can be made ([`Images::admit_tables`]).
@@ -2341,6 +2375,9 @@ impl Images {
         if let Some(w) = &self.worker {
             w.set(Vec::new());
         }
+        // (A running decode's result is for the old document, and takes a place only if it is a
+        // remote image's.)
+        self.cache.expect = self.results_running();
         // A result nobody has taken holds its memory until it is: it is taken before anything is
         // made beside it (a decoded bitmap of the old document is dropped, a remote one is kept).
         self.drain_results();
@@ -2743,24 +2780,43 @@ impl Images {
             self.forget_evicted();
             self.trim_records();
         }
-        let fit = self.request_fit(boxes, on_screen);
+        // What the request will keep is protected before it is worked out how many boxes it has
+        // room for, so that what it can't evict is not counted as room: asked in the other order
+        // the protection took the room away and the request, refused, returned with nothing asked
+        // for, and an image admitted to be decoded alone sat in the cache with no job.
+        self.protect_wanted(boxes, on_screen);
+        let running = self.results_running();
+        let mut most = usize::MAX;
+        let fit = loop {
+            self.extra = 0;
+            let fit = self.request_fit(boxes, on_screen, most);
+            self.extra = fit.allowance;
+            // (The room for the results is kept while room is made: a trim would give it back.)
+            self.cache.expect = running + fit.results;
+            if fit.allowance == 0 || self.make_room("request", 0) {
+                break fit;
+            }
+            // Not so by what `request_fit` worked out, which is all that can ever be made: a
+            // request for fewer boxes is tried, down to what `REQUEST_FREE` lets in whatever the
+            // room is, so that there is always a request.
+            if fit.allowance <= REQUEST_FREE + SLOTS_FREE {
+                break fit;
+            }
+            most = fit.allowance / 2;
+        };
+        self.cache.unprotect();
         let (boxes, on_screen) = (&boxes[..fit.boxes], on_screen.min(fit.boxes));
-        let (allowance, local) = (fit.allowance, fit.local);
-        self.extra = allowance;
+        let local = fit.local;
         // (The work the allowance is for: an image evicted since was cached when it was worked
         // out, and is asked for by the next request.)
         let mut work = fit.work;
-        // What the request will keep is not what is evicted for the room it needs.
-        self.protect_wanted(boxes, on_screen);
-        let made = allowance == 0 || self.make_room("request", 0);
-        self.cache.unprotect();
-        if !made && allowance > REQUEST_FREE {
-            // (Not so by what `request_fit` worked out, which is all that can ever be made, but
-            // nothing is allocated if it is not.)
-            self.extra = 0;
-            self.charge_bookkeeping();
-            return;
-        }
+        // The results go in places made ready for them, not in the room a result finds (and
+        // drops the result for want of).
+        self.cache.reserve_slots(if fit.results > 0 {
+            fit.results + running
+        } else {
+            0
+        });
         // The table of the files' sizes grows (a new one is made beside the old) for the local
         // images asked for, and is cut to them once it has twice as many: it holds the images of
         // the last requests, not the document's.
@@ -2980,6 +3036,16 @@ impl Images {
                 self.exclusive = Some(key.clone());
                 heavy_chosen = true;
             }
+            // A body no job holds yet is pinned by this one (it can't be evicted until the decode
+            // is done), and a decode that is running or queued holds its own memory beside the
+            // cache: a body that doesn't fit beside them is left to the request that follows the
+            // decode's result, whatever its image's place (an in-view image is wanted, not at any
+            // price: queued behind a 21 MB decode, four bodies of 3.5 MB each that eviction could
+            // have made room from went 5 MB over the budget).
+            #[cfg(feature = "remote-images")]
+            if fresh_body && (reserve > 0 || !jobs.is_empty()) && body_cost(&key, &source) > room {
+                continue;
+            }
             // What the job holds is held for it from now on: the body is in use.
             #[cfg(feature = "remote-images")]
             if let Key::Remote(url) = &key {
@@ -3026,6 +3092,9 @@ impl Images {
             fetching = self.fetch_reserve(starting);
         }
         self.cache.reserve = reserve;
+        // The results to come are the jobs queued and the one running: what was set for room is
+        // what was asked for in the end.
+        self.cache.expect = running + jobs.len();
         // The cache is made room for them before they are let start: they can't take more. (Each
         // decode was judged to fit when it was chosen; this makes the room for the whole.)
         self.cache.fetching = fetching;
@@ -3115,12 +3184,14 @@ impl Images {
     /// (it is touched, and for a remote one in view an entry of the list of those), so a prefix of
     /// cached images never uses up what the later ones need, and each request goes on where the
     /// last had to stop: the images it asked for are cached by the next, and cost nothing then.
-    fn request_fit(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) -> Fit {
-        let limit = self.room_limit();
+    fn request_fit(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize, most: usize) -> Fit {
+        let limit = self.room_limit().min(most);
         let entry = size_of::<(u32, Option<FileInfo>)>();
         let base = self.base.as_ref().map_or(0, |b| b.as_os_str().len());
         let (mut work, mut local, mut paths, mut scratch) = (0usize, 0usize, 0usize, 0usize);
-        let (mut remote, mut remote_view) = (0usize, 0usize);
+        let (mut remote, mut remote_view, mut results) = (0usize, 0usize, 0usize);
+        // The results still to come take slots too (the running job's, and a replaced worker's).
+        let running = self.results_running();
         let mut fit = Fit::default();
         for (k, &(id, w, h)) in boxes.iter().enumerate() {
             if let Some(key) = self.key(id) {
@@ -3129,23 +3200,36 @@ impl Images {
                 match self.src(id) {
                     // (The list of those in view is made once, for as many as there are.)
                     Src::Remote(_) if cached => remote_view += usize::from(k < on_screen),
-                    Src::Remote(_) => {
+                    Src::Remote(url) => {
                         work += 1;
                         remote += 1;
+                        #[cfg(feature = "remote-images")]
+                        {
+                            results += usize::from(self.cache.peek_bytes(url).is_some());
+                        }
+                        #[cfg(not(feature = "remote-images"))]
+                        let _ = url;
                     }
                     Src::File(src) if !cached => {
                         work += 1;
                         local += 1;
+                        results += 1;
                         paths += src.len().min(MAX_SRC) + base + STR_OVERHEAD;
                         scratch = scratch.max(self.path_scratch(src));
                     }
                     _ => {}
                 }
             }
+            // (The list of those in view keeps its buffer from one request to the next, and is
+            // made again only if it has not the room: it is charged then, and not before.)
             #[cfg(feature = "remote-images")]
             let remote_bytes = remote
                 .saturating_mul(REQUEST_PER_REMOTE_BOX)
-                .saturating_add(remote_view.saturating_mul(3 * size_of::<(Arc<str>, u32, u32)>()));
+                .saturating_add(if remote_view <= self.in_view.capacity() {
+                    0
+                } else {
+                    remote_view.saturating_mul(size_of::<(Arc<str>, u32, u32)>())
+                });
             #[cfg(not(feature = "remote-images"))]
             let remote_bytes = {
                 let _ = (remote, remote_view);
@@ -3159,14 +3243,20 @@ impl Images {
             } else {
                 table_bytes(need.max(self.costs.capacity().saturating_add(1)), entry)
             };
+            // The slots the results will go in: the list has the room for them or is made larger
+            // (a result that has no place to go can only be dropped).
+            let slots = self
+                .cache
+                .reserve_bytes(if results > 0 { results + running } else { 0 });
             let bytes = work
                 .saturating_mul(REQUEST_PER_BOX)
                 .saturating_add(remote_bytes)
                 .saturating_add(costs)
                 .saturating_add(paths)
                 .saturating_add(scratch)
+                .saturating_add(slots)
                 .saturating_add(if local > 0 { FILE_LOOKUP } else { 0 });
-            if bytes > limit.max(REQUEST_FREE) {
+            if bytes > limit.max(REQUEST_FREE + SLOTS_FREE) {
                 break;
             }
             fit = Fit {
@@ -3174,9 +3264,16 @@ impl Images {
                 allowance: bytes,
                 work,
                 local,
+                results,
             };
         }
         fit
+    }
+
+    /// The results that are still to come back from the workers, each of which takes a slot: the
+    /// job running (or whose result is not taken) and one for each replaced worker.
+    fn results_running(&self) -> usize {
+        self.worker.as_ref().map_or(0, |w| usize::from(!w.idle())) + self.retired.len()
     }
 
     /// What working out the path of a local image whose `src` is `len` bytes takes at most beside
@@ -3278,11 +3375,12 @@ impl Images {
             } => {
                 // The result is in the cache (or dropped) before the worker is let go on,
                 // so what it holds is never uncounted: see `Queue::busy`.
+                self.cache.expect = self.cache.expect.saturating_sub(1);
                 if matches!(key, Key::Local(_)) && doc_gen != self.doc_gen {
                     Worker::taken(&worker);
                     return;
                 }
-                let stored = match bitmap {
+                match bitmap {
                     Some(b) => {
                         #[cfg(feature = "remote-images")]
                         if let Key::Remote(url) = &key {
@@ -3290,15 +3388,17 @@ impl Images {
                         }
                         self.decodes += 1;
                         self.charge_bookkeeping();
-                        self.store(key.clone(), Data::Pixels(b), doc_gen == self.doc_gen)
+                        // A result with no place to go is dropped, and its image is not failed:
+                        // there is no room now, which a later request finds otherwise (the
+                        // image is asked for again, and the list of slots made the room first,
+                        // so this is only for results that came beside bodies that took it).
+                        let _ = self.store(key, Data::Pixels(b), doc_gen == self.doc_gen);
                     }
-                    None => false,
-                };
-                if !stored {
-                    self.failed(
+                    // It could not be decoded: the data is bad. The image shows its alt text.
+                    None => self.failed(
                         key,
                         page.as_mut().map(|(doc, layout)| (*doc, &mut **layout)),
-                    );
+                    ),
                 }
                 Worker::taken(&worker);
             }
@@ -3629,6 +3729,10 @@ impl Images {
         if !self.alone(kept, need, Some(&url)) {
             return false;
         }
+        // (It goes in a place in the list of slots: with none, it waits.)
+        if !self.can_store() {
+            return false;
+        }
         let Some(i) = self.waiting.iter().position(|(u, _)| *u == url) else {
             return false;
         };
@@ -3714,13 +3818,27 @@ impl Images {
         }
         match (keep, taken) {
             (true, Some(bytes)) => {
-                if self.store(Key::Remote(url.clone()), Data::Bytes(bytes), true) {
-                    if self.in_view.iter().any(|(u, ..)| *u == url) {
-                        self.cache.bytes_of(&url);
+                match self.store(Key::Remote(url.clone()), Data::Bytes(bytes), true) {
+                    Ok(()) => {
+                        if self.in_view.iter().any(|(u, ..)| *u == url) {
+                            self.cache.bytes_of(&url);
+                        }
                     }
-                } else {
-                    // No room even for its place in the list: its image shows its alt text.
-                    self.remote.failed(&url, own);
+                    // No room even for its place in the list, now: not a failure of the image. One
+                    // in view waits for room, holding the fetchers' credit; any other is dropped
+                    // for room, and fetched again when there is (see `Images::admission`).
+                    Err(Data::Bytes(bytes)) => {
+                        if let Some(Some((w, h))) = self.remote.size(&url) {
+                            let result = Ok((bytes, w, h));
+                            if self.in_view.iter().any(|(u, ..)| *u == url) {
+                                self.waiting.push((url, result));
+                            } else {
+                                self.drop_fetched(url, result);
+                            }
+                            return;
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
             (_, taken) => drop(taken),
@@ -3787,7 +3905,9 @@ impl Images {
         }
         self.retired_cost();
         let kept = self.cache.kept();
+        let growth = self.cache.growth();
         self.retired.is_empty()
+            && (growth <= SLOTS_FREE || self.room_limit() >= growth)
             && self
                 .waiting
                 .iter()
@@ -3939,6 +4059,17 @@ impl Images {
     /// budget, [`Images::alone`].) `false` means the decode can't run in the budget at all, and
     /// the image is refused: shown as its alt text. Nothing is allocated: only what is evicted.
     fn fits_bookkeeping(&mut self, own: usize) -> bool {
+        // What the request in progress builds is not the document's: it is gone when the decode
+        // runs, and an image refused for it would be refused for good, for a moment's cost.
+        let extra = std::mem::take(&mut self.extra);
+        let fits = self.fits_bookkeeping_now(own);
+        self.extra = extra;
+        self.charge_bookkeeping();
+        fits
+    }
+
+    fn fits_bookkeeping_now(&mut self, own: usize) -> bool {
+        self.charge_bookkeeping();
         if self.cache.fits(0, 0, own, 0, 0) {
             return true;
         }
@@ -4003,20 +4134,29 @@ impl Images {
     }
 
     /// Put a result in the cache, making room for the list it goes in first ([`Images::make_room`]:
-    /// the slot's own room is made by the cache, the result being allocated already). `false`: the
+    /// the slot's own room is made by the cache, the result being allocated already). `Err`: the
     /// list is full and its growth doesn't fit (everything evictable is gone, so what is left is
-    /// painted or held by a decode, a few slots at most), and the result is dropped, its image
-    /// showing its alt text (the caller says so). A growth of at most [`SLOTS_FREE`] is let in
-    /// whatever the answer: the pixels painted in a frame are the one exception to the budget,
-    /// and the list of them is the size of their number, which a window cannot make
-    /// more than a few hundred.
-    fn store(&mut self, key: Key, data: Data, current: bool) -> bool {
+    /// painted or held by a decode), and the data is given back: there is no room *now*, which is
+    /// no fault of the image, and what it becomes is the caller's to say (a decoded result is
+    /// dropped and asked for again, a body waits). A request makes the room for the results it asks
+    /// for first ([`Cache::reserve_slots`]), so this is for what came beside them. A growth of at
+    /// most [`SLOTS_FREE`] is let in whatever the answer: the pixels painted in a frame are the one
+    /// exception to the budget, and the list of them is the size of their number.
+    fn store(&mut self, key: Key, data: Data, current: bool) -> Result<(), Data> {
         let growth = self.cache.growth();
         if growth > 0 && !self.make_room("slot list", growth) && growth > SLOTS_FREE {
-            return false;
+            return Err(data);
         }
         self.cache.insert_as(key, data, current);
-        true
+        Ok(())
+    }
+
+    /// Whether [`Images::store`] would have a place for one more slot now (nothing is allocated;
+    /// what is evictable is evicted, as `store` does).
+    #[cfg(feature = "remote-images")]
+    fn can_store(&mut self) -> bool {
+        let growth = self.cache.growth();
+        growth <= SLOTS_FREE || self.make_room("slot list", growth)
     }
 
     /// Whether the document has a remote image nothing is known about yet.

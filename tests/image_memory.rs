@@ -2114,57 +2114,265 @@ fn the_tables_of_a_document_waiting_for_a_decode_are_made_without_a_poll_asked_f
 /// ones in view settled with 145 of the 301 cached, the worker idle and nothing to wake the
 /// window for, however many frames were painted (143 of 301 here, the others neither decoded nor
 /// failed). Beside a bitmap that leaves room for the rest all 301 are decoded; beside one that
-/// leaves none (the slot list can't grow, and a result that can't go in is its image's alt text,
-/// see `Images::store`) every one is either: nothing is left waiting.
+/// leaves none (835 wide) none is failed either (round 13: no room for the slot list is no
+/// fault of the image, `Images::store`), and what the oracle says must be decoded is.
 #[test]
 fn a_request_cut_short_goes_on_where_it_left_off() {
     let _serial = serial();
-    use vomd::render::Pixels;
     let dir = scratch("cut-short");
-    std::fs::write(dir.join("tiny.png"), zero_png(1, 1, 0, 8, false, 1 << 20)).unwrap();
+    let tiny = zero_png(1, 1, 0, 8, false, 1 << 20);
+    std::fs::write(dir.join("tiny.png"), &tiny).unwrap();
     let mut src = String::from("![b](big.png)");
     src.extend((0..300).map(|_| " ![t](tiny.png)"));
-    for (side, room) in [(700, true), (835, false)] {
-        std::fs::write(
-            dir.join("big.png"),
-            zero_png(side, 10_000, 0, 8, false, 1 << 20),
-        )
-        .unwrap();
+    for side in [700u32, 835] {
+        let big = zero_png(side, 10_000, 0, 8, false, 1 << 20);
+        std::fs::write(dir.join("big.png"), &big).unwrap();
         let (doc, mut layout, mut images) = images_for(&dir, &src);
         let mut boxes = vec![(1u32, side, 10_000u32)];
         boxes.extend((2..=301).map(|id| (id, 1, 1)));
-        frames(
-            &mut images,
-            &doc,
-            &mut layout,
-            &boxes[..1],
-            1,
-            Duration::from_millis(1),
-            |i| i.stats().decoded == 1,
-        );
-        frames(
-            &mut images,
-            &doc,
-            &mut layout,
-            &boxes,
-            boxes.len(),
-            Duration::from_millis(1),
-            |i| i.stats().decoded + i.stats().failed >= 301,
-        );
+        quiesce(&mut images, &doc, &mut layout, &boxes[..1], 1);
+        quiesce(&mut images, &doc, &mut layout, &boxes, boxes.len());
         let stats = images.stats();
         println!(
             "{side} x 10,000 and 300 one-pixel images in view: {} of 301 decoded, {} failed",
             stats.decoded, stats.failed
         );
-        if room {
-            assert_eq!((stats.decoded, stats.failed), (301, 0));
-            assert!(
-                boxes
-                    .iter()
-                    .all(|&(id, w, h)| images.pixels(id, w, h).is_some())
-            );
+        assert_eq!(stats.failed, 0);
+        let missing = undecoded_in_view(
+            &mut images,
+            &boxes,
+            boxes.len(),
+            |id, w, h| {
+                let bytes = if id == 1 { &big } else { &tiny };
+                vomd::image::decode_reservation(bytes, w, h).map(|c| c + bytes.len())
+            },
+            301 * 24,
+        );
+        assert!(
+            missing.is_empty(),
+            "{side}: in view, with room, and not decoded: {missing:?}"
+        );
+        if side == 700 {
+            assert_eq!(stats.decoded, 301);
         }
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What the test knows of the images it made, and the window it paints them in, to say which of
+/// the images in view must be decoded (the oracle of the liveness tests: nothing in it asks the
+/// image code, not even [`Images::is_waiting`]). `reserved` is what decoding a valid image to its
+/// box holds with the file it reads (`None`: not an image the decoders take), `overhead` is the
+/// least the document's own tables hold. An image in view that isn't decoded is let off only when
+/// the pixels painted in the frame by the others and what decoding it holds are more than the
+/// budget between them: the budget is theirs, which is the one case where "no room now" is the
+/// right answer (and then only until the viewport changes).
+#[cfg(feature = "images")]
+fn undecoded_in_view(
+    images: &mut Images,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
+    reserved: impl Fn(u32, u32, u32) -> Option<usize>,
+    overhead: usize,
+) -> Vec<String> {
+    use vomd::render::Pixels;
+    let mut painted = 0usize;
+    let mut missing = Vec::new();
+    for &(id, w, h) in boxes.iter().take(on_screen) {
+        let (w, h) = vomd::image::clamp_box(w, h);
+        match images.pixels(id, w, h) {
+            Some(b) if (b.width, b.height) == (w, h) => {
+                painted += b.data.capacity() * size_of::<u32>();
+            }
+            _ => missing.push((id, w, h)),
+        }
+    }
+    missing
+        .into_iter()
+        .filter_map(|(id, w, h)| {
+            let need = reserved(id, w, h)?;
+            (painted + need + overhead <= CACHE_BYTES).then(|| {
+                format!("image {id} at {w} x {h} (decoding it holds {need}, {painted} painted by the others)")
+            })
+        })
+        .collect()
+}
+
+/// What the window does until nothing is left to do: a frame of `boxes` (the viewport changed),
+/// then a poll for each wake the threads send and a frame again only if the poll says so, until
+/// the image code is idle with no wake untaken for `quiet` (the image code holds nothing that
+/// will become work on its own after that). Nothing else asks for a frame.
+#[cfg(feature = "images")]
+fn quiesce(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut PageLayout,
+    boxes: &[(u32, u32, u32)],
+    on_screen: usize,
+) {
+    let t = Instant::now();
+    frame(images, boxes, on_screen);
+    let mut seen = images.wakes();
+    let mut idle_since: Option<Instant> = None;
+    loop {
+        assert!(
+            t.elapsed() < Duration::from_secs(120),
+            "never settled: {:?}\n{}",
+            images.stats(),
+            images.memory_report()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        if images.wakes() != seen {
+            seen = images.wakes();
+            idle_since = None;
+            if images.poll(doc, layout) {
+                frame(images, boxes, on_screen);
+            }
+            continue;
+        }
+        if !images.is_idle() {
+            idle_since = None;
+            continue;
+        }
+        if idle_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_millis(300) {
+            return;
+        }
+    }
+}
+
+/// Temporary pressure on the cache is not a failure of the image (round 13): 835 × 10,000 is a
+/// bitmap that leaves no room for the slot list to grow, painted beside valid 1 × 1 images (300
+/// of them were enough: 256 decoded, 45 failed; 1,500 here, so that some of them don't fit).
+/// The ones that can't be stored while it is painted were taken for failed images and showed
+/// their alt text until the document was reopened (none of the 45 ever
+/// loaded however the window was scrolled or zoomed after). They are not failed now: the
+/// viewport that lets them in finds them loaded, by scrolling away and back, by only them being
+/// in view, and by the bitmap shown at another size.
+#[test]
+fn no_room_now_is_not_a_failed_image() {
+    const TINY: usize = 700;
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("no-room");
+    let tiny = zero_png(1, 1, 0, 8, false, 1 << 20);
+    std::fs::write(dir.join("tiny.png"), &tiny).unwrap();
+    let mut src = String::from("![b](big.png)");
+    src.extend((0..TINY).map(|_| " ![t](tiny.png)"));
+    let big = zero_png(835, 10_000, 0, 8, false, 1 << 20);
+    std::fs::write(dir.join("big.png"), &big).unwrap();
+    let (doc, mut layout, mut images) = images_for(&dir, &src);
+    let reserved = |id: u32, w: u32, h: u32| {
+        let bytes = if id == 1 { &big } else { &tiny };
+        vomd::image::decode_reservation(bytes, w, h).map(|c| c + bytes.len())
+    };
+    let overhead = (TINY + 1) * 24;
+    let mut all = vec![(1u32, 835u32, 10_000u32)];
+    all.extend((2..=TINY as u32 + 1).map(|id| (id, 1, 1)));
+    // The bitmap alone, painted: cached.
+    quiesce(&mut images, &doc, &mut layout, &all[..1], 1);
+    assert_eq!(images.stats().decoded, 1);
+    // All of them in view beside it: what fits is decoded, the rest has to wait.
+    quiesce(&mut images, &doc, &mut layout, &all, all.len());
+    let stats = images.stats();
+    println!(
+        "835 x 10,000 painted beside {TINY} one-pixel images: {} decoded, {} failed",
+        stats.decoded, stats.failed
+    );
+    assert_eq!(stats.failed, 0, "an image that had no room is not failed");
+    assert!((1..=TINY as u32 + 1).all(|id| images.is_waiting(id)));
+    // Scrolled away (nothing in view) and back to them with the bitmap out of view: they were
+    // never lost, and nothing is in the way of the room they need.
+    quiesce(&mut images, &doc, &mut layout, &[], 0);
+    let rest: Vec<_> = all[1..].to_vec();
+    quiesce(&mut images, &doc, &mut layout, &rest, rest.len());
+    let missing = undecoded_in_view(&mut images, &rest, rest.len(), reserved, overhead);
+    assert!(
+        missing.is_empty(),
+        "in view with room for all of them, and not decoded: {missing:?}\n{}",
+        images.memory_report()
+    );
+    assert_eq!(images.stats().failed, 0);
+    // The bitmap shown at half the size, with all of them: the room is there.
+    let mut half = vec![(1u32, 417u32, 5_000u32)];
+    half.extend((2..=TINY as u32 + 1).map(|id| (id, 1, 1)));
+    quiesce(&mut images, &doc, &mut layout, &half, half.len());
+    let missing = undecoded_in_view(&mut images, &half, half.len(), reserved, overhead);
+    assert!(
+        missing.is_empty(),
+        "zoomed to 50%, with room for all of them, and not decoded: {missing:?}\n{}",
+        images.memory_report()
+    );
+    assert_eq!(images.stats().failed, 0);
+    assert!(
+        half.iter()
+            .all(|&(id, w, h)| images.pixels(id, w, h).is_some())
+    );
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A fetched body that the room is made for is decoded: 835 × 10,000 (a bitmap that takes the
+/// budget) painted with 300 remote 1 × 1 images in view at distinct URLs, driven by what the
+/// window does (a frame for the viewport, a poll for each wake, a frame if the poll says so),
+/// stopped with 2 decoded, 6 fetched, none failed and 299 missing: the request chose how many
+/// boxes it had room for before it protected what it keeps, the protection took the room away,
+/// and the request, refused, returned with nothing asked for while a body admitted to be decoded
+/// alone sat in the cache and the fetchers were held off for it. Every one is decoded now.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_request_refused_after_protecting_still_decodes_the_admitted_body() {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("refused-after-protect");
+    let serve = dir.join("srv");
+    std::fs::create_dir_all(&serve).unwrap();
+    std::fs::write(serve.join("tiny.png"), zero_png(1, 1, 0, 8, false, 1 << 20)).unwrap();
+    std::fs::write(
+        dir.join("big.png"),
+        zero_png(835, 10_000, 0, 8, false, 1 << 20),
+    )
+    .unwrap();
+    fake_curl(&dir, &serve);
+    let mut src = String::from("![b](big.png)");
+    src.extend((0..300).map(|i| format!(" ![t](http://127.0.0.1/tiny.png?{i})")));
+    let doc = Doc::parse(&src);
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    let mut all = vec![(1u32, 835u32, 10_000u32)];
+    all.extend((2..=301).map(|id| (id, 1, 1)));
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &all[..1],
+        1,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 1,
+    );
+    images.set_remote(true, &doc, &mut layout);
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &all,
+        all.len(),
+        Duration::from_millis(1),
+        |i| i.stats().decoded + i.stats().failed >= 301,
+    );
+    let stats = images.stats();
+    println!(
+        "835 x 10,000 painted with 300 remote one-pixel images: {} of 301 decoded, {} fetched, {} failed",
+        stats.decoded, stats.fetched, stats.failed
+    );
+    assert_eq!((stats.decoded, stats.failed), (301, 0));
+    assert!(
+        all.iter()
+            .all(|&(id, w, h)| images.pixels(id, w, h).is_some())
+    );
+    drop(images);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2412,9 +2620,17 @@ mod mix {
         let (local_dir, srv) = (dir.join("local"), dir.join("srv"));
         std::fs::create_dir_all(&local_dir).unwrap();
         std::fs::create_dir_all(&srv).unwrap();
+        // The bitmap is 31.8 MB (it leaves room for some slots) or 32.8 MB (it leaves what a
+        // decode's fixed costs and a few hundred slots take: the decode is within the budget by
+        // itself, and the slot list can't grow beside it when it is painted).
+        let (tw, th) = if rng.percent(50) {
+            (820, 10_000)
+        } else {
+            (600, 13_250)
+        };
         std::fs::write(
             local_dir.join("tall.png"),
-            zero_png(600, 13_250, 0, 8, false, 1 << 20),
+            zero_png(tw, th, 0, 8, false, 1 << 20),
         )
         .unwrap();
         std::fs::write(
@@ -2427,8 +2643,8 @@ mod mix {
             remote: Vec::new(),
             tall: Asset {
                 name: "tall.png".into(),
-                w: 600,
-                h: 13_250,
+                w: tw,
+                h: th,
                 remote: false,
             },
             tiny: Asset {
@@ -2670,6 +2886,86 @@ mod mix {
         }
     }
 
+    /// How long the window may wait for the image code with nothing more asked for: a minute
+    /// with nothing to show for it. A wait that is making progress (decodes taken since the last
+    /// look: the worker goes through hundreds of queued images at the speed of a debug build)
+    /// is no stuck state, and its time is counted from the last one.
+    struct Watch {
+        since: Instant,
+        decodes: usize,
+    }
+
+    impl Watch {
+        fn new() -> Watch {
+            Watch {
+                since: Instant::now(),
+                decodes: 0,
+            }
+        }
+
+        fn ok(&mut self, images: &Images) -> bool {
+            let decodes = images.stats().decodes;
+            if decodes != self.decodes {
+                self.decodes = decodes;
+                self.since = Instant::now();
+            }
+            self.since.elapsed() < Duration::from_secs(60)
+        }
+    }
+
+    /// The window with nothing more asked for: a poll for each wake, a frame if the poll says so,
+    /// until the image code is idle and every wake is taken, the budget held meanwhile (the
+    /// look the operations of the mix take at the live bytes).
+    #[allow(clippy::too_many_arguments)]
+    fn drain(
+        seed: u64,
+        step: usize,
+        images: &mut Images,
+        doc: &Doc,
+        layout: &mut PageLayout,
+        painted: &mut Painted,
+        last: &(Vec<(u32, u32, u32)>, usize),
+        seen: &mut usize,
+        img_start: usize,
+        past: &mut isize,
+        shown: &mut usize,
+        log: &[String],
+    ) {
+        let mut t = Watch::new();
+        while !images.is_idle() || images.wakes() != *seen {
+            assert!(
+                t.ok(images),
+                "seed {seed}: stuck after step {step} (away from the view) with nothing more asked for: {:?} ({})\n{}",
+                images.stats(),
+                images.memory_report(),
+                log.iter()
+                    .rev()
+                    .take(8)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(2));
+            if images.wakes() != *seen {
+                *seen = images.wakes();
+                if images.poll(doc, layout) {
+                    painted.frame(images, &last.0, last.1);
+                }
+            }
+            let over = image_step_over(img_start);
+            (*past, *shown) = painted.note(over, *past, *shown);
+            assert!(
+                over <= CACHE_BYTES + SLACK + painted.step,
+                "seed {seed}: {over} bytes of the image code's live over the start, {} painted ({}); {:?}\n{}",
+                painted.step,
+                images.memory_report(),
+                images.stats(),
+                trip_report()
+            );
+        }
+    }
+
     /// One run of the mix for `seed`: documents opened and left, scrolling, zooming, frames polled
     /// at every pace, remote images turned off and on, the wake replaced, reloads: and after each
     /// operation the image code's live bytes (counted apart from the page's and the driver's: see
@@ -2693,6 +2989,10 @@ mod mix {
         #[cfg(debug_assertions)]
         vomd::image::set_room_probe(room_probe);
         let pool = tagged(Tag::Driver, || make_pool(&mut rng, &dir, profile));
+        let mut files = Files {
+            dir: dir.clone(),
+            valid: std::collections::HashMap::new(),
+        };
         fake_curl_hold(&dir, &dir.join("srv"), "0.3");
         let mut images = Images::default();
         images.set_policy(vomd::settings::RemoteImages::Always);
@@ -2774,7 +3074,8 @@ mod mix {
                 op = 0;
             }
             let what = match op {
-                0..=39 => "frame",
+                0..=35 => "frame",
+                36..=39 => "away and back",
                 40..=54 => "scroll",
                 55..=59 => "zoom",
                 60..=64 => "open",
@@ -2785,6 +3086,9 @@ mod mix {
                 84..=93 => "poll",
                 _ => "settle",
             };
+            // Zooming is looked at once its images are there, now and then (the pictures at the
+            // new size must be decoded, whatever the old ones took of the room).
+            let settle_zoom = what == "zoom" && rng.percent(60);
             tagged(Tag::Driver, || {
                 log.push(format!(
                     "{step}: {what} (top {top}, zoom {zoom}, remote {remote})"
@@ -2846,7 +3150,14 @@ mod mix {
             // Frame: paint what is in view, ask for the images near.
             if matches!(
                 what,
-                "frame" | "scroll" | "zoom" | "open" | "reload" | "slow poll" | "settle"
+                "frame"
+                    | "scroll"
+                    | "zoom"
+                    | "open"
+                    | "reload"
+                    | "slow poll"
+                    | "settle"
+                    | "away and back"
             ) {
                 // Profile 10: now and then hundreds of tiny images in view beside the cached
                 // bitmap, painted again and again (a request has room for some of them: the next
@@ -2887,16 +3198,41 @@ mod mix {
                     }
                     boxes
                 };
+                if what == "away and back" {
+                    // The window shows another part of the document, the threads do what they
+                    // have to (the viewport is no longer the one the room was made for), and it
+                    // comes back: what is in view then must be there, with nothing left over
+                    // from the pressure the other view put on the cache.
+                    let far = if top < n / 2 { n.saturating_sub(1) } else { 0 };
+                    let away = tagged(Tag::Driver, || build(far, in_view, near));
+                    painted.frame(&mut images, &away, in_view.min(away.len()));
+                    last = (away, in_view);
+                    drain(
+                        seed,
+                        step,
+                        &mut images,
+                        doc,
+                        layout,
+                        &mut painted,
+                        &last,
+                        &mut seen,
+                        img_start,
+                        &mut past,
+                        &mut shown,
+                        &log,
+                    );
+                }
                 if flood || wide {
                     // The bitmap is cached first (in view: it is decoded at its size), and then
                     // the window has scrolled past it, painting what is not it: what the flood
                     // finds is a cache that is full of it, nothing in it wanted or painted.
-                    let warm = vec![(1, 1, 1), (2, 600, 13_250)];
+                    let tall = &pool.tall;
+                    let warm = vec![(1, 1, 1), (2, tall.w, tall.h)];
                     painted.frame(&mut images, &warm, 2);
                     last = (warm, 2);
                     let t = Instant::now();
                     // (The slot of the bitmap costs its pixels and 64 bytes: the report says so.)
-                    let bitmap = format!("{}", 600 * 13_250 * 4 + 64);
+                    let bitmap = format!("{}", tall.w as usize * tall.h as usize * 4 + 64);
                     while !images.memory_report().contains(&bitmap)
                         && t.elapsed() < Duration::from_secs(30)
                     {
@@ -2930,7 +3266,7 @@ mod mix {
                 // The bitmap is in view too, painted at its size with all of them: the budget is
                 // its, and what is left is what the images beside it have.
                 let in_view = if wide {
-                    boxes.insert(0, (2, 600, 13_250));
+                    boxes.insert(0, (2, pool.tall.w, pool.tall.h));
                     in_view + 1
                 } else {
                     in_view
@@ -2951,9 +3287,12 @@ mod mix {
                     last = (boxes, in_view);
                 }
             } else if what == "remote off and on" {
-                // Turning them on or off asks for the images again without a repaint (what was
-                // painted is still the frame's).
-                images.request(&last.0, last.1);
+                // Turning them on or off repaints the window (`View::set_remote` marks the images
+                // dirty and the outcome is a redraw), and the images are asked for again after the
+                // paint, as after every frame: a request is never made over results that were
+                // stored since the last paint and have not been painted, which a bare request
+                // would take for pixels kept by a window (and go over the budget for).
+                painted.frame(&mut images, &last.0, last.1);
             }
             if what != "slow poll" {
                 let pace = [0u64, 0, 1, 2, 5, 16][rng.below(6) as usize];
@@ -2971,12 +3310,12 @@ mod mix {
             }
             // The reader stops and waits: what the last frame asked for is done by the threads
             // and the window's polls alone, and the budget holds meanwhile.
-            if what == "settle" || wide {
-                let t = Instant::now();
+            if what == "settle" || wide || what == "away and back" || settle_zoom {
+                let mut t = Watch::new();
                 painted.frame(&mut images, &last.0, last.1);
                 while !images.is_idle() || images.wakes() != seen {
                     assert!(
-                        t.elapsed() < Duration::from_secs(60),
+                        t.ok(&images),
                         "seed {seed}: stuck after step {step} with nothing more asked for: {:?} ({})\n{}",
                         images.stats(),
                         images.memory_report(),
@@ -3014,6 +3353,7 @@ mod mix {
                     remote,
                     &last,
                     &log,
+                    &mut files,
                 );
             }
             let allowed = CACHE_BYTES + SLACK + painted.step;
@@ -3034,7 +3374,7 @@ mod mix {
         }
         // What the last frame asked for gets done, in the budget, whatever was held back on the
         // way (a transfer held off for a decode, a body that waits): nothing is stuck for good.
-        let t = Instant::now();
+        let mut t = Watch::new();
         let (page, doc, layout) = &mut state;
         // One last frame, as the window paints after the last thing it was asked; then only
         // what the threads wake it for (a state that is left only by a request nothing woke the
@@ -3043,7 +3383,7 @@ mod mix {
         painted.frame(&mut images, &last.0, last.1);
         while !images.is_idle() || images.wakes() != seen {
             assert!(
-                t.elapsed() < Duration::from_secs(60),
+                t.ok(&images),
                 "seed {seed}: stuck with nothing more asked for: {:?} ({})\n{}",
                 images.stats(),
                 images.memory_report(),
@@ -3073,7 +3413,16 @@ mod mix {
                 trip_report()
             );
         }
-        liveness(seed, "at the end", &mut images, page, remote, &last, &log);
+        liveness(
+            seed,
+            "at the end",
+            &mut images,
+            page,
+            remote,
+            &last,
+            &log,
+            &mut files,
+        );
         let _ = start;
         drop(armed);
         // Everything is let go, and nothing is left: the threads end and take what they hold
@@ -3096,13 +3445,62 @@ mod mix {
         past
     }
 
+    /// What the test knows of the files of a run, for the oracle of [`liveness`]: whether the
+    /// decoders take a file (`decode` at a small box, the first time it is asked, the files being
+    /// the test's own), and what decoding it to a box holds with the bytes it reads.
+    struct Files {
+        dir: PathBuf,
+        valid: std::collections::HashMap<(bool, String), bool>,
+    }
+
+    impl Files {
+        fn bytes(&self, asset: &Asset) -> Vec<u8> {
+            let sub = if asset.remote { "srv" } else { "local" };
+            std::fs::read(self.dir.join(sub).join(&asset.name)).unwrap_or_default()
+        }
+
+        /// Whether the decoders take the image (so that it must be shown): not a file that isn't
+        /// there, not an image at all, not one whose data is cut short or broken.
+        fn valid(&mut self, asset: &Asset) -> bool {
+            if asset.w == 0 {
+                return false;
+            }
+            let key = (asset.remote, asset.name.clone());
+            if let Some(&v) = self.valid.get(&key) {
+                return v;
+            }
+            let v = tagged(Tag::Driver, || {
+                let bytes = self.bytes(asset);
+                vomd::image::decode_reservation(&bytes, 8, 8).is_some()
+                    && vomd::image::decode(&bytes, 8, 8).is_some()
+            });
+            self.valid.insert(key, v);
+            v
+        }
+
+        /// What decoding the image to `w` x `h` holds, the bytes of the file it reads included.
+        fn reserved(&self, asset: &Asset, w: u32, h: u32) -> usize {
+            tagged(Tag::Driver, || {
+                let bytes = self.bytes(asset);
+                vomd::image::decode_reservation(&bytes, w, h).unwrap_or(0) + bytes.len()
+            })
+        }
+    }
+
     /// Nothing is left to do (no thread working, no wake the window has not taken a poll for, no
-    /// frame asked for): every image in view of the last frame that is still to be shown (a file,
-    /// or a remote image while remote images are on that has not failed: [`Images::is_waiting`])
-    /// is decoded at the size of its box, and the tables of the document are made. If not, work
-    /// that could be done is not and nothing will do it: an idle state with work left in it is
-    /// stuck for good. (An image the budget has no room for is not waiting: its alt text is its
-    /// answer.)
+    /// frame asked for): the tables of the document are made, and every image in view of the last
+    /// frame that the test knows must be shown is decoded at the size of its box. What the test
+    /// knows is its own and nothing is asked of the image code (not even [`Images::is_waiting`]):
+    /// it made the files, and the decoders say (`Files::valid`) which of them they take; an image
+    /// that is valid, in view, and a file or (while remote images are on) a remote one, must have
+    /// its pixels, unless the budget is provably the others': the pixels painted in the frame
+    /// (what `pixels` gave it, of any size: a stand-in is painted too) and what decoding it holds
+    /// are more than the budget between them, with the least the document's tables hold. That is
+    /// the one case where "no room now" is the right answer, and then only until the viewport
+    /// changes so that there is room (the mix scrolls away and back, and zooms, and looks again).
+    /// A document that costs half the budget to keep by its tables alone is not judged here: its
+    /// own test is the tables one. A state that is idle with work left in it is stuck for good.
+    #[allow(clippy::too_many_arguments)]
     fn liveness(
         seed: u64,
         when: &str,
@@ -3111,6 +3509,7 @@ mod mix {
         remote: bool,
         last: &(Vec<(u32, u32, u32)>, usize),
         log: &[String],
+        files: &mut Files,
     ) {
         use vomd::render::Pixels;
         let report = |images: &Images| {
@@ -3132,20 +3531,37 @@ mod mix {
             "seed {seed}: the tables of the document are not made and nothing is left to do {when}\n{}",
             report(images)
         );
+        // The least the document's own tables hold: a source each, and for a remote URL its places
+        // in the sets and tables kept per URL.
+        let overhead = page.assets.len() * 24 + page.src.matches("http://").count() * 350;
+        if overhead * 2 > CACHE_BYTES {
+            return;
+        }
+        let mut painted = 0usize;
+        let mut missing = Vec::new();
         for &(id, w, h) in last.0.iter().take(last.1) {
+            let (w, h) = vomd::image::clamp_box(w, h);
+            match images.pixels(id, w, h) {
+                Some(b) => {
+                    painted += b.data.capacity() * size_of::<u32>();
+                    if (b.width, b.height) != (w, h) {
+                        missing.push((id, w, h));
+                    }
+                }
+                None => missing.push((id, w, h)),
+            }
+        }
+        for (id, w, h) in missing {
             let Some(asset) = page.assets.get(id as usize - 1) else {
                 continue;
             };
-            if (asset.remote && !remote) || !images.is_waiting(id) {
+            if (asset.remote && !remote) || !files.valid(asset) {
                 continue;
             }
-            let (w, h) = vomd::image::clamp_box(w, h);
-            let shown = images
-                .pixels(id, w, h)
-                .is_some_and(|b| (b.width, b.height) == (w, h));
+            let need = files.reserved(asset, w, h);
             assert!(
-                shown,
-                "seed {seed}: image {id} ({}, {} x {}) is in view at {w} x {h}, is still to be shown and nothing is left to do {when}: not decoded\n{}",
+                painted + need + overhead > CACHE_BYTES,
+                "seed {seed}: image {id} ({}, {} x {}) is valid and in view at {w} x {h}, decoding it holds {need}, only {painted} is painted by the others and the tables hold {overhead} at least, and it is not decoded when nothing is left to do {when}\n{}",
                 asset.name,
                 asset.w,
                 asset.h,

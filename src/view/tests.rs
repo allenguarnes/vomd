@@ -1964,6 +1964,96 @@ mod with_fonts {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Paint a frame of `v`, then run what the window does with the image threads until they
+    /// have nothing left to do and nothing has changed for a while: a poll for what they finish,
+    /// a frame if it says so.
+    #[cfg(feature = "images")]
+    fn settle_images(v: &mut View) {
+        let t = Instant::now();
+        frame(v, Instant::now());
+        let mut quiet = 0;
+        let mut was = (v.image_stats(), v.images.wakes());
+        while quiet < 60 {
+            assert!(t.elapsed() < Duration::from_secs(120), "never settled");
+            if v.poll_images(Instant::now()) {
+                frame(v, Instant::now());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            let now = (v.image_stats(), v.images.wakes());
+            quiet = if now == was && v.images.is_idle() {
+                quiet + 1
+            } else {
+                0
+            };
+            was = now;
+        }
+    }
+
+    /// No room for an image now is not a failure of the image (round 13), through the whole
+    /// window: 835 x 10,000 (a bitmap that takes the budget) and 300 valid 1 x 1 images in one
+    /// paragraph, shown at the bottom, then at half the zoom. The ones the cache had no room for
+    /// while the bitmap was painted showed their alt text for good (45 of them, and then the
+    /// bitmap's own replacement at the new zoom): none does, and with the bitmap's room gone to
+    /// a smaller size every one is loaded.
+    #[cfg(feature = "images")]
+    #[test]
+    fn images_without_room_are_not_failed_by_scrolling_or_zooming() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-room-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = |w: u32, h: u32| {
+            let mut out = Vec::new();
+            let mut enc = ::png::Encoder::new(&mut out, w, h);
+            enc.set_color(::png::ColorType::Grayscale);
+            enc.set_compression(::png::Compression::Fast);
+            enc.write_header()
+                .unwrap()
+                .write_image_data(&vec![0u8; (w * h) as usize])
+                .unwrap();
+            out
+        };
+        std::fs::write(dir.join("big.png"), png(835, 10_000)).unwrap();
+        std::fs::write(dir.join("tiny.png"), png(1, 1)).unwrap();
+        let mut src = String::from("![b](big.png)");
+        src.extend((0..300).map(|_| " ![t](tiny.png)"));
+        let mut v = View::with_base(
+            Fonts::new().unwrap(),
+            Doc::parse(&src),
+            None,
+            (1920, 1080),
+            1.0,
+            Some(dir.clone()),
+        );
+        v.set_text(Params::default().font_size, 160.0);
+        v.ensure();
+        settle_images(&mut v);
+        v.set_scroll(v.max_scroll());
+        settle_images(&mut v);
+        let stats = v.image_stats();
+        println!(
+            "at the bottom: {} of 301 decoded, {} failed",
+            stats.decoded, stats.failed
+        );
+        let at_bottom = stats.failed;
+        v.set_zoom(50);
+        settle_images(&mut v);
+        let stats = v.image_stats();
+        println!(
+            "at 50%: {} of 301 decoded, {} failed",
+            stats.decoded, stats.failed
+        );
+        assert_eq!(
+            (at_bottom, stats.failed),
+            (0, 0),
+            "an image with no room now is not failed, nor is the bitmap's replacement"
+        );
+        assert!((1..=301).all(|id| v.images.is_waiting(id)));
+        assert!(
+            (1..=301).all(|id| v.layout().image_size(id) != Some(ImageSize::Alt)),
+            "an image shows its alt text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A document's images are attached once when it is opened, base directory included.
     #[cfg(feature = "images")]
     #[test]
