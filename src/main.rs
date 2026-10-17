@@ -169,6 +169,8 @@ struct App {
     back: BackStack,
     /// The toolbar's visibility as last applied from or saved to the settings.
     toolbar_shown: bool,
+    /// The wide layout as last applied from or saved to the settings.
+    wide_set: bool,
     shown: bool,
     exit_code: i32,
 }
@@ -235,6 +237,8 @@ impl App {
             view.set_toolbar(prefs.toolbar);
         }
         self.toolbar_shown = prefs.toolbar;
+        view.set_wide(prefs.wide);
+        self.wide_set = prefs.wide;
         view.set_text(prefs.font_size, prefs.line_width);
         for mono in [false, true] {
             let (family, cached) = if mono {
@@ -303,6 +307,12 @@ impl App {
                 self.toolbar_shown = shown;
                 self.store
                     .set("toolbar", if shown { "true" } else { "false" }, now);
+            }
+            let wide = view.wide();
+            if wide != self.wide_set {
+                self.wide_set = wide;
+                self.store
+                    .set("wide", if wide { "true" } else { "false" }, now);
             }
         }
     }
@@ -903,6 +913,7 @@ fn main() {
         pointer: false,
         back: BackStack::default(),
         toolbar_shown: true,
+        wide_set: false,
         shown: false,
         exit_code: 0,
     };

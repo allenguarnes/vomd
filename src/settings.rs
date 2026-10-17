@@ -176,6 +176,8 @@ pub struct Prefs {
     pub remote_images: RemoteImages,
     pub font_size: f32,
     pub line_width: f32,
+    /// Wide layout: the text spans the window instead of stopping at `line_width`.
+    pub wide: bool,
     /// System family names; `None` = the embedded faces.
     pub font_sans: Option<String>,
     pub font_mono: Option<String>,
@@ -201,6 +203,7 @@ impl Default for Prefs {
             remote_images: RemoteImages::Ask,
             font_size: 16.0,
             line_width: 80.0,
+            wide: false,
             font_sans: None,
             font_mono: None,
             font_sans_path: None,
@@ -277,6 +280,7 @@ impl Prefs {
             remote_images: remote.unwrap_or(d.remote_images),
             font_size: font_size.unwrap_or(d.font_size),
             line_width: line_width.unwrap_or(d.line_width),
+            wide: s.get("wide").and_then(parse_bool).unwrap_or(d.wide),
             font_sans_path: font_sans.as_deref().and_then(|f| {
                 FontPaths::parse(s.get("font_sans_path")?).filter(|p| p.family_is(f))
             }),
@@ -811,6 +815,9 @@ pub const TEMPLATE: &str = "\
 
 # Maximum characters per line, 40 to 200.
 # line_width = 80
+
+# Wide layout: the text spans the window instead of stopping at line_width (W toggles it).
+# wide = false
 
 # Fonts: default (built in) or the name of an installed family, e.g. Noto Sans. VOMD finds
 # the files once and remembers them below as font_sans_path / font_mono_path. A family that

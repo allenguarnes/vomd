@@ -8,6 +8,7 @@ fn ctx(width: u32) -> Ctx {
         can_back: true,
         zoom: 100,
         theme: ThemeMode::System,
+        wide: false,
         settings: true,
         remote: 0,
         remote_on: false,
@@ -46,17 +47,19 @@ fn wide_bar_shows_everything() {
             Item::Settings,
             Item::Reload,
             Item::Theme,
+            Item::Wide,
             Item::ZoomIn,
             Item::ZoomReset,
             Item::ZoomOut
         ]
     );
     assert!(s.overflow.is_empty());
-    // Right group flush with the right edge, left to right: − % + theme reload settings.
+    // Right group flush with the right edge, left to right: − % + wide theme reload settings.
     let r = |i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;
     assert_eq!(r(Item::Settings).x1, 900.0 - EDGE);
     assert!(r(Item::ZoomOut).x1 <= r(Item::ZoomReset).x0 + 0.01);
-    assert!(r(Item::ZoomIn).x1 <= r(Item::Theme).x0 + 0.01);
+    assert!(r(Item::ZoomIn).x1 <= r(Item::Wide).x0 + 0.01);
+    assert!(r(Item::Wide).x1 <= r(Item::Theme).x0 + 0.01);
     // No settings file: no ⚙.
     let s = slots(&Ctx {
         settings: false,
@@ -66,8 +69,8 @@ fn wide_bar_shows_everything() {
 }
 
 #[test]
-fn narrow_bar_collapses_zoom_first_then_theme() {
-    let full = (EDGE + BUTTON + GAP + 2.0 * BUTTON + PERCENT + 3.0 * BUTTON + EDGE) as u32;
+fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
+    let full = (EDGE + BUTTON + GAP + 2.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
     assert!(slots(&ctx(full)).overflow.is_empty(), "exactly fits");
     let s = slots(&ctx(full - 1));
     assert_eq!(s.overflow, [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]);
@@ -75,8 +78,19 @@ fn narrow_bar_collapses_zoom_first_then_theme() {
     let s = slots(&ctx(150));
     assert_eq!(
         s.overflow,
-        [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn, Item::Theme]
+        [
+            Item::ZoomOut,
+            Item::ZoomReset,
+            Item::ZoomIn,
+            Item::Wide,
+            Item::Theme
+        ]
     );
+    // Wide layout goes before the theme: with room for the theme, reload and ⚙ only, it's in
+    // the dropdown.
+    let s = slots(&ctx(200));
+    assert_eq!(s.overflow.last(), Some(&Item::Wide));
+    assert!(items(&s).contains(&Item::Theme));
     // Down to 320 px and below, everything stays reachable: shown or in the menu.
     for w in [320, 200, 120, 80, 40, 1] {
         let s = slots(&ctx(w));
@@ -87,6 +101,7 @@ fn narrow_bar_collapses_zoom_first_then_theme() {
             Item::ZoomOut,
             Item::ZoomReset,
             Item::ZoomIn,
+            Item::Wide,
             Item::Theme,
             Item::Reload,
             Item::Settings,
@@ -124,6 +139,7 @@ fn clicks_map_to_the_shortcuts_actions() {
         (Item::ZoomOut, Command::Action(Action::ZoomOut)),
         (Item::ZoomReset, Command::Action(Action::ZoomReset)),
         (Item::ZoomIn, Command::Action(Action::ZoomIn)),
+        (Item::Wide, Command::Action(Action::ToggleWide)),
         (Item::Theme, Command::Action(Action::CycleTheme)),
         (Item::Reload, Command::Action(Action::Reload)),
         (Item::Settings, Command::Settings),
@@ -231,7 +247,11 @@ fn short_window_scrolls_the_dropdown() {
         ..ctx(150)
     };
     let s = slots(&c);
-    assert_eq!(s.overflow.len(), 4, "zoom and theme are in the dropdown");
+    assert_eq!(
+        s.overflow.len(),
+        5,
+        "zoom, wide and theme are in the dropdown"
+    );
     let mut t = Toolbar::default();
     assert!(!t.scroll_menu(&c, 10.0), "closed: the document's");
     let (mx, my) = center(&s, Item::More);
@@ -260,7 +280,7 @@ fn short_window_scrolls_the_dropdown() {
     assert_eq!(t.menu, Some(0.0));
     assert!(t.scroll_menu(&c, 1.0e6));
     let b = menu_box(&c, &s).unwrap();
-    let last = menu_row(&c, b, t.menu.unwrap(), 3);
+    let last = menu_row(&c, b, t.menu.unwrap(), 4);
     assert_eq!(
         last.y1 + EDGE,
         b.y1,
@@ -497,7 +517,7 @@ fn the_remote_images_button() {
     t.press(&none, x, y);
     assert_eq!(t.release(&none, x, y), (true, None));
     // Narrower: the zoom goes into `⋯` first, then it.
-    let full = (EDGE + BUTTON + GAP + 3.0 * BUTTON + PERCENT + 3.0 * BUTTON + EDGE) as u32;
+    let full = (EDGE + BUTTON + GAP + 3.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
     assert!(slots(&Ctx { width: full, ..c }).overflow.is_empty());
     let s = slots(&Ctx {
         width: full - 1,
@@ -592,4 +612,19 @@ fn the_pulse_moves_to_the_more_button_with_the_images_button() {
         .filter(|&(x, y)| changed(x, y))
         .count();
     assert!(on_more > 20, "`⋯` pulses: {on_more}");
+}
+
+#[test]
+fn wide_button_names_and_draws_the_layout_it_switches_to() {
+    let c = ctx(900);
+    let on = Ctx { wide: true, ..c };
+    assert_eq!(Item::Wide.label(&c), "Wide layout (W)");
+    assert_eq!(Item::Wide.label(&on), "Normal width (W)");
+    assert_eq!(Item::Wide.icon(&c), Some(icon::UNFOLD));
+    assert_eq!(Item::Wide.icon(&on), Some(icon::FOLD));
+    // Both click the same action: the view flips whatever it has.
+    assert_eq!(
+        Item::Wide.command(),
+        Some(Command::Action(Action::ToggleWide))
+    );
 }

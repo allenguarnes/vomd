@@ -53,6 +53,11 @@ fn keys() {
         (ch("x"), none, None),
         (ch("b"), none, Some(Action::ToggleToolbar)),
         (ch("B"), none, Some(Action::ToggleToolbar)),
+        (ch("w"), none, Some(Action::ToggleWide)),
+        (ch("W"), none, Some(Action::ToggleWide)),
+        (ch("W"), shift, Some(Action::ToggleWide)),
+        (ch("W"), ctrl, Some(Action::Quit)),
+        (ch("w"), ModifiersState::ALT, None),
         (ch("["), none, Some(Action::PrevHeading)),
         (ch("]"), none, Some(Action::NextHeading)),
         (Key::Named(NamedKey::Backspace), none, Some(Action::Back)),
@@ -421,6 +426,47 @@ mod with_fonts {
         v.ensure();
         assert_eq!(v.anchor().block, block, "HiDPI");
         assert_eq!(v.scale(), 2.0);
+    }
+
+    #[test]
+    fn wide_layout_keeps_the_reading_position() {
+        let now = Instant::now();
+        let mut v = view(&wrapping(100), 1600, 500);
+        settle(&mut v);
+        let (_, capped) = v.layout().column();
+        v.set_scroll(v.layout().top(40) + 5.0);
+        let block = v.anchor().block;
+        assert_eq!(block, 40);
+        assert!(!v.wide());
+        assert_eq!(v.apply(Action::ToggleWide, now), Outcome::Redraw);
+        v.ensure();
+        assert!(v.wide());
+        let (x, w) = v.layout().column();
+        assert!(w > capped, "the column grew: {w} > {capped}");
+        assert_eq!((x, w), (32.0, 1600.0 - 64.0), "margins only");
+        assert_eq!(v.anchor().block, block, "wide");
+        v.apply(Action::ToggleWide, now);
+        v.ensure();
+        assert!(!v.wide());
+        assert_eq!(v.layout().column().1, capped, "back to the cap");
+        assert_eq!(v.anchor().block, block, "normal again");
+    }
+
+    #[test]
+    fn set_wide_does_nothing_when_unchanged() {
+        let mut v = view(&paras(50), 1600, 500);
+        settle(&mut v);
+        let before = v.layout().params();
+        v.set_wide(false);
+        assert_eq!(v.layout().params(), before);
+        assert!(v.layout().complete(), "nothing was remeasured");
+        v.set_wide(true);
+        assert!(v.layout().params().wide);
+        assert!(v.wide());
+        v.set_wide(true);
+        assert!(v.wide());
+        v.set_wide(false);
+        assert_eq!(v.layout().params(), before);
     }
 
     /// A lot of text that wraps differently at every width.
@@ -1827,11 +1873,17 @@ mod with_fonts {
         );
     }
 
-    /// The view at 200 px wide (`⋯` holds zoom and theme) with the dropdown open.
+    /// The view at 200 px wide (`⋯` holds zoom and wide layout) with the dropdown open.
     fn open_menu_view(now: Instant) -> View {
         let mut v = view(&paras(20), 200, 300);
         v.set_toolbar(true);
-        let (mx, my) = (200.0 - 4.0 - 3.0 * 32.0 + 16.0, 16.0);
+        let more = toolbar::slots(&v.toolbar_ctx())
+            .items
+            .iter()
+            .find(|(i, _)| *i == toolbar::Item::More)
+            .unwrap()
+            .1;
+        let (mx, my) = (f64::from((more.x0 + more.x1) / 2.0), 16.0);
         assert!(v.press(mx, my, now));
         v.release_toolbar(mx, my);
         v

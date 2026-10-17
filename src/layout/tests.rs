@@ -75,6 +75,59 @@ fn spec_layout_is_deterministic_across_widths_and_scales() {
     }
 }
 
+/// Wide layout: no cap, so the column is the window less the margins (`em` on narrow windows,
+/// `2em` otherwise); the normal column stops at `line_width`.
+#[test]
+fn wide_column_spans_the_window() {
+    let em = 16.0;
+    let at = |width: f32, wide: bool| {
+        let l = Layout::new(
+            &Doc::parse("text"),
+            Params {
+                wide,
+                ..params(width, 1.0)
+            },
+        );
+        l.column()
+    };
+    for width in [1600.0, 900.0, 481.0] {
+        let (x, w) = at(width, true);
+        assert_eq!((x, w), (2.0 * em, width - 4.0 * em), "wide at {width}");
+    }
+    // Narrow windows keep the narrow margin.
+    assert_eq!(at(400.0, true), (em, 400.0 - 2.0 * em));
+    // Normal stays capped at 80 characters, centered.
+    let (x, w) = at(1600.0, false);
+    assert_eq!(w, 80.0 * CHAR_EM * em);
+    assert_eq!(x, (1600.0 - w) / 2.0);
+    // A window narrower than the cap is the same either way.
+    assert_eq!(at(481.0, false), at(481.0, true));
+    // Tiny windows: at least one em, either way.
+    for width in [1.0, 10.0, 30.0] {
+        for wide in [false, true] {
+            let (x, w) = at(width, wide);
+            assert!(w >= em && x >= 0.0, "{width} {wide}: {x} {w}");
+        }
+    }
+}
+
+/// In wide layout, everything that sizes itself to the column follows it: wrapped text,
+/// table and code block widths, and heights stay consistent.
+#[test]
+fn wide_layout_is_measured_to_the_column() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(&fixture("spec.md"));
+    let wide = |wide| Params {
+        wide,
+        ..params(2400.0, 1.0)
+    };
+    let narrow = complete(&doc, &fonts, wide(false));
+    let l = complete(&doc, &fonts, wide(true));
+    check_geometry(&l);
+    assert!(l.total_height() < narrow.total_height(), "less wrapping");
+    assert_eq!(l.column().1, 2400.0 - 64.0);
+}
+
 #[test]
 fn content_stays_in_column() {
     let fonts = Fonts::new().unwrap();

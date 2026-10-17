@@ -74,6 +74,8 @@ pub enum Action {
     Back,
     /// Show or hide the toolbar (`B`).
     ToggleToolbar,
+    /// Wide layout on or off (`W`): the text spans the window or stops at `line_width`.
+    ToggleWide,
     /// Escape: closes the toolbar's dropdown if it's open, else quits.
     Escape,
     /// Load remote images for this document, or hide them again (`I`).
@@ -186,6 +188,7 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             "[" => Some(Action::PrevHeading),
             "]" => Some(Action::NextHeading),
             "b" | "B" => Some(Action::ToggleToolbar),
+            "w" | "W" => Some(Action::ToggleWide),
             "i" | "I" if cfg!(feature = "remote-images") => Some(Action::ToggleRemote),
             _ => None,
         },
@@ -381,6 +384,8 @@ pub struct View {
     zoom: u16,
     /// Base font size (logical px) and maximum characters per line (`font_size`, `line_width`).
     text: (f32, f32),
+    /// Wide layout: no cap on the column (`wide`, `W`).
+    wide: bool,
     theme: ThemeMode,
     system_dark: bool,
     fade: ScrollbarFade,
@@ -445,7 +450,7 @@ impl View {
         let hidpi = sane_scale(hidpi);
         let d = Params::default();
         let text = (d.font_size, d.line_width);
-        let params = params(width, hidpi, 100, text);
+        let params = params(width, hidpi, 100, text, false);
         let mut view = View {
             layout: Layout::new(&doc, params),
             doc,
@@ -471,6 +476,7 @@ impl View {
             hidpi,
             zoom: 100,
             text,
+            wide: false,
             theme: ThemeMode::System,
             system_dark: false,
             fade: ScrollbarFade::default(),
@@ -560,6 +566,17 @@ impl View {
         self.relayout();
     }
 
+    pub fn wide(&self) -> bool {
+        self.wide
+    }
+
+    /// Wide layout on or off (the `wide` setting); the reading position is kept.
+    pub fn set_wide(&mut self, wide: bool) {
+        if std::mem::replace(&mut self.wide, wide) != wide {
+            self.relayout();
+        }
+    }
+
     /// Set body text (`mono` false) or code (`mono` true) in a family loaded from disk, or back
     /// in the default faces with `None` (see [`Fonts::set_family`]); everything is remeasured,
     /// keeping the reading position. Returns false if the family's regular face couldn't be
@@ -632,6 +649,7 @@ impl View {
             can_back: self.can_back,
             zoom: self.zoom,
             theme: self.theme,
+            wide: self.wide,
             settings: self.settings,
             remote: self.remote_count,
             remote_on: self.images.remote_on(),
@@ -672,8 +690,9 @@ impl View {
     /// only, nothing rewrapped), so a window that got narrower and taller would seem to end
     /// above the position, and clamping against that would throw it away.
     fn relayout(&mut self) {
-        self.layout
-            .set_params(params(self.width, self.hidpi, self.zoom, self.text));
+        self.layout.set_params(params(
+            self.width, self.hidpi, self.zoom, self.text, self.wide,
+        ));
         self.ensure();
     }
 
@@ -776,6 +795,7 @@ impl View {
                 self.set_toolbar(visible);
             }
             Action::Reload => return Outcome::Reload,
+            Action::ToggleWide => self.set_wide(!self.wide),
             Action::ToggleRemote => {
                 if self.remote_count == 0 {
                     return Outcome::Nothing;
@@ -1575,7 +1595,7 @@ impl View {
         self.message = message;
         self.layout = Layout::new(
             &self.doc,
-            params(self.width, self.hidpi, self.zoom, self.text),
+            params(self.width, self.hidpi, self.zoom, self.text, self.wide),
         );
         self.anchor = Anchor::TOP;
         self.drag = None;
@@ -1621,7 +1641,7 @@ impl View {
         self.message = message;
         self.layout = Layout::new(
             &self.doc,
-            params(self.width, self.hidpi, self.zoom, self.text),
+            params(self.width, self.hidpi, self.zoom, self.text, self.wide),
         );
         // A reload keeps remote images on.
         self.attach_images();
@@ -1744,13 +1764,21 @@ fn section_end(doc: &Doc, from: u32) -> u32 {
         .unwrap_or(doc.blocks.len() as u32)
 }
 
-/// Layout parameters for a window `width` wide at `hidpi` and `zoom` percent.
-fn params(width: u32, hidpi: f64, zoom: u16, (font_size, line_width): (f32, f32)) -> Params {
+/// Layout parameters for a window `width` wide at `hidpi` and `zoom` percent, in wide layout or
+/// not.
+fn params(
+    width: u32,
+    hidpi: f64,
+    zoom: u16,
+    (font_size, line_width): (f32, f32),
+    wide: bool,
+) -> Params {
     Params {
         width: width as f32,
         scale: (hidpi * f64::from(zoom) / 100.0) as f32,
         font_size,
         line_width,
+        wide,
         page_pad: PAGE_PAD,
     }
 }

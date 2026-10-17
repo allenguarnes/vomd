@@ -78,6 +78,7 @@ Each window is its own process, so opening another file starts another window.
 | `Ctrl` + `=` `-` `0`, `Ctrl` + wheel | Zoom in / out / reset |
 | `T` | Theme: system → light → dark |
 | `B` | Show / hide the toolbar |
+| `W` | Wide layout on / off: the text spans the window instead of stopping at `line_width` |
 | `I` | Load remote images for this document (press again to hide them) |
 | `R`, `F5` | Reload |
 | Click a link | Follow it; hover shows where it goes |
@@ -101,9 +102,10 @@ it with every key listed and commented out:
 | `remote_images` | `ask`, `never`, `always` |
 | `font_size` | `16` (10–32) |
 | `line_width` | `80` (40–200 characters) |
+| `wide` | `false`, `true` (the text spans the window; `line_width` is ignored) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed family such as `Noto Sans` |
 
-Theme, zoom, toolbar and window size are saved automatically when you change them.
+Theme, zoom, toolbar, wide layout and window size are saved automatically when you change them.
 
 ## Privacy
 

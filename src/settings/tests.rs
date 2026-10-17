@@ -75,6 +75,20 @@ fn defaults_are_not_written() {
 }
 
 #[test]
+fn wide_is_a_bool_and_bad_values_are_ignored() {
+    assert!(!Prefs::default().wide);
+    for (v, want) in [("true", true), ("On", true), ("false", false), ("0", false)] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("wide = {v}")));
+        assert_eq!(p.wide, want, "{v}");
+    }
+    for v in ["maybe", "", "2"] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("wide = {v}")));
+        assert!(!p.wide, "{v:?} is ignored");
+    }
+    assert!(TEMPLATE.contains("# wide = false"));
+}
+
+#[test]
 fn prefs_defaults_and_bad_values() {
     assert_eq!(Prefs::from_settings(&Settings::default()), Prefs::default());
     let s = Settings::parse(
@@ -92,6 +106,7 @@ fn prefs_defaults_and_bad_values() {
     assert_eq!(p.remote_images, RemoteImages::Always);
     assert_eq!(p.font_size, d.font_size);
     assert_eq!(p.line_width, 120.0);
+    assert!(!p.wide, "off by default");
     assert_eq!(p.font_sans.as_deref(), Some("Noto Sans"));
     assert_eq!(p.font_mono, None);
     for (v, want) in [
@@ -275,6 +290,7 @@ fn template_is_all_defaults() {
         "remote_images",
         "font_size",
         "line_width",
+        "wide",
         "font_sans",
         "font_mono",
     ] {

@@ -86,6 +86,8 @@ pub struct Params {
     pub font_size: f32,
     /// Maximum characters per line (`line_width` setting).
     pub line_width: f32,
+    /// Wide layout (`wide` setting): the column has no cap and spans the window, margins aside.
+    pub wide: bool,
     /// Space above the first block and below the last, in em. The app pads the page like
     /// GitHub (about 2 em); 0 by default, so block 0 starts at y = 0.
     pub page_pad: f32,
@@ -98,6 +100,7 @@ impl Default for Params {
             scale: 1.0,
             font_size: 16.0,
             line_width: 80.0,
+            wide: false,
             page_pad: 0.0,
         }
     }
@@ -548,7 +551,11 @@ impl Layout {
         } else {
             2.0 * self.em
         };
-        let cap = p.line_width * CHAR_EM * self.em;
+        let cap = if p.wide {
+            f32::INFINITY
+        } else {
+            p.line_width * CHAR_EM * self.em
+        };
         self.col_w = cap.min(p.width - 2.0 * margin).max(self.em);
         self.col_x = ((p.width - self.col_w) / 2.0).max(0.0);
     }

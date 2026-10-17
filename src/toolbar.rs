@@ -1,9 +1,9 @@
 //! The toolbar: one slim bar docked at the top, never over the text.
 //!
 //! Left: Back. Right: remote images (only when the document has any), zoom (− 100% +), theme,
-//! reload, settings. Buttons for features that aren't built yet are absent. On narrow windows
+//! wide layout, theme, reload, settings. Buttons for features that aren't built yet are absent. On narrow windows
 //! the right group collapses into a `⋯` button with a small dropdown, the one popup in the app:
-//! zoom first, then remote images, theme, ...
+//! zoom first, then remote images, wide layout, theme, ...
 //! A tooltip with the name and shortcut appears after 500 ms. Icons are glyphs of an embedded
 //! Lucide subset, drawn through the glyph cache, so they're crisp at every scale.
 //!
@@ -46,6 +46,9 @@ mod icon {
     pub const SETTINGS: char = '\u{e154}';
     pub const MORE: char = '\u{e0b6}';
     pub const IMAGE: char = '\u{e0f6}';
+    /// Wide layout is off (the button widens) and on (it narrows).
+    pub const UNFOLD: char = '\u{e43d}';
+    pub const FOLD: char = '\u{e43b}';
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +60,8 @@ pub enum Item {
     /// The percentage between − and +; clicking it resets the zoom.
     ZoomReset,
     ZoomIn,
+    /// Wide layout on or off.
+    Wide,
     Theme,
     Reload,
     Settings,
@@ -84,6 +89,8 @@ pub struct Ctx {
     pub can_back: bool,
     pub zoom: u16,
     pub theme: ThemeMode,
+    /// Wide layout is on.
+    pub wide: bool,
     /// There is a settings file to open (not with `--no-settings`).
     pub settings: bool,
     /// Remote images in the document (0: no remote-images button).
@@ -144,6 +151,8 @@ impl Item {
             Item::ZoomOut => "Zoom out (Ctrl+−)".into(),
             Item::ZoomReset => format!("Reset zoom {}% (Ctrl+0)", ctx.zoom),
             Item::ZoomIn => "Zoom in (Ctrl+=)".into(),
+            Item::Wide if ctx.wide => "Normal width (W)".into(),
+            Item::Wide => "Wide layout (W)".into(),
             Item::Theme => match ctx.theme {
                 ThemeMode::System => "Theme: system (T)",
                 ThemeMode::Light => "Theme: light (T)",
@@ -156,12 +165,14 @@ impl Item {
         }
     }
 
-    fn icon(self) -> Option<char> {
+    fn icon(self, ctx: &Ctx) -> Option<char> {
         Some(match self {
             Item::Back => icon::BACK,
             Item::Images => icon::IMAGE,
             Item::ZoomOut => icon::MINUS,
             Item::ZoomIn => icon::PLUS,
+            Item::Wide if ctx.wide => icon::FOLD,
+            Item::Wide => icon::UNFOLD,
             Item::Theme => icon::THEME,
             Item::Reload => icon::RELOAD,
             Item::Settings => icon::SETTINGS,
@@ -177,6 +188,7 @@ impl Item {
             Item::ZoomOut => Command::Action(Action::ZoomOut),
             Item::ZoomReset => Command::Action(Action::ZoomReset),
             Item::ZoomIn => Command::Action(Action::ZoomIn),
+            Item::Wide => Command::Action(Action::ToggleWide),
             Item::Theme => Command::Action(Action::CycleTheme),
             Item::Reload => Command::Action(Action::Reload),
             Item::Settings => Command::Settings,
@@ -196,20 +208,22 @@ impl Item {
 /// The right group's items, left to right, with their logical widths and collapse groups: the
 /// lowest group collapses into `⋯` first. The remote-images button is the first, and only there
 /// when the document has remote images; it goes after the zoom (collapsed alone, `⋯` would take
-/// its place for nothing). ⚙ is the last, and only there with a settings file.
-const RIGHT: [(Item, f32, u8); 7] = [
+/// its place for nothing). Wide layout goes just before the theme and collapses just before it.
+/// ⚙ is the last, and only there with a settings file.
+const RIGHT: [(Item, f32, u8); 8] = [
     (Item::Images, BUTTON, 1),
     (Item::ZoomOut, BUTTON, 0),
     (Item::ZoomReset, PERCENT, 0),
     (Item::ZoomIn, BUTTON, 0),
-    (Item::Theme, BUTTON, 2),
-    (Item::Reload, BUTTON, 3),
-    (Item::Settings, BUTTON, 4),
+    (Item::Wide, BUTTON, 2),
+    (Item::Theme, BUTTON, 3),
+    (Item::Reload, BUTTON, 4),
+    (Item::Settings, BUTTON, 5),
 ];
 
 /// The right group's items in this window.
 fn right_items(ctx: &Ctx) -> &'static [(Item, f32, u8)] {
-    &RIGHT[usize::from(ctx.remote == 0)..6 + usize::from(ctx.settings)]
+    &RIGHT[usize::from(ctx.remote == 0)..7 + usize::from(ctx.settings)]
 }
 
 /// How many of the right group's leading groups don't fit and collapse into `⋯`.
@@ -625,13 +639,13 @@ impl Toolbar {
         } else {
             (rect, rect)
         };
-        if let Some(c) = item.icon() {
+        if let Some(c) = item.icon(ctx) {
             draw_icon(frame, fonts, cache, c, icon_box, s, color);
         }
         let label = if row {
             Some(item.label(ctx))
         } else {
-            item.icon().is_none().then(|| format!("{}%", ctx.zoom))
+            item.icon(ctx).is_none().then(|| format!("{}%", ctx.zoom))
         };
         if let Some(label) = label {
             let p = layout_label(fonts, text, &label, label_box, s, row);

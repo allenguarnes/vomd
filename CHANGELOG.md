@@ -32,6 +32,8 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   is missed while starting (the first read is reported at once; signals are followed in
   order, and one that races a read triggers a backed-off re-read, 50 ms doubling to 5 s, until a
   read completes undisturbed), and the bus going away also returns to winit and `GTK_THEME`.
+- Wide layout: `W`, the toolbar's button (next to the theme's) or `wide = true` in
+  `settings.ini` lets the text span the window instead of stopping at `line_width`; it is saved.
 - The scrollbar also shows while the pointer is over its column.
 - Budgets checked in CI (`cargo xtask budgets`): binary size, cold and warm start, idle RSS,
   idle CPU, 4K scroll frame time. Fuzz targets for the parser, layout and settings.
