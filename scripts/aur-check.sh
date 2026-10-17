@@ -22,7 +22,8 @@ check() { # name
     mkdir -p "$dir/root"
     tar -C "$dir/root" -xf "$pkg"
     for f in usr/bin/vomd usr/share/applications/vomd.desktop \
-             usr/share/icons/hicolor/scalable/apps/vomd.svg "usr/share/licenses/$1/LICENSE"; do
+             usr/share/icons/hicolor/scalable/apps/vomd.svg "usr/share/licenses/$1/LICENSE" \
+             "usr/share/doc/$1/README.md" "usr/share/doc/$1/assets/icon@2x.png"; do
         test -e "$dir/root/$f" || { echo "missing $f in $pkg"; exit 1; }
     done
     desktop-file-validate "$dir/root/usr/share/applications/vomd.desktop"

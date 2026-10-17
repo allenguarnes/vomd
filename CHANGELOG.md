@@ -22,12 +22,14 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
 - Local PNG and JPEG images, decoded lazily at their displayed size under a 32 MB cache.
 - Remote images, off by default: loaded per document with `I`, through the system `curl`.
 - A one-line notice for files over 10 MB, which still render.
-- Packaging: AUR `vomd` and `vomd-bin`, a release tarball with a desktop entry and icon.
+- Packaging: AUR `vomd` and `vomd-bin`, a release tarball with a desktop entry, icon and the
+  README's image.
 - The app icon (an eye over the Markdown mark). The window's Wayland app ID and X11 `WM_CLASS` are
   `vomd`, so the desktop shows it for the window.
 - The system theme comes from the desktop portal's `color-scheme` (Plasma's and GNOME's dark
   mode, followed live, and back to winit and `GTK_THEME` when the preference is withdrawn), which
-  say nothing on Wayland.
+  say nothing on Wayland. Only the portal's own signals count, none is missed while starting,
+  and the bus going away also returns to winit and `GTK_THEME`.
 - The scrollbar also shows while the pointer is over its column.
 - Budgets checked in CI (`cargo xtask budgets`): binary size, cold and warm start, idle RSS,
   idle CPU, 4K scroll frame time. Fuzz targets for the parser, layout and settings.

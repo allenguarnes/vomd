@@ -721,11 +721,13 @@ fn dist(release: bool) -> bool {
     let stage = dist.join(&name);
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage).expect("create dist/");
-    let files: [(&Path, &str); 9] = [
+    let files: [(&Path, &str); 10] = [
         (&bin, "vomd"),
         (Path::new("packaging/vomd.desktop"), "vomd.desktop"),
         (Path::new("assets/icon.svg"), "vomd.svg"),
         (Path::new("README.md"), "README.md"),
+        // The README's image, at the path it names.
+        (Path::new("assets/icon@2x.png"), "assets/icon@2x.png"),
         (Path::new("CHANGELOG.md"), "CHANGELOG.md"),
         (Path::new("LICENSE"), "LICENSE"),
         // The fonts and icons built into the binary.
@@ -743,8 +745,9 @@ fn dist(release: bool) -> bool {
         ),
     ];
     for (from, to) in files {
-        fs::copy(root().join(from), stage.join(to))
-            .unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
+        let to = stage.join(to);
+        fs::create_dir_all(to.parent().unwrap()).expect("create dist/ subdirectory");
+        fs::copy(root().join(from), to).unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
     }
     let tarball = dist.join(format!("{name}.tar.gz"));
     let ok = Command::new("tar")

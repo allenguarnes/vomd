@@ -81,9 +81,11 @@ fn changed(value: u32, key: &str) -> Vec<u8> {
 }
 
 /// Run a fake session bus on one end of a socket pair: authenticate, answer each call with
-/// `answer(member) -> messages to send`, then send `after` once AddMatch is answered.
+/// `answer(serial, member) -> messages to send`, then send `after` once `end` is answered and
+/// close. `AddMatch` must name the portal as sender.
 fn fake_bus(
     answer: impl Fn(u32, &str) -> Vec<Vec<u8>> + Send + 'static,
+    end: &'static str,
     after: Vec<Vec<u8>>,
 ) -> UnixStream {
     let (client, mut server) = UnixStream::pair().unwrap();
@@ -99,11 +101,15 @@ fn fake_bus(
         let mut begin = [0u8; 7];
         server.read_exact(&mut begin).unwrap();
         assert_eq!(&begin, b"BEGIN\r\n");
-        while let Some((serial, member, _)) = read_call(&mut server) {
+        while let Some((serial, member, body)) = read_call(&mut server) {
+            if member == "AddMatch" {
+                let rule = Reader::new(&body).str().unwrap().to_owned();
+                assert_eq!(rule, MATCH_RULE);
+            }
             for m in answer(serial, &member) {
                 server.write_all(&m).unwrap();
             }
-            if member == "AddMatch" {
+            if member == end {
                 for m in &after {
                     server.write_all(m).unwrap();
                 }
@@ -126,6 +132,7 @@ fn reads_the_preference_and_follows_changes() {
             "ReadOne" => vec![bus_msg(RETURN, serial, "", "v", &variant_u(1, 0))],
             _ => vec![bus_msg(RETURN, serial, "", "", &[])],
         },
+        "ReadOne",
         vec![
             bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(2, KEY)),
             // Another key of the namespace is not ours.
@@ -137,13 +144,63 @@ fn reads_the_preference_and_follows_changes() {
                 &changed(1, "accent-color"),
             ),
             bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(0, KEY)),
+            bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(1, KEY)),
         ],
     );
-    let mut bus = Bus::over(stream).expect("connected");
-    assert_eq!(bus.read_setting(), Some(true));
     let mut seen = Vec::new();
-    bus.follow(|v| seen.push(v));
-    assert_eq!(seen, [Some(false), None]);
+    run(Bus::over(stream).expect("connected"), |v| seen.push(v));
+    // The bus closing at the end is reported as no preference.
+    assert_eq!(seen, [Some(true), Some(false), None, Some(true), None]);
+}
+
+/// The signals are asked for before the setting is read, and one that arrives while a reply
+/// is awaited (here the `AddMatch` one, then the `ReadOne` one) is newer than what is read.
+#[test]
+fn a_change_while_starting_wins() {
+    for (during_add, during_read, read, first) in [
+        (Some(1), None, 2, Some(true)),
+        (None, Some(2), 1, Some(false)),
+        (Some(1), Some(0), 2, None),
+        (None, None, 2, Some(false)),
+    ] {
+        let stream = fake_bus(
+            move |serial, member| {
+                let signal = |v| bus_msg(SIGNAL, 0, "SettingChanged", "ssv", &changed(v, KEY));
+                let ok = bus_msg(RETURN, serial, "", "", &[]);
+                match member {
+                    "AddMatch" => during_add.map(signal).into_iter().chain([ok]).collect(),
+                    "ReadOne" => during_read
+                        .map(signal)
+                        .into_iter()
+                        .chain([bus_msg(RETURN, serial, "", "v", &variant_u(read, 0))])
+                        .collect(),
+                    _ => vec![ok],
+                }
+            },
+            "ReadOne",
+            Vec::new(),
+        );
+        let mut seen = Vec::new();
+        run(Bus::over(stream).expect("connected"), |v| seen.push(v));
+        assert_eq!(seen, [first, None], "{during_add:?} {during_read:?} {read}");
+    }
+}
+
+/// Without the subscription there is nothing to follow or to end: the read is the answer.
+#[test]
+fn a_refused_subscription_reads_once() {
+    let stream = fake_bus(
+        |serial, member| match member {
+            "AddMatch" => vec![bus_msg(ERROR, serial, "", "", &[])],
+            "ReadOne" => vec![bus_msg(RETURN, serial, "", "v", &variant_u(1, 0))],
+            _ => vec![bus_msg(RETURN, serial, "", "", &[])],
+        },
+        "ReadOne",
+        Vec::new(),
+    );
+    let mut seen = Vec::new();
+    run(Bus::over(stream).expect("connected"), |v| seen.push(v));
+    assert_eq!(seen, [Some(true)]);
 }
 
 #[test]
@@ -155,6 +212,7 @@ fn falls_back_to_read_on_old_portals() {
             "Read" => vec![bus_msg(RETURN, serial, "", "v", &variant_u(2, 1))],
             _ => vec![bus_msg(RETURN, serial, "", "", &[])],
         },
+        "Read",
         Vec::new(),
     );
     let mut bus = Bus::over(stream).expect("connected");
@@ -168,6 +226,7 @@ fn no_portal_is_no_preference() {
             "Hello" => vec![bus_msg(RETURN, serial, "", "", &[])],
             _ => vec![bus_msg(ERROR, serial, "", "", &[])],
         },
+        "Read",
         Vec::new(),
     );
     let mut bus = Bus::over(stream).expect("connected");
@@ -195,6 +254,7 @@ fn oversized_messages_end_the_connection() {
         stream: client,
         serial: 0,
         dead: false,
+        changed: None,
     };
     assert!(bus.recv().is_err());
 }
@@ -205,6 +265,8 @@ fn values_and_addresses() {
     assert_eq!(scheme(2), Some(false));
     assert_eq!(scheme(0), None);
     assert_eq!(scheme(7), None);
+    // Only the portal's own signals are asked for.
+    assert!(MATCH_RULE.contains("sender='org.freedesktop.portal.Desktop'"));
     assert_eq!(
         unescape("/run/user/1000/bus").unwrap(),
         b"/run/user/1000/bus"
@@ -229,6 +291,7 @@ fn the_portal_is_waited_for() {
             }
             _ => vec![bus_msg(RETURN, serial, "", "", &[])],
         },
+        "ReadOne",
         Vec::new(),
     );
     let mut bus = Bus::over(stream).expect("connected");
@@ -253,6 +316,7 @@ fn a_failed_read_ends_the_connection() {
             }
             _ => vec![bus_msg(RETURN, serial, "", "", &[])],
         },
+        "ReadOne",
         Vec::new(),
     );
     let mut bus = Bus::over(stream).expect("connected");

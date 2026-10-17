@@ -25,16 +25,37 @@ const SIGNAL: u8 = 4;
 const MAX_PART: u32 = 1 << 20;
 
 /// Watch the preference: `f` gets the current value, then each change, until the bus goes
-/// away. `None` is no preference, or no bus or portal to ask (use the other sources).
+/// away, which is reported as `None` too. `None` is no preference, or no bus or portal to ask
+/// (use the other sources).
 pub fn watch(mut f: impl FnMut(Option<bool>)) {
-    let Some(mut bus) = Bus::connect() else {
-        f(None);
-        return;
-    };
-    f(bus.read_setting());
-    // (A read that failed midway leaves the stream unusable: `follow` sees `dead`.)
-    bus.follow(f);
+    match Bus::connect() {
+        Some(bus) => run(bus, f),
+        None => f(None),
+    }
 }
+
+fn run(mut bus: Bus, mut f: impl FnMut(Option<bool>)) {
+    // Subscribe before reading, so a change between the two isn't missed; one that arrives
+    // while waiting for a reply is newer than what the read may have seen, and wins.
+    let watching = bus.add_match();
+    let read = bus.read_setting();
+    f(bus.changed.take().unwrap_or(read));
+    // (A read that failed midway leaves the stream unusable: `follow` sees `dead`.)
+    if watching {
+        bus.follow(&mut f);
+        // The bus went away: a value it last gave no longer holds, use the other sources.
+        f(None);
+    }
+}
+
+/// The signals wanted: `color-scheme` changes, from the portal only (the bus matches the name
+/// against its owner, so no other client can pass one off as the portal's).
+const MATCH_RULE: &str = concat!(
+    "type='signal',sender='org.freedesktop.portal.Desktop',",
+    "interface='org.freedesktop.portal.Settings',member='SettingChanged',",
+    "path='/org/freedesktop/portal/desktop',",
+    "arg0='org.freedesktop.appearance',arg1='color-scheme'"
+);
 
 /// `color-scheme`: 1 prefers dark, 2 prefers light, 0 (or anything else) no preference.
 fn scheme(value: u32) -> Option<bool> {
@@ -50,6 +71,8 @@ struct Bus {
     serial: u32,
     /// A write or read failed, perhaps midway through a message: the stream is not used again.
     dead: bool,
+    /// The newest `SettingChanged` seen while waiting for a reply, not yet reported.
+    changed: Option<Option<bool>>,
 }
 
 /// How long the login and `Hello` may take. Later calls and the signals wait without a limit:
@@ -90,6 +113,7 @@ impl Bus {
             stream,
             serial: 0,
             dead: false,
+            changed: None,
         };
         let hello = bus.call(BUS, "/org/freedesktop/DBus", BUS, "Hello", "", &[])?;
         if hello.kind != RETURN {
@@ -113,24 +137,24 @@ impl Bus {
         Reader::new(&reply.body).variant_u32(0).and_then(scheme)
     }
 
-    /// Ask for `SettingChanged` on `color-scheme` and hand each new value to `f`, until the
-    /// connection ends. Blocks without waking in between.
-    fn follow(&mut self, mut f: impl FnMut(Option<bool>)) {
-        let rule = concat!(
-            "type='signal',interface='org.freedesktop.portal.Settings',",
-            "member='SettingChanged',path='/org/freedesktop/portal/desktop',",
-            "arg0='org.freedesktop.appearance',arg1='color-scheme'"
+    /// Ask for `SettingChanged` on `color-scheme`; whether the bus agreed.
+    fn add_match(&mut self) -> bool {
+        let added = self.call(
+            BUS,
+            "/org/freedesktop/DBus",
+            BUS,
+            "AddMatch",
+            "s",
+            &[MATCH_RULE],
         );
-        let added = self.call(BUS, "/org/freedesktop/DBus", BUS, "AddMatch", "s", &[rule]);
-        if added.is_none_or(|m| m.kind != RETURN) {
-            return;
-        }
+        added.is_some_and(|m| m.kind == RETURN)
+    }
+
+    /// Hand each new value to `f`, until the connection ends. Blocks without waking in between.
+    fn follow(&mut self, mut f: impl FnMut(Option<bool>)) {
         while let Ok(msg) = self.recv() {
-            if msg.kind == SIGNAL && msg.member == "SettingChanged" {
-                let mut r = Reader::new(&msg.body);
-                if r.str() == Some(NAMESPACE) && r.str() == Some(KEY) {
-                    f(r.variant_u32(0).and_then(scheme));
-                }
+            if let Some(value) = setting_changed(&msg) {
+                f(value);
             }
         }
     }
@@ -160,7 +184,11 @@ impl Bus {
                 {
                     return Some(reply);
                 }
-                Ok(_) => {}
+                Ok(other) => {
+                    if let Some(value) = setting_changed(&other) {
+                        self.changed = Some(value);
+                    }
+                }
                 Err(_) => self.dead = true,
             }
         }
@@ -266,6 +294,15 @@ struct Msg {
     reply_serial: u32,
     member: String,
     body: Vec<u8>,
+}
+
+/// The new value of a `SettingChanged` signal for `color-scheme`.
+fn setting_changed(msg: &Msg) -> Option<Option<bool>> {
+    if msg.kind != SIGNAL || msg.member != "SettingChanged" {
+        return None;
+    }
+    let mut r = Reader::new(&msg.body);
+    (r.str() == Some(NAMESPACE) && r.str() == Some(KEY)).then(|| r.variant_u32(0).and_then(scheme))
 }
 
 /// A method call with string arguments.
