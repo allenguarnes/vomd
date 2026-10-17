@@ -309,13 +309,18 @@ fn jpeg_info(
 
 // ---- Local files ------------------------------------------------------------------------
 
+/// Longest `src` of a local image, in bytes as written (percent-encoded): a path of a few KB is
+/// longer than any system takes (`PATH_MAX` is 4096 on Linux, 1024 on macOS), and a longer string
+/// would make the copies a lookup makes cost what the document's own does. Longer is refused.
+pub const MAX_SRC: usize = 16 << 10;
+
 /// The local file an image's `src` names: a path, absolute or relative to `base` (the
 /// document's directory), percent-decoded, without its `?query` or `#fragment`. `None` for URLs
-/// (anything with a scheme), for network paths (see [`is_network`]) and for a relative path
-/// without a base (a document read from stdin).
+/// (anything with a scheme), for network paths (see [`is_network`]), for a relative path
+/// without a base (a document read from stdin) and for a `src` longer than [`MAX_SRC`].
 pub fn local_path(src: &str, base: Option<&Path>) -> Option<PathBuf> {
     let src = src.trim();
-    if src.is_empty() || src.chars().any(char::is_control) {
+    if src.is_empty() || src.len() > MAX_SRC || src.chars().any(char::is_control) {
         return None;
     }
     // A scheme is two characters or more: `C:\x.png` is a Windows path.
@@ -1094,10 +1099,17 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // |                                     | and `sizes_str`, kept as it changes          | `attach`/`forget_remote`, and a URL's record goes when   |
 // |                                     |                                              | its last slot is evicted (`forget_evicted`) or a late    |
 // |                                     |                                              | body is dropped; `shrink_map` after                      |
-// | `Images::deferred`, `urls`, `costs` | bookkeeping: `table_bytes` of the capacity   | replaced with the document; `deferred` pruned with it    |
-// | `srcs` (list, local paths)          | bookkeeping: capacity and `srcs_heap`        | replaced by the next document, the old one freed first   |
-// | a remote image's URL in `srcs`      | not counted: the document's own string,      | the document's                                           |
-// |                                     | shared (`ImageRef::src` is an `Arc<str>`)    |                                                         |
+// | `Images::deferred`, `urls`          | bookkeeping: `table_bytes` of the capacity   | replaced with the document; `deferred` pruned with it    |
+// | `costs` (sizes of local files)      | bookkeeping: `table_bytes` of the capacity;  | cut to the images of the request once it has twice as    |
+// |                                     | its growth is in the request's allowance     | many (`request`), and replaced with the document         |
+// | `srcs` (one `Src` per image)        | bookkeeping: capacity; charged, and the cache| replaced by the next document, the old one freed first   |
+// | and `urls` (a place per remote one) | made room for, before either is made         |                                                         |
+// |                                     | (`attach_bytes`, `Images::attach`)           |                                                         |
+// | the string in a `Src`               | not counted: the document's own, shared      | the document's                                           |
+// |                                     | (`ImageRef::src` is an `Arc<str>`)           |                                                         |
+// | a local image's path                | not kept: worked out from the string when a  | a lookup: dropped when it is done (`path_scratch` is    |
+// |                                     | file's header or a job needs it; a job's copy| taken off the room before it is made); a job: with the   |
+// |                                     | is charged as it is queued (`path_cost`)     | queue                                                    |
 // | `in_view`, `retired`, `waiting`     | bookkeeping: capacity                        | `shrink_vec` after what clears or prunes them            |
 // | worker replaced by `set_wake`       | its decode in `retired_cost`; its queue and  | until its running job's result is taken                  |
 // |                                     | `WORKER_FIXED` in bookkeeping                |                                                         |
@@ -1110,16 +1122,22 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // | what a request builds: the lists of | the allowance of the request: `REQUEST_PER_  | replaced by the next request                             |
 // | URLs and the set that removes the   | REMOTE` for each remote image of the         |                                                         |
 // | duplicates, jobs and their paths    | document while remote images are on, 2 x     |                                                         |
-// |                                     | `Job` for each box, the paths                |                                                         |
+// |                                     | `Job` for each box, the table of sizes grown |                                                         |
+// |                                     | to the local boxes, each job's path as queued|                                                         |
 // | `Cache::fetching` while held off    | `Remote::reserve_idle`: the bodies not       | `sync_pause`, and set back to the static reserve, and the |
 // | and idle                            | released and their bookkeeping               | room made for it, before they go on                      |
 //
 // What is not charged: the page's own memory (the `Doc` and `Layout`, with each image's source and
 // size in them, as for text), the `boxes` a caller passes to a request (the images within a screen
 // of the viewport: the window's frame), the threads' stacks (not the allocator's), and the
-// allocator's rounding beyond what each row allows for. `tests/image_memory.rs` runs random mixes
-// of everything above and holds the live bytes of all of it to the budget and 256 KiB (`SLACK`
-// there) for what is no image's: the page and the test's own.
+// allocator's rounding beyond what each row allows for. What grows with a document's images is
+// one `Src` (24 bytes) each and, for a remote image, a place in `urls` (about 20 to 40 bytes), and
+// nothing else that stays: all of it is known from the numbers of images and is charged, and the
+// cache made room for it, before any of it is made; the rest of what is per image is per box of
+// a request, and goes with the request. `tests/image_memory.rs` runs random mixes of everything
+// above with an allocator that counts what the image code has live apart from the page's and the
+// test's own, and holds it to the budget and a small allowance for the allocator and the threads
+// (`SLACK` there), the pixels painted in a frame being the one exception, by exactly their amount.
 //
 // Fetchers and decodes against the budget: the fetchers are set aside `FETCH_RESERVE` whatever
 // they hold (so they never have to ask for room), which leaves room for a decode of about 18 MiB
@@ -1703,14 +1721,7 @@ impl Worker {
     fn bookkeeping_of(shared: &Shared) -> usize {
         let (lock, _) = &**shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let paths: usize = q
-            .jobs
-            .iter()
-            .map(|j| match &j.source {
-                Source::File(path) => path.as_os_str().len() + STR_OVERHEAD,
-                Source::Bytes(_) => 0,
-            })
-            .sum();
+        let paths: usize = q.jobs.iter().map(|j| path_cost(&j.source)).sum();
         WORKER_FIXED
             .saturating_add(vec_bytes(&q.jobs))
             .saturating_add(paths)
@@ -1793,12 +1804,16 @@ fn decode_job(_: &Job) -> Option<Bitmap> {
 
 // ---- A document's images ----------------------------------------------------------------
 
-/// Where one of the document's images comes from.
+/// Where one of the document's images comes from. Both kinds hold the document's own string for
+/// the image (`ImageRef::src`, shared, not copied): where a local one's file is, is worked out
+/// from it when a job or a file's size needs it ([`local_path`]) and not kept, so what an image
+/// costs here is the size of this enum and nothing that grows with its path.
 #[derive(Clone, Debug)]
 enum Src {
     /// Nothing loadable (not found, failed to decode, not PNG or JPEG, a `data:` URL, ...).
     None,
-    File(PathBuf),
+    /// A local file: its `src`, which [`local_path`] resolves against the document's directory.
+    File(Arc<str>),
     Remote(Arc<str>),
 }
 
@@ -1839,15 +1854,14 @@ pub struct Images {
     base: Option<PathBuf>,
     /// Bumped for every document: results for an older one are dropped.
     doc_gen: u64,
+    /// One entry per image of the document, charged before it is made ([`Images::attach`]). The
+    /// strings in it are the document's own, shared: the page's memory, as the `Doc` is, and not
+    /// counted here.
     srcs: Vec<Src>,
-    /// What the paths of `srcs` hold (the resolved copy each local image has), and what a job
-    /// copies of one: kept from when `srcs` is made. (A remote image's URL is the document's own
-    /// string, shared: it is the page's memory, as the `Doc` is, and not counted here.)
-    srcs_heap: usize,
-    paths_heap: usize,
     /// What each local image is (its file's size and header, for what decoding it holds: see
     /// [`decode_cost`]), by id, once its header is read: `None` if it can't be. Only the images
-    /// that were asked for have an entry.
+    /// asked for by the last requests have an entry: it is cut to those once it has twice as
+    /// many ([`Images::request`]).
     costs: std::collections::HashMap<u32, Option<FileInfo>>,
     cache: Cache,
     /// Results with pixels taken so far ([`Stats::decodes`]).
@@ -1931,11 +1945,34 @@ fn body_cost(key: &Key, source: &Source) -> usize {
     }
 }
 
+/// What the copy of a local file's path a job carries holds (see [`Worker::bookkeeping_of`]).
+fn path_cost(source: &Source) -> usize {
+    match source {
+        Source::File(path) => path.as_os_str().len() + STR_OVERHEAD,
+        Source::Bytes(_) => 0,
+    }
+}
+
 /// What a request builds per remote image of the document, besides what stays: the list of URLs
 /// to fetch (it doubles as it grows), the list of those dropped for room, and the set that takes
 /// the duplicates out (see `Remote::fetch`), and the old queue as the new one replaces it.
 #[cfg(feature = "remote-images")]
 const REQUEST_PER_REMOTE: usize = 128;
+
+/// What a document of `images` images, `remote` of them remote, costs to keep in [`Images`]: a
+/// [`Src`] each, and a place in the set of URLs for a remote one. It is the whole of what grows
+/// with the document's images, and is known from their numbers: [`Images::attach`] charges it,
+/// and makes room for it, before making any of it.
+fn attach_bytes(images: usize, remote: usize) -> usize {
+    #[cfg(feature = "remote-images")]
+    let urls = table_bytes(remote, size_of::<Arc<str>>());
+    #[cfg(not(feature = "remote-images"))]
+    let urls = {
+        let _ = remote;
+        0
+    };
+    images.saturating_mul(size_of::<Src>()).saturating_add(urls)
+}
 
 impl Default for Images {
     fn default() -> Self {
@@ -1946,8 +1983,6 @@ impl Default for Images {
             base: None,
             doc_gen: 0,
             srcs: Vec::new(),
-            srcs_heap: 0,
-            paths_heap: 0,
             costs: std::collections::HashMap::new(),
             cache: Cache::new(CACHE_BYTES),
             decodes: 0,
@@ -2025,6 +2060,12 @@ impl Images {
 
     /// Start on a document (opened or reloaded) and its new layout: local images are decoded
     /// again (the files may have changed); remote ones stay cached by URL.
+    ///
+    /// What the document's images cost to keep is one [`Src`] each and, for a remote one, its
+    /// place in the set of URLs ([`attach_bytes`]): worked out from the numbers of images, charged
+    /// and made room for (what is cached is evicted to it: nothing of the old document is being
+    /// painted now) before any of it is made. A document whose images cost more than the budget
+    /// has none loaded: every image shows its alt text.
     pub fn attach(&mut self, doc: &Doc, layout: &mut Layout) {
         self.doc_gen += 1;
         self.refused = Vec::new();
@@ -2036,53 +2077,71 @@ impl Images {
         {
             self.urls = std::collections::HashSet::new();
         }
-        self.srcs = doc
-            .images
-            .iter()
-            .map(|img| {
-                if img.remote {
-                    // The document's own string: one copy of the URL, and it is the page's.
-                    Src::Remote(img.src.clone())
-                } else if cfg!(feature = "images") {
-                    local_path(&img.src, self.base.as_deref()).map_or(Src::None, Src::File)
-                } else {
-                    Src::None
-                }
-            })
-            .collect();
-        self.srcs_heap = 0;
-        self.paths_heap = 0;
-        for src in &self.srcs {
-            match src {
-                Src::File(path) => {
-                    self.paths_heap += path.as_os_str().len() + STR_OVERHEAD;
-                    self.srcs_heap += path.as_os_str().len() + STR_OVERHEAD;
-                }
-                Src::Remote(_) | Src::None => {}
-            }
-        }
         if let Some(w) = &self.worker {
             w.set(Vec::new());
+        }
+        // What the old document had painted is not painted any more: room is made from it first.
+        self.cache.frame += 1;
+        let images = doc.images.len();
+        let remote = doc.images.iter().filter(|img| img.remote).count();
+        self.cache.reserve =
+            self.retired_cost() + self.worker.as_ref().map_or(0, Worker::busy_cost);
+        let need = attach_bytes(images, remote);
+        let mut loaded = need <= self.cache.cap;
+        if loaded {
+            self.cache.overhead = self.bookkeeping_bytes().saturating_add(need);
+            self.cache.evict();
+            #[cfg(feature = "remote-images")]
+            self.forget_evicted();
+            // (What goes takes its records with it: the answer is the one after.)
+            loaded = self.bookkeeping_bytes().saturating_add(need) <= self.cache.cap;
+        }
+        if loaded {
+            self.srcs = doc
+                .images
+                .iter()
+                .map(|img| {
+                    if img.remote {
+                        // The document's own string: one copy of the URL, and it is the page's.
+                        Src::Remote(img.src.clone())
+                    } else if cfg!(feature = "images")
+                        && local_path(&img.src, self.base.as_deref()).is_some()
+                    {
+                        // (Its path is worked out again when it is wanted, and not kept.)
+                        Src::File(img.src.clone())
+                    } else {
+                        Src::None
+                    }
+                })
+                .collect();
         }
         if cfg!(feature = "images") {
             let base = self.base.clone();
             layout.set_image_probe(
                 doc,
-                Some(Box::new(move |img: &ImageRef| probe(img, base.as_deref()))),
+                Some(Box::new(move |img: &ImageRef| {
+                    if loaded {
+                        probe(img, base.as_deref())
+                    } else {
+                        ImageSize::Alt
+                    }
+                })),
             );
         }
         #[cfg(feature = "remote-images")]
         {
             // Nothing is in view of the new document yet: the bodies that waited are let go.
             self.in_view.clear();
-            self.urls = self
-                .srcs
-                .iter()
-                .filter_map(|s| match s {
+            // Made at the size it was charged for: one table, no growing.
+            let mut urls =
+                std::collections::HashSet::with_capacity(if loaded { remote } else { 0 });
+            if loaded {
+                urls.extend(self.srcs.iter().filter_map(|s| match s {
                     Src::Remote(url) => Some(url.clone()),
                     _ => None,
-                })
-                .collect();
+                }));
+            }
+            self.urls = urls;
             self.remote_images = self.urls.len();
             // Nothing is wanted of the new document yet: the first request says.
             self.heavy_wanted = false;
@@ -2232,11 +2291,14 @@ impl Images {
     fn cost(&mut self, id: u32, w: u32, h: u32) -> usize {
         let result = w as usize * h as usize * 4;
         match self.src(id).clone() {
-            Src::File(path) => self
-                .costs
-                .entry(id)
-                .or_insert_with(|| file_info(&path))
-                .map_or(result, |info| info.cost(w, h)),
+            // The path is worked out for the lookup of the file's header, and dropped.
+            Src::File(src) => {
+                let base = self.base.as_deref();
+                self.costs
+                    .entry(id)
+                    .or_insert_with(|| local_path(&src, base).and_then(|p| file_info(&p)))
+                    .map_or(result, |info| info.cost(w, h))
+            }
             #[cfg(feature = "remote-images")]
             Src::Remote(url) if self.remote.on => self
                 .cache
@@ -2279,11 +2341,36 @@ impl Images {
         // too: the jobs (a `Vec` doubles as it grows) and the paths they copy.
         #[cfg(feature = "remote-images")]
         self.forget_evicted();
-        let transient = boxes
+        // What the lookups of files' sizes need: the table of them grows (a new one is made
+        // beside the old) for the local images asked for, and is cut to them once it has twice
+        // as many: it holds the images of the last requests, not the document's.
+        let local = boxes
+            .iter()
+            .filter(|b| matches!(self.src(b.0), Src::File(_)))
+            .count();
+        let entry = size_of::<(u32, Option<FileInfo>)>();
+        let costs = if local == 0 {
+            0
+        } else {
+            table_bytes(self.costs.len().saturating_add(local), entry)
+        };
+        let mut transient = boxes
             .len()
             .saturating_mul(2 * size_of::<Job>())
-            .saturating_add(self.paths_heap);
+            .saturating_add(costs);
         self.charge_bookkeeping(transient);
+        if local > 0 {
+            if self.costs.len() > 2 * local + 16 {
+                let mut kept = std::collections::HashMap::with_capacity(local);
+                for &(id, ..) in boxes {
+                    if let Some(info) = self.costs.remove(&id) {
+                        kept.insert(id, info);
+                    }
+                }
+                self.costs = kept;
+            }
+            self.costs.reserve(local);
+        }
         let mut jobs = Vec::new();
         #[cfg(feature = "remote-images")]
         let mut fetch: Vec<Arc<str>> = Vec::new();
@@ -2345,8 +2432,14 @@ impl Images {
             };
             #[cfg(not(feature = "remote-images"))]
             let room_fetch = 0;
+            // (Working out a local image's path takes memory for a moment, taken off first.)
+            let scratch = match self.src(id) {
+                Src::File(src) => self.path_scratch(src),
+                _ => 0,
+            };
             let room = (self.cache.cap.saturating_sub(room_fetch))
                 .saturating_sub(self.cache.overhead)
+                .saturating_sub(scratch)
                 .saturating_sub(bodies)
                 .saturating_sub(reserve.max(retired.saturating_add(cost)));
             // Kept only if it fits with the ones before it (one that crosses the line is the one
@@ -2377,7 +2470,12 @@ impl Images {
             #[cfg(not(feature = "remote-images"))]
             let fresh_body = false;
             let source = match self.src(id).clone() {
-                Src::File(path) => Source::File(path),
+                // (Resolved when the job is made, and the copy belongs to the job: it is charged
+                // when the job is queued, below. The one being made is in the request's scratch.)
+                Src::File(src) => match local_path(&src, self.base.as_deref()) {
+                    Some(path) => Source::File(path),
+                    None => continue,
+                },
                 // One that failed (fetched, or decoded to nothing) is not tried again while the
                 // document is open, whatever body is still held: two jobs for it, another size
                 // each, pin its body for each other, and would fail one after the other for good.
@@ -2413,7 +2511,9 @@ impl Images {
             // cost to keep (their sources, URLs and records) can't run in the budget at all, and
             // is not tried: the image shows its alt text. (One bigger than the cache by itself is
             // another matter: it runs alone, over the budget by its own size.)
-            let own = cost.saturating_add(body_cost(&key, &source));
+            let own = cost
+                .saturating_add(body_cost(&key, &source))
+                .saturating_add(path_cost(&source));
             if own <= self.cache.cap && !self.fits_bookkeeping(own, transient) {
                 if !self.refused.contains(&key) {
                     self.refused.push(key);
@@ -2460,6 +2560,11 @@ impl Images {
             if fresh_body {
                 bodies = bodies.saturating_add(body_cost(&key, &source));
             }
+            // The path the job carries is held by the queue from now on, beside the old queue's:
+            // taken off the room of the jobs after it.
+            let held = path_cost(&source);
+            transient = transient.saturating_add(held);
+            self.cache.overhead = self.cache.overhead.saturating_add(held);
             jobs.push(Job {
                 doc_gen: self.doc_gen,
                 key,
@@ -2535,6 +2640,18 @@ impl Images {
             (self.wake)();
         }
         self.charge_bookkeeping(0);
+    }
+
+    /// What working out the path of a local image whose `src` is `len` bytes takes at most beside
+    /// what is kept: the percent-decoded copy and the joined one (and the document's directory),
+    /// for as long as it takes. It is taken off the room before the path is made.
+    fn path_scratch(&self, src: &str) -> usize {
+        let base = self.base.as_ref().map_or(0, |b| b.as_os_str().len());
+        src.len()
+            .min(MAX_SRC)
+            .saturating_mul(2)
+            .saturating_add(base)
+            .saturating_add(2 * STR_OVERHEAD)
     }
 
     /// What the replaced workers' decodes hold (see [`Images::retired`]); the idle ones are
@@ -3127,7 +3244,6 @@ impl Images {
             .cache
             .bookkeeping()
             .saturating_add(vec_bytes(&self.srcs))
-            .saturating_add(self.srcs_heap)
             .saturating_add(table_bytes(
                 self.costs.capacity(),
                 size_of::<(u32, Option<FileInfo>)>(),

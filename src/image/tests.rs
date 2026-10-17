@@ -197,6 +197,10 @@ fn local_paths_resolve_against_the_document() {
     // A single root, and what only looks like one, are paths.
     assert_eq!(p("%2Fabs/a.png"), Some(PathBuf::from("/abs/a.png")));
     assert_eq!(p("a//b.png"), Some(PathBuf::from("/docs/proj/a//b.png")));
+    // A `src` longer than any system's path (as written, so percent-encoded) isn't a file, and
+    // one of the longest allowed is.
+    assert_eq!(p(&"a".repeat(MAX_SRC + 1)), None);
+    assert!(p(&"a".repeat(MAX_SRC)).is_some());
     // A relative path needs a base (stdin); an absolute one doesn't.
     assert_eq!(local_path("a.png", None), None);
     assert_eq!(
@@ -1086,6 +1090,186 @@ fn images_beyond_the_cache_are_not_decoded_over_and_over() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What an image costs to keep is the document's own string, shared, and the size of a [`Src`]:
+/// the path of a local one is worked out when a job or a file's size wants it, and is not kept,
+/// so a document of long paths holds what one of short ones does (it kept a copy of each,
+/// resolved: 34,000 images of 1,000-character paths were 34.9 MB beside a budget of 33.5).
+#[test]
+fn a_local_images_path_is_not_kept() {
+    assert!(size_of::<Src>() <= 24, "{}", size_of::<Src>());
+    let attached = |len: usize| {
+        let src: String = (0..100)
+            .map(|i| format!("![p]({}{i}.png) ", "d".repeat(len)))
+            .collect();
+        let doc = Doc::parse(&src);
+        let mut layout = Layout::new(&doc, crate::layout::Params::default());
+        let mut images = Images::default();
+        images.set_base(Some(PathBuf::from("/docs")));
+        images.attach(&doc, &mut layout);
+        assert!(images.srcs.iter().all(|s| matches!(s, Src::File(_))));
+        // The strings are the document's: not copies.
+        for (src, img) in images.srcs.iter().zip(&doc.images) {
+            match src {
+                Src::File(s) => assert!(Arc::ptr_eq(s, &img.src)),
+                _ => unreachable!(),
+            }
+        }
+        images.bookkeeping_bytes()
+    };
+    assert_eq!(attached(5), attached(5_000));
+    // And what is charged for a document is known from its numbers: before it is made.
+    assert_eq!(attach_bytes(100, 0) % size_of::<Src>(), 0);
+    assert!(attach_bytes(100, 0) >= 100 * size_of::<Src>());
+}
+
+/// A document whose images cost more to keep than the budget has none loaded, and says so:
+/// every image shows its alt text, and nothing is made for it (the tables are charged, and made
+/// room for, before they are made, so there is nothing to give back). A smaller one beside it is
+/// loaded as always.
+#[test]
+fn a_document_whose_images_cost_more_than_the_budget_has_none() {
+    let dir = scratch("none");
+    std::fs::write(
+        dir.join("a.png"),
+        png_bytes(30, 20, |_, _| [0, 0, 255, 255]),
+    )
+    .unwrap();
+    let src: String = (0..1_000).map(|_| "![p](a.png) ").collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.cache.cap = attach_bytes(1_000, 0) - 1;
+    images.attach(&doc, &mut layout);
+    assert!(images.srcs.is_empty(), "nothing made");
+    assert!(images.key(1).is_none());
+    assert_eq!(images.cache.overhead, images.bookkeeping_bytes());
+    assert!(images.cache.overhead < attach_bytes(1_000, 0) / 4);
+    // The layout is told the images are alt text, though the file is there.
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
+    assert_eq!(layout.image_size(1), Some(ImageSize::Alt));
+    // Asked for, they are nothing.
+    images.begin_frame();
+    images.request(&[(1, 10, 10)], 1);
+    assert!(images.is_idle());
+    // The same budget has room for a document a tenth of that.
+    let src: String = (0..100).map(|_| "![p](a.png) ").collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    images.attach(&doc, &mut layout);
+    assert_eq!(images.srcs.len(), 100);
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
+    assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(30, 20)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Attaching makes room for the tables before it makes them: what is cached is evicted to it,
+/// including what the old document had painted (it is not painted any more), and not more than
+/// that.
+#[test]
+fn attach_evicts_for_its_tables_and_no_more() {
+    let slot = |n: u32| {
+        Data::Pixels(Bitmap {
+            width: n,
+            height: 1,
+            data: vec![0; n as usize],
+        })
+    };
+    let url = |i: u32| Key::Remote(Arc::from(format!("http://x/{i}")));
+    let doc = Doc::parse("![a](a.png) ![b](b.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(PathBuf::from("/docs")));
+    // Two bitmaps painted in the last frame of the old document, with room for both and the
+    // tables of this one.
+    images.cache.insert(url(1), slot(10_000));
+    images.cache.insert(url(2), slot(10_000));
+    images.begin_frame();
+    images.cache.touch(&url(1), 10_000, 1);
+    images.cache.touch(&url(2), 10_000, 1);
+    images.cache.cap = images.cache.bytes + attach_bytes(2, 0) + 4_000;
+    images.attach(&doc, &mut layout);
+    assert_eq!(images.stats().decoded, 2, "room enough: nothing goes");
+    // Room for one: the least recently painted is evicted, though they were painted in the last
+    // frame of the old document.
+    images.cache.cap = images.cache.bytes + attach_bytes(2, 0) - 1_000;
+    images.attach(&doc, &mut layout);
+    assert_eq!(images.stats().decoded, 1, "{}", images.memory_report());
+}
+
+/// The table of the sizes of local files holds what the last requests asked for, cut to them
+/// once it has twice as many: a document of thousands of images read from the top to the bottom
+/// doesn't keep an entry for each.
+#[test]
+fn the_table_of_file_sizes_follows_the_requests() {
+    let src: String = (0..200).map(|i| format!("![p](p{i}.png) ")).collect();
+    let doc = Doc::parse(&src);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(PathBuf::from("/nowhere")));
+    images.attach(&doc, &mut layout);
+    // Down the document, a screen of 20 at a time: none is ever cached (the files aren't
+    // there), so each is asked about.
+    let mut most = 0;
+    for top in (1..=200u32).step_by(10) {
+        let boxes: Vec<_> = (top..top + 20)
+            .filter(|&id| id <= 200)
+            .map(|id| (id, 10, 10))
+            .collect();
+        images.begin_frame();
+        images.request(&boxes, 2);
+        most = most.max(images.costs.len());
+    }
+    assert!(most <= 3 * 20 + 16, "{most} entries");
+    assert!(images.costs.len() <= 3 * 20 + 16);
+    // And the capacity is charged as it is.
+    assert!(
+        images.bookkeeping_bytes()
+            >= table_bytes(
+                images.costs.capacity(),
+                size_of::<(u32, Option<FileInfo>)>()
+            )
+    );
+}
+
+/// A decode that fits the budget by itself but not beside what the document's images cost to
+/// keep is refused, and its image shows its alt text, instead of being let in over the budget
+/// (what the document's tables hold is charged by [`Images::bookkeeping_bytes`]): the same
+/// decode, with the same room, is run beside a document with a tenth of the images.
+#[test]
+fn a_decode_the_bookkeeping_leaves_no_room_for_is_refused() {
+    let dir = scratch("refuse-unit");
+    std::fs::write(
+        dir.join("a.png"),
+        png_bytes(100, 100, |_, _| [1, 2, 3, 255]),
+    )
+    .unwrap();
+    let run = |others: usize| {
+        let mut src = String::from("![a](a.png)");
+        for i in 0..others {
+            src += &format!(" ![p](p{i}.png)");
+        }
+        let doc = Doc::parse(&src);
+        let mut layout = Layout::new(&doc, crate::layout::Params::default());
+        let mut images = Images::default();
+        images.set_base(Some(dir.clone()));
+        images.attach(&doc, &mut layout);
+        // Room for the decode and 40,000 bytes of tables, which 2,000 images are over.
+        images.cache.cap = images.cost(1, 100, 100) + 40_000;
+        images.begin_frame();
+        images.request(&[(1, 100, 100)], 1);
+        wait(&mut images, &doc, &mut layout, |i| {
+            i.stats().decoded == 1 || i.stats().failed == 1
+        });
+        images.stats()
+    };
+    assert_eq!(run(100).decoded, 1, "room beside 100 images");
+    let refused = run(2_000);
+    assert_eq!((refused.decoded, refused.failed), (0, 1), "{refused:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A decode's own memory is kept free of the cache: slots not painted this frame are evicted
 /// to make room for the biggest job, and none painted this frame.
 #[test]
@@ -1118,8 +1302,8 @@ fn a_decode_is_given_room_by_evicting_what_is_not_painted() {
         })
     };
     images.cache.cap = 500_000 + JPEG_META_COST;
-    images.srcs[1] = Src::File(dir.join("b.png"));
-    images.srcs[2] = Src::File(dir.join("c.png"));
+    images.srcs[1] = Src::File(Arc::from("b.png"));
+    images.srcs[2] = Src::File(Arc::from("c.png"));
     images.cache.insert(Key::Local(2), slot(25_000));
     images.cache.insert(Key::Local(3), slot(25_000));
     images.begin_frame();

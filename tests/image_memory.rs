@@ -17,12 +17,39 @@ struct Counting;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// What is live that is an image's (see [`Tag`]), and its peak.
+static IMAGE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static IMAGE_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Whose an allocation is, by the thread that makes it and what it is doing: the image code's
+/// (every thread but a test's own, and a test's while it isn't told otherwise: so nothing is left
+/// out of the image's account by what a test forgets to say), or the page's (a `Doc` and its
+/// `Layout`) and the test driver's (the boxes it builds, its log), which are no image's memory
+/// and are counted apart ([`tagged`]). The tag is kept in a header before the allocation, so
+/// that what is freed is taken off the account it was put on, by whichever thread frees it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+enum Tag {
+    Image = 0,
+    Page = 1,
+    Driver = 2,
+}
 
 thread_local! {
     /// What this thread has allocated less what it has freed (what it frees of another's
     /// counts against it): [`built`] measures what a call makes by it, whatever the other
     /// threads allocate meanwhile.
     static MINE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    static TAG: std::cell::Cell<Tag> = const { std::cell::Cell::new(Tag::Image) };
+}
+
+/// Run `f` with what this thread allocates counted as `tag`'s.
+#[cfg(feature = "remote-images")]
+fn tagged<T>(tag: Tag, f: impl FnOnce() -> T) -> T {
+    let before = TAG.with(|t| t.replace(tag));
+    let out = f();
+    TAG.with(|t| t.set(before));
+    out
 }
 
 fn mine(n: isize) {
@@ -30,37 +57,77 @@ fn mine(n: isize) {
     let _ = MINE.try_with(|m| m.set(m.get() + n));
 }
 
-fn add(n: usize) {
+fn add(n: usize, tag: Tag) {
     mine(n as isize);
     let live = LIVE.fetch_add(n, Relaxed) + n;
     PEAK.fetch_max(live, Relaxed);
+    if tag == Tag::Image {
+        let live = IMAGE_LIVE.fetch_add(n, Relaxed) + n;
+        IMAGE_PEAK.fetch_max(live, Relaxed);
+    }
 }
 
-fn sub(n: usize) {
+fn sub(n: usize, tag: Tag) {
     mine(-(n as isize));
     LIVE.fetch_sub(n, Relaxed);
+    if tag == Tag::Image {
+        IMAGE_LIVE.fetch_sub(n, Relaxed);
+    }
+}
+
+/// Room before what a caller gets, for the tag (the alignment keeps it a multiple of itself).
+fn header(l: Layout) -> usize {
+    l.align().max(16)
+}
+
+fn outer(l: Layout) -> Layout {
+    Layout::from_size_align(l.size() + header(l), header(l)).unwrap()
+}
+
+/// The block at `base` is the caller's `size` bytes after its header: tag it, count it.
+unsafe fn seal(base: *mut u8, l: Layout) -> *mut u8 {
+    if base.is_null() {
+        return base;
+    }
+    let tag = TAG.try_with(|t| t.get()).unwrap_or(Tag::Image);
+    let p = unsafe { base.add(header(l)) };
+    unsafe { (p.sub(size_of::<usize>()) as *mut usize).write(tag as usize) };
+    add(l.size(), tag);
+    p
+}
+
+unsafe fn tag_of(p: *mut u8) -> Tag {
+    match unsafe { (p.sub(size_of::<usize>()) as *const usize).read() } {
+        1 => Tag::Page,
+        2 => Tag::Driver,
+        _ => Tag::Image,
+    }
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        add(l.size());
-        unsafe { System.alloc(l) }
+        unsafe { seal(System.alloc(outer(l)), l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        add(l.size());
-        unsafe { System.alloc_zeroed(l) }
+        unsafe { seal(System.alloc_zeroed(outer(l)), l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        sub(l.size());
-        unsafe { System.dealloc(p, l) }
+        sub(l.size(), unsafe { tag_of(p) });
+        unsafe { System.dealloc(p.sub(header(l)), outer(l)) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        if new >= l.size() {
-            add(new - l.size());
-        } else {
-            sub(l.size() - new);
+        let tag = unsafe { tag_of(p) };
+        let grown = Layout::from_size_align(new, l.align()).unwrap();
+        let base = unsafe { System.realloc(p.sub(header(l)), outer(l), outer(grown).size()) };
+        if base.is_null() {
+            return base;
         }
-        unsafe { System.realloc(p, l, new) }
+        if new >= l.size() {
+            add(new - l.size(), tag);
+        } else {
+            sub(l.size() - new, tag);
+        }
+        unsafe { base.add(header(l)) }
     }
 }
 
@@ -78,7 +145,7 @@ fn serial() -> MutexGuard<'static, ()> {
 #[cfg(feature = "remote-images")]
 fn built<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = MINE.with(|m| m.get());
-    let out = f();
+    let out = tagged(Tag::Page, f);
     (out, (MINE.with(|m| m.get()) - before).max(0) as usize)
 }
 
@@ -86,7 +153,22 @@ fn built<T>(f: impl FnOnce() -> T) -> (T, usize) {
 fn mark() -> usize {
     let live = LIVE.load(Relaxed);
     PEAK.store(live, Relaxed);
+    IMAGE_PEAK.store(IMAGE_LIVE.load(Relaxed), Relaxed);
     live
+}
+
+/// The image code's live bytes now ([`Tag::Image`]); their peak is counted from the last [`mark`].
+#[cfg(feature = "remote-images")]
+fn image_live() -> usize {
+    IMAGE_LIVE.load(Relaxed)
+}
+
+/// How far the image code's live bytes (from [`image_live`]) got over `start` since the last
+/// look, which is where the next one's peak is counted from: no peak falls between two.
+#[cfg(feature = "remote-images")]
+fn image_step_over(start: usize) -> usize {
+    let now = IMAGE_LIVE.load(Relaxed);
+    IMAGE_PEAK.swap(now, Relaxed).saturating_sub(start)
 }
 
 /// How far the live bytes got over `start`.
@@ -655,14 +737,19 @@ fn events(
 /// seconds, with nothing to wake for.)
 const QUIET: Duration = Duration::from_secs(20);
 
-/// One frame: what is in view painted, then the images asked for.
-fn frame(images: &mut Images, boxes: &[(u32, u32, u32)], on_screen: usize) {
+/// One frame: what is in view painted, then the images asked for. Returns the bytes of the
+/// pixels painted (the cache may not evict them: they are what the budget may be gone over by).
+fn frame(images: &mut Images, boxes: &[(u32, u32, u32)], on_screen: usize) -> usize {
     use vomd::render::Pixels;
     images.begin_frame();
+    let mut painted = 0;
     for &(id, w, h) in boxes.iter().take(on_screen) {
-        let _ = images.pixels(id, w, h);
+        painted += images
+            .pixels(id, w, h)
+            .map_or(0, |b| b.data.capacity() * size_of::<u32>());
     }
     images.request(boxes, on_screen);
+    painted
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1430,18 +1517,19 @@ fn a_documents_urls_are_the_documents_not_image_memory() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A decode that fits the budget by itself but not beside what the document's images cost to keep
-/// is refused, and its image shows its alt text, instead of being let in over the budget: the same
-/// PNG with 3,000 local images of 1,000-character paths (3.2 MB of paths kept, as many again
-/// copied by a request). It was let in alone whatever the total: 35,504,718 bytes live over the start at most
-/// in a 33,554,432 budget (3,192,439 now, the PNG not decoded; a debug build). One bigger than the budget by itself is another matter (it runs alone,
-/// and goes over by its own size).
+/// A local image's path is worked out when a job or a file's size needs it, and not kept: the
+/// same PNG with 3,000 local images of 1,000-character paths (3.2 MB of resolved paths kept, as
+/// many again copied by a request, when `Images` kept them) is decoded in the budget beside them,
+/// where it was refused (the paths and the sources they were kept in left it 35,504,718 bytes
+/// live over the start at most: refused, 3,192,439 over with it shown as its alt text; a debug
+/// build). One bigger than the budget by itself is another matter (it runs alone, and goes over
+/// by its own size), and a decode the bookkeeping leaves no room for is refused (the unit test
+/// `a_decode_the_bookkeeping_leaves_no_room_for_is_refused`).
 #[test]
-fn a_decode_the_bookkeeping_leaves_no_room_for_is_refused() {
+fn local_paths_cost_nothing_beside_a_big_decode() {
     let _serial = serial();
-    use vomd::layout::ImageSize;
     use vomd::render::Pixels;
-    let dir = scratch("refuse");
+    let dir = scratch("paths-beside");
     std::fs::write(dir.join("tall.png"), tall_png()).unwrap();
     let mut src = String::from("![t](tall.png)");
     for i in 0..3000 {
@@ -1460,37 +1548,228 @@ fn a_decode_the_bookkeeping_leaves_no_room_for_is_refused() {
         &[(1, 795, 10_000)],
         1,
         Duration::from_millis(1),
-        |i| i.stats().decoded == 1 || i.stats().failed >= 1,
+        |i| i.stats().decoded == 1,
     );
     let over = peak_over(start);
-    println!("a decode beside 3.2 MB of paths: {over} bytes live over the start at most");
+    println!("a decode beside 3,000 long local paths: {over} bytes live over the start at most");
     assert!(
         over <= CACHE_BYTES,
         "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
     );
-    assert_eq!(layout.image_size(1), Some(ImageSize::Alt), "refused");
-    assert!(images.pixels(1, 795, 10_000).is_none());
-    assert_eq!(images.stats().decodes, 0);
-    // Without the paths it is decoded, in the same budget.
-    let dir2 = scratch("refuse-alone");
-    std::fs::write(dir2.join("tall.png"), tall_png()).unwrap();
-    let doc = Doc::parse("![t](tall.png)");
-    let mut layout = PageLayout::new(&doc, Params::default());
-    images.set_base(Some(dir2.clone()));
-    images.attach(&doc, &mut layout);
+    assert!(images.pixels(1, 795, 10_000).is_some());
+    assert_eq!(images.stats().decodes, 1);
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What a document's images cost to keep is one entry each, charged and made room for before it
+/// is made (review round 10): 34,000 local images with paths of 1,000 characters took
+/// 34,940,890 bytes of resolved paths and sources at `attach`, with nothing cached, decoding or
+/// downloading (the budget is 33,554,432), and a second document opened over it (or the same
+/// reloaded) was made while the first's was alive. Now an entry is the document's own string,
+/// shared, and the path is worked out when a job wants it.
+#[test]
+fn attaching_a_document_of_long_paths_keeps_no_copy_of_them() {
+    let _serial = serial();
+    let path = |i: usize| format!("/tmp/{}{i}.png", "abcdefghij/".repeat(90));
+    let page = |tag: &str| -> String {
+        (0..34_000)
+            .map(|i| format!("![{tag}]({})\n\n", path(i)))
+            .collect()
+    };
+    let (first, second) = (Doc::parse(&page("a")), Doc::parse(&page("b")));
+    let mut layout = PageLayout::new(&first, Params::default());
+    let mut other = PageLayout::new(&second, Params::default());
+    let mut images = Images::default();
+    // The 24 bytes of a `Src` (the document's string is shared) and what a count of them rounds
+    // to: nothing here grows with a path.
+    let bound = 34_000 * 32 + (64 << 10);
+    let start = mark();
+    images.attach(&first, &mut layout);
+    let over = peak_over(start);
+    let after = live().saturating_sub(start);
+    println!(
+        "attach of 34,000 long paths: {over} bytes live over the start at most, {after} after"
+    );
+    assert!(
+        over <= bound,
+        "{over} bytes live over the start, {bound} allowed"
+    );
+    // Another document opened over it, and the first again (a reload): the old one's tables are
+    // gone before the new one's are made.
+    for n in 0..3 {
+        let start = mark();
+        if n == 1 {
+            images.attach(&first, &mut layout);
+        } else {
+            images.attach(&second, &mut other);
+        }
+        let over = peak_over(start);
+        println!("attach over a document: {over} bytes live over what was there at most");
+        assert!(
+            over <= bound,
+            "{over} bytes over what was there, {bound} allowed"
+        );
+    }
+    let held = live().saturating_sub(start);
+    assert!(held <= bound, "{held} bytes live after the documents");
+    // The paths are made when wanted: three of them, which are not files, show their alt text.
+    let boxes: Vec<_> = (1..=3).map(|id| (id, 40, 30)).collect();
+    let start = mark();
     frames(
         &mut images,
-        &doc,
-        &mut layout,
+        &second,
+        &mut other,
+        &boxes,
+        3,
+        Duration::from_millis(1),
+        |i| i.stats().failed >= 3,
+    );
+    let over = peak_over(start);
+    assert!(
+        over <= 64 << 10,
+        "{over} bytes for a request of three images"
+    );
+}
+
+/// Attaching makes room first: a 795 × 10,000 bitmap (31.8 MB) of a remote image was cached
+/// (not painted any more: the document is left) when 3,000 local images with 1,000-character
+/// paths were attached, and took 34,883,674 bytes live over the start, beside it, until the next
+/// request evicted it. Now their entries are small enough for it to stay, and a document with
+/// as many images as the cache has no room for beside it has it evicted before its tables are made.
+/// The fetch is a `curl` in front of the real one on `PATH` (nothing is fetched from anywhere).
+#[cfg(feature = "remote-images")]
+#[test]
+fn attaching_makes_room_before_it_makes_the_tables() {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("attach-room");
+    std::fs::write(dir.join("tall"), tall_png()).unwrap();
+    fake_curl(&dir, &dir);
+    let first = Doc::parse("![t](http://127.0.0.1/tall)");
+    let mut first_layout = PageLayout::new(&first, Params::default());
+    let mut paths = String::new();
+    for i in 0..3000 {
+        paths += &format!("![p]({}{i}.png) ", "d".repeat(1000));
+    }
+    let long = Doc::parse(&paths);
+    let mut long_layout = PageLayout::new(&long, Params::default());
+    // 80,000 images: their entries (24 bytes each and a place in the set) are over what the
+    // bitmap leaves of the budget.
+    let many: String = (0..80_000).map(|i| format!("![p](p{i}.png) ")).collect();
+    let many = Doc::parse(&many);
+    let mut many_layout = PageLayout::new(&many, Params::default());
+    let mut images = Images::default();
+    images.set_policy(vomd::settings::RemoteImages::Always);
+    images.set_base(Some(dir.clone()));
+    let start = mark();
+    images.attach(&first, &mut first_layout);
+    images.set_remote(true, &first, &mut first_layout);
+    frames(
+        &mut images,
+        &first,
+        &mut first_layout,
         &[(1, 795, 10_000)],
         1,
         Duration::from_millis(1),
         |i| i.stats().decoded == 1,
     );
     assert!(images.pixels(1, 795, 10_000).is_some());
+    let bitmap = live().saturating_sub(start);
+    // Left for the next document: remote images are off again.
+    images.forget_remote();
+    mark();
+    images.attach(&long, &mut long_layout);
+    let over = peak_over(start);
+    println!(
+        "3,000 long paths attached beside the bitmap ({bitmap} bytes): {over} bytes live over the start at most"
+    );
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    assert_eq!(images.stats().decoded, 1, "there is room: it stays cached");
+    images.forget_remote();
+    mark();
+    images.attach(&many, &mut many_layout);
+    let over = peak_over(start);
+    println!("80,000 images attached beside the bitmap: {over} bytes live over the start at most");
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    assert_eq!(
+        images.stats().decoded,
+        0,
+        "no room: evicted before the tables"
+    );
     drop(images);
     std::fs::remove_dir_all(&dir).unwrap();
-    std::fs::remove_dir_all(&dir2).unwrap();
+}
+
+/// A request for local images carries a path for each job, charged as the job is queued (the
+/// queue is replaced by the next request, beside it): 800 images of 900-character paths (hard
+/// links to one small PNG) decode in the budget, with the table of their sizes cut to what the
+/// requests ask for.
+#[test]
+fn a_request_for_many_local_images_stays_in_the_budget() {
+    let _serial = serial();
+    use vomd::render::Pixels;
+    let dir = scratch("many-local");
+    let deep = dir
+        .join("a".repeat(200))
+        .join("b".repeat(200))
+        .join("c".repeat(200));
+    std::fs::create_dir_all(&deep).unwrap();
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, 8, 8);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&[9u8; 64])
+            .unwrap();
+    }
+    std::fs::write(deep.join("0.png"), &png).unwrap();
+    let rel = format!(
+        "{}/{}/{}",
+        "a".repeat(200),
+        "b".repeat(200),
+        "c".repeat(200)
+    );
+    let mut src = String::new();
+    for i in 0..800 {
+        if i > 0 {
+            std::fs::hard_link(deep.join("0.png"), deep.join(format!("{i}.png"))).unwrap();
+        }
+        src += &format!("![p]({rel}/{i}.png) ");
+    }
+    let doc = Doc::parse(&src);
+    let mut layout = PageLayout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    let start = mark();
+    images.attach(&doc, &mut layout);
+    let boxes: Vec<_> = (1..=800).map(|id| (id, 8, 8)).collect();
+    frames(
+        &mut images,
+        &doc,
+        &mut layout,
+        &boxes,
+        800,
+        Duration::from_millis(1),
+        |i| i.stats().decoded == 800,
+    );
+    let over = peak_over(start);
+    println!("800 local images of 900-character paths: {over} bytes live over the start at most");
+    assert!(
+        over <= CACHE_BYTES,
+        "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
+    );
+    assert!((1..=800).all(|id| images.pixels(id, 8, 8).is_some()));
+    drop(images);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[cfg(feature = "remote-images")]
@@ -1499,12 +1778,14 @@ mod mix {
 
     // ---- A random mix of operations -----------------------------------------------------------
 
-    /// What the mix may go over `CACHE_BYTES` by, live (review round 7): the allocations of
-    /// the test and the subsystem that are no image's memory, none of them charged: the page's
-    /// `Doc` and `Layout` (a few dozen images), the tables of a document's images, the queue of
-    /// jobs and the boxes of a request, the threads' bookkeeping. They are some tens of KB (the
-    /// largest seen is printed with `--nocapture`); this is 256 KiB.
-    const SLACK: usize = 256 << 10;
+    /// What the image code's live bytes may go over `CACHE_BYTES` by, besides the painted pixels
+    /// of the operation (see [`Painted`]), which are the only exception to the budget: the
+    /// allocations nothing charges and no one's memory but the allocator's and the threads' (the
+    /// thread structures, the channels, what `Command` builds to start a `curl`). The page's
+    /// `Doc` and `Layout` and the driver's own are counted apart ([`Tag`]) and have no part in
+    /// it. It is measured, and never used: 200 seeds had the image code's live bytes 0.96 MB or
+    /// more under the budget (3.1 MB painted in the frame is the most the exception was).
+    const SLACK: usize = 64 << 10;
 
     /// What a heavy image's decode holds, its reservation and the file it reads from, at most:
     /// with the 3 MiB painted in a frame and the bookkeeping it is within the budget, so that
@@ -1564,6 +1845,12 @@ mod mix {
         vomd::image::decode_reservation(bytes, 700, 700).is_some_and(|c| c + bytes.len() <= FIT)
     }
 
+    /// What decoding `bytes` to a box a mix makes holds, with the bytes themselves (a fetched
+    /// body is the cache's, a local file is read: either way they are held while it runs).
+    fn held(bytes: &[u8]) -> usize {
+        vomd::image::decode_reservation(bytes, 600, 400).unwrap_or(0) + bytes.len()
+    }
+
     /// A valid image that decodes with 3 MiB to [`HEAVY`] (29 MiB) held, the sizes cameras make: baseline
     /// and progressive JPEGs, an interlaced 16-bit PNG. (Decoded to a box of a few hundred pixels,
     /// the result is small: what is held is the source's frame.) Its natural size is returned.
@@ -1579,8 +1866,7 @@ mod mix {
                     zero_png(w, h, 6, 16, true, 1 << 20)
                 }
             };
-            let held = vomd::image::decode_reservation(&bytes, 600, 400).unwrap() + bytes.len();
-            if (3 << 20..=HEAVY).contains(&held) {
+            if (3 << 20..=HEAVY).contains(&held(&bytes)) {
                 return (bytes, w, h);
             }
         }
@@ -1719,18 +2005,27 @@ mod mix {
                 pool.remote.push(Asset { name, w: 0, h: 0 });
                 continue;
             }
-            if slow == "trickle" {
+            let pad = if slow == "trickle" {
                 // More than the credit its first half takes, so the second half asks for more.
-                bytes.resize(bytes.len() + (2 << 20) + rng.below(2 << 20) as usize, 0);
+                (2 << 20) + rng.below(2 << 20) as usize
             } else if heavy && !slow.is_empty() {
                 // What a transfer held open has read: the fetchers hold it for as long.
-                bytes.resize(bytes.len() + (3 << 20) + rng.below(1 << 20) as usize, 0);
+                (3 << 20) + rng.below(1 << 20) as usize
             } else if rng.percent(60) {
-                bytes.resize(
-                    bytes.len() + rng.below(if heavy { 4 << 20 } else { 2 << 20 }) as usize,
-                    0,
-                );
-            }
+                rng.below(if heavy { 4 << 20 } else { 2 << 20 }) as usize
+            } else {
+                0
+            };
+            // What its decode holds is no more than [`HEAVY`] with the padding either: the body
+            // is the file the decode reads from, so the padding is cut where it would take the
+            // image past it, and checked once it is added.
+            let room = HEAVY.saturating_sub(held(&bytes));
+            bytes.resize(bytes.len() + pad.min(room), 0);
+            assert!(
+                held(&bytes) <= HEAVY,
+                "{name}: a decode holds {} with its padding",
+                held(&bytes)
+            );
             std::fs::write(srv.join(&name), &bytes).unwrap();
             pool.remote.push(Asset { name, w, h });
         }
@@ -1813,12 +2108,52 @@ mod mix {
         (bw as u32, bh as u32)
     }
 
+    /// The pixels painted in the frame, which the cache may not evict: the one exception to the
+    /// budget, and so the only thing the image code's live bytes may be over it by
+    /// (besides [`SLACK`]), and only by their amount, which the test saw painted: the bytes of the
+    /// bitmaps `pixels` gave the frame. During an operation the pixels that can't go are the last
+    /// frame's (until the next one begins) or a frame of the operation's, so the most of either is
+    /// the allowance for the operation.
+    #[derive(Default)]
+    struct Painted {
+        /// What the last frame painted.
+        now: usize,
+        /// The most that was protected since the operation began.
+        step: usize,
+    }
+
+    impl Painted {
+        fn begin_step(&mut self) {
+            self.step = self.now;
+        }
+
+        /// A frame of `boxes`.
+        fn frame(&mut self, images: &mut Images, boxes: &[(u32, u32, u32)], on_screen: usize) {
+            self.now = super::frame(images, boxes, on_screen);
+            self.step = self.step.max(self.now);
+        }
+
+        /// Note `over`, the image code's live bytes over the start in this operation: how far it
+        /// is past the budget (negative: within it), the exception taken off, when that is the
+        /// most so far, and with how much painted.
+        fn note(&self, over: usize, worst: isize, shown: usize) -> (isize, usize) {
+            let past = over as isize - (CACHE_BYTES + self.step) as isize;
+            if past >= worst {
+                (past, self.step)
+            } else {
+                (worst, shown)
+            }
+        }
+    }
+
     /// One run of the mix for `seed`: documents opened and left, scrolling, zooming, frames polled
     /// at every pace, remote images turned off and on, the wake replaced, reloads: and after each
-    /// operation the live bytes may not have gone over `CACHE_BYTES + SLACK`, except where
-    /// documented at [`PAINTED`] and [`FIT`] (what the mix builds can't). Returns the largest
-    /// number of bytes over the start there were.
-    fn random_run(seed: u64) -> usize {
+    /// operation the image code's live bytes (counted apart from the page's and the driver's: see
+    /// [`Tag`]) may not have gone over `CACHE_BYTES + SLACK`, but by the pixels painted in the
+    /// frame (see [`Painted`]); the image that holds most is held to [`HEAVY`] with the padding of
+    /// a fetched body, checked after it is added. Returns the most the image code's live bytes
+    /// were past the budget with the painted pixels taken off (negative: within it).
+    fn random_run(seed: u64) -> isize {
         let mut rng = Rng::new(seed);
         let before = live();
         let dir = scratch(&format!("mix{seed}"));
@@ -1827,7 +2162,7 @@ mod mix {
         // 29 MiB) and transfers held open, local and remote, 7: the same, mostly remote, 8 and 9: the
         // same with hundreds more images after them, 8 with long URLs, 9 with long local paths.
         let profile = seed % 10;
-        let pool = make_pool(&mut rng, &dir, profile);
+        let pool = tagged(Tag::Driver, || make_pool(&mut rng, &dir, profile));
         fake_curl_hold(&dir, &dir.join("srv"), "0.3");
         let mut images = Images::default();
         images.set_policy(vomd::settings::RemoteImages::Always);
@@ -1837,28 +2172,31 @@ mod mix {
         let window = || -> vomd::image::Wake { Arc::new(|| {}) };
         images.set_wake(window());
         // What the page, its layout and the boxes are, and where the window is.
-        let page0 = random_page(&mut rng, &pool, profile);
-        let ((doc, layout), first_mem) = built(|| {
+        let page0 = tagged(Tag::Driver, || random_page(&mut rng, &pool, profile));
+        let ((doc, layout), _) = built(|| {
             let doc = Doc::parse(&page0.src);
             let layout = PageLayout::new(&doc, Params::default());
             (doc, layout)
         });
         let mut state = (page0, doc, layout);
-        // What the pages' own memory (a `Doc` and its `Layout`) goes over the first's by, at most
-        // (the old page and the new are alive while the images are attached to the new one): it
-        // is no image's, and the allowance for it is measured, not guessed.
-        let (mut doc_mem, mut doc_extra) = (first_mem, 0usize);
+        // What the pages' own memory (a `Doc` and its `Layout`) and the driver's (the boxes it
+        // makes, its log) are is counted apart from the image code's ([`Tag`]): the budget is
+        // held to what the image code has live, with no allowance for what is no image's, and
+        // the exception to the budget, the pixels painted in the frame, is the amount the test
+        // saw painted (see `Painted`).
         let start = mark();
+        let img_start = image_live();
+        let mut painted = Painted::default();
         let mut log: Vec<String> = Vec::new();
         let (mut top, mut zoom, mut remote) = (0usize, 1.0f32, false);
-        let mut peak = 0usize;
+        // The most the image code's live bytes were past the budget, the painted pixels the
+        // operation had to keep (the exception, and nothing else, may take it past the budget)
+        // taken off, and what was painted when that was.
+        let (mut past, mut shown) = (isize::MIN, 0usize);
         // The boxes of the last frame, and how many were in view.
         let mut last: (Vec<(u32, u32, u32)>, usize) = (Vec::new(), 0);
-        let open = |images: &mut Images,
-                    state: &mut (Page, Doc, PageLayout),
-                    mem: &mut (usize, usize),
-                    page: Page| {
-            let ((doc, mut layout), now) = built(|| {
+        let open = |images: &mut Images, state: &mut (Page, Doc, PageLayout), page: Page| {
+            let ((doc, mut layout), _) = built(|| {
                 let doc = Doc::parse(&page.src);
                 let layout = PageLayout::new(&doc, Params::default());
                 (doc, layout)
@@ -1867,22 +2205,18 @@ mod mix {
             images.forget_remote();
             images.attach(&doc, &mut layout);
             *state = (page, doc, layout);
-            mem.1 = mem.1.max((mem.0 + now).saturating_sub(first_mem));
-            mem.0 = now;
         };
-        let mut mem = (doc_mem, doc_extra);
         open(
             &mut images,
             &mut state,
-            &mut mem,
-            random_page(&mut rng, &pool, profile),
+            tagged(Tag::Driver, || random_page(&mut rng, &pool, profile)),
         );
-        (doc_mem, doc_extra) = mem;
-        let _ = doc_mem;
         // The wakes the window has taken a poll for.
         let mut seen = images.wakes();
         let big = matches!(profile, 1 | 4 | 5);
         for step in 0..if big { 260 } else { 160 } {
+            // The peak is looked at for each operation, with what is painted for it.
+            painted.begin_step();
             let n = state.0.assets.len();
             let mut op = rng.below(100);
             // A page of big pictures is kept long enough for its images to fill the cache.
@@ -1901,9 +2235,11 @@ mod mix {
                 84..=93 => "poll",
                 _ => "settle",
             };
-            log.push(format!(
-                "{step}: {what} (top {top}, zoom {zoom}, remote {remote})"
-            ));
+            tagged(Tag::Driver, || {
+                log.push(format!(
+                    "{step}: {what} (top {top}, zoom {zoom}, remote {remote})"
+                ));
+            });
             match what {
                 "scroll" => {
                     top =
@@ -1911,19 +2247,17 @@ mod mix {
                 }
                 "zoom" => zoom = [0.5, 1.0, 1.0, 2.0][rng.below(4) as usize],
                 "open" => {
-                    let page = random_page(&mut rng, &pool, profile);
-                    let mut m = (doc_mem, doc_extra);
-                    open(&mut images, &mut state, &mut m, page);
-                    (doc_mem, doc_extra) = m;
+                    let page = tagged(Tag::Driver, || random_page(&mut rng, &pool, profile));
+                    open(&mut images, &mut state, page);
                     (top, remote) = (0, false);
                 }
                 "reload" => {
                     let (page, doc, layout) = &mut state;
-                    // (The page is the same: its memory is the same, and the old document's
-                    // strings are alive, as the images' sources, until they are attached again.)
-                    doc_extra = doc_extra.max((2 * doc_mem).saturating_sub(first_mem));
-                    *doc = Doc::parse(&page.src);
-                    *layout = PageLayout::new(doc, Params::default());
+                    ((*doc, *layout), _) = built(|| {
+                        let doc = Doc::parse(&page.src);
+                        let layout = PageLayout::new(&doc, Params::default());
+                        (doc, layout)
+                    });
                     images.forget_remote();
                     images.attach(doc, layout);
                     remote = false;
@@ -1958,19 +2292,23 @@ mod mix {
                 let in_view = rng.range(1, if profile == 3 { 40 } else { 6 }) as usize;
                 let near = rng.range(0, if matches!(profile, 1 | 4 | 5) { 14 } else { 8 }) as usize;
                 let mut budget = PAINTED;
-                let mut boxes = Vec::new();
-                for (k, id) in (top..n).enumerate().take(in_view + near) {
-                    let mut near_budget = if k < in_view { budget } else { 4 << 20 };
-                    let b = box_of(&page.assets[id], zoom, &mut near_budget);
-                    if k < in_view {
-                        budget = near_budget;
+                let boxes = tagged(Tag::Driver, || {
+                    let mut boxes = Vec::new();
+                    for (k, id) in (top..n).enumerate().take(in_view + near) {
+                        let mut near_budget = if k < in_view { budget } else { 4 << 20 };
+                        let b = box_of(&page.assets[id], zoom, &mut near_budget);
+                        if k < in_view {
+                            budget = near_budget;
+                        }
+                        boxes.push((id as u32 + 1, b.0, b.1));
                     }
-                    boxes.push((id as u32 + 1, b.0, b.1));
-                }
-                frame(&mut images, &boxes, in_view.min(boxes.len()));
+                    boxes
+                });
+                painted.frame(&mut images, &boxes, in_view.min(boxes.len()));
                 last = (boxes, in_view);
             } else if what == "remote off and on" {
-                // Turning them on or off asks for the images again without a repaint.
+                // Turning them on or off asks for the images again without a repaint (what was
+                // painted is still the frame's).
                 images.request(&last.0, last.1);
             }
             if what != "slow poll" {
@@ -1982,14 +2320,14 @@ mod mix {
             if images.wakes() != seen {
                 seen = images.wakes();
                 if images.poll(doc, layout) {
-                    frame(&mut images, &last.0, last.1);
+                    painted.frame(&mut images, &last.0, last.1);
                 }
             }
             // The reader stops and waits: what the last frame asked for is done by the threads
             // and the window's polls alone, and the budget holds meanwhile.
             if what == "settle" {
                 let t = Instant::now();
-                frame(&mut images, &last.0, last.1);
+                painted.frame(&mut images, &last.0, last.1);
                 while !images.is_idle() {
                     assert!(
                         t.elapsed() < Duration::from_secs(60),
@@ -2008,29 +2346,29 @@ mod mix {
                     if images.wakes() != seen {
                         seen = images.wakes();
                         if images.poll(doc, layout) {
-                            frame(&mut images, &last.0, last.1);
+                            painted.frame(&mut images, &last.0, last.1);
                         }
                     }
-                    {
-                        let over = peak_over(start);
-                        peak = peak.max(over);
-                        assert!(
-                            over <= CACHE_BYTES + SLACK + doc_extra,
-                            "seed {seed}: {over} bytes live over the start ({}); {:?}",
-                            images.memory_report(),
-                            images.stats()
-                        );
-                    }
+                    let over = image_step_over(img_start);
+                    (past, shown) = painted.note(over, past, shown);
+                    assert!(
+                        over <= CACHE_BYTES + SLACK + painted.step,
+                        "seed {seed}: {over} bytes of the image code's live over the start, {} painted ({}); {:?}",
+                        painted.step,
+                        images.memory_report(),
+                        images.stats()
+                    );
                 }
             }
-            let allowed = CACHE_BYTES + SLACK + doc_extra;
-            let over = peak_over(start);
-            peak = peak.max(over);
+            let allowed = CACHE_BYTES + SLACK + painted.step;
+            let over = image_step_over(img_start);
+            (past, shown) = painted.note(over, past, shown);
             if over > allowed {
                 let recent: Vec<_> = log.iter().rev().take(14).rev().cloned().collect();
                 panic!(
-                    "seed {seed}: {over} bytes live over the start after step {step}, {} allowed ({:?}; {})\nrecent steps:\n{}",
+                    "seed {seed}: {over} bytes of the image code's live over the start after step {step}, {} allowed with {} painted ({:?}; {})\nrecent steps:\n{}",
                     allowed,
+                    painted.step,
                     images.stats(),
                     images.memory_report(),
                     recent.join("\n")
@@ -2045,7 +2383,8 @@ mod mix {
         // One last frame, as the window paints after the last thing it was asked; then only
         // what the threads wake it for (a state that is left only by a request nothing woke the
         // window for is stuck for good, and a failure here).
-        frame(&mut images, &last.0, last.1);
+        painted.begin_step();
+        painted.frame(&mut images, &last.0, last.1);
         while !images.is_idle() {
             assert!(
                 t.elapsed() < Duration::from_secs(60),
@@ -2064,24 +2403,20 @@ mod mix {
             if images.wakes() != seen {
                 seen = images.wakes();
                 if images.poll(doc, layout) {
-                    frame(&mut images, &last.0, last.1);
+                    painted.frame(&mut images, &last.0, last.1);
                 }
             }
-            {
-                let over = peak_over(start);
-                peak = peak.max(over);
-                assert!(
-                    over <= CACHE_BYTES + SLACK + doc_extra,
-                    "seed {seed}: {over} bytes live over the start ({}); {:?}",
-                    images.memory_report(),
-                    images.stats()
-                );
-            }
+            let over = image_step_over(img_start);
+            (past, shown) = painted.note(over, past, shown);
+            assert!(
+                over <= CACHE_BYTES + SLACK + painted.step,
+                "seed {seed}: {over} bytes of the image code's live over the start, {} painted ({}); {:?}",
+                painted.step,
+                images.memory_report(),
+                images.stats()
+            );
         }
-        assert!(
-            peak <= CACHE_BYTES + SLACK + doc_extra,
-            "seed {seed}: {peak} bytes live over the start while the last frame was done"
-        );
+        let _ = start;
         // Everything is let go, and nothing is left: the threads end and take what they hold
         // with them.
         let stats = images.stats();
@@ -2096,8 +2431,10 @@ mod mix {
             left <= LEFT,
             "seed {seed}: {left} bytes live after everything is dropped"
         );
-        println!("seed {seed}: peak {peak} bytes over the start, {left} left after, {stats:?}");
-        peak
+        println!(
+            "seed {seed}: the image code's live bytes were at most {past} past the budget ({shown} painted), {left} left after, {stats:?}"
+        );
+        past
     }
 
     /// Which seeds to run: `VOMD_IMAGE_SEEDS=A..B` (or `N`: 0 to N), 3 by default.
@@ -2115,10 +2452,12 @@ mod mix {
     #[test]
     fn a_random_mix_of_operations_stays_in_the_budget() {
         let _serial = serial();
-        let mut worst = 0;
+        let mut worst = isize::MIN;
         for seed in seeds() {
             worst = worst.max(random_run(seed));
         }
-        println!("worst: {worst} bytes over the start (of {CACHE_BYTES} + {SLACK})");
+        println!(
+            "worst: the image code's live bytes were {worst} past the budget, painted pixels taken off (of {SLACK} allowed)"
+        );
     }
 }
