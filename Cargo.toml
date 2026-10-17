@@ -46,3 +46,10 @@ incremental = false
 [dev-dependencies]
 insta = "1"
 png = "0.18" # golden images (tests/golden.rs); already a dependency with `images`
+
+# Tests decode and account for thousands of images: build them optimized, keeping debug
+# assertions and overflow checks (the image tests' room probe needs debug_assertions).
+[profile.test]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
