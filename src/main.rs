@@ -460,6 +460,17 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title(view::title(&self.input))
             .with_inner_size(size)
             .with_visible(false);
+        // The Wayland app ID (and X11 WM_CLASS) names vomd.desktop, so the desktop shows its
+        // icon for the window: Wayland has no default and would show a generic one.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        let attrs =
+            winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "vomd", "vomd");
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

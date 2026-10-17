@@ -724,7 +724,7 @@ fn dist(release: bool) -> bool {
     let files: [(&Path, &str); 9] = [
         (&bin, "vomd"),
         (Path::new("packaging/vomd.desktop"), "vomd.desktop"),
-        (Path::new("packaging/vomd.svg"), "vomd.svg"),
+        (Path::new("assets/icon.svg"), "vomd.svg"),
         (Path::new("README.md"), "README.md"),
         (Path::new("CHANGELOG.md"), "CHANGELOG.md"),
         (Path::new("LICENSE"), "LICENSE"),

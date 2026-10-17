@@ -10,3 +10,4 @@ Categories=Office;Viewer;
 MimeType=text/markdown;text/x-markdown;
 Keywords=markdown;md;readme;viewer;
 StartupNotify=false
+StartupWMClass=vomd

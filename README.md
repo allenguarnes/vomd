@@ -1,3 +1,5 @@
+<img src="assets/icon@2x.png" width="128" alt="VOMD icon">
+
 # VOMD: View-Only Markdown
 
 A tiny, fast Markdown viewer for the Linux desktop. Double-click a `.md` file and it appears,

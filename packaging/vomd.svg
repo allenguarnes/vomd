@@ -1,7 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <!-- VOMD: a page with the Markdown "M↓" mark. -->
-  <rect x="8" y="8" width="112" height="112" rx="22" fill="#24292f"/>
-  <rect x="22" y="30" width="84" height="68" rx="10" fill="none" stroke="#f6f8fa" stroke-width="7"/>
-  <path d="M36 84V46h10l10 13 10-13h10v38H66V62l-10 13-10-13v22z" fill="#f6f8fa"/>
-  <path d="M84 46h10v19h8L89 82 76 65h8z" fill="#58a6ff"/>
-</svg>

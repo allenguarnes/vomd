@@ -23,6 +23,8 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
 - Remote images, off by default: loaded per document with `I`, through the system `curl`.
 - A one-line notice for files over 10 MB, which still render.
 - Packaging: AUR `vomd` and `vomd-bin`, a release tarball with a desktop entry and icon.
+- The app icon (an eye over the Markdown mark). The window's Wayland app ID and X11 `WM_CLASS` are
+  `vomd`, so the desktop shows it for the window.
 - Budgets checked in CI (`cargo xtask budgets`): binary size, cold and warm start, idle RSS,
   idle CPU, 4K scroll frame time. Fuzz targets for the parser, layout and settings.
 
