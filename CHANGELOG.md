@@ -3,7 +3,7 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-10-19
 
 The first release, for Linux (x86-64; Windows and macOS compile but are unsupported).
 

@@ -16,7 +16,7 @@ the network unless you ask it to.
 - **Images**: local PNG and JPEG, decoded lazily. Remote images load only after you press `I`.
 - **Live reload**: when the window gets focus, a document that changed on disk is shown again
   at the same place.
-- **Large files**: a 5 MB document opens in about 60 ms. Files over 10 MB still render, with
+- **Large files**: a 5 MB document opens in under 100 ms. Files over 10 MB still render, with
   a notice.
 
 Raw HTML is never run. Tags are stripped and their text kept, and a few tags (`<b>`, `<img>`,

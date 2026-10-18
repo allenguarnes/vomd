@@ -1,6 +1,6 @@
 # A `v*` tag builds the Linux x86_64 release (baseline x86-64, no target-cpu),
 # checks the budgets, and attaches the tarball, its checksum and the budget report to the
-# GitHub release.
+# GitHub release, whose notes are the version's CHANGELOG section.
 name: Release
 
 on:
@@ -25,10 +25,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb xauth libx11-6 libx11-xcb1 \
             libxcb1 libxcursor1 libxi6 libxkbcommon0 libxkbcommon-x11-0 binutils
-      - name: The tag matches Cargo.toml
+      - name: The tag matches Cargo.toml and the CHANGELOG dates it
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           test "v$version" = "$GITHUB_REF_NAME"
+          grep -Eq "^## \[$version\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md
       - run: cargo test --workspace --locked
       # A shared runner is two to three times slower than the machine the time budgets are
       # for, so start and scroll times are reported here, not gated; size and memory still are.
@@ -43,10 +44,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The notes are this version's CHANGELOG section.
+          version="${GITHUB_REF_NAME#v}"
+          awk -v head="## [$version]" '
+            index($0, head) == 1 { on = 1; next }
+            on && (/^## / || /^\[[^]]+\]: /) { exit }
+            on { print }
+          ' CHANGELOG.md > changes.md
+          test -s changes.md
           {
-            echo "## Budgets, measured on the release runner"
+            cat changes.md
+            echo
+            echo "<details><summary>Budgets, measured on the release runner</summary>"
+            echo
+            echo "A shared runner is two to three times slower than the machine the time budgets"
+            echo "are for, so start and scroll times are reported here, not gated."
             echo
             cat budgets.md
+            echo
+            echo "</details>"
           } > notes.md
           gh release create "$GITHUB_REF_NAME" --title "VOMD $GITHUB_REF_NAME" \
             --notes-file notes.md dist/*.tar.gz dist/*.sha256 budgets.md
