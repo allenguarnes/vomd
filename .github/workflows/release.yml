@@ -30,10 +30,13 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           test "v$version" = "$GITHUB_REF_NAME"
       - run: cargo test --workspace --locked
+      # A shared runner is two to three times slower than the machine the time budgets are
+      # for, so start and scroll times are reported here, not gated; size and memory still are.
+      # `cargo xtask budgets` on an idle machine gates them all before a release.
       - name: Budgets
         run: |
           xvfb-run -a -s "-screen 0 3840x2160x24" \
-            cargo xtask budgets --report budgets.md
+            cargo xtask budgets --timings-advisory --report budgets.md
       - name: Tarball (fails if it would need glibc newer than 2.36)
         run: cargo xtask dist --release
       - name: Release

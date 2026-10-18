@@ -40,7 +40,8 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   text, so this costs two to three times the plain remeasure (0.5 ms on a 42,000-block
   document).
 - The scrollbar also shows while the pointer is over its column.
-- Budgets checked in CI (`cargo xtask budgets`): binary size, cold and warm start, idle RSS,
-  idle CPU, 4K scroll frame time. Fuzz targets for the parser, layout and settings.
+- Budgets measured by `cargo xtask budgets`: binary size, cold and warm start, idle RSS,
+  idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
+  (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
 [1.0.0]: https://github.com/allenguarnes/vomd/releases/tag/v1.0.0

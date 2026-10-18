@@ -1,4 +1,5 @@
 //! Dev tooling: `cargo xtask <size|bench|budgets|dist|fixtures|bless>`. Never shipped.
+//! `budgets [--timings-advisory] [--report <file.md>]`.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -51,10 +52,13 @@ fn main() {
     let ok = match arg(0) {
         Some("size") => size(),
         Some("bench") => bench(arg(1)),
-        Some("budgets") => budgets(match (arg(1), arg(2)) {
-            (Some("--report"), Some(path)) => Some(Path::new(path)),
-            _ => None,
-        }),
+        Some("budgets") => budgets(
+            args.iter()
+                .position(|a| a == "--report")
+                .and_then(|i| args.get(i + 1))
+                .map(Path::new),
+            !args.iter().any(|a| a == "--timings-advisory"),
+        ),
         Some("dist") => dist(arg(1) == Some("--release")),
         Some("fixtures") => fixtures(),
         Some("bless") => bless(),
@@ -452,7 +456,10 @@ struct Row {
 }
 
 /// Every budget row, measured and checked; a miss fails. Needs a display (CI runs Xvfb).
-fn budgets(report: Option<&Path>) -> bool {
+/// Without `timings_gated` (`--timings-advisory`, for shared CI runners, which are two to three
+/// times slower than the machine the budgets are for) the start and scroll times are only
+/// reported; size, memory, idle CPU and a run that gives no output still fail.
+fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
     if !baseline_cpu() {
         return false;
     }
@@ -507,7 +514,7 @@ fn budgets(report: Option<&Path>) -> bool {
                         format!("{cold:.1} ms"),
                         format!("≤ {COLD_BUDGET_MS} ms (first of {BENCH_RUNS} runs)"),
                         cold <= COLD_BUDGET_MS,
-                        true,
+                        timings_gated,
                     );
                     gated_row(
                         format!("warm start, {name}"),
@@ -515,7 +522,7 @@ fn budgets(report: Option<&Path>) -> bool {
                         format!("{warm:.1} ms"),
                         format!("≤ {WARM_BUDGET_MS} ms (median of {})", BENCH_RUNS - 1),
                         warm <= WARM_BUDGET_MS,
-                        !WARM_UNGATED.contains(name),
+                        timings_gated && !WARM_UNGATED.contains(name),
                     );
                 }
                 None => gated_row(
@@ -570,7 +577,7 @@ fn budgets(report: Option<&Path>) -> bool {
                 format!("{p95:.2} ms"),
                 format!("≤ {SCROLL_BUDGET_MS} ms"),
                 p95 <= SCROLL_BUDGET_MS,
-                true,
+                timings_gated,
             ),
             None => gated_row(
                 "scroll frame, 4K".into(),
