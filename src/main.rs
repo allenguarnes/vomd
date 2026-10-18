@@ -204,6 +204,7 @@ impl App {
             view.resize(w.get(), h.get());
         }
         view.paint(&mut buf, w.get() as usize, Instant::now());
+        vomd::render::opaque(&mut buf);
         if buf.present().is_err() {
             return;
         }

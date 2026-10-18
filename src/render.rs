@@ -640,5 +640,23 @@ impl ScrollbarFade {
     }
 }
 
+/// Set the unused top byte of every pixel to 0xFF just before presenting. softbuffer labels
+/// frames XRGB8888, so that byte should be ignored, but some compositors read it as alpha:
+/// KWin 6.8 with NVIDIA 615 (Wayland) shows a `0x00RRGGBB` frame as black or see-through.
+/// Four pixels per step, because the size-optimized build doesn't vectorize a per-pixel loop
+/// (about 1 ms at 4K instead of 2).
+pub fn opaque(buf: &mut [u32]) {
+    const A4: u128 = 0xff00_0000_ff00_0000_ff00_0000_ff00_0000;
+    // SAFETY: every bit pattern is a valid `u32` and `u128`, and `align_to_mut` keeps the
+    // middle slice aligned.
+    let (head, mid, tail) = unsafe { buf.align_to_mut::<u128>() };
+    for p in mid {
+        *p |= A4;
+    }
+    for p in head.iter_mut().chain(tail) {
+        *p |= 0xff00_0000;
+    }
+}
+
 #[cfg(test)]
 mod tests;

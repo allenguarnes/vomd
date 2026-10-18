@@ -716,3 +716,25 @@ mod doc {
         }
     }
 }
+
+#[test]
+fn opaque_sets_only_the_top_byte() {
+    // Every length and start offset, so unaligned heads and tails are covered.
+    let src: Vec<u32> = (0..40u32)
+        .map(|i| i.wrapping_mul(0x0101_0101) & 0x00ff_ffff)
+        .collect();
+    for start in 0..4 {
+        for len in 0..src.len() - start {
+            let mut px = src.clone();
+            opaque(&mut px[start..start + len]);
+            for (i, (&p, &s)) in px.iter().zip(&src).enumerate() {
+                let want = if (start..start + len).contains(&i) {
+                    s | 0xff00_0000
+                } else {
+                    s
+                };
+                assert_eq!(p, want, "start {start}, len {len}, pixel {i}");
+            }
+        }
+    }
+}
