@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned so a new stable release (new clippy lints, different code size) can't turn CI or a
+# release build red on its own. Bump deliberately, then rerun clippy and the budgets.
+channel = "1.99"
 components = ["rustfmt", "clippy"]

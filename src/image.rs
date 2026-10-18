@@ -1019,7 +1019,7 @@ fn resample_rows(
                 *a += r * weight;
             }
         }
-        for px in acc.chunks_exact(4) {
+        for px in acc.as_chunks::<4>().0 {
             // Color sums carry a factor 255 from the alpha they're premultiplied by.
             let ch = |v: f32, scale: f32| (v / scale).round().clamp(0.0, 255.0) as u32;
             let a = ch(px[3], 1.0);
@@ -1041,7 +1041,7 @@ fn resample_rows(
 /// One source row (`channels` bytes a pixel) averaged along its width into `out`, four floats
 /// (premultiplied r, g, b and alpha) per target pixel, by the `xs` spans.
 fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
-    for (t, px) in out.chunks_exact_mut(4).enumerate() {
+    for (t, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let (x0, wx) = xs.get(t);
         px.fill(0.0);
         for (p, &weight) in row[x0 * channels..].chunks_exact(channels).zip(wx) {

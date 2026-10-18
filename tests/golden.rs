@@ -202,7 +202,12 @@ fn read_png(path: &Path) -> Option<(usize, usize, Vec<u8>)> {
 fn compare(expected: &[u8], actual: &[u8]) -> (usize, Vec<u8>) {
     let mut bad = 0;
     let mut diff = Vec::with_capacity(expected.len());
-    for (e, a) in expected.chunks_exact(3).zip(actual.chunks_exact(3)) {
+    for (e, a) in expected
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(actual.as_chunks::<3>().0)
+    {
         if e.iter().zip(a).any(|(e, a)| e.abs_diff(*a) > TOLERANCE) {
             bad += 1;
             diff.extend_from_slice(&[255, 0, 0]);

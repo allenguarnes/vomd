@@ -236,7 +236,7 @@ impl<'a> Frame<'a> {
             let src_start = ((sy + row_i) * w + sx) * 4;
             let src = &rgba[src_start..src_start + (c.x1 - c.x0) as usize * 4];
             let dst = &mut self.row(y)[c.x0 as usize..c.x1 as usize];
-            for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
+            for (d, p) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
                 *d = over_premul(*d, p[0], p[1], p[2], p[3]);
             }
         }

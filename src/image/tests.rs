@@ -382,7 +382,12 @@ fn resampled_columns_first(frame: &Frame, w: u32, h: u32) -> Vec<u32> {
         acc.fill(0.0);
         for (k, &weight) in wy.iter().enumerate() {
             let row = &frame.data[(y0 + k) * frame.stride..];
-            for (a, p) in acc.chunks_exact_mut(4).zip(row.chunks_exact(ch)) {
+            for (a, p) in acc
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(row.chunks_exact(ch))
+            {
                 let al = f32::from(p[3]) * weight;
                 a[0] += f32::from(p[0]) * al;
                 a[1] += f32::from(p[1]) * al;
