@@ -1,0 +1,100 @@
+.TH VOMD 1 "" "VOMD" "User Commands"
+.SH NAME
+vomd \- view Markdown documents
+.SH SYNOPSIS
+.B vomd
+.RB [ \-\-no\-settings ]
+.RI [ FILE ]
+.br
+.B vomd
+.BR \-\-help " | " \-\-version
+.SH DESCRIPTION
+.B vomd
+(View-Only Markdown) opens a Markdown document for reading: CommonMark and GitHub Flavored
+Markdown, in light and dark themes that follow the system.
+It never edits files and never runs HTML.
+.PP
+Any extension is read as Markdown.
+With
+.I FILE
+given as
+.BR \- ,
+the document is read from standard input.
+With no
+.IR FILE ,
+an empty window opens; a file can be dropped on it (X11).
+Each window is its own process.
+.PP
+The document is reloaded when it changes on disk and the window gets focus, keeping the
+reading position.
+Remote images are not loaded until asked for (\fBI\fR).
+.SH OPTIONS
+.TP
+.B \-\-no\-settings
+Ignore the settings file.
+.TP
+.BR \-h ", " \-\-help
+Print the usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.SH KEYS
+.TP
+.RB "Wheel, " Up ", " Down ", " j ", " k
+Scroll.
+.TP
+.BR PgUp ", " PgDn ", " Space ", " Shift+Space
+Scroll a page.
+.TP
+.BR Home ", " End ", " g ", " G
+Top, bottom.
+.TP
+.BR [ ", " ]
+Previous, next heading.
+.TP
+.BR Ctrl+= ", " Ctrl+\- ", " Ctrl+0 ", Ctrl+wheel"
+Zoom in, out, reset.
+.TP
+.B T
+Theme: system, light, dark.
+.TP
+.B B
+Show or hide the toolbar.
+.TP
+.B W
+Wide layout on or off: the text spans the window instead of stopping at
+.BR line_width .
+.TP
+.B I
+Load the remote images of this document (again to hide them).
+.TP
+.BR R ", " F5
+Reload.
+.TP
+.BR Backspace ", " Alt+Left ", " Ctrl+[
+Back, after following a link to another document.
+.TP
+.BR Esc ", " Q ", " Ctrl+W
+Quit.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/vomd/settings.ini
+Optional settings
+.RI ( ~/.config/vomd/settings.ini
+by default): plain
+.I key = value
+lines, applied when the window gets focus.
+The toolbar's settings button creates it with every key listed and commented out.
+Theme, zoom, toolbar, wide layout and window size are saved when they change.
+.SH PRIVACY
+.B vomd
+makes no network requests of its own.
+Remote images are fetched with the system
+.BR curl (1)
+only after
+.B I
+is pressed for a document, or for every document with
+.BR "remote_images = always" .
+.SH SEE ALSO
+.UR https://github.com/allenguarnes/vomd
+.UE

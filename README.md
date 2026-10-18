@@ -37,6 +37,26 @@ source instead, use `packaging/aur/vomd`. It follows your `makepkg.conf`, so wit
 `RUSTFLAGS` (`-C opt-level=3 -C target-cpu=native`) the binary is larger (about 4.9 MB) and
 faster, and runs only on the CPU it was built on.
 
+**Debian, Ubuntu:** from v1.1.0, each [release](https://github.com/allenguarnes/vomd/releases)
+has a `.deb` for Debian 12 or newer and Ubuntu 24.04 or newer (x86-64):
+
+```sh
+sudo apt install ./vomd_*_amd64.deb
+```
+
+**AppImage:** from v1.1.0, each release also has `vomd-<version>-x86_64.AppImage`, for any
+x86-64 distribution with glibc 2.36 or newer. It brings no libraries of its own and uses the
+system's Wayland or X11 ones, which every desktop has:
+
+```sh
+chmod +x vomd-*-x86_64.AppImage
+./vomd-*-x86_64.AppImage README.md
+```
+
+It mounts itself with FUSE, which most desktops have (`fuse3`). Without it, run it with
+`--appimage-extract-and-run`. An AppImage doesn't register itself as the app for `.md`
+files; an integration tool such as Gear Lever or AppImageLauncher can.
+
 **Release tarball:** each [release](https://github.com/allenguarnes/vomd/releases) has
 `vomd-<version>-x86_64-linux.tar.gz` (glibc 2.36 or newer, any x86-64 CPU):
 
@@ -140,7 +160,10 @@ on. `never` removes the option.
 `just ci` runs formatting, clippy (every feature set), the tests, and Windows/macOS compile
 checks. `cargo xtask budgets` measures every performance budget against a release build (it
 needs a display). `just fuzz <doc|layout|settings> [seconds]` fuzzes on the stable toolchain.
-`scripts/aur-check.sh` builds and checks both AUR packages offline.
+`scripts/aur-check.sh` builds and checks both AUR packages offline. `scripts/pkg-build.sh` builds
+the release files (tarball, `.deb`, AppImage) in a Debian 12 container as CI does, and
+`scripts/pkg-check.sh` installs and runs the `.deb` and AppImage on Debian 12, Debian 13 and
+Ubuntu 24.04 (both need docker).
 
 ## License
 

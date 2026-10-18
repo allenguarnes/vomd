@@ -1,4 +1,4 @@
-# Linux runs everything, budgets included; Windows and macOS are compile checks
+# Linux runs everything, budgets and packages included; Windows and macOS are compile checks
 # only (unsupported until P14). Mirrors `just ci` and `cargo xtask budgets`.
 name: CI
 
@@ -55,6 +55,19 @@ jobs:
           name: budgets
           path: budgets.md
           if-no-files-found: ignore
+
+  # The release files as the release builds them, and the .deb and AppImage installed and run
+  # on every supported distribution (docker; the display servers run in containers too).
+  packages:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Tarball, .deb and AppImage, built in Debian 12
+        run: scripts/pkg-build.sh
+      - name: The .deb and AppImage on Debian 12, Debian 13 and Ubuntu 24.04
+        run: scripts/pkg-check.sh
 
   compile-check:
     strategy:

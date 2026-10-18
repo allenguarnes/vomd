@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Check dist/'s Debian package and AppImage (`cargo xtask dist`, or scripts/pkg-build.sh on a
+# host with a newer glibc) in clean containers of every supported distribution. Needs docker.
+#
+# For each image: the .deb is installed with apt, which brings only what it depends on; VOMD
+# then has to show its first frame on an X server (Xvfb) and on a Wayland compositor (weston,
+# headless) that run in containers of their own, so their libraries can't stand in for a
+# missing dependency; a screenshot must show a page; lintian must find no errors; removal must
+# leave nothing. The AppImage is run in another clean container with only the display
+# libraries, through --appimage-extract-and-run (containers have no FUSE).
+# Screenshots land in the printed work dir. VOMD_PKG_IMAGES overrides the images.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+images=${VOMD_PKG_IMAGES:-"debian:12 debian:13 ubuntu:24.04"}
+deb=$(ls "$root"/dist/vomd_*_amd64.deb)
+appimage=$(ls "$root"/dist/vomd-*-x86_64.AppImage)
+# The libraries the .deb depends on, which the AppImage needs from the system as well.
+libs=$(dpkg-deb -f "$deb" Depends 2>/dev/null || ar p "$deb" control.tar.xz | tar xJO ./control |
+    sed -n 's/^Depends: //p')
+libs=$(echo "$libs" | tr ',' '\n' | sed 's/(.*)//; s/ //g' | grep -v '^libc6$' | tr '\n' ' ')
+work=$(mktemp -d /tmp/vomd-pkg-check.XXXXXX)
+mkdir -p "$work/x11" "$work/wayland" "$work/shots" "$work/pkg"
+chmod 700 "$work/wayland"
+cp "$deb" "$work/pkg/vomd.deb"
+cp "$appimage" "$work/pkg/vomd.AppImage"
+echo "== work dir: $work"
+echo "== $(basename "$deb"), $(basename "$appimage")"
+
+label=vomd-pkg-check=$$
+cleanup() {
+    docker ps -aq --filter "label=$label" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    # Files the containers made as root.
+    docker run --rm -v "$work:/w" debian:12 sh -c 'rm -rf /w/x11 /w/wayland' >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+start() { # image, extra docker args...
+    local image=$1
+    shift
+    local c
+    c=$(docker run -d --rm --label "$label" "$@" \
+        -v "$work/x11:/tmp/.X11-unix" -v "$work/wayland:/run/wayland" \
+        -v "$work/pkg:/pkg:ro" -v "$root/fixtures:/fixtures:ro" \
+        -e DISPLAY=:99 -e XDG_RUNTIME_DIR=/run/wayland -e DEBIAN_FRONTEND=noninteractive -e DEBCONF_NOWARNINGS=yes \
+        "$image" sleep infinity)
+    echo "$c"
+}
+dx() { docker exec "$@"; }
+apt_install() { # container, packages...
+    local c=$1
+    shift
+    dx "$c" sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends $* >/dev/null"
+}
+fail() {
+    echo "FAIL: $*"
+    exit 1
+}
+
+# The display servers.
+echo "== display servers"
+server=$(start debian:13)
+apt_install "$server" xvfb weston imagemagick
+dx -d "$server" Xvfb :99 -screen 0 1280x900x24 -nolisten tcp -ac
+dx -d "$server" weston --backend=headless --renderer=pixman --socket=wayland-vomd --width=1280 \
+    --height=900 --idle-time=0
+for _ in $(seq 50); do
+    [ -S "$work/x11/X99" ] && [ -S "$work/wayland/wayland-vomd" ] && break
+    sleep 0.2
+done
+[ -S "$work/x11/X99" ] || fail "Xvfb didn't start"
+[ -S "$work/wayland/wayland-vomd" ] || fail "weston didn't start"
+
+# First frame on X11 and on Wayland: VOMD_BENCH=1 prints `vomd-bench first_frame_ms=…` once a
+# frame is presented, and exits. Each run can reach only its own server: no WAYLAND_DISPLAY (and
+# no wayland-0) for X11, an empty DISPLAY for Wayland, so neither falls back to the other.
+first_frames() { # container, command...
+    local c=$1
+    shift
+    local out
+    out=$(dx -e VOMD_BENCH=1 "$c" timeout 30 "$@" --no-settings \
+        /fixtures/readme.md 2>&1) || true
+    grep -q 'vomd-bench first_frame_ms' <<<"$out" || fail "no first frame on X11: $out"
+    out=$(dx -e VOMD_BENCH=1 -e WAYLAND_DISPLAY=wayland-vomd -e DISPLAY= "$c" timeout 30 "$@" \
+        --no-settings /fixtures/readme.md 2>&1) || true
+    grep -q 'vomd-bench first_frame_ms' <<<"$out" || fail "no first frame on Wayland: $out"
+}
+
+# A screenshot of the X server while VOMD shows golden.md: the page must not be blank.
+screenshot() { # container, name, command...
+    local c=$1 name=$2
+    shift 2
+    dx -d "$c" timeout 8 "$@" --no-settings /fixtures/golden.md
+    sleep 4
+    dx "$server" import -window root "/tmp/$name.png"
+    docker cp -q "$server:/tmp/$name.png" "$work/shots/$name.png"
+    local spread
+    spread=$(dx "$server" convert "/tmp/$name.png" -format '%[fx:standard_deviation]' info:)
+    awk -v s="$spread" 'BEGIN { exit !(s > 0.02) }' || fail "$name: blank screenshot ($spread)"
+    sleep 4
+}
+
+for image in $images; do
+    tag=${image//[:\/]/-}
+    echo "== $image: .deb"
+    c=$(start "$image")
+    apt_install "$c" /pkg/vomd.deb
+    dx "$c" dpkg -s vomd | grep -q '^Status: install ok installed' || fail "not installed"
+    dx "$c" vomd --version
+    first_frames "$c" vomd
+    screenshot "$c" "$tag-deb" vomd
+    echo "   first frame on X11 and Wayland, screenshot $work/shots/$tag-deb.png"
+    apt_install "$c" lintian
+    # Lintian errors fail; warnings are printed.
+    lint=$(dx "$c" lintian --tag-display-limit 0 --suppress-tags initial-upload-closes-no-bugs /pkg/vomd.deb 2>&1) || true
+    [ -n "$lint" ] && echo "$lint" | sed 's/^/   /'
+    grep -q '^E:' <<<"$lint" && fail "lintian errors"
+    dx "$c" apt-get remove -y -qq vomd >/dev/null
+    dx "$c" sh -c '! dpkg -L vomd 2>/dev/null && test ! -e /usr/bin/vomd' || fail "left after removal"
+    docker rm -f "$c" >/dev/null
+
+    echo "== $image: AppImage"
+    c=$(start "$image")
+    # shellcheck disable=SC2086
+    apt_install "$c" $libs
+    dx "$c" sh -c 'cp /pkg/vomd.AppImage /tmp/ && cd /tmp && ./vomd.AppImage --appimage-extract >/dev/null'
+    for f in AppRun vomd.desktop vomd.svg .DirIcon usr/bin/vomd; do
+        dx "$c" test -e "/tmp/squashfs-root/$f" || fail "AppImage lacks $f"
+    done
+    dx -e APPIMAGE_EXTRACT_AND_RUN=1 "$c" /tmp/vomd.AppImage --version
+    first_frames "$c" env APPIMAGE_EXTRACT_AND_RUN=1 /tmp/vomd.AppImage
+    screenshot "$c" "$tag-appimage" env APPIMAGE_EXTRACT_AND_RUN=1 /tmp/vomd.AppImage
+    echo "   first frame on X11 and Wayland, screenshot $work/shots/$tag-appimage.png"
+    apt_install "$c" desktop-file-utils
+    dx "$c" desktop-file-validate /tmp/squashfs-root/vomd.desktop
+    docker rm -f "$c" >/dev/null
+done
+echo "== all packages pass"

@@ -3,6 +3,17 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- A Debian package (`vomd_<version>-1_amd64.deb`, Debian 12+ and Ubuntu 24.04+) with a man
+  page, and an AppImage for any x86-64 distribution with glibc 2.36 or newer, both attached to
+  each release and checked by CI on Debian 12, Debian 13 and Ubuntu 24.04, on X11 and Wayland.
+
+### Fixed
+- Release binaries are built on Debian 12 (glibc 2.36), so a glibc older than 2.39 no longer
+  prints "weak version `GLIBC_2.39' not found" at every start.
+
 ## [1.0.0] - 2026-10-19
 
 The first release, for Linux (x86-64; Windows and macOS compile but are unsupported).
@@ -44,4 +55,5 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/allenguarnes/vomd/releases/tag/v1.0.0

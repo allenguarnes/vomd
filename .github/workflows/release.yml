@@ -1,6 +1,7 @@
-# A `v*` tag builds the Linux x86_64 release (baseline x86-64, no target-cpu),
-# checks the budgets, and attaches the tarball, its checksum and the budget report to the
-# GitHub release, whose notes are the version's CHANGELOG section.
+# A `v*` tag builds the Linux x86_64 release (baseline x86-64, no target-cpu, in a Debian 12
+# container), checks the budgets and the .deb and AppImage on Debian and Ubuntu, and attaches
+# the tarball, .deb and AppImage, their checksums and the budget report to the GitHub release,
+# whose notes are the version's CHANGELOG section.
 name: Release
 
 on:
@@ -38,18 +39,25 @@ jobs:
         run: |
           xvfb-run -a -s "-screen 0 3840x2160x24" \
             cargo xtask budgets --timings-advisory --report budgets.md
-      - name: Tarball (fails if it would need glibc newer than 2.36)
-        run: cargo xtask dist --release
+      - name: Tarball, .deb and AppImage, built in Debian 12 (fails on glibc newer than 2.36)
+        run: scripts/pkg-build.sh
+      - name: The .deb and AppImage on Debian 12, Debian 13 and Ubuntu 24.04
+        run: scripts/pkg-check.sh
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The notes are this version's CHANGELOG section.
+          # The notes are this version's CHANGELOG section, its wrapped lines joined (GitHub
+          # shows every line break in release notes).
           version="${GITHUB_REF_NAME#v}"
           awk -v head="## [$version]" '
             index($0, head) == 1 { on = 1; next }
             on && (/^## / || /^\[[^]]+\]: /) { exit }
-            on { print }
+            !on { next }
+            /^$/ || /^#/ { if (buf != "") print buf; buf = ""; print; next }
+            /^- / { if (buf != "") print buf; buf = $0; next }
+            { sub(/^ +/, ""); buf = buf == "" ? $0 : buf " " $0 }
+            END { if (buf != "") print buf }
           ' CHANGELOG.md > changes.md
           test -s changes.md
           {
@@ -65,4 +73,5 @@ jobs:
             echo "</details>"
           } > notes.md
           gh release create "$GITHUB_REF_NAME" --title "VOMD $GITHUB_REF_NAME" \
-            --notes-file notes.md dist/*.tar.gz dist/*.sha256 budgets.md
+            --notes-file notes.md dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.sha256 \
+            budgets.md

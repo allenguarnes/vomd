@@ -8,6 +8,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
+mod pkg;
+
 // Budgets (Linux x86_64): (default build, --no-default-features).
 const SIZE_BUDGET: [u64; 2] = [4_000_000, 3_000_000];
 const COLD_BUDGET_MS: f64 = 100.0;
@@ -682,9 +684,10 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
     ok
 }
 
-/// The release tarball: `dist/vomd-<version>-x86_64-linux.tar.gz` holding the
-/// binary, the desktop entry, the icon, README, CHANGELOG and the licenses (ours and those of
-/// the embedded fonts).
+/// The release files, each with a `.sha256`: the tarball `dist/vomd-<version>-x86_64-linux.tar.gz`
+/// holding the binary, the desktop entry, the icon, the man page, README, CHANGELOG and the
+/// licenses (ours and those of the embedded fonts), and the Debian package and AppImage made from the same files
+/// (`pkg`).
 fn dist(release: bool) -> bool {
     if !baseline_cpu() {
         return false;
@@ -697,7 +700,7 @@ fn dist(release: bool) -> bool {
         Some((a, b)) => {
             eprintln!(
                 "{}: the binary needs glibc {a}.{b}, newer than the {}.{} promised: build \
-                 releases on an older distribution (CI uses Ubuntu 24.04)",
+                 releases in a Debian 12 container (scripts/pkg-build.sh, as CI does)",
                 if release { "error" } else { "warning" },
                 GLIBC_FLOOR.0,
                 GLIBC_FLOOR.1
@@ -728,9 +731,10 @@ fn dist(release: bool) -> bool {
     let stage = dist.join(&name);
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage).expect("create dist/");
-    let files: [(&Path, &str); 10] = [
+    let files: [(&Path, &str); 11] = [
         (&bin, "vomd"),
         (Path::new("packaging/vomd.desktop"), "vomd.desktop"),
+        (Path::new("packaging/vomd.1"), "vomd.1"),
         (Path::new("assets/icon.svg"), "vomd.svg"),
         (Path::new("README.md"), "README.md"),
         // The README's image, at the path it names.
@@ -764,26 +768,26 @@ fn dist(release: bool) -> bool {
         .arg(&name)
         .status()
         .is_ok_and(|s| s.success());
-    let _ = fs::remove_dir_all(&stage);
     if !ok {
+        let _ = fs::remove_dir_all(&stage);
         eprintln!("tar failed");
         return false;
     }
-    let sum = Command::new("sha256sum")
-        .current_dir(&dist)
-        .arg(tarball.file_name().unwrap())
-        .output()
-        .expect("sha256sum");
-    fs::write(dist.join(format!("{name}.tar.gz.sha256")), &sum.stdout).expect("write sum");
-    print!("{}", String::from_utf8_lossy(&sum.stdout));
     println!("wrote {}", tarball.display());
-    true
+    let ok = pkg::write_sum(&tarball)
+        && pkg::deb(&stage, ours, &dist)
+        && pkg::appimage(&stage, ours, &dist);
+    let _ = fs::remove_dir_all(&stage);
+    ok
 }
 
 /// The oldest glibc release binaries support: RELR relocations need 2.36.
 const GLIBC_FLOOR: (u32, u32) = (2, 36);
 
-/// The newest `GLIBC_x.y` version a strong undefined symbol of `bin` needs (`objdump -T`).
+/// The newest `GLIBC_x.y` version an undefined symbol of `bin` names (`objdump -T`). Weak ones
+/// count too: the binary runs without them, but an older glibc's loader prints "weak version
+/// `GLIBC_x.y' not found" at every start (Rust's std links `pidfd_spawnp` weakly when the build
+/// machine's glibc has it).
 fn glibc_floor(bin: &Path) -> Option<(u32, u32)> {
     let out = Command::new("objdump").arg("-T").arg(bin).output().ok()?;
     if !out.status.success() {
@@ -792,8 +796,6 @@ fn glibc_floor(bin: &Path) -> Option<(u32, u32)> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut newest = (2, 0);
     for line in text.lines().filter(|l| l.contains("*UND*")) {
-        // `0000… w   DF *UND*  0000… (GLIBC_2.39) name`: the flags come before `DF`.
-        let weak = line.split_whitespace().nth(1) == Some("w");
         let Some(v) = line.split("GLIBC_").nth(1) else {
             continue;
         };
@@ -803,9 +805,7 @@ fn glibc_floor(bin: &Path) -> Option<(u32, u32)> {
             .collect();
         let mut parts = v.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
         let version = (parts.next()?, parts.next().unwrap_or(0));
-        if !weak {
-            newest = newest.max(version);
-        }
+        newest = newest.max(version);
     }
     Some(newest)
 }
