@@ -5,15 +5,18 @@
 # For each image: the .deb is installed with apt, which brings only what it depends on; VOMD
 # then has to show its first frame on an X server (Xvfb) and on a Wayland compositor (weston,
 # headless) that run in containers of their own, so their libraries can't stand in for a
-# missing dependency; a screenshot must show a page; lintian must find no errors; removal must
-# leave nothing. The AppImage is run in another clean container with only the display
-# libraries, through --appimage-extract-and-run (containers have no FUSE).
+# missing dependency; a screenshot must show a page, not just VOMD's background; lintian must
+# find no errors; removal must leave nothing. The AppImage is run in another clean container
+# with only the display libraries, through --appimage-extract-and-run (containers have no FUSE).
 # Screenshots land in the printed work dir. VOMD_PKG_IMAGES overrides the images.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 images=${VOMD_PKG_IMAGES:-"debian:12 debian:13 ubuntu:24.04"}
-deb=$(ls "$root"/dist/vomd_*_amd64.deb)
-appimage=$(ls "$root"/dist/vomd-*-x86_64.AppImage)
+ver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
+deb=$(ls "$root"/dist/vomd_"$ver"-*_amd64.deb 2>/dev/null | tail -1 || true)
+appimage="$root/dist/vomd-$ver-x86_64.AppImage"
+[ -f "$deb" ] || { echo "FAIL: no dist/vomd_$ver-*_amd64.deb: run cargo xtask dist"; exit 1; }
+[ -f "$appimage" ] || { echo "FAIL: no $appimage: run cargo xtask dist"; exit 1; }
 # The libraries the .deb depends on, which the AppImage needs from the system as well.
 libs=$(dpkg-deb -f "$deb" Depends 2>/dev/null || ar p "$deb" control.tar.xz | tar xJO ./control |
     sed -n 's/^Depends: //p')
@@ -59,7 +62,7 @@ fail() {
 # The display servers.
 echo "== display servers"
 server=$(start debian:13)
-apt_install "$server" xvfb weston imagemagick
+apt_install "$server" xvfb weston imagemagick x11-utils
 dx -d "$server" Xvfb :99 -screen 0 1280x900x24 -nolisten tcp -ac
 dx -d "$server" weston --backend=headless --renderer=pixman --socket=wayland-vomd --width=1280 \
     --height=900 --idle-time=0
@@ -85,7 +88,10 @@ first_frames() { # container, command...
     grep -q 'vomd-bench first_frame_ms' <<<"$out" || fail "no first frame on Wayland: $out"
 }
 
-# A screenshot of the X server while VOMD shows golden.md: the page must not be blank.
+# A screenshot of the X server while VOMD shows golden.md: the page must not be blank. Only the
+# window's page area counts (its geometry comes from the X server, below the toolbar strip): the
+# window against the black root would pass any threshold on its own.
+toolbar=32
 screenshot() { # container, name, command...
     local c=$1 name=$2
     shift 2
@@ -93,9 +99,15 @@ screenshot() { # container, name, command...
     sleep 4
     dx "$server" import -window root "/tmp/$name.png"
     docker cp -q "$server:/tmp/$name.png" "$work/shots/$name.png"
-    local spread
-    spread=$(dx "$server" convert "/tmp/$name.png" -format '%[fx:standard_deviation]' info:)
-    awk -v s="$spread" 'BEGIN { exit !(s > 0.02) }' || fail "$name: blank screenshot ($spread)"
+    local geo w h x y spread
+    # The root's one child, `0x… "golden.md": ("vomd" "vomd")  900x810+0+0  +0+0`.
+    geo=$(dx "$server" xwininfo -root -tree | grep -oE ' [0-9]+x[0-9]+\+[0-9]+\+[0-9]+ ' | head -1) || true
+    [ -n "$geo" ] || fail "$name: no VOMD window on the X server"
+    IFS='x+ ' read -r w h x y <<<"$geo"
+    [ "$h" -gt "$toolbar" ] || fail "$name: window too small ($geo)"
+    spread=$(dx "$server" convert "/tmp/$name.png" -crop "${w}x$((h - toolbar))+$x+$((y + toolbar))" \
+        +repage -format '%[fx:standard_deviation]' info:)
+    awk -v s="$spread" 'BEGIN { exit !(s > 0.05) }' || fail "$name: blank page ($spread)"
     sleep 4
 }
 
@@ -114,8 +126,13 @@ for image in $images; do
     lint=$(dx "$c" lintian --tag-display-limit 0 --suppress-tags initial-upload-closes-no-bugs /pkg/vomd.deb 2>&1) || true
     [ -n "$lint" ] && echo "$lint" | sed 's/^/   /'
     grep -q '^E:' <<<"$lint" && fail "lintian errors"
+    files=$(dx "$c" sh -c 'dpkg -L vomd | while read -r f; do if [ -f "$f" ] || [ -L "$f" ]; then echo "$f"; fi; done')
+    [ -n "$files" ] || fail "dpkg -L vomd lists no files"
     dx "$c" apt-get remove -y -qq vomd >/dev/null
-    dx "$c" sh -c '! dpkg -L vomd 2>/dev/null && test ! -e /usr/bin/vomd' || fail "left after removal"
+    dx "$c" dpkg -s vomd 2>/dev/null | grep -q '^Status: install ok installed' && fail "still installed"
+    # shellcheck disable=SC2086
+    left=$(dx "$c" sh -c 'for f; do if [ -e "$f" ] || [ -L "$f" ]; then echo "$f"; fi; done' sh $files)
+    [ -z "$left" ] || fail "left after removal: $left"
     docker rm -f "$c" >/dev/null
 
     echo "== $image: AppImage"
