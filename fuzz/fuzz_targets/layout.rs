@@ -20,10 +20,31 @@ thread_local! {
     static CACHE: RefCell<GlyphCache> = RefCell::new(GlyphCache::default());
 }
 
+fn paint(layout: &Layout, fonts: &Fonts, scroll: f32, scale: f32) {
+    let mut px = vec![0u32; W * H];
+    let mut frame = Frame::new(&mut px, W, H, W);
+    let area = Clip {
+        x0: 0,
+        y0: 0,
+        x1: W as i32,
+        y1: H as i32,
+    };
+    let vp = Viewport {
+        area,
+        scroll: f64::from(scroll),
+    };
+    CACHE.with(|cache| {
+        let cache = &mut cache.borrow_mut();
+        render::paint(&mut frame, vp, layout, fonts, cache, &LIGHT);
+    });
+    render::paint_scrollbar(&mut frame, vp, layout.total_height(), scale, &LIGHT);
+}
+
 fuzz_target!(|data: &[u8]| {
-    // The first two bytes pick the width (narrow ones wrap everything, wide ones pass the
-    // line width's cap), the scale and the wide layout.
-    let Some((&[b0, b1], rest)) = data.split_first_chunk() else {
+    // The first three bytes pick the width (narrow ones wrap everything, wide ones pass the
+    // line width's cap), the scale and the wide layout, and a second width and wide layout
+    // the document is laid out in again once only its first screen is measured.
+    let Some((&[b0, b1, b2], rest)) = data.split_first_chunk() else {
         return;
     };
     let b = u16::from_le_bytes([b0, b1]);
@@ -35,26 +56,18 @@ fuzz_target!(|data: &[u8]| {
         wide: b & 2 != 0,
         ..Params::default()
     };
+    let again = Params {
+        width: 8.0 + f32::from(b2 >> 1) * 24.0,
+        wide: b2 & 1 != 0,
+        ..params
+    };
     FONTS.with(|fonts| {
         let mut layout = Layout::new(&doc, params);
+        let scroll = layout.ensure(&doc, fonts, layout.anchor_at(0.0), H as f32);
+        paint(&layout, fonts, scroll, params.scale);
+        layout.set_params(again);
         while !layout.idle(&doc, fonts, Instant::now() + Duration::from_secs(1)) {}
         let scroll = layout.ensure(&doc, fonts, layout.anchor_at(0.0), H as f32);
-        let mut px = vec![0u32; W * H];
-        let mut frame = Frame::new(&mut px, W, H, W);
-        let area = Clip {
-            x0: 0,
-            y0: 0,
-            x1: W as i32,
-            y1: H as i32,
-        };
-        let vp = Viewport {
-            area,
-            scroll: f64::from(scroll),
-        };
-        CACHE.with(|cache| {
-            let cache = &mut cache.borrow_mut();
-            render::paint(&mut frame, vp, &layout, fonts, cache, &LIGHT);
-        });
-        render::paint_scrollbar(&mut frame, vp, layout.total_height(), params.scale, &LIGHT);
+        paint(&layout, fonts, scroll, params.scale);
     });
 });

@@ -218,7 +218,7 @@ fn set_params_remeasures() {
         n.ensure(&doc, &fonts, Anchor::TOP, 800.0);
         n.total_height()
     };
-    l.set_params(&doc, params(500.0, 1.0));
+    l.set_params(params(500.0, 1.0));
     assert!(!l.complete());
     while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
     assert!((l.total_height() - narrow_total).abs() < 1e-2);
@@ -612,19 +612,19 @@ fn a_family_switch_after_a_param_change_leaves_no_stale_characters() {
     );
     let mut l = Layout::new(&doc, params(900.0, 1.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
-    l.set_params(&doc, params(900.0, 1.5));
+    l.set_params(params(900.0, 1.5));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     // Queued again by the remeasure with the defaults, not taken yet.
     assert!(fonts.set_family(false, Some(&jb_faces())));
     l.invalidate_all();
-    l.set_params(&doc, params(900.0, 2.0));
+    l.set_params(params(900.0, 2.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     assert_eq!(l.take_missing(), vec!['\u{E000}']);
     // Without a family change a relayout queues what is uncovered again, not what was before.
     let mut fonts = Fonts::new().unwrap();
     let mut l = Layout::new(&doc, params(900.0, 1.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
-    l.set_params(&doc, params(900.0, 1.5));
+    l.set_params(params(900.0, 1.5));
     l.ensure(&doc, &fonts, Anchor::TOP, 800.0);
     let mut both = l.take_missing();
     both.sort_unstable();
@@ -1840,7 +1840,7 @@ fn images_are_boxes_of_their_size() {
     assert!(t.width >= 1.0 && t.width <= 3.0, "keeps its shape: {t:?}");
 
     // Twice the scale (HiDPI or zoom): twice the pixels.
-    l.set_params(&doc, params(900.0, 2.0));
+    l.set_params(params(900.0, 2.0));
     l.ensure(&doc, &fonts, Anchor::TOP, 4000.0);
     assert_eq!(boxes(&l, 0)[0].b.width, 200.0);
     assert_eq!(boxes(&l, 0)[0].b.ascent, 100.0);
@@ -1990,7 +1990,7 @@ fn a_wider_column_rescales_the_estimates() {
     let was = l.total_height();
     let wide_total = complete(&doc, &fonts, wide).total_height();
     assert!(was > wide_total * 2.5, "{was} vs {wide_total}");
-    l.set_params(&doc, wide);
+    l.set_params(wide);
     assert!(!l.complete());
     let estimate = l.total_height();
     assert!(
@@ -1999,13 +1999,51 @@ fn a_wider_column_rescales_the_estimates() {
     );
     // The same for a window that gets wider.
     let mut l = complete(&doc, &fonts, params(900.0, 1.0));
-    l.set_params(&doc, normal);
+    l.set_params(normal);
     let narrow_estimate = l.total_height();
     let exact = complete(&doc, &fonts, normal).total_height();
     assert!(
         (narrow_estimate / exact - 1.0).abs() < 0.25,
         "{narrow_estimate} vs {exact}"
     );
+}
+
+/// Blocks never measured keep exactly the estimate of the column they are in, however the
+/// column changed on the way: the estimates read what the prepass stored, not the document.
+#[test]
+fn unmeasured_blocks_follow_the_estimate_through_column_changes() {
+    let doc = Doc::parse(&format!(
+        "{}\n\n{}",
+        fixture("golden.md"),
+        fixture("tables.md")
+    ));
+    let start = Params {
+        page_pad: 0.5,
+        ..params(1400.0, 1.0)
+    };
+    let mut l = Layout::new(&doc, start);
+    for p in [
+        Params {
+            width: 500.0,
+            ..start
+        },
+        Params {
+            wide: true,
+            width: 2600.0,
+            ..start
+        },
+        Params {
+            width: 90.0,
+            ..start
+        },
+        start,
+    ] {
+        l.set_params(p);
+        let fresh = Layout::new(&doc, p);
+        for i in 0..=doc.blocks.len() {
+            assert_eq!(l.y(i), fresh.y(i), "block {i} at {}", p.width);
+        }
+    }
 }
 
 /// The wide layout in a window narrower than the cap changes nothing: the document isn't
@@ -2021,17 +2059,14 @@ fn wide_in_a_narrow_window_keeps_the_measured_blocks() {
         wide: true,
         ..normal
     };
-    l.set_params(&doc, wide);
+    l.set_params(wide);
     assert_eq!(l.params(), wide);
     assert!(l.complete(), "nothing was invalidated");
     assert_eq!(l.total_height(), total);
     // Where it does change the column, it measures again.
-    l.set_params(
-        &doc,
-        Params {
-            width: 3000.0,
-            ..wide
-        },
-    );
+    l.set_params(Params {
+        width: 3000.0,
+        ..wide
+    });
     assert!(!l.complete());
 }

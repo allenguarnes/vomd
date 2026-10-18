@@ -205,6 +205,15 @@ pub struct BlockGeom {
     pub missing: bool,
 }
 
+impl BlockGeom {
+    /// The height stays as the estimate; the laid-out content and what it found are void.
+    fn unmeasure(&mut self) {
+        self.measured = false;
+        self.content = None;
+        self.missing = false;
+    }
+}
+
 /// Precomputed per-block context that depends on neighbors.
 #[derive(Clone, Copy, Debug, Default)]
 struct Meta {
@@ -215,6 +224,42 @@ struct Meta {
     first_row: bool,
     /// Part of the footnote section at the end of the document.
     footnote: bool,
+    /// What the height estimate reads, found once so a change of the column's width costs
+    /// no pass over the text or the blocks: the kind of estimate, the bytes of text, the lines
+    /// of a code block (a chunk ending in a newline has no empty line after it), the spacing
+    /// above in em (the page padding above the first block is added by the estimate), the
+    /// rows of padding of a code block or table row, and the content's left edge in em.
+    shape: Est,
+    pads: u8,
+    chars: u32,
+    code_lines: u32,
+    gap: f32,
+    indent: f32,
+    /// The estimate of the height under the layout's current geometry, so a change of it
+    /// scales a height by the estimate's change without computing the old one again. A block
+    /// not measured since yet has exactly this height.
+    est: f32,
+}
+
+/// How a block's height is estimated.
+#[derive(Clone, Copy, Debug, Default)]
+enum Est {
+    #[default]
+    Text,
+    Heading(u8),
+    Code,
+    Rule,
+    Row,
+}
+
+/// What the height estimate depends on besides the document: the layout's `em`, the column's
+/// width and the page padding, passed explicitly so the estimates before and after a change
+/// of them are both computed from their own values.
+#[derive(Clone, Copy, Debug)]
+struct Basis {
+    em: f32,
+    col_w: f32,
+    page_pad: f32,
 }
 
 /// A position in the document that survives relayout: a block and a fraction of its height.
@@ -308,8 +353,9 @@ impl Layout {
         };
         layout.meta = layout.prepass(doc);
         layout.set_geometry();
-        for i in 0..doc.blocks.len() {
-            layout.geoms[i].h = layout.estimate(doc, i);
+        layout.estimate_all();
+        for (g, m) in layout.geoms.iter_mut().zip(&layout.meta) {
+            g.h = m.est;
         }
         layout.rebuild_heights();
         layout
@@ -369,7 +415,7 @@ impl Layout {
     /// document seeming that much longer until it is measured. Nothing happens, beyond
     /// recording `params`, when the column and everything else laid out stay the same (the
     /// wide layout in a window narrower than the cap).
-    pub fn set_params(&mut self, doc: &Doc, params: Params) {
+    pub fn set_params(&mut self, params: Params) {
         let old_params = std::mem::replace(&mut self.params, params);
         if params == old_params {
             return;
@@ -389,24 +435,25 @@ impl Layout {
             // The text wraps as before: only the font size scales the heights.
             let ratio = if old.0 > 0.0 { new.0 / old.0 } else { 1.0 };
             self.remeasure(ratio);
+            self.estimate_all();
             return;
         }
-        // Estimates are cheap (no shaping), but still one pass over the text each.
-        (self.em, self.col_x, self.col_w) = old;
-        let before: Vec<f32> = (0..self.geoms.len())
-            .map(|i| self.estimate(doc, i))
-            .collect();
-        (self.em, self.col_x, self.col_w) = new;
-        for (i, before) in before.into_iter().enumerate() {
-            let after = self.estimate(doc, i);
-            let g = &mut self.geoms[i];
-            g.h = if before > 0.0 && g.h > 0.0 {
-                g.h * after / before
+        let basis = self.basis();
+        let n = self.meta.len();
+        for (i, (g, m)) in self.geoms.iter_mut().zip(&mut self.meta).enumerate() {
+            let est = Self::estimate_at(*m, i, n, basis);
+            g.h = if g.h == m.est {
+                // Never measured: the estimate itself.
+                est
+            } else if m.est > 0.0 && g.h > 0.0 {
+                g.h * est / m.est
             } else {
-                after
+                est
             };
+            m.est = est;
+            g.unmeasure();
         }
-        self.remeasure(1.0);
+        self.reset_measuring();
     }
 
     /// The faces text is set in changed (`font_sans` / `font_mono`): everything is remeasured.
@@ -421,10 +468,13 @@ impl Layout {
     fn remeasure(&mut self, ratio: f32) {
         for g in &mut self.geoms {
             g.h *= ratio;
-            g.measured = false;
-            g.content = None;
-            g.missing = false;
+            g.unmeasure();
         }
+        self.reset_measuring();
+    }
+
+    /// Start measuring again from the top, every block having been [`BlockGeom::unmeasure`]d.
+    fn reset_measuring(&mut self) {
         self.missing.clear();
         self.live.clear();
         self.table_cols.iter_mut().for_each(|c| *c = None);
@@ -632,6 +682,31 @@ impl Layout {
                 meta[i].first_row = r.start == i as u32;
             }
             meta[i].footnote = footnotes.is_some_and(|f| i >= f);
+            let spans = doc.block_spans(b);
+            let m = &mut meta[i];
+            m.chars = text_bytes(doc, b).try_into().unwrap_or(u32::MAX);
+            m.gap = if i == 0 { 0.0 } else { Self::gap_em(doc, i) };
+            m.pads = !b.joined as u8 + !joined_next(doc, i) as u8;
+            m.indent = nesting_x(doc, b, b.quote, b.list) + Self::footnote_x(b, *m);
+            m.shape = match b.kind {
+                BlockKind::Paragraph | BlockKind::AlertTitle(_) => Est::Text,
+                BlockKind::Heading(level) => Est::Heading(level.clamp(1, 6)),
+                BlockKind::Code => {
+                    let newlines: usize = spans
+                        .iter()
+                        .map(|s| doc.span_text(s).matches('\n').count())
+                        .sum();
+                    let ends_line = spans
+                        .last()
+                        .is_some_and(|s| doc.span_text(s).ends_with('\n'));
+                    m.code_lines = (newlines + !ends_line as usize)
+                        .try_into()
+                        .unwrap_or(u32::MAX);
+                    Est::Code
+                }
+                BlockKind::Rule => Est::Rule,
+                BlockKind::TableRow { .. } => Est::Row,
+            };
         }
         meta
     }
@@ -1053,6 +1128,11 @@ impl Layout {
         if i == 0 {
             return self.params.page_pad;
         }
+        Self::gap_em(doc, i)
+    }
+
+    /// Spacing above block `i`, which is not the first, in em.
+    fn gap_em(doc: &Doc, i: usize) -> f32 {
         if doc.blocks[i].joined {
             return 0.0;
         }
@@ -1535,42 +1615,51 @@ impl Layout {
         }
     }
 
-    /// Height estimate for an unmeasured block.
-    fn estimate(&self, doc: &Doc, i: usize) -> f32 {
-        let block = &doc.blocks[i];
-        let em = self.em;
-        let gap = self.gap_before(doc, i) * em;
-        let avail = (self.col_w - self.indent(doc, block, self.meta[i])).max(em);
-        let chars = text_bytes(doc, block);
-        let lines = |size: f32| ((chars as f32 * CHAR_EM * size) / avail).ceil().max(1.0);
-        gap + self.page_end(doc, i)
-            + match block.kind {
-                BlockKind::Paragraph | BlockKind::AlertTitle(_) => lines(em) * BODY_LH * em,
-                BlockKind::Heading(level) => {
-                    let size = HEADING_SIZES[(level.clamp(1, 6) - 1) as usize] * em;
+    /// What the height estimates depend on now.
+    fn basis(&self) -> Basis {
+        Basis {
+            em: self.em,
+            col_w: self.col_w,
+            page_pad: self.params.page_pad,
+        }
+    }
+
+    /// Estimate every block's height under the current geometry.
+    fn estimate_all(&mut self) {
+        let (basis, n) = (self.basis(), self.meta.len());
+        for (i, m) in self.meta.iter_mut().enumerate() {
+            m.est = Self::estimate_at(*m, i, n, basis);
+        }
+    }
+
+    /// Height estimate for an unmeasured block `i` of `n`, whose `meta` the prepass filled,
+    /// for any `basis`; reads nothing else.
+    #[inline(always)]
+    fn estimate_at(meta: Meta, i: usize, n: usize, basis: Basis) -> f32 {
+        let em = basis.em;
+        let pad = basis.page_pad * em;
+        let edges = if i == 0 { pad } else { 0.0 } + if i + 1 == n { pad } else { 0.0 };
+        let avail = (basis.col_w - meta.indent * em).max(em);
+        let lines = |size: f32| {
+            ((meta.chars as f32 * CHAR_EM * size) / avail)
+                .ceil()
+                .max(1.0)
+        };
+        meta.gap * em
+            + edges
+            + match meta.shape {
+                Est::Text => lines(em) * BODY_LH * em,
+                Est::Heading(level) => {
+                    let size = HEADING_SIZES[(level - 1) as usize] * em;
                     lines(size) * HEADING_LH * size
                 }
-                BlockKind::Code => {
-                    // A chunk ending in a newline has no empty line after it.
-                    let spans = doc.block_spans(block);
-                    let newlines: usize = spans
-                        .iter()
-                        .map(|s| doc.span_text(s).matches('\n').count())
-                        .sum();
-                    let ends_line = spans
-                        .last()
-                        .is_some_and(|s| doc.span_text(s).ends_with('\n'));
-                    let text_lines = newlines + !ends_line as usize;
-                    let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
-                    (text_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em
-                        + pads as f32 * em
+                Est::Code => {
+                    (meta.code_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em
+                        + meta.pads as f32 * em
                 }
-                BlockKind::Rule => 0.25 * em,
+                Est::Rule => 0.25 * em,
                 // The cells share the width: a row is about as tall as its text set on one line.
-                BlockKind::TableRow { .. } => {
-                    let pads = !block.joined as u8 + !joined_next(doc, i) as u8;
-                    lines(em) * BODY_LH * em + pads as f32 * CELL_PAD_Y * em
-                }
+                Est::Row => lines(em) * BODY_LH * em + meta.pads as f32 * CELL_PAD_Y * em,
             }
     }
 }

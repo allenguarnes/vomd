@@ -699,10 +699,9 @@ impl View {
     /// estimates in the new column, nothing rewrapped), so a window that got narrower and taller
     /// would seem to end above the position, and clamping against that would throw it away.
     fn relayout(&mut self) {
-        self.layout.set_params(
-            &self.doc,
-            params(self.width, self.hidpi, self.zoom, self.text, self.wide),
-        );
+        self.layout.set_params(params(
+            self.width, self.hidpi, self.zoom, self.text, self.wide,
+        ));
         self.ensure();
     }
 
