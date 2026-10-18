@@ -24,34 +24,39 @@ Raw HTML is never run. Tags are stripped and their text kept, and a few tags (`<
 
 ## Install
 
-**Arch Linux:** the packages aren't on the AUR yet; build them from a clone with `makepkg`.
-`packaging/aur/vomd` builds from source and `packaging/aur/vomd-bin` is the release binary:
+**Arch Linux:** the packages aren't on the AUR yet, so build one from a clone with `makepkg`:
 
 ```sh
-git clone https://github.com/allenguarnes/vomd && cd vomd/packaging/aur/vomd-bin  # or …/vomd
+git clone https://github.com/allenguarnes/vomd
+cd vomd/packaging/aur/vomd-bin
 makepkg -si
 ```
 
-`vomd` honors `makepkg.conf`: its `RUSTFLAGS` (CachyOS sets `-C opt-level=3 -C target-cpu=native`)
-replace the size-tuned `opt-level`, so that binary can be larger (about 4.9 MB) and faster than the
-release one, and runs only on the CPU it was built on. `vomd-bin` is the small, portable build.
+`vomd-bin` installs the release binary, which is small and runs on any x86-64 CPU. To build from
+source instead, use `packaging/aur/vomd`. It follows your `makepkg.conf`, so with CachyOS's
+`RUSTFLAGS` (`-C opt-level=3 -C target-cpu=native`) the binary is larger (about 4.9 MB) and
+faster, and runs only on the CPU it was built on.
 
 **Release tarball:** each [release](https://github.com/allenguarnes/vomd/releases) has
 `vomd-<version>-x86_64-linux.tar.gz` (glibc 2.36 or newer, any x86-64 CPU):
 
 ```sh
-tar xf vomd-*-x86_64-linux.tar.gz && cd vomd-*-x86_64-linux
+tar xf vomd-*-x86_64-linux.tar.gz
+cd vomd-*-x86_64-linux
 install -Dm755 vomd ~/.local/bin/vomd
 install -Dm644 vomd.desktop ~/.local/share/applications/vomd.desktop
 install -Dm644 vomd.svg ~/.local/share/icons/hicolor/scalable/apps/vomd.svg
-xdg-mime default vomd.desktop text/markdown     # make it the default for .md files
+# Make it the default for .md files:
+xdg-mime default vomd.desktop text/markdown
 ```
 
 **From source:** you need a stable Rust toolchain.
 
 ```sh
-cargo build --release          # target/release/vomd
-cargo build --release --no-default-features   # smallest: no images, system fonts
+# Builds target/release/vomd:
+cargo build --release
+# The smallest build, with no images and system fonts only:
+cargo build --release --no-default-features
 ```
 
 The Cargo features are `images` (PNG/JPEG), `remote-images` (via the system `curl`) and
