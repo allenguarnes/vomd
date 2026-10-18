@@ -593,7 +593,16 @@ fn arabic_keeps_joining_across_style_boundaries() {
         fonts.add_fallback(&f.path, f.index);
     }
     let mut ctx = TextCtx::default();
-    let plain = ctx.shape(&fonts, &para(word));
+    // The fallback the system picks, then every Arabic face on its own: some draw lam + alef
+    // as one ligature cluster (DejaVu), others as two.
+    arabic_joining(&mut ctx, &fonts, word);
+    for fonts in arabic_fonts() {
+        arabic_joining(&mut ctx, &fonts, word);
+    }
+}
+
+fn arabic_joining(ctx: &mut TextCtx, fonts: &Fonts, word: &str) {
+    let plain = ctx.shape(fonts, &para(word));
     // Needs an installed face that draws all of it.
     if !plain.missing.is_empty() || plain.glyphs.iter().any(|g| g.id == 0) {
         return;
@@ -610,7 +619,7 @@ fn arabic_keeps_joining_across_style_boundaries() {
             (&word[..split], &nolink as &dyn Fn(&mut TextStyle)),
             (&word[split..], &link),
         ]);
-        let shaped = ctx.shape(&fonts, &p);
+        let shaped = ctx.shape(fonts, &p);
         assert_eq!(ids(&shaped), ids(&plain), "split at {split}");
         assert_eq!(shaped.runs, 1, "split at {split}");
         // Each cluster has the style of the item it starts in: the link covers the tail only.
@@ -626,12 +635,15 @@ fn arabic_keeps_joining_across_style_boundaries() {
         (&word[2..6], &colored),
         (&word[6..], &nolink),
     ]);
-    assert_eq!(ids(&ctx.shape(&fonts, &p)), ids(&plain));
-    // The hit map still resolves each cluster to the right document offset.
-    let l = ctx.layout(&fonts, &p, 1000.0, Align::Start, 1.5);
+    assert_eq!(ids(&ctx.shape(fonts, &p)), ids(&plain));
+    // The hit map still resolves each cluster to the right document offset: where the plain
+    // word's clusters start, so [0, 2, 6] in a face that ligates lam + alef.
+    let l = ctx.layout(fonts, &p, 1000.0, Align::Start, 1.5);
     let mut docs = visual_docs(&l, 0);
     docs.sort_unstable();
-    assert_eq!(docs, [0, 2, 4, 6]);
+    let mut starts: Vec<u32> = plain.clusters.iter().map(|c| c.start).collect();
+    starts.sort_unstable();
+    assert_eq!(docs, starts);
 }
 
 /// One `Fonts` per installed Arabic-capable file (DejaVu, Noto Naskh/Sans Arabic, ...), each
