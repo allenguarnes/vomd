@@ -24,10 +24,12 @@ Raw HTML is never run. Tags are stripped and their text kept, and a few tags (`<
 
 ## Install
 
-**Arch Linux (AUR):** `vomd` builds from source and `vomd-bin` is the release binary:
+**Arch Linux:** the packages aren't on the AUR yet; build them from a clone with `makepkg`.
+`packaging/aur/vomd` builds from source and `packaging/aur/vomd-bin` is the release binary:
 
 ```sh
-paru -S vomd        # or: yay -S vomd-bin
+git clone https://github.com/allenguarnes/vomd && cd vomd/packaging/aur/vomd-bin  # or …/vomd
+makepkg -si
 ```
 
 `vomd` honors `makepkg.conf`: its `RUSTFLAGS` (CachyOS sets `-C opt-level=3 -C target-cpu=native`)

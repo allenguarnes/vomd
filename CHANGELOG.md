@@ -22,8 +22,8 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
 - Local PNG and JPEG images, decoded lazily at their displayed size under a 32 MB cache.
 - Remote images, off by default: loaded per document with `I`, through the system `curl`.
 - A one-line notice for files over 10 MB, which still render.
-- Packaging: AUR `vomd` and `vomd-bin`, a release tarball with a desktop entry, icon and the
-  README's image.
+- Packaging: Arch PKGBUILDs `vomd` (from source) and `vomd-bin`, and a release tarball with a
+  desktop entry, icon and the README's image.
 - The app icon (an eye over the Markdown mark). The window's Wayland app ID and X11 `WM_CLASS` are
   `vomd`, so the desktop shows it for the window.
 - The system theme comes from the desktop portal's `color-scheme` (Plasma's and GNOME's dark
