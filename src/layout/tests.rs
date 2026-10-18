@@ -2036,6 +2036,22 @@ fn unmeasured_blocks_follow_the_estimate_through_column_changes() {
             width: 90.0,
             ..start
         },
+        // Page padding alone, and the same em from another scale and font size: the column is
+        // the same, the text wraps as before, the estimates still follow.
+        Params {
+            page_pad: 2.0,
+            ..start
+        },
+        Params {
+            scale: 2.0,
+            font_size: 8.0,
+            page_pad: 2.0,
+            ..start
+        },
+        Params {
+            scale: 1.5,
+            ..start
+        },
         start,
     ] {
         l.set_params(p);
@@ -2044,6 +2060,12 @@ fn unmeasured_blocks_follow_the_estimate_through_column_changes() {
             assert_eq!(l.y(i), fresh.y(i), "block {i} at {}", p.width);
         }
     }
+}
+
+/// There is one `Meta` per block: a document of a million blocks pays for each byte.
+#[test]
+fn layout_metadata_stays_small() {
+    assert!(std::mem::size_of::<Meta>() <= 20);
 }
 
 /// The wide layout in a window narrower than the cap changes nothing: the document isn't

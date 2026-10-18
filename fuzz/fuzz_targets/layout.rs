@@ -40,11 +40,15 @@ fn paint(layout: &Layout, fonts: &Fonts, scroll: f32, scale: f32) {
     render::paint_scrollbar(&mut frame, vp, layout.total_height(), scale, &LIGHT);
 }
 
+/// Page padding in em.
+const PADS: [f32; 4] = [0.0, 0.5, 2.0, 4.0];
+
 fuzz_target!(|data: &[u8]| {
-    // The first three bytes pick the width (narrow ones wrap everything, wide ones pass the
-    // line width's cap), the scale and the wide layout, and a second width and wide layout
-    // the document is laid out in again once only its first screen is measured.
-    let Some((&[b0, b1, b2], rest)) = data.split_first_chunk() else {
+    // The first four bytes pick the width (narrow ones wrap everything, wide ones pass the
+    // line width's cap), the scale, the wide layout and the page padding, and the same again
+    // for the second parameters the document is laid out in once only its first screen is
+    // measured.
+    let Some((&[b0, b1, b2, b3], rest)) = data.split_first_chunk() else {
         return;
     };
     let b = u16::from_le_bytes([b0, b1]);
@@ -54,18 +58,27 @@ fuzz_target!(|data: &[u8]| {
         width: 8.0 + f32::from((b >> 2) % 3000),
         scale: if b & 1 == 0 { 1.0 } else { 2.0 },
         wide: b & 2 != 0,
+        page_pad: PADS[usize::from(b3 >> 3) & 3],
         ..Params::default()
     };
     let again = Params {
         width: 8.0 + f32::from(b2 >> 1) * 24.0,
+        scale: if b3 & 1 == 0 { 1.0 } else { 2.0 },
         wide: b2 & 1 != 0,
+        page_pad: PADS[usize::from(b3 >> 1) & 3],
         ..params
     };
     FONTS.with(|fonts| {
         let mut layout = Layout::new(&doc, params);
         let scroll = layout.ensure(&doc, fonts, layout.anchor_at(0.0), H as f32);
         paint(&layout, fonts, scroll, params.scale);
+        let unmeasured: Vec<bool> = layout.geoms().iter().map(|g| !g.measured).collect();
         layout.set_params(again);
+        // A block never measured has the height a fresh layout estimates for it.
+        let fresh = Layout::new(&doc, again);
+        for (i, (g, f)) in layout.geoms().iter().zip(fresh.geoms()).enumerate() {
+            assert!(!unmeasured[i] || g.h == f.h, "block {i}");
+        }
         while !layout.idle(&doc, fonts, Instant::now() + Duration::from_secs(1)) {}
         let scroll = layout.ensure(&doc, fonts, layout.anchor_at(0.0), H as f32);
         paint(&layout, fonts, scroll, params.scale);

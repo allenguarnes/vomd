@@ -214,31 +214,67 @@ impl BlockGeom {
     }
 }
 
-/// Precomputed per-block context that depends on neighbors.
+/// Precomputed per-block context that depends on neighbors, kept small: there is one per block.
 #[derive(Clone, Copy, Debug, Default)]
 struct Meta {
     /// Alert whose quote this block belongs to, and that quote's depth.
     alert: Option<(Alert, u8)>,
-    /// Even data row of a table (striped background); all fragments of a row agree.
-    stripe: bool,
-    first_row: bool,
-    /// Part of the footnote section at the end of the document.
-    footnote: bool,
     /// What the height estimate reads, found once so a change of the column's width costs
     /// no pass over the text or the blocks: the kind of estimate, the bytes of text, the lines
     /// of a code block (a chunk ending in a newline has no empty line after it), the spacing
-    /// above in em (the page padding above the first block is added by the estimate), the
-    /// rows of padding of a code block or table row, and the content's left edge in em.
+    /// above and the content's left edge in quarters of an em (every value is one; the page
+    /// padding above the first block is added by the estimate), and the rows of padding of a
+    /// code block or table row (in `flags`).
     shape: Est,
-    pads: u8,
+    flags: u8,
+    gap: u8,
+    indent: u16,
     chars: u32,
     code_lines: u32,
-    gap: f32,
-    indent: f32,
     /// The estimate of the height under the layout's current geometry, so a change of it
     /// scales a height by the estimate's change without computing the old one again. A block
-    /// not measured since yet has exactly this height.
+    /// never measured has exactly this height.
     est: f32,
+}
+
+impl Meta {
+    /// Even data row of a table (striped background); all fragments of a row agree.
+    const STRIPE: u8 = 1;
+    const FIRST_ROW: u8 = 2;
+    /// Part of the footnote section at the end of the document.
+    const FOOTNOTE: u8 = 4;
+    /// The rows of padding, 0 to 2, in the two bits above.
+    const PADS_SHIFT: u32 = 3;
+
+    fn stripe(self) -> bool {
+        self.flags & Self::STRIPE != 0
+    }
+
+    fn first_row(self) -> bool {
+        self.flags & Self::FIRST_ROW != 0
+    }
+
+    fn footnote(self) -> bool {
+        self.flags & Self::FOOTNOTE != 0
+    }
+
+    fn pads(self) -> u8 {
+        self.flags >> Self::PADS_SHIFT
+    }
+
+    fn set(&mut self, flag: u8, on: bool) {
+        self.flags = self.flags & !flag | if on { flag } else { 0 };
+    }
+}
+
+/// `em` as a count of quarters, which every spacing and indent is (so f32 holds it exactly).
+fn quarters(em: f32) -> u16 {
+    debug_assert_eq!(em * 4.0, (em * 4.0).round());
+    (em * 4.0) as u16
+}
+
+fn from_quarters(q: impl Into<f32>) -> f32 {
+    q.into() * 0.25
 }
 
 /// How a block's height is estimated.
@@ -431,13 +467,13 @@ impl Layout {
             return;
         }
         let new = (self.em, self.col_x, self.col_w);
-        if old.2 == new.2 {
-            // The text wraps as before: only the font size scales the heights.
-            let ratio = if old.0 > 0.0 { new.0 / old.0 } else { 1.0 };
-            self.remeasure(ratio);
-            self.estimate_all();
-            return;
-        }
+        // The text wraps as before when the column is the same: only the font size scales
+        // the heights of measured blocks.
+        let ratio = if old.2 == new.2 && old.0 > 0.0 {
+            new.0 / old.0
+        } else {
+            1.0
+        };
         let basis = self.basis();
         let n = self.meta.len();
         for (i, (g, m)) in self.geoms.iter_mut().zip(&mut self.meta).enumerate() {
@@ -445,6 +481,8 @@ impl Layout {
             g.h = if g.h == m.est {
                 // Never measured: the estimate itself.
                 est
+            } else if old.2 == new.2 {
+                g.h * ratio
             } else if m.est > 0.0 && g.h > 0.0 {
                 g.h * est / m.est
             } else {
@@ -458,16 +496,15 @@ impl Layout {
 
     /// The faces text is set in changed (`font_sans` / `font_mono`): everything is remeasured.
     pub fn invalidate_all(&mut self) {
-        self.remeasure(1.0);
+        self.remeasure();
     }
 
-    /// Mark every block unmeasured, its old height scaled by `ratio` as the estimate. What was
-    /// queued for `take_missing` came from measurements that are now void (the faces may have
+    /// Mark every block unmeasured, its old height remaining as the estimate. What was queued
+    /// for `take_missing` came from measurements that are now void (the faces may have
     /// changed): measuring again queues whatever is still uncovered. `tried` is kept, so a
     /// character already returned is never returned again.
-    fn remeasure(&mut self, ratio: f32) {
+    fn remeasure(&mut self) {
         for g in &mut self.geoms {
-            g.h *= ratio;
             g.unmeasure();
         }
         self.reset_measuring();
@@ -678,16 +715,21 @@ impl Layout {
                 } else {
                     row + 1
                 };
-                meta[i].stripe = !header && row.is_multiple_of(2);
-                meta[i].first_row = r.start == i as u32;
+                meta[i].set(Meta::STRIPE, !header && row.is_multiple_of(2));
+                meta[i].set(Meta::FIRST_ROW, r.start == i as u32);
             }
-            meta[i].footnote = footnotes.is_some_and(|f| i >= f);
+            meta[i].set(Meta::FOOTNOTE, footnotes.is_some_and(|f| i >= f));
             let spans = doc.block_spans(b);
             let m = &mut meta[i];
             m.chars = text_bytes(doc, b).try_into().unwrap_or(u32::MAX);
-            m.gap = if i == 0 { 0.0 } else { Self::gap_em(doc, i) };
-            m.pads = !b.joined as u8 + !joined_next(doc, i) as u8;
-            m.indent = nesting_x(doc, b, b.quote, b.list) + Self::footnote_x(b, *m);
+            m.gap = if i == 0 {
+                0
+            } else {
+                quarters(Self::gap_em(doc, i)) as u8
+            };
+            let pads = !b.joined as u8 + !joined_next(doc, i) as u8;
+            m.flags |= pads << Meta::PADS_SHIFT;
+            m.indent = quarters(nesting_x(doc, b, b.quote, b.list) + Self::footnote_x(b, *m));
             m.shape = match b.kind {
                 BlockKind::Paragraph | BlockKind::AlertTitle(_) => Est::Text,
                 BlockKind::Heading(level) => Est::Heading(level.clamp(1, 6)),
@@ -1162,7 +1204,7 @@ impl Layout {
     /// block: its number in the gutter, quote bars, and text.
     fn footnote_x(block: &Block, meta: Meta) -> f32 {
         let footnote = matches!(block.marker, Marker::Footnote(_))
-            || (meta.footnote && block.list == 0 && block.kind != BlockKind::Rule);
+            || (meta.footnote() && block.list == 0 && block.kind != BlockKind::Rule);
         if footnote { LIST_INDENT } else { 0.0 }
     }
 
@@ -1188,7 +1230,7 @@ impl Layout {
             bold: false,
             italic: false,
             mono: false,
-            size: if meta.footnote {
+            size: if meta.footnote() {
                 FOOTNOTE_SIZE * em
             } else {
                 em
@@ -1452,10 +1494,10 @@ impl Layout {
         let h = row_h + top + bottom;
         let width = edge.min(reach);
         let line = self.hairline();
-        if meta.stripe {
+        if meta.stripe() {
             out.rect(indent, gap, width, h, Role::TableStripe);
         }
-        if meta.first_row {
+        if meta.first_row() {
             out.rect(indent, gap, width, line, Role::Border);
         }
         if last {
@@ -1639,13 +1681,13 @@ impl Layout {
         let em = basis.em;
         let pad = basis.page_pad * em;
         let edges = if i == 0 { pad } else { 0.0 } + if i + 1 == n { pad } else { 0.0 };
-        let avail = (basis.col_w - meta.indent * em).max(em);
+        let avail = (basis.col_w - from_quarters(meta.indent) * em).max(em);
         let lines = |size: f32| {
             ((meta.chars as f32 * CHAR_EM * size) / avail)
                 .ceil()
                 .max(1.0)
         };
-        meta.gap * em
+        from_quarters(meta.gap) * em
             + edges
             + match meta.shape {
                 Est::Text => lines(em) * BODY_LH * em,
@@ -1655,11 +1697,11 @@ impl Layout {
                 }
                 Est::Code => {
                     (meta.code_lines as f32).max(lines(CODE_SIZE * em)) * CODE_LH * CODE_SIZE * em
-                        + meta.pads as f32 * em
+                        + f32::from(meta.pads()) * em
                 }
                 Est::Rule => 0.25 * em,
                 // The cells share the width: a row is about as tall as its text set on one line.
-                Est::Row => lines(em) * BODY_LH * em + meta.pads as f32 * CELL_PAD_Y * em,
+                Est::Row => lines(em) * BODY_LH * em + f32::from(meta.pads()) * CELL_PAD_Y * em,
             }
     }
 }
