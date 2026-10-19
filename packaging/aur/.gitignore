@@ -1,0 +1,7 @@
+# What `makepkg` leaves in a package's folder: its build dirs, the downloaded sources and the
+# built package.
+pkg/
+src/
+*.tar.gz
+*.pkg.tar.*
+*.log
