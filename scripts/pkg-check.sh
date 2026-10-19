@@ -122,10 +122,12 @@ for image in $images; do
     screenshot "$c" "$tag-deb" vomd
     echo "   first frame on X11 and Wayland, screenshot $work/shots/$tag-deb.png"
     apt_install "$c" lintian
-    # Lintian errors fail; warnings are printed.
-    lint=$(dx "$c" lintian --tag-display-limit 0 --suppress-tags initial-upload-closes-no-bugs /pkg/vomd.deb 2>&1) || true
+    # Lintian errors fail, and so does lintian failing to run: its exit status decides. Warnings
+    # are printed.
+    lint_status=0
+    lint=$(dx "$c" lintian --fail-on error --tag-display-limit 0 --suppress-tags initial-upload-closes-no-bugs /pkg/vomd.deb 2>&1) || lint_status=$?
     [ -n "$lint" ] && echo "$lint" | sed 's/^/   /'
-    grep -q '^E:' <<<"$lint" && fail "lintian errors"
+    [ "$lint_status" -eq 0 ] || fail "lintian exited with status $lint_status"
     files=$(dx "$c" sh -c 'dpkg -L vomd | while read -r f; do if [ -f "$f" ] || [ -L "$f" ]; then echo "$f"; fi; done')
     [ -n "$files" ] || fail "dpkg -L vomd lists no files"
     dx "$c" apt-get remove -y -qq vomd >/dev/null
