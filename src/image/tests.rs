@@ -2318,6 +2318,34 @@ fn the_worker_lets_go_of_a_body_before_it_sends_the_result() {
     Worker::taken(&w);
 }
 
+/// Replacing the queue says what the job the worker has begun holds, as of the swap: a job taken
+/// from the old queue after a request worked out its reserve runs all the same, and the request
+/// keeps room for it from this.
+#[test]
+fn replacing_the_queue_returns_what_the_running_job_holds() {
+    let body = Arc::new(png_bytes(40, 30, |x, y| [x as u8, y as u8, 2, 255]));
+    let (tx, rx) = channel();
+    let worker = Worker::spawn(tx, Arc::new(|| {}));
+    assert_eq!(worker.set(Vec::new()), 0, "nothing runs");
+    let job = || Job {
+        doc_gen: 0,
+        key: Key::Remote("https://x.y/a.png".into()),
+        source: Source::Bytes(body.clone()),
+        w: 40,
+        h: 30,
+        cost: 12_345,
+    };
+    worker.set(vec![job()]);
+    // The result is not taken: the job is held until it is.
+    let Ok(Done::Decoded { worker: w, .. }) = rx.recv_timeout(Duration::from_secs(60)) else {
+        panic!("a result");
+    };
+    assert_eq!(worker.set(Vec::new()), 12_345);
+    assert_eq!(worker.busy_cost(), 12_345);
+    Worker::taken(&w);
+    assert_eq!(worker.set(Vec::new()), 0, "its result was taken");
+}
+
 /// A file that is bigger now than when its header was read isn't decoded with memory nothing
 /// counted: the job is charged for the file as it was.
 #[test]

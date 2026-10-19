@@ -1970,8 +1970,10 @@ impl Worker {
         Worker { shared }
     }
 
-    /// Replace the queue (most wanted first), skipping the job being decoded.
-    fn set(&self, mut jobs: Vec<Job>) {
+    /// Replace the queue (most wanted first), skipping the job being decoded. Returns what that
+    /// job holds, as of the swap: a job the worker took from the old queue since the caller last
+    /// looked ([`Worker::busy_cost`]) can't be taken back, and it is only here that it is known.
+    fn set(&self, mut jobs: Vec<Job>) -> usize {
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((key, w, h, _)) = &q.busy {
@@ -1979,6 +1981,7 @@ impl Worker {
         }
         q.jobs = jobs;
         cv.notify_one();
+        q.busy.as_ref().map_or(0, |b| b.3)
     }
 
     /// The main thread took the result of the job the worker `shared` ran (it is in the cache,
@@ -3247,7 +3250,11 @@ impl Images {
             self.worker = Some(Worker::spawn(self.tx.clone(), self.wake.clone()));
         }
         if let Some(w) = &self.worker {
-            w.set(jobs);
+            // The worker may have started a job of the queue this replaces after the reserve was
+            // worked out from what it held: that decode runs whatever the new queue is, and is
+            // kept room for like any other.
+            let started = w.set(jobs);
+            self.cache.reserve = self.cache.reserve.max(retired.saturating_add(started));
         }
         #[cfg(feature = "remote-images")]
         {

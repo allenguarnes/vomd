@@ -3,6 +3,12 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- An image decode that started just as the images wanted changed is counted in the room the
+  image cache keeps free. Before, the cache could briefly fill the memory that decode used.
+
 ## [1.1.0] - 2026-10-19
 
 ### Added
@@ -78,5 +84,6 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/allenguarnes/vomd/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/allenguarnes/vomd/releases/tag/v1.0.0
