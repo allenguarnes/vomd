@@ -762,17 +762,17 @@ impl Store {
         Some(self.prefs())
     }
 
-    /// The ⚙ action: save what is pending, write the commented template if there is
-    /// no file, then open the file in the default editor. `Unsupported` without a settings file
-    /// (`--no-settings`, no config directory: `path()` is `None`, which P9 uses to disable the
-    /// button).
-    pub fn open_in_editor(&mut self) -> io::Result<()> {
+    /// The ⚙ action's file, for the default editor: save what is pending and write the
+    /// commented template if there is no file. `Unsupported` without a settings file
+    /// (`--no-settings`, no config directory: `path()` is `None`, which disables the button).
+    pub fn editor_file(&mut self) -> io::Result<PathBuf> {
         self.prepare_file()?;
-        let path = self.path.as_deref().ok_or(io::ErrorKind::Unsupported)?;
-        crate::platform::open(path.as_os_str())
+        self.path
+            .clone()
+            .ok_or_else(|| io::ErrorKind::Unsupported.into())
     }
 
-    /// The file part of [`Store::open_in_editor`]: a file made here is the template with the
+    /// The file part of [`Store::editor_file`]: a file made here is the template with the
     /// pending changes on top (not a file of just those), and what is pending is written.
     fn prepare_file(&mut self) -> io::Result<()> {
         let path = self.path.clone().ok_or(io::ErrorKind::Unsupported)?;

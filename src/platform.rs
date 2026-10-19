@@ -27,15 +27,54 @@ pub fn attach_console() {
     // TODO(P14): AttachConsole(ATTACH_PARENT_PROCESS) on Windows.
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+mod desktop;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub use desktop::Opener;
+
+/// What started the application (see `desktop::Opener`).
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub enum Opener {
+    XdgOpen,
+}
+
+/// Start the default application for the local file `path`, the way the desktop would, also
+/// when it runs in a terminal. Returns the launcher, to be waited on off the main thread (it
+/// can block on `xdg-mime`, so call it off the main thread too). Errors say why in words fit
+/// for the window.
+pub fn open_file(path: &std::path::Path) -> std::io::Result<(std::process::Child, Opener)> {
+    if !path.is_absolute() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        desktop::open_file(path)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        // TODO(P14): untested.
+        launcher(path.as_os_str()).map(|c| (c, Opener::XdgOpen))
+    }
+}
+
 /// Hand a file or URL to the desktop's default application (no shell; the target is
 /// one argument, never part of a command line). Doesn't wait for the application.
 pub fn open(target: &std::ffi::OsStr) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
     // Defense in depth: callers only pass URLs with a scheme or absolute paths, but a target
     // starting with `-` must never reach a launcher as an option.
     if target.to_string_lossy().starts_with('-') {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
+    let mut child = launcher(target)?;
+    // Reap it in the background so it doesn't linger as a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// The platform's opener started on `target`, not waited for.
+fn launcher(target: &std::ffi::OsStr) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = Command::new("xdg-open");
     #[cfg(target_os = "macos")]
@@ -48,15 +87,11 @@ pub fn open(target: &std::ffi::OsStr) -> std::io::Result<()> {
         c.arg("url.dll,FileProtocolHandler");
         c
     };
-    let mut child = cmd
-        .arg(target)
+    cmd.arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    // Reap it in the background so it doesn't linger as a zombie.
-    std::thread::spawn(move || child.wait());
-    Ok(())
+        .spawn()
 }
 
 /// Open `path` for reading without ever waiting for a writer: where the platform's `O_NONBLOCK`

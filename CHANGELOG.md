@@ -11,6 +11,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
   each release and checked by CI on Debian 12, Debian 13 and Ubuntu 24.04, on X11 and Wayland.
 
 ### Fixed
+- The toolbar's settings button opens `settings.ini` in a terminal editor set as the default
+  (`Terminal=true`, such as Neovim) through `xdg-terminal-exec`. Before, on desktops
+  `xdg-open` doesn't know (Hyprland, Sway) the editor started with no terminal and waited
+  unseen. If the file can't be opened, a note in the window says why.
 - Release binaries are built on Debian 12 (glibc 2.36), so a glibc older than 2.39 no longer
   prints "weak version `GLIBC_2.39' not found" at every start.
 

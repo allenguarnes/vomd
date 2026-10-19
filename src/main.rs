@@ -43,6 +43,8 @@ enum UserEvent {
         allow(dead_code)
     )]
     SystemDark(Option<bool>),
+    /// The settings file couldn't be opened in an editor: why, for a toast.
+    OpenFailed(String),
 }
 
 /// How long the first window waits for the portal's dark preference before painting with
@@ -326,7 +328,7 @@ impl App {
                 }
                 self.record(now);
             }
-            Command::Settings => self.save(|s| s.open_in_editor()),
+            Command::Settings => self.open_settings(),
         }
     }
 
@@ -483,6 +485,33 @@ impl App {
         }
         if let Some(prefs) = self.store.take_merged() {
             self.apply(&prefs);
+        }
+    }
+
+    /// The ⚙ action: the settings file (made from the template if missing, with what is pending
+    /// saved) opened in the default editor off the main thread. A failure shows as a toast.
+    fn open_settings(&mut self) {
+        let file = self.store.editor_file();
+        if let Some(prefs) = self.store.take_merged() {
+            self.apply(&prefs);
+        }
+        match file {
+            Ok(path) => {
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    if let Some(why) = open_in_editor(&path) {
+                        let _ = proxy.send_event(UserEvent::OpenFailed(why));
+                    }
+                });
+            }
+            Err(e) => self.toast(format!("Can't open the settings file: {e}")),
+        }
+    }
+
+    fn toast(&mut self, text: String) {
+        if let Some(view) = self.view.as_mut() {
+            view.show_toast(text, Instant::now());
+            self.redraw();
         }
     }
 
@@ -647,6 +676,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
             }
+            UserEvent::OpenFailed(why) => self.toast(why),
             UserEvent::SystemDark(dark) => {
                 self.portal = dark;
                 if let (Some(view), Some(gfx)) = (self.view.as_mut(), self.gfx.as_ref())
@@ -933,6 +963,25 @@ fn bench_size() -> Option<(f64, f64)> {
 }
 
 /// Family names in settings compare case-insensitively.
+/// Open `path` in the default editor and wait for the launcher (run off the main thread).
+/// Returns why it failed, for a toast: no application, no way to start it, or `xdg-open`
+/// giving up. A terminal's exit status is the editor's, so it isn't judged.
+fn open_in_editor(path: &std::path::Path) -> Option<String> {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    match platform::open_file(path) {
+        Err(e) => Some(format!("Can't open {name}: {e}")),
+        Ok((mut child, opener)) => match child.wait() {
+            Ok(status) if !status.success() && matches!(opener, platform::Opener::XdgOpen) => {
+                Some(format!("Can't open {name}: xdg-open failed ({status})"))
+            }
+            _ => None,
+        },
+    }
+}
+
 fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (None, None) => true,

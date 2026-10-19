@@ -1050,6 +1050,6 @@ fn the_template_gets_pending_changes_on_top() {
 fn the_gear_needs_a_settings_file() {
     let mut st = Store::open(None);
     assert!(st.path().is_none());
-    let e = st.open_in_editor().unwrap_err();
+    let e = st.editor_file().unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
 }

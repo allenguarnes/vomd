@@ -1117,9 +1117,7 @@ impl View {
             if let Some(text) = note.map(str::to_owned) {
                 self.paint_preview(&mut frame, &text, theme);
             }
-            if cfg!(feature = "remote-images")
-                && let Some((_, text)) = self.toast.clone()
-            {
+            if let Some((_, text)) = self.toast.clone() {
                 self.paint_toast(&mut frame, &text, theme, false);
             }
             if let Some((until, text)) = self.notice.as_mut() {
@@ -1487,6 +1485,12 @@ impl View {
         self.images_dirty = true;
         self.close_menu();
         self.ensure();
+    }
+
+    /// Show `text` in the toast box at the bottom right for a few seconds (a call before it
+    /// expires replaces it). The caller repaints.
+    pub fn show_toast(&mut self, text: String, now: Instant) {
+        self.toast = Some((now + TOAST, text));
     }
 
     /// After the document's first frame: point out its blocked remote images once (the
