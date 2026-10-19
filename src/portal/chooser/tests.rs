@@ -78,7 +78,8 @@ fn read_call(s: &mut UnixStream) -> Option<(u32, String, Vec<u8>)> {
 }
 
 /// A fake session bus: `Hello` names us `UNIQUE`, `AddMatch` succeeds (the rules are sent to
-/// `rules`), and `OpenFile` is answered by `open_file(serial, body)`.
+/// `rules`), and `OpenFile` is answered by `open_file(serial, body)`; an empty message in its
+/// answer hangs up.
 fn fake(
     open_file: impl Fn(u32, &[u8]) -> Vec<Vec<u8>> + Send + 'static,
     rules: std::sync::mpsc::Sender<String>,
@@ -117,7 +118,7 @@ fn fake(
                 _ => vec![msg(ERROR, serial, "", "", "", "", &[])],
             };
             for m in out {
-                if server.write_all(&m).is_err() {
+                if m.is_empty() || server.write_all(&m).is_err() {
                     return;
                 }
             }
@@ -201,13 +202,21 @@ fn cancelled_and_failed_dialogs() {
         ]
     });
     assert_eq!(choice, Choice::Cancelled);
+    // Some backends send 2 for Escape: a cancel, not a reason to ask another way.
     let (choice, _) = choose(|serial, _| {
         vec![
             handle_reply(serial, &handle()),
             signal(&handle(), PORTAL_NAME, &response_body(2, &[])),
         ]
     });
-    assert_eq!(choice, Choice::Unavailable);
+    assert_eq!(choice, Choice::Cancelled);
+    let (choice, _) = choose(|serial, _| {
+        vec![
+            handle_reply(serial, &handle()),
+            signal(&handle(), PORTAL_NAME, &response_body(7, &[])),
+        ]
+    });
+    assert!(matches!(choice, Choice::Failed(_)), "{choice:?}");
     // Success with no file is no file.
     let (choice, _) = choose(|serial, _| {
         vec![
@@ -280,6 +289,29 @@ fn an_old_portals_own_request_path() {
 #[test]
 fn no_file_chooser_is_unavailable() {
     let (choice, _) = choose(|serial, _| vec![msg(ERROR, serial, "", "", PORTAL_NAME, "", &[])]);
+    assert_eq!(choice, Choice::Unavailable);
+}
+
+#[test]
+fn a_location_that_is_not_a_file_fails() {
+    for uri in ["https://x/a.md", "file://host/a.md", "/home/a/r.md"] {
+        let (choice, _) = choose(move |serial, _| {
+            vec![
+                handle_reply(serial, &handle()),
+                signal(&handle(), PORTAL_NAME, &response_body(0, &[uri])),
+            ]
+        });
+        assert!(matches!(choice, Choice::Failed(_)), "{uri}: {choice:?}");
+    }
+}
+
+#[test]
+fn a_connection_lost_after_the_request_fails_but_before_it_is_unavailable() {
+    // Hung up once the request is taken: its dialog may be up, so no other way is tried.
+    let (choice, _) = choose(|serial, _| vec![handle_reply(serial, &handle()), Vec::new()]);
+    assert!(matches!(choice, Choice::Failed(_)), "{choice:?}");
+    // Hung up before the reply: the portal never had it.
+    let (choice, _) = choose(|_, _| vec![Vec::new()]);
     assert_eq!(choice, Choice::Unavailable);
 }
 

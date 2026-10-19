@@ -47,6 +47,7 @@ pub fn choose_file(folder: Option<&std::path::Path>) -> Result<Option<std::path:
         match crate::portal::choose_file(OPEN_TITLE, folder) {
             Choice::Picked(path) => Ok(Some(path)),
             Choice::Cancelled => Ok(None),
+            Choice::Failed(why) => Err(why),
             Choice::Unavailable => desktop::choose_with_tools(OPEN_TITLE, folder),
         }
     }

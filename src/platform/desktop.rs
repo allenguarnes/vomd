@@ -253,9 +253,36 @@ pub fn choose_with_tools(title: &str, folder: Option<&Path>) -> Result<Option<Pa
     )
 }
 
+/// Have the child killed when VOMD ends, so a dialog left up while the window quits doesn't
+/// outlive it with nobody to hear its answer. Linux only (`PR_SET_PDEATHSIG`); elsewhere the
+/// dialog stays up.
+fn die_with_vomd(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe extern "C" {
+            fn prctl(option: i32, ...) -> i32;
+        }
+        const PR_SET_PDEATHSIG: i32 = 1;
+        const SIGTERM: std::ffi::c_ulong = 15;
+        // SAFETY: prctl is async-signal-safe and takes plain integers. The death signal follows
+        // the thread that forked, not the process: that is the thread waiting on the child, which
+        // lives until the child is done, and VOMD exiting ends it either way.
+        unsafe {
+            cmd.pre_exec(|| {
+                prctl(PR_SET_PDEATHSIG, SIGTERM);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
 /// Run a dialog that prints the chosen path: exit 0 with the path, 1 when cancelled.
 fn dialog(cmd: &mut Command) -> io::Result<Result<Option<PathBuf>, String>> {
     use std::os::unix::ffi::OsStringExt;
+    die_with_vomd(cmd);
     let out = cmd.stdin(Stdio::null()).stderr(Stdio::null()).output()?;
     let program = cmd.get_program().to_string_lossy().into_owned();
     Ok(match out.status.code() {
@@ -370,5 +397,60 @@ Terminal=false
         assert_eq!(find_entry("../nvim.desktop", &dirs), None);
         assert_eq!(find_entry("", &dirs), None);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A dialog (here `sleep`) is killed when the process that ran it from a thread exits. The
+    /// test runs itself as that process, so it can exit while the dialog is up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dialog_dies_with_vomd() {
+        let wait = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
+            let start = std::time::Instant::now();
+            while !done() {
+                assert!(start.elapsed().as_secs() < 10, "timed out: {what}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let pid_of = |file: &Path| {
+            std::fs::read_to_string(file)
+                .ok()?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        };
+        if let Some(file) = std::env::var_os("VOMD_TEST_DIALOG_PID").map(PathBuf::from) {
+            // The stand-in for VOMD: a dialog on a thread, and an exit while it is up.
+            let pid_file = file.clone();
+            std::thread::spawn(move || {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "echo $$ > \"$0\"; exec sleep 60"])
+                    .arg(pid_file);
+                let _ = dialog(&mut cmd);
+            });
+            wait(
+                "the dialog to start",
+                Box::new(move || pid_of(&file).is_some()),
+            );
+            std::process::exit(0);
+        }
+        let file = std::env::temp_dir().join(format!("vomd-dialog-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["a_dialog_dies_with_vomd", "--test-threads=1", "--nocapture"])
+            .env("VOMD_TEST_DIALOG_PID", &file)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let pid = pid_of(&file).expect("the dialog started");
+        let _ = std::fs::remove_file(&file);
+        // Gone, or a zombie waiting for init to reap it.
+        let gone = move || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+                || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|s| s.rsplit(") ").next().is_some_and(|r| r.starts_with('Z')))
+        };
+        wait("the dialog to end with its parent", Box::new(gone));
     }
 }

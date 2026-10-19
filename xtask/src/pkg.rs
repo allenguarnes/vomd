@@ -16,7 +16,7 @@ use crate::root;
 /// need glibc 2.36 (Debian 12, Ubuntu 23.04).
 const DEB_DEPENDS: &str = "libc6 (>= 2.36), libgcc-s1, libwayland-client0, libxkbcommon0, \
                            libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon-x11-0";
-const DEB_RECOMMENDS: &str = "curl, xdg-utils";
+const DEB_RECOMMENDS: &str = "curl, xdg-utils, xdg-desktop-portal-gtk | zenity | kdialog";
 const DEB_SUGGESTS: &str = "fonts-noto-cjk, fonts-noto-color-emoji";
 
 /// The AppImage runtime (AppImage/type2-runtime): static, with FUSE 3 built in and

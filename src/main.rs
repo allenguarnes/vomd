@@ -525,9 +525,10 @@ impl App {
     }
 
     /// Open: ask for a file (off the main thread, starting in the document's folder), then go
-    /// to it like a dropped one. A second request while the dialog is up does nothing.
+    /// to it like a dropped one. A second request while the dialog is up says so.
     fn choose_file(&mut self) {
         if std::mem::replace(&mut self.choosing, true) {
+            self.toast("A file dialog is already open".into());
             return;
         }
         let folder = nav::base_dir(&self.input).and_then(|d| std::path::absolute(d).ok());

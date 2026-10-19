@@ -113,7 +113,10 @@ Each window is its own process, so opening another file starts another window.
 | `Ctrl+O` | Open a file (the desktop's file dialog) |
 | `Esc`, `Q`, `Ctrl+W` | Quit |
 
-The toolbar has buttons for these, and its ⚙ button opens the settings file.
+The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
+desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends
+one of them, and the AppImage needs one on a desktop without a portal chooser (a bare window
+manager).
 
 ## Settings
 

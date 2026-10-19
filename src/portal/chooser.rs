@@ -21,9 +21,12 @@ pub enum Choice {
     Picked(PathBuf),
     /// The dialog was closed without a file.
     Cancelled,
-    /// No portal file chooser (no bus, no portal, no backend with a file chooser, or it
-    /// failed): try another way.
+    /// No portal file chooser (no bus, no portal, no backend with a file chooser, or the call
+    /// was refused): try another way. Only before the portal has taken the request: after
+    /// that its dialog may be up, and a second one would be wrong.
     Unavailable,
+    /// The portal took the request but its answer can't be used (in words for the window).
+    Failed(String),
 }
 
 /// Ask the portal for a file to open, starting in `folder`. Blocks until the dialog closes:
@@ -33,6 +36,10 @@ pub fn choose_file(title: &str, folder: Option<&Path>) -> Choice {
         Some(mut bus) => open_file(&mut bus, title, folder, &token()),
         None => Choice::Unavailable,
     }
+}
+
+fn failed(why: &str) -> Choice {
+    Choice::Failed(why.into())
 }
 
 /// A request token no other request of this process has had: the process id, a counter and
@@ -126,13 +133,14 @@ fn open_file(bus: &mut Bus, title: &str, folder: Option<&Path>, token: &str) -> 
     if reply.kind != RETURN || reply.sender.is_empty() {
         return Choice::Unavailable;
     }
+    // From here the portal has the request, and maybe a dialog up: no fallback.
     let Some(handle) = Reader::new(&reply.body).str().map(str::to_owned) else {
-        return Choice::Unavailable;
+        return failed("the file dialog gave an unexpected reply");
     };
     // Portals before version 0.9 make up their own request path.
     if handle != path {
         if !subscribe(bus, &handle, &mut early) {
-            return Choice::Unavailable;
+            return failed("the file dialog's answer couldn't be received");
         }
         path = handle;
     }
@@ -144,7 +152,7 @@ fn open_file(bus: &mut Bus, title: &str, folder: Option<&Path>, token: &str) -> 
         match bus.recv() {
             Ok(m) if m.kind == SIGNAL && ours(&m) => return response(&m.body),
             Ok(_) => {}
-            Err(_) => return Choice::Unavailable,
+            Err(_) => return failed("the connection to the file dialog was lost"),
         }
     }
 }
@@ -175,39 +183,44 @@ fn subscribe(bus: &mut Bus, path: &str, early: &mut Vec<Msg>) -> bool {
 }
 
 /// A `Response` (`ua{sv}`): 0 with the chosen `uris`, 1 when the user cancelled, 2 when the
-/// dialog failed some other way.
+/// dialog ended some other way. Some backends (xdg-desktop-portal-gtk 1.14 and 1.15, -gnome 43
+/// and 46) send 2 for Escape or closing the window, so it counts as a cancel.
 fn response(body: &[u8]) -> Choice {
+    let unusable = || failed("the file dialog gave an answer that can't be used");
     let mut r = Reader::new(body);
     let Some(code) = r.u32() else {
-        return Choice::Unavailable;
+        return unusable();
     };
     match code {
         0 => {}
-        1 => return Choice::Cancelled,
-        _ => return Choice::Unavailable,
+        1 | 2 => return Choice::Cancelled,
+        _ => return unusable(),
     }
     let Some(n) = r.u32() else {
-        return Choice::Unavailable;
+        return unusable();
     };
     r.align(8);
     let Some(end) = r.pos.checked_add(n as usize) else {
-        return Choice::Unavailable;
+        return unusable();
     };
     while r.pos < end {
         r.align(8);
         let (Some(key), Some(sig)) = (r.str(), r.sig()) else {
-            return Choice::Unavailable;
+            return unusable();
         };
         if key == "uris" && sig == "as" {
             return match r.str_array().as_deref() {
-                Some([uri, ..]) => file_path(uri).map_or(Choice::Unavailable, Choice::Picked),
+                Some([uri, ..]) => file_path(uri).map_or_else(
+                    || failed("the file dialog gave a location that isn't a local file"),
+                    Choice::Picked,
+                ),
                 Some([]) => Choice::Cancelled,
-                None => Choice::Unavailable,
+                None => unusable(),
             };
         }
         let mut sig = sig.as_bytes();
         if r.skip(&mut sig, 0).is_none() || !sig.is_empty() {
-            return Choice::Unavailable;
+            return unusable();
         }
     }
     Choice::Cancelled
