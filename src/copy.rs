@@ -21,24 +21,38 @@ const EAGER: usize = 256 * 1024;
 #[derive(Clone, Debug)]
 pub enum Content {
     Text(Arc<str>),
-    /// Text that isn't made yet: `lo..hi` of the document, which this keeps alive.
+    /// Text that isn't made yet: `lo..hi` of the document, which this keeps alive. `code` says
+    /// it is a whole code block, made as the block is (see [`Content::code`]).
     Lazy {
         doc: Arc<Doc>,
         lo: Pos,
         hi: Pos,
+        code: bool,
     },
 }
 
 impl Content {
     /// The copy of `lo..hi`: its text, if it is short, else what makes it. Short is judged by
     /// the text of the selected spans, which costs a walk over the blocks and no copy.
-    pub fn of(doc: &Arc<Doc>, (lo, hi): (Pos, Pos)) -> Content {
-        let mut cursor = TextCursor::new(doc.clone(), lo, hi);
+    pub fn of(doc: &Arc<Doc>, range: (Pos, Pos)) -> Content {
+        Content::make(doc, range, false)
+    }
+
+    /// The copy of the code block whose chunks are blocks `first..=last` (the button on it): the
+    /// code as written, with no prefix of the quote or list it is in and no line break after its
+    /// last line, made like [`Content::of`] does.
+    pub fn code(doc: &Arc<Doc>, first: u32, last: u32) -> Content {
+        Content::make(doc, (Pos::start(first), Pos::end(last)), true)
+    }
+
+    fn make(doc: &Arc<Doc>, (lo, hi): (Pos, Pos), code: bool) -> Content {
+        let mut cursor = TextCursor::new(doc.clone(), lo, hi).whole_code(code);
         if cursor.size_hint() > EAGER {
             return Content::Lazy {
                 doc: doc.clone(),
                 lo,
                 hi,
+                code,
             };
         }
         let mut text = String::new();
@@ -50,9 +64,9 @@ impl Content {
     pub fn chunks(&self) -> Chunks {
         Chunks(match self {
             Content::Text(text) => Source::Text(text.clone(), 0),
-            Content::Lazy { doc, lo, hi } => {
-                Source::Lazy(Box::new(TextCursor::new(doc.clone(), *lo, *hi)))
-            }
+            Content::Lazy { doc, lo, hi, code } => Source::Lazy(Box::new(
+                TextCursor::new(doc.clone(), *lo, *hi).whole_code(*code),
+            )),
         })
     }
 
@@ -60,7 +74,9 @@ impl Content {
     pub fn size_hint(&self) -> usize {
         match self {
             Content::Text(text) => text.len(),
-            Content::Lazy { doc, lo, hi } => TextCursor::new(doc.clone(), *lo, *hi).size_hint(),
+            Content::Lazy { doc, lo, hi, code } => TextCursor::new(doc.clone(), *lo, *hi)
+                .whole_code(*code)
+                .size_hint(),
         }
     }
 }
@@ -125,6 +141,8 @@ pub struct TextCursor {
     bol: bool,
     row: Option<Row>,
     done: bool,
+    /// The range is one code block (see [`Content::code`]): its text and nothing else.
+    code: bool,
 }
 
 impl TextCursor {
@@ -140,7 +158,14 @@ impl TextCursor {
             bol: false,
             row: None,
             done: false,
+            code: false,
         }
+    }
+
+    /// Make the text of the code block the range is, as [`Content::code`] does, or not.
+    fn whole_code(mut self, code: bool) -> TextCursor {
+        self.code = code;
+        self
     }
 
     /// Append about `max` bytes of the text to `out` (never half a character, and at least one
@@ -193,7 +218,7 @@ impl TextCursor {
                     }
                 }
             }
-            if ends_code(doc, b, to) {
+            if !self.code && ends_code(doc, b, to) {
                 total = total.saturating_sub(1);
             }
         }
@@ -253,7 +278,7 @@ impl TextCursor {
                 &mut body,
             ),
         }
-        if ends_code(doc, b, to) && body.ends_with('\n') {
+        if !self.code && ends_code(doc, b, to) && body.ends_with('\n') {
             body.pop();
         }
         // The prefix (a bullet, quote marks, an indent) goes with the first character of the
@@ -263,7 +288,12 @@ impl TextCursor {
             return false;
         }
         self.begin(doc, b, starts);
-        let (_, cont) = prefixes(doc, block);
+        // A code block copied by its button is the code, and not how a quote or an item holds it.
+        let cont = if self.code {
+            String::new()
+        } else {
+            prefixes(doc, block).1
+        };
         self.write(&body, &cont);
         true
     }
@@ -292,7 +322,7 @@ impl TextCursor {
         }
         if !block.joined {
             self.bol = false;
-            if starts && !lead {
+            if starts && !lead && !self.code {
                 self.pending.push_str(&prefixes(doc, block).0);
             }
         }

@@ -30,7 +30,12 @@ use crate::theme::{DARK, LIGHT, Role, Theme};
 use crate::toolbar::{self, Toolbar};
 
 #[cfg(feature = "clipboard")]
+mod copybtn;
+#[cfg(feature = "clipboard")]
 mod gesture;
+
+#[cfg(feature = "clipboard")]
+pub use copybtn::CodeCopy;
 
 /// Zoom limits and step, in percent.
 pub const ZOOM_MIN: u16 = 50;
@@ -479,6 +484,9 @@ pub struct View {
     /// The selected text, and the mouse gesture making it.
     #[cfg(feature = "clipboard")]
     select: gesture::Select,
+    /// The copy button on the code block under the pointer.
+    #[cfg(feature = "clipboard")]
+    copy: copybtn::CopyButton,
 }
 
 impl View {
@@ -554,6 +562,8 @@ impl View {
             notice: None,
             #[cfg(feature = "clipboard")]
             select: gesture::Select::default(),
+            #[cfg(feature = "clipboard")]
+            copy: copybtn::CopyButton::default(),
         };
         view.images.set_base(base);
         view.attach_images();
@@ -928,6 +938,8 @@ impl View {
     /// Returns true if the window needs a repaint: the toolbar or the scrollbar took the press, or
     /// the selection changed.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        #[cfg(feature = "clipboard")]
+        self.cancel_copy();
         let ctx = self.toolbar_ctx();
         if self.toolbar.press(&ctx, x, y) {
             self.pressed = None;
@@ -937,7 +949,16 @@ impl View {
         }
         self.ensure_content();
         let taken = self.press_scrollbar(x, y, now);
-        // Not the scrollbar's: remember the link under it, for a click on release.
+        // Not the scrollbar's: the copy button of a code block takes it, with no link or
+        // selection.
+        #[cfg(feature = "clipboard")]
+        if !taken && self.press_copy(x, y) {
+            self.pressed = None;
+            self.cancel_select();
+            self.copy_look();
+            return true;
+        }
+        // Not that either: remember the link under it, for a click on release.
         self.pressed = if taken { None } else { self.link_at(x, y) };
         // Not the scrollbar's either: a press on text, which may start a selection.
         #[cfg(feature = "clipboard")]
@@ -1071,6 +1092,8 @@ impl View {
                 .image_at(x, y)
                 .is_some_and(|id| self.images.blocked(id));
         let note = std::mem::replace(&mut self.hover_blocked, blocked) != blocked;
+        #[cfg(feature = "clipboard")]
+        let note = note | self.copy_pointer(Some((x, y)));
         (std::mem::replace(&mut self.hover, link) != link) | bar | note
     }
 
@@ -1079,6 +1102,8 @@ impl View {
     pub fn hover_end(&mut self) -> bool {
         let note = std::mem::take(&mut self.hover_blocked);
         let bar = self.set_over_bar(false, Instant::now());
+        #[cfg(feature = "clipboard")]
+        let note = note | self.copy_pointer(None);
         self.hover.take().is_some() | self.toolbar.leave() | note | bar
     }
 
@@ -1211,6 +1236,8 @@ impl View {
                 );
                 self.images_dirty = true;
             }
+            #[cfg(feature = "clipboard")]
+            self.paint_copy_button(&mut frame, vp.area, theme, now);
             if self.fade.visible(now) || self.bar_held() {
                 let total = self.layout.total_height();
                 render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
@@ -1459,6 +1486,10 @@ impl View {
         let scroll = self.select_deadline();
         #[cfg(not(feature = "clipboard"))]
         let scroll = None;
+        #[cfg(feature = "clipboard")]
+        let checked = self.copy_deadline();
+        #[cfg(not(feature = "clipboard"))]
+        let checked = None;
         [
             fade,
             self.toolbar.deadline(&self.toolbar_ctx()),
@@ -1466,6 +1497,7 @@ impl View {
             self.toast.as_ref().map(|t| t.0),
             self.notice.as_ref().and_then(|n| n.0),
             scroll,
+            checked,
         ]
         .into_iter()
         .flatten()
@@ -1492,7 +1524,7 @@ impl View {
             self.notice = None;
         }
         #[cfg(feature = "clipboard")]
-        let scrolled = self.autoscroll(now);
+        let scrolled = self.autoscroll(now) | self.copy_expire(now);
         #[cfg(not(feature = "clipboard"))]
         let scrolled = false;
         fade | pulse | toast | notice | scrolled | self.toolbar.expire(&self.toolbar_ctx(), now)
@@ -1740,7 +1772,10 @@ impl View {
         self.anchor = Anchor::TOP;
         self.drag = None;
         #[cfg(feature = "clipboard")]
-        self.clear_selection();
+        {
+            self.clear_selection();
+            self.forget_copy();
+        }
         self.kept = None;
         self.hover = None;
         self.hover_blocked = false;
@@ -1780,7 +1815,10 @@ impl View {
         self.hover_blocked = false;
         self.pressed = None;
         #[cfg(feature = "clipboard")]
-        self.clear_selection();
+        {
+            self.clear_selection();
+            self.forget_copy();
+        }
         self.doc = share(doc);
         self.message = message;
         self.layout = Layout::new(

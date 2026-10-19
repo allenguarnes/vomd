@@ -16,7 +16,8 @@ the network unless you ask it to.
 - **Images**: local PNG and JPEG, decoded lazily. Remote images load only after you press `I`.
 - **Selecting and copying text**: drag, double-click a word, triple-click a block, or press
   `Ctrl+A`; `Ctrl+C` copies it as plain text, and what you select is also pasted by a middle
-  click (X11 and Wayland).
+  click (X11 and Wayland). A code block shows a copy button, as on GitHub, when the pointer is
+  over it.
 - **Live reload**: when the window gets focus, a document that changed on disk is shown again
   at the same place.
 - **Large files**: a 5 MB document opens in under 100 ms. Files over 10 MB still render, with
@@ -129,6 +130,7 @@ Each window is its own process, so opening another file starts another window.
 | Drag | Select text (a drag that starts on a link selects, and doesn't follow it) |
 | Double-click, triple-click | Select a word, a paragraph (or a heading, code block, table row) |
 | `Shift` + click | Extend the selection |
+| Click the copy button of a code block | Copy the block's code (the button shows at the block's upper right while the pointer is over it) |
 | `Ctrl+A` | Select everything |
 | `Ctrl+C`, `Ctrl+Insert` | Copy the selection |
 | `Backspace`, `Alt+←`, `Ctrl+[` | Back |
@@ -145,6 +147,16 @@ so copying all of a very large document costs nothing until then. Dragging past 
 of the window scrolls. On X11 a selection goes with the window that owns it, so as the window
 closes VOMD asks the clipboard manager (the desktop's, if it runs one) to keep the clipboard; on
 Wayland the compositor's own manager does that.
+
+**Copying a code block.** While the pointer is over a code block, a copy button shows in its
+upper right corner, as on GitHub, and a click copies the block's code to the clipboard (not to
+the primary selection, and the selection is left as it was). The code is as written: with its
+tabs, indentation and blank lines, without the language tag, and without the quote marks or list
+indent of what holds the block, and without a line break after the last line. The button then
+shows a check mark for two seconds. A block too small for the button has none, and a block
+taller than the window keeps its button at its top, where it scrolls away with the block. If
+there is no clipboard to copy to, a note in the window says so. The button needs the pointer;
+`Ctrl+A` and `Ctrl+C` are the keyboard's way to copy.
 
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends
@@ -186,8 +198,9 @@ on. `never` removes the option.
 - **Linux only** for now. The code is portable and compiles for Windows and macOS, but those
   are untested and unsupported until a later release.
 - No table of contents panel yet; it is planned.
-- Selecting and copying work on X11 and Wayland only; there is no keyboard selection (Shift
-  and the arrows), and a word is a run of letters, digits and marks (a run of Chinese or Japanese
+- Selecting and copying, and the code blocks' copy button, work on X11 and Wayland only; there
+  is no keyboard selection (Shift and the arrows), the button can't be reached from the
+  keyboard, and a word is a run of letters, digits and marks (a run of Chinese or Japanese
   characters counts as one word).
 - No screen-reader support (AccessKit would add too much to the binary). Text scaling comes
   from the system scale factor that winit reports (`Xft.dpi` on X11, the output scale on
@@ -204,7 +217,8 @@ checks. `cargo xtask budgets` measures every performance budget against a releas
 needs a display). `just fuzz <doc|layout|settings> [seconds]` fuzzes on the stable toolchain.
 `scripts/aur-check.sh` builds and checks both AUR packages offline. `scripts/clipboard-check.sh`
 selects, copies and pastes against Xvfb and a headless sway in containers, with the real `xclip`,
-`xsel` and `wl-paste` (it needs docker). `scripts/pkg-build.sh` builds
+`xsel` and `wl-paste` (it needs docker); the copy button is clicked on X11 only, because a
+headless sway has no pointer. `scripts/pkg-build.sh` builds
 the release files (tarball, `.deb`, AppImage) in a Debian 12 container as CI does, and
 `scripts/pkg-check.sh` installs and runs the `.deb` and AppImage on Debian 12, Debian 13 and
 Ubuntu 24.04 (both need docker).

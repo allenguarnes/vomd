@@ -29,6 +29,8 @@ use vomd::platform;
 use vomd::settings::{self, FontPaths, Prefs, Store};
 use vomd::text::fallback::{self, Family, Found};
 use vomd::toolbar::Command;
+#[cfg(feature = "clipboard")]
+use vomd::view::CodeCopy;
 use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
 
 /// Idle layout runs in slices this long between events.
@@ -547,7 +549,12 @@ impl App {
         } else {
             view.hover_end()
         };
-        let update = view::hover_change(self.pointer, view.hovered().is_some(), changed);
+        // The hand is for what a click acts on: a link, a code block's copy button.
+        #[cfg(feature = "clipboard")]
+        let hand = view.hovered().is_some() || view.over_copy();
+        #[cfg(not(feature = "clipboard"))]
+        let hand = view.hovered().is_some();
+        let update = view::hover_change(self.pointer, hand, changed);
         #[cfg(feature = "clipboard")]
         let text = self.cursor_in && view.text_cursor(self.cursor.x, self.cursor.y);
         #[cfg(feature = "clipboard")]
@@ -645,7 +652,29 @@ impl App {
         }
         let content = self.view.as_ref().and_then(View::copy_content);
         if let (Some(content), Some(clipboard)) = (content, self.clipboard.as_mut()) {
-            clipboard.set(which, content);
+            // (Without a clipboard a copy by key does nothing, as it always has; the copy button
+            // says why.)
+            let _ = clipboard.set(which, content);
+        }
+    }
+
+    /// A click on a code block's copy button: offer its code as the clipboard (never as PRIMARY,
+    /// which is what was selected), and show the check mark. If there is no clipboard to offer
+    /// it to, a toast says so instead.
+    #[cfg(feature = "clipboard")]
+    fn copy_code(&mut self, copy: CodeCopy, now: Instant) {
+        let result = match self.clipboard.as_mut() {
+            Some(clipboard) => clipboard.set(Which::Clipboard, copy.content),
+            None => Err("no window system to copy to".into()),
+        };
+        match result {
+            Ok(()) => {
+                if let Some(view) = self.view.as_mut() {
+                    view.code_copied(copy.block, now);
+                }
+                self.redraw();
+            }
+            Err(why) => self.toast(format!("Can't copy: {why}")),
         }
     }
 
@@ -889,7 +918,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(false) => {
                 // A button released elsewhere isn't seen: the drag ends here.
                 #[cfg(feature = "clipboard")]
-                view.release_select();
+                {
+                    view.release_select();
+                    view.cancel_copy();
+                }
                 self.save(|s| s.flush());
             }
             WindowEvent::Focused(true) => {
@@ -957,6 +989,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let (x, y) = (self.cursor.x, self.cursor.y);
                 #[cfg(feature = "clipboard")]
                 let mut offer_primary = false;
+                #[cfg(feature = "clipboard")]
+                let mut code = None;
                 let (changed, clicked, command) = match state {
                     ElementState::Pressed => (view.press(x, y, now), None, None),
                     ElementState::Released => {
@@ -964,6 +998,7 @@ impl ApplicationHandler<UserEvent> for App {
                         #[cfg(feature = "clipboard")]
                         {
                             offer_primary = view.release_select();
+                            code = view.release_copy(x, y);
                         }
                         (
                             view.release(now) | bar,
@@ -985,6 +1020,10 @@ impl ApplicationHandler<UserEvent> for App {
                 #[cfg(feature = "clipboard")]
                 if offer_primary {
                     self.offer(Which::Primary);
+                }
+                #[cfg(feature = "clipboard")]
+                if let Some(copy) = code {
+                    self.copy_code(copy, now);
                 }
             }
             _ => {}

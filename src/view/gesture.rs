@@ -128,13 +128,13 @@ impl View {
     }
 
     /// The point is in the document area.
-    fn in_area(&self, x: f64, y: f64) -> bool {
+    pub(super) fn in_area(&self, x: f64, y: f64) -> bool {
         (0.0..f64::from(self.width)).contains(&x)
             && (f64::from(self.top_inset)..f64::from(self.height)).contains(&y)
     }
 
     /// Document y of window y, for a point in the area.
-    fn doc_y(&self, y: f64) -> f64 {
+    pub(super) fn doc_y(&self, y: f64) -> f64 {
         self.scroll() + (y - f64::from(self.top_inset))
     }
 
@@ -166,6 +166,7 @@ impl View {
             && self.drag.is_none()
             && !self.over_bar
             && self.hover.is_none()
+            && !self.over_copy()
             && !self.toolbar.covers(&self.toolbar_ctx(), x, y)
             && self.char_at(x, y).is_some()
     }

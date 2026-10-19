@@ -39,7 +39,7 @@ const MENU_W: f32 = 230.0;
 pub const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 
 /// Lucide code points in `assets/fonts/icons.ttf`.
-mod icon {
+pub(crate) mod icon {
     pub const BACK: char = '\u{e048}';
     pub const MINUS: char = '\u{e11c}';
     pub const PLUS: char = '\u{e13d}';
@@ -52,6 +52,11 @@ mod icon {
     /// Wide layout is off (the button widens) and on (it narrows).
     pub const UNFOLD: char = '\u{e43d}';
     pub const FOLD: char = '\u{e43b}';
+    /// The copy button on code blocks, and its mark once the code is copied.
+    #[cfg(feature = "clipboard")]
+    pub const COPY: char = '\u{e09e}';
+    #[cfg(feature = "clipboard")]
+    pub const CHECK: char = '\u{e06c}';
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,7 +127,7 @@ impl Rect {
             && (f64::from(self.y0)..f64::from(self.y1)).contains(&y)
     }
 
-    fn px(&self) -> (i32, i32, i32, i32) {
+    pub(crate) fn px(&self) -> (i32, i32, i32, i32) {
         let r = |v: f32| v.round() as i32;
         (r(self.x0), r(self.y0), r(self.x1), r(self.y1))
     }
@@ -666,8 +671,9 @@ impl Toolbar {
     }
 }
 
-/// An icon glyph centered in `rect` (by its ink: the Lucide glyphs fill their em box).
-fn draw_icon(
+/// An icon glyph centered in `rect` (by its ink: the Lucide glyphs fill their em box), 16 logical
+/// pixels tall at scale `s`.
+pub(crate) fn draw_icon(
     frame: &mut Frame,
     fonts: &Fonts,
     cache: &mut GlyphCache,

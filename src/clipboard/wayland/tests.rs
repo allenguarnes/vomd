@@ -2,6 +2,7 @@ use std::io::Read;
 
 use super::*;
 use crate::copy::CHUNK;
+use crate::doc::{BlockKind, Doc};
 
 /// What a program reading the other end of the pipe gets.
 fn pasted(content: &Content, as_latin1: bool) -> Vec<u8> {
@@ -109,4 +110,43 @@ fn only_a_few_pastes_are_written_at_once() {
     drop(writers);
     assert_eq!(count.load(Ordering::Acquire), 0);
     assert!(Writer::start(&count).is_some());
+}
+
+/// What a program pastes after a click on the copy button of the first code block of `src`.
+fn pasted_code(src: &str) -> Vec<u8> {
+    let doc = Arc::new(Doc::parse(src));
+    let first = doc
+        .blocks
+        .iter()
+        .position(|b| b.kind == BlockKind::Code)
+        .expect("a code block") as u32;
+    let last = crate::select::block_unit(&doc, first).1.block;
+    pasted(&Content::code(&doc, first, last), false)
+}
+
+#[test]
+fn a_pasted_code_block_is_its_code_to_the_byte() {
+    // (A headless sway has no pointer to click the button with, so the path from the button
+    // to a pasting program is checked here: the copy it makes, through the pipe's writer.)
+    let code = "fn f() {\n\treturn 1;  // tab\n\n    deep   spaced \u{e9}\n}";
+    let quoted: String = code.lines().map(|l| format!("> {l}\n")).collect();
+    assert_eq!(
+        pasted_code(&format!("```rust\n{code}\n```\n")),
+        code.as_bytes()
+    );
+    assert_eq!(
+        pasted_code(&format!("> ```\n{quoted}> ```\n")),
+        code.as_bytes()
+    );
+    // Several MB, made as the pipe is read.
+    let big: String = (0..150_000).map(|i| format!("line {i}\n")).collect();
+    let big = big.trim_end_matches('\n');
+    assert!(big.len() > 1_000_000);
+    let got = pasted_code(&format!("```\n{big}\n```\n"));
+    assert!(
+        got == big.as_bytes(),
+        "{} bytes, not {}",
+        got.len(),
+        big.len()
+    );
 }

@@ -19,6 +19,15 @@ and versions follow [Semantic Versioning](https://semver.org/).
   keep the clipboard.
   Needs the new `clipboard` feature, on by default; the smallest build leaves it out.
 - `Esc` clears the selection before it quits (after closing the toolbar's menu, as before).
+- A copy button on code blocks, as on GitHub: while the pointer is over a fenced or indented
+  code block, a button shows in its upper right corner, and a click copies the block's code to
+  the clipboard (not the primary selection, and a selection is left alone). The code is as
+  written, with its tabs, indentation and blank lines, without the language tag, without the
+  quote marks or list indent of what holds the block, and without a line break after the last
+  line; a block of several MB is made only when something pastes it. The button turns into a
+  check mark for two seconds, lights up and shows the hand under the pointer, scales with the
+  zoom and the display, and is left off blocks too small for it. If there is no clipboard, a
+  note says so. Part of the `clipboard` feature, so the smallest build has none.
 
 ### Fixed
 - An image decode that started just as the images wanted changed is counted in the room the

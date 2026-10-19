@@ -39,20 +39,20 @@ pub enum Which {
 }
 
 /// A backend before its first copy, running, or unable to start (it says so once, and a copy
-/// then does nothing).
+/// then does nothing; the reason is kept for whoever asks).
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 #[derive(Debug)]
 enum Backend<T> {
     Idle,
     Running(T),
-    Failed,
+    Failed(String),
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 impl<T> Backend<T> {
     /// The running backend, started with `start` the first time (a failure is reported once, on
-    /// a terminal).
-    fn get(&mut self, start: impl FnOnce() -> Result<T, String>) -> Option<&T> {
+    /// a terminal). `Err` is why there is none.
+    fn get(&mut self, start: impl FnOnce() -> Result<T, String>) -> Result<&T, &str> {
         if matches!(self, Backend::Idle) {
             *self = match start() {
                 Ok(backend) => Backend::Running(backend),
@@ -60,13 +60,14 @@ impl<T> Backend<T> {
                     if crate::platform::stderr_is_tty() {
                         eprintln!("vomd: no clipboard: {why}");
                     }
-                    Backend::Failed
+                    Backend::Failed(why)
                 }
             };
         }
         match self {
-            Backend::Running(backend) => Some(backend),
-            _ => None,
+            Backend::Running(backend) => Ok(backend),
+            Backend::Failed(why) => Err(why),
+            Backend::Idle => Err("not started"),
         }
     }
 }
@@ -99,25 +100,30 @@ impl Clipboard {
 
     /// Offer `content` as the selection `which`, in place of what was offered before. A program
     /// that pastes it gets the text from the thread that serves the selection; it stays on offer
-    /// until another program claims the selection or the window closes.
-    pub fn set(&mut self, which: Which, content: Content) {
+    /// until another program claims the selection or the window closes. `Err` is why nothing was
+    /// offered (the backend couldn't start, or this window system has none), short enough for a
+    /// toast.
+    pub fn set(&mut self, which: Which, content: Content) -> Result<(), String> {
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
         match self.display {
             RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => {
-                if let Some(x11) = self.x11.get(x11::Owner::start) {
-                    x11.set(which, content);
-                }
+                let x11 = self.x11.get(x11::Owner::start)?;
+                x11.set(which, content);
+                Ok(())
             }
             RawDisplayHandle::Wayland(handle) => {
                 let display = handle.display.as_ptr();
-                if let Some(wayland) = self.wayland.get(|| wayland::Owner::start(display)) {
-                    wayland.set(which, content);
-                }
+                let wayland = self.wayland.get(|| wayland::Owner::start(display))?;
+                wayland.set(which, content);
+                Ok(())
             }
-            _ => {}
+            _ => Err("this display has no clipboard support".into()),
         }
         #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
-        let _ = (which, content);
+        {
+            let _ = (which, content);
+            Err("this system has no clipboard support".into())
+        }
     }
 
     /// The window is closing: if the clipboard is ours, let a clipboard manager keep it, which

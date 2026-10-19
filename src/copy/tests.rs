@@ -538,3 +538,183 @@ fn pieces_never_split_a_character() {
     assert_eq!(pieces.concat(), *text);
     assert!(pieces.iter().all(|p| p.len() <= CHUNK && !p.is_empty()));
 }
+
+/// The first and last chunk of each code block of the document, as the copy button names them.
+fn code_blocks(d: &Doc) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (i, b) in d.blocks.iter().enumerate() {
+        if b.kind != BlockKind::Code {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(run) if b.joined => run.1 = i as u32,
+            _ => runs.push((i as u32, i as u32)),
+        }
+    }
+    runs
+}
+
+/// What the button of each code block of `src` copies, in the pieces the clipboard asks for.
+fn buttons(src: &str) -> Vec<String> {
+    let d = doc(src);
+    code_blocks(&d)
+        .into_iter()
+        .map(|(first, last)| Content::code(&d, first, last).chunks().collect())
+        .collect()
+}
+
+fn button(src: &str) -> String {
+    let all = buttons(src);
+    assert_eq!(all.len(), 1, "one code block in {src:?}");
+    all.into_iter().next().unwrap()
+}
+
+#[test]
+fn the_button_copies_the_code_as_written() {
+    // No language tag, no prompt stripped, and no line break after the last line.
+    assert_eq!(button("```\nplain\n```\n"), "plain");
+    assert_eq!(
+        button("```console\n$ ls -l\ntotal 0\n```"),
+        "$ ls -l\ntotal 0"
+    );
+    assert_eq!(button("~~~sh title=\"x\"\n# comment\n~~~"), "# comment");
+    // Tabs, indentation, runs of spaces and blank lines stay as they are.
+    assert_eq!(
+        button("```rust\nfn f() {\n\treturn 1;  // tab\n\n    deep   spaced\n\n\n}\n```"),
+        "fn f() {\n\treturn 1;  // tab\n\n    deep   spaced\n\n\n}"
+    );
+    assert_eq!(button("```\nλ 日本 🙂\n```"), "λ 日本 🙂");
+    // Markup in code is text.
+    assert_eq!(
+        button("```\n**not bold** [x](y) <b>\n```"),
+        "**not bold** [x](y) <b>"
+    );
+}
+
+#[test]
+fn the_button_drops_the_line_break_that_ends_the_code_and_no_more() {
+    // The last line's own break isn't code; a blank last line is, and is kept.
+    assert_eq!(button("```\na\n```"), "a");
+    assert_eq!(button("```\na\n\n```"), "a\n");
+    assert_eq!(button("```\na\n\n\n```"), "a\n\n");
+    assert_eq!(button("```\n\na\n```"), "\na");
+    // An unclosed fence ends with the document.
+    assert_eq!(button("```\na\nb\n"), "a\nb");
+}
+
+#[test]
+fn the_button_gives_an_indented_block_its_code_without_the_indent_that_makes_it_one() {
+    assert_eq!(
+        button("para\n\n    one\n    two\n\n    three\n\nafter\n"),
+        "one\ntwo\n\nthree"
+    );
+    assert_eq!(button("para\n\n\ttabbed\n\t\tdeeper\n"), "tabbed\n\tdeeper");
+}
+
+#[test]
+fn the_button_copies_the_code_and_not_the_quote_or_list_around_it() {
+    assert_eq!(button("> ```\n> q1\n>\n> q2\n> ```\n"), "q1\n\nq2");
+    assert_eq!(button("> > ```\n> > deep\n> > ```\n"), "deep");
+    assert_eq!(button("- item\n\n  ```\n  c1\n\n  c2\n  ```\n"), "c1\n\nc2");
+    assert_eq!(
+        button("1. one\n   - two\n\n     ```\n     inner\n       indented\n     ```\n"),
+        "inner\n  indented"
+    );
+    assert_eq!(button("> - a\n>\n>   ```\n>   in\n>   ```\n"), "in");
+    assert_eq!(
+        button("> [!NOTE]\n> ```\n> note code\n> ```\n"),
+        "note code"
+    );
+    // (A list item that starts with code puts it on the marker's line.)
+    assert_eq!(button("- ```\n  first\n  ```\n"), "first");
+}
+
+#[test]
+fn each_code_block_has_its_own_copy() {
+    assert_eq!(
+        buttons("```\nA\n```\n\ntext\n\n```\nB1\nB2\n```\n\n    C\n"),
+        ["A", "B1\nB2", "C"]
+    );
+    // Two blocks that touch are still two.
+    assert_eq!(buttons("```\nA\n```\n```\nB\n```\n"), ["A", "B"]);
+}
+
+#[test]
+fn a_code_block_with_nothing_in_it_copies_nothing() {
+    assert_eq!(button("```\n```\n"), "");
+}
+
+#[test]
+fn the_button_leaves_a_selection_copy_as_it_was() {
+    // Ctrl+C of the same block still says how a quote holds it.
+    let d = doc("> ```\n> q1\n> ```\n");
+    let (first, last) = code_blocks(&d)[0];
+    let range = (Pos::start(first), Pos::end(last));
+    let by_selection: String = Content::of(&d, range).chunks().collect();
+    let by_button: String = Content::code(&d, first, last).chunks().collect();
+    assert_eq!(by_selection, "> q1");
+    assert_eq!(by_button, "q1");
+}
+
+/// `lines` lines of code, `line 0`, `line 1`, and so on, each with a tab and a gap now and then.
+fn long_code(lines: usize) -> String {
+    let mut code = String::new();
+    for i in 0..lines {
+        code.push_str(&format!("line {i}\twith some text to fill it"));
+        if i % 7 == 6 {
+            code.push('\n');
+        }
+        if i + 1 < lines {
+            code.push('\n');
+        }
+    }
+    code
+}
+
+#[test]
+fn the_code_of_a_huge_block_is_made_as_it_is_pasted() {
+    // A block of several MB: chunks of the document, one block to the button.
+    let code = long_code(120_000);
+    assert!(code.len() > 3_000_000);
+    let d = doc(&format!("Before.\n\n```text\n{code}\n```\n\nAfter.\n"));
+    let runs = code_blocks(&d);
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].1 > runs[0].0 + 100, "the block is many chunks");
+    let content = Content::code(&d, runs[0].0, runs[0].1);
+    assert!(
+        matches!(content, Content::Lazy { code: true, .. }),
+        "too big to make at once"
+    );
+    assert_eq!(content.size_hint(), code.len());
+    let mut total = 0;
+    let mut joined = String::new();
+    for piece in content.chunks() {
+        assert!(!piece.is_empty() && piece.len() <= CHUNK + 4);
+        total += piece.len();
+        joined.push_str(&piece);
+    }
+    assert_eq!(total, code.len());
+    assert!(joined == code, "the pieces are the code, byte for byte");
+}
+
+#[test]
+fn a_block_in_a_document_that_is_parsed_in_segments_copies_exactly() {
+    // Over 1 MB, so the document is parsed in segments, and the code is among them.
+    let filler = "A paragraph of plain words that fills the document up to a size.\n\n";
+    let code = "if x {\n\ty()\n\n    z()\n}";
+    let src = format!(
+        "{}```go\n{code}\n```\n\n{}",
+        filler.repeat(15_000),
+        filler.repeat(15_000)
+    );
+    assert!(src.len() > 1_000_000);
+    assert_eq!(buttons(&src), [code]);
+    // And a block that is itself bigger than a segment, among them.
+    let long = long_code(2_000);
+    let src = format!(
+        "{}```\n{long}\n```\n\n{}",
+        filler.repeat(20_000),
+        filler.repeat(20_000)
+    );
+    assert_eq!(buttons(&src), [long]);
+}

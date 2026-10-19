@@ -18,6 +18,8 @@ use vomd::render::{self, Clip, Frame, Pixels, Viewport};
 use vomd::select::Pos;
 use vomd::text::cache::GlyphCache;
 use vomd::theme::{DARK, LIGHT, Theme};
+#[cfg(feature = "clipboard")]
+use vomd::view::{ThemeMode, View};
 
 /// Tallest golden image; documents are cut off below this.
 const MAX_H: usize = 4000;
@@ -159,12 +161,86 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// What the pointer is doing at a code block's copy button.
+#[cfg(feature = "clipboard")]
+#[derive(Clone, Copy)]
+enum Look {
+    /// Over the block, off the button: it shows, not lit.
+    Rest,
+    /// On the button.
+    Hover,
+    /// On the button just after a click: the check mark.
+    Checked,
+}
+
+/// A copy button, painted by the viewer itself with the pointer where `look` says (the button
+/// shows only over a code block, so these go through [`View`], not the painter alone).
+#[cfg(feature = "clipboard")]
+struct ButtonCase {
+    name: &'static str,
+    /// Logical width of the window, and the window system's scale.
+    width: f32,
+    scale: f32,
+    dark: bool,
+    look: Look,
+}
+
+#[cfg(feature = "clipboard")]
+const BUTTON_CASES: &[ButtonCase] = &[
+    ButtonCase {
+        name: "copybtn-rest-light",
+        width: 520.0,
+        scale: 1.0,
+        dark: false,
+        look: Look::Rest,
+    },
+    ButtonCase {
+        name: "copybtn-hover-light",
+        width: 520.0,
+        scale: 1.0,
+        dark: false,
+        look: Look::Hover,
+    },
+    ButtonCase {
+        name: "copybtn-hover-dark",
+        width: 520.0,
+        scale: 1.0,
+        dark: true,
+        look: Look::Hover,
+    },
+    ButtonCase {
+        name: "copybtn-checked-light",
+        width: 520.0,
+        scale: 1.0,
+        dark: false,
+        look: Look::Checked,
+    },
+    ButtonCase {
+        name: "copybtn-checked-dark",
+        width: 520.0,
+        scale: 1.0,
+        dark: true,
+        look: Look::Checked,
+    },
+    // HiDPI 2×: the button, its border and its icon scale with the window.
+    ButtonCase {
+        name: "copybtn-hover-2x",
+        width: 400.0,
+        scale: 2.0,
+        dark: false,
+        look: Look::Hover,
+    },
+];
+
+/// An image: width, height and pixels.
+type Rendered = (usize, usize, Vec<u32>);
+
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
 /// The case painted: `(width, height, pixels)`. A whole-document case is cut off at [`MAX_H`].
-fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
+fn render_case(case: &Case, fonts: &Fonts) -> Rendered {
     let src = std::fs::read_to_string(root().join("fixtures").join(case.fixture)).unwrap();
     let doc = Doc::parse(&src);
     let width = (case.width * case.scale).round();
@@ -245,6 +321,72 @@ fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
         render::paint_scrollbar(&mut frame, vp, total, case.scale, case.theme);
     }
     (w, h, px)
+}
+
+/// The button case painted: `(width, height, pixels)`, the whole of `codecopy.md`. The pointer
+/// is over its first code block, and the button is the first block's.
+#[cfg(feature = "clipboard")]
+fn render_button(case: &ButtonCase) -> Rendered {
+    let src = std::fs::read_to_string(root().join("fixtures/codecopy.md")).unwrap();
+    let doc = Doc::parse(&src);
+    let w = (case.width * case.scale).round() as u32;
+    let mut view = View::new(
+        Fonts::new().unwrap(),
+        doc,
+        None,
+        (w, MAX_H as u32),
+        f64::from(case.scale),
+    );
+    view.set_theme_mode(if case.dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    });
+    while !view.idle(Instant::now() + Duration::from_secs(1)) {}
+    view.ensure();
+    let h = (view.layout().total_height().ceil() as u32).clamp(1, MAX_H as u32);
+    view.resize(w, h);
+    view.ensure();
+    let first = view
+        .doc()
+        .blocks
+        .iter()
+        .position(|b| b.kind == vomd::doc::BlockKind::Code)
+        .expect("the fixture has a code block");
+    // The middle of the block's background, and the button at its corner.
+    let content = view.layout().geoms()[first].content.as_deref().unwrap();
+    let r = content
+        .rects
+        .iter()
+        .find(|r| r.role == vomd::theme::Role::CodeBg)
+        .unwrap();
+    let inside = (
+        f64::from(view.layout().column().0 + r.x + r.w / 2.0),
+        view.layout().top(first) + f64::from(r.y + r.h / 2.0),
+    );
+    let button = view
+        .copy_button_at(inside.0, inside.1)
+        .expect("the block has room for a button");
+    let on = (
+        f64::from(button.x0 + button.x1) / 2.0,
+        f64::from(button.y0 + button.y1) / 2.0,
+    );
+    let now = Instant::now();
+    match case.look {
+        Look::Rest => {
+            view.hover_at(inside.0, inside.1, now);
+        }
+        Look::Hover => {
+            view.hover_at(on.0, on.1, now);
+        }
+        Look::Checked => {
+            view.hover_at(on.0, on.1, now);
+            view.code_copied(first as u32, now);
+        }
+    }
+    let mut px = vec![0; w as usize * h as usize];
+    view.paint(&mut px, w as usize, now + Duration::from_millis(100));
+    (w as usize, h as usize, px)
 }
 
 /// The caret before (`end` false) or after the first `needle` of the document's text.
@@ -344,44 +486,41 @@ fn goldens() {
     let bless = std::env::var_os("VOMD_BLESS").is_some_and(|v| v == "1");
     let out_dir = root().join("target/golden-out");
     let mut failures = Vec::new();
-    for case in CASES {
-        let (w, h, px) = render_case(case, &fonts);
+    let cases = CASES
+        .iter()
+        .map(|case| (case.name, render_case(case, &fonts)));
+    #[cfg(feature = "clipboard")]
+    let cases = cases.chain(
+        BUTTON_CASES
+            .iter()
+            .map(|case| (case.name, render_button(case))),
+    );
+    for (name, (w, h, px)) in cases {
         let rgb = to_rgb(&px);
-        let golden: PathBuf = root()
-            .join("tests/golden")
-            .join(format!("{}.png", case.name));
+        let golden: PathBuf = root().join("tests/golden").join(format!("{name}.png"));
         if bless {
             write_png(&golden, w, h, &rgb);
             println!("blessed {} ({w}×{h})", golden.display());
             continue;
         }
-        let actual_path = out_dir.join(format!("{}.png", case.name));
+        let actual_path = out_dir.join(format!("{name}.png"));
         let Some((ew, eh, expected)) = read_png(&golden) else {
             write_png(&actual_path, w, h, &rgb);
-            failures.push(format!(
-                "{}: no golden (run `cargo xtask bless`)",
-                case.name
-            ));
+            failures.push(format!("{name}: no golden (run `cargo xtask bless`)"));
             continue;
         };
         if (ew, eh) != (w, h) {
             write_png(&actual_path, w, h, &rgb);
-            failures.push(format!("{}: size {w}×{h}, golden {ew}×{eh}", case.name));
+            failures.push(format!("{name}: size {w}×{h}, golden {ew}×{eh}"));
             continue;
         }
         let (bad, diff) = compare(&expected, &rgb);
         let share = bad as f64 / (w * h) as f64;
         if share > MAX_BAD {
             write_png(&actual_path, w, h, &rgb);
-            write_png(
-                &out_dir.join(format!("{}-diff.png", case.name)),
-                w,
-                h,
-                &diff,
-            );
+            write_png(&out_dir.join(format!("{name}-diff.png")), w, h, &diff);
             failures.push(format!(
-                "{}: {bad} pixels ({:.3}%) differ; see {}",
-                case.name,
+                "{name}: {bad} pixels ({:.3}%) differ; see {}",
                 share * 100.0,
                 out_dir.display()
             ));

@@ -12,6 +12,11 @@
 #     PRIMARY, and a drag offers something it selected: a headless sway has no pointer device for
 #     a client to hear (the one wlrctl makes lives as long as the command), so on Wayland the
 #     selections are made by keyboard;
+#   - (X11 only, for the same reason) pointing at a code block and clicking the copy button
+#     that shows in its corner makes the clipboard exactly the code (tab, blank line,
+#     indentation, no final line break), and leaves PRIMARY and what Ctrl+A selected alone;
+#     a click beside the button copies nothing; the Wayland path of such a copy is covered by a
+#     unit test (`a_pasted_code_block_is_its_code_to_the_byte`);
 #   - the answers come after 3 s of idle, and the idle window used no CPU for them;
 #   - another program taking the selection ends VOMD's offer, and a new Ctrl+C gets it back;
 #   - a 5 MB document copies whole (X11's INCR, Wayland's pipe), byte for byte, to two programs
@@ -45,6 +50,12 @@ printf 'Paragraph one: café 日本 and some more words.\n\n- item one\n- item t
 printf 'Paragraph one: caf\351 ?? and some more words.\n\n- item one\n- item two\n\n> quoted line\n\na\tb\n1\t2' >small.latin1
 printf 'Paragraph one: café 日本 and some more words.' >first.expected
 printf 'Paragraph' >word.expected
+# A document that starts with code, for the copy button: the code has a tab, a blank line, an
+# indented line and a non-ASCII letter, and the text that selecting all of it gives.
+printf '%s\n' '```rust' 'fn f() {' $'\treturn 1;  // tab' '' '    deep   spaced é' '}' '```' '' 'After the code.' >code.md
+printf 'fn f() {\n\treturn 1;  // tab\n\n    deep   spaced é\n}' >code.expected
+printf 'fn f() {\n\treturn 1;  // tab\n\n    deep   spaced \351\n}' >code.latin1
+{ cat code.expected; printf '\n\nAfter the code.'; } >code.all
 awk -v n=90000 'BEGIN { for (i = 1; i <= n; i++) { if (i > 1) printf "\n\n"; printf "Paragraph %d of the big document, with a little text in it.", i } }' >big.expected
 { cat big.expected; echo; } >big.md
 big_sha=$(sha256sum <big.expected | cut -d' ' -f1)
@@ -126,6 +137,17 @@ text_y() { echo $((Y + 32 + 32 + 12)); }
 
 x11_pointer() { DISPLAY=:99 xdotool mousemove "$(($(text_x) + $1))" "$(text_y)"; }
 
+# The page's first block is a code block at 100% zoom and scale 1: its top is under the toolbar
+# (32 px) and the page's padding (32 px), its right edge is the column's, and its copy button is
+# 28 px square, 8 px in from the corner. The block's own text is at the left, and its middle
+# (the first line's, as `text_y` finds it) is over the block but not the button.
+button_x() {
+    local col=720
+    [ "$WIDTH" -lt 784 ] && col=$((WIDTH - 64))
+    echo $((X + (WIDTH + col) / 2 - 8 - 14))
+}
+button_y() { echo $((Y + 32 + 32 + 8 + 14)); }
+
 # `paste sel`: what a program gets from the selection (clipboard or primary); `same sel file`.
 x11_paste() { xclip -o -selection "$1" 2>/dev/null; }
 x11_same() { # sel, file
@@ -199,6 +221,48 @@ x11_suite() {
     [ "${#dragged}" -ge 5 ] || fail "X11: the drag offered only '$dragged'"
     x11_same clipboard small.expected || fail "X11: selecting with the mouse changed the clipboard"
     ok "X11: double-click, triple-click and drag are PRIMARY; the clipboard is Ctrl+C's alone"
+    x11_end
+
+    echo "-- copy button"
+    x11_vomd code.md cfg-on
+    # Pointing at the block shows the button, and nothing is copied by that.
+    printf keep | xclip -i -selection clipboard
+    x11_pointer 30
+    sleep 0.5
+    DISPLAY=:99 xdotool mousemove "$(button_x)" "$(button_y)"
+    sleep 0.5
+    [ "$(x11_paste clipboard)" = keep ] || fail "X11: pointing at the copy button changed the clipboard"
+    # A click on the code beside the button copies nothing, and a selection is made there.
+    x11_pointer 30
+    DISPLAY=:99 xdotool click 1
+    sleep 0.7
+    [ "$(x11_paste clipboard)" = keep ] || fail "X11: a click beside the copy button changed the clipboard"
+    # Select all (PRIMARY is the whole page), then click the button.
+    x11_key ctrl+a
+    retry x11_same primary code.all || fail "X11: Ctrl+A didn't offer the page as PRIMARY: $(x11_paste primary | od -c | head -5)"
+    DISPLAY=:99 xdotool mousemove "$(button_x)" "$(button_y)"
+    sleep 0.3
+    DISPLAY=:99 xdotool click 1
+    retry x11_same clipboard code.expected || fail "X11: the copy button didn't copy the code exactly: $(x11_paste clipboard | od -c | head -8)"
+    sleep 0.5
+    x11_same primary code.all || fail "X11: the copy button changed PRIMARY: $(x11_paste primary | od -c | head -5)"
+    xclip -o -selection clipboard -t STRING >got.txt
+    cmp -s got.txt code.latin1 || fail "X11: the copied code's STRING differs: $(od -c got.txt | head -5)"
+    ok "X11: a click on the copy button makes the clipboard exactly the code, and leaves PRIMARY alone"
+    # Clicking it again copies again, whatever was copied in between.
+    printf other | xclip -i -selection clipboard
+    retry test "$(x11_paste clipboard)" = other || fail "X11: another program couldn't take the clipboard"
+    sleep 2.5
+    DISPLAY=:99 xdotool click 1
+    retry x11_same clipboard code.expected || fail "X11: a second click didn't copy the code again"
+    ok "X11: the button copies again"
+    # Idle after the check mark's two seconds: the loop sleeps (no CPU).
+    sleep 2.5
+    before=$(ticks "$pid")
+    sleep 3
+    after=$(ticks "$pid")
+    [ $((after - before)) -le 1 ] || fail "X11: the idle window with a button used $((after - before)) ticks of CPU in 3 s"
+    ok "X11: after the check mark goes, the window is idle"
     x11_end
 
     echo "-- special requests"

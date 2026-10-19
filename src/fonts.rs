@@ -125,8 +125,8 @@ pub struct Fonts {
     fallbacks: Vec<FaceId>,
 }
 
-/// Toolbar icons (`scripts/subset-icons.sh`): 7 Lucide glyphs, 3 KB, so they are embedded
-/// even without `embed-fonts` (no system font has them).
+/// Toolbar and button icons (`scripts/subset-icons.sh`): 13 Lucide glyphs, 4 KB, so they are
+/// embedded even without `embed-fonts` (no system font has them).
 static ICONS: &[u8] = include_bytes!("../assets/fonts/icons.ttf");
 
 #[cfg(feature = "embed-fonts")]
