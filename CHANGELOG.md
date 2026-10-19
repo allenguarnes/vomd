@@ -6,6 +6,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Open a file from the window: `Ctrl+O` or the toolbar's folder button shows the desktop's
+  file dialog (the XDG portal's, so KDE's, GNOME's or the GTK one, else `zenity` or
+  `kdialog`), starting in the document's folder. The empty window says so, and offers
+  dropping a file only on X11, where it works.
 - A Debian package (`vomd_<version>-1_amd64.deb`, Debian 12+ and Ubuntu 24.04+) with a man
   page, and an AppImage for any x86-64 distribution with glibc 2.36 or newer, both attached to
   each release and checked by CI on Debian 12, Debian 13 and Ubuntu 24.04, on X11 and Wayland.

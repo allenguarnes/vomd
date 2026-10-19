@@ -87,7 +87,7 @@ The Cargo features are `images` (PNG/JPEG), `remote-images` (via the system `cur
 ```
 vomd [FILE]          Open FILE (any extension is read as Markdown)
 vomd -               Read Markdown from standard input
-vomd                 An empty window: drop a file on it (X11)
+vomd                 An empty window: Ctrl+O opens a file
 vomd --no-settings   Ignore the settings file
 vomd --help | --version
 ```
@@ -110,6 +110,7 @@ Each window is its own process, so opening another file starts another window.
 | `R`, `F5` | Reload |
 | Click a link | Follow it; hover shows where it goes |
 | `Backspace`, `Alt+←`, `Ctrl+[` | Back |
+| `Ctrl+O` | Open a file (the desktop's file dialog) |
 | `Esc`, `Q`, `Ctrl+W` | Quit |
 
 The toolbar has buttons for these, and its ⚙ button opens the settings file.

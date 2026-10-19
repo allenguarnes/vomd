@@ -22,7 +22,9 @@ given as
 the document is read from standard input.
 With no
 .IR FILE ,
-an empty window opens; a file can be dropped on it (X11).
+an empty window opens:
+.B Ctrl+O
+picks a file to open, or one can be dropped on it (X11).
 Each window is its own process.
 .PP
 The document is reloaded when it changes on disk and the window gets focus, keeping the
@@ -73,6 +75,12 @@ Reload.
 .TP
 .BR Backspace ", " Alt+Left ", " Ctrl+[
 Back, after following a link to another document.
+.TP
+.B Ctrl+O
+Open a file, in the desktop's file dialog (the portal's, else
+.BR zenity (1)
+or
+.BR kdialog (1)).
 .TP
 .BR Esc ", " Q ", " Ctrl+W
 Quit.

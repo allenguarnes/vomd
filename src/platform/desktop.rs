@@ -217,6 +217,67 @@ pub fn open_file(path: &Path) -> io::Result<(Child, Opener)> {
     }
 }
 
+/// Ask with `zenity`, else `kdialog`, when the portal has no file chooser. `Ok(None)` when the
+/// user picked nothing.
+pub fn choose_with_tools(title: &str, folder: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let globs = crate::platform::MARKDOWN_GLOBS.join(" ");
+    let mut zenity = Command::new("zenity");
+    zenity.args([
+        "--file-selection".into(),
+        format!("--title={title}"),
+        format!("--file-filter=Markdown | {globs}"),
+        "--file-filter=All files | *".into(),
+    ]);
+    if let Some(folder) = folder {
+        // A trailing slash: start in the folder, with no file selected.
+        let mut arg = OsString::from("--filename=");
+        arg.push(folder.join(""));
+        zenity.arg(arg);
+    }
+    let mut kdialog = Command::new("kdialog");
+    kdialog
+        .args(["--title", title, "--getopenfilename"])
+        .arg(folder.unwrap_or(Path::new(".")))
+        .arg(format!("Markdown files ({globs})"));
+    for mut cmd in [zenity, kdialog] {
+        match dialog(&mut cmd) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("the file dialog failed: {e}")),
+            Ok(picked) => return picked,
+        }
+    }
+    Err(
+        "no file dialog: the desktop portal has none, and neither zenity nor kdialog is \
+         installed"
+            .into(),
+    )
+}
+
+/// Run a dialog that prints the chosen path: exit 0 with the path, 1 when cancelled.
+fn dialog(cmd: &mut Command) -> io::Result<Result<Option<PathBuf>, String>> {
+    use std::os::unix::ffi::OsStringExt;
+    let out = cmd.stdin(Stdio::null()).stderr(Stdio::null()).output()?;
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    Ok(match out.status.code() {
+        Some(0) => {
+            let mut bytes = out.stdout;
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
+            }
+            let path = PathBuf::from(OsString::from_vec(bytes));
+            if path.as_os_str().is_empty() {
+                Ok(None)
+            } else if path.is_absolute() {
+                Ok(Some(path))
+            } else {
+                Err(format!("{program} gave no usable path"))
+            }
+        }
+        Some(1) => Ok(None),
+        _ => Err(format!("{program} failed ({})", out.status)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

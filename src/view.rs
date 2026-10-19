@@ -80,6 +80,8 @@ pub enum Action {
     Escape,
     /// Load remote images for this document, or hide them again (`I`).
     ToggleRemote,
+    /// Choose a file to open (`Ctrl+O`).
+    Open,
     Quit,
 }
 
@@ -92,6 +94,8 @@ pub enum Outcome {
     Reload,
     /// Return to the last place on the back stack (the shell owns it: it may be another file).
     Back,
+    /// Ask the user for a file and open it (the shell shows the dialog).
+    Open,
     Quit,
 }
 
@@ -145,6 +149,7 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
                 "-" | "_" => Some(Action::ZoomOut),
                 "0" => Some(Action::ZoomReset),
                 "w" | "W" => Some(Action::Quit),
+                "o" | "O" => Some(Action::Open),
                 // Cmd+[ is the macOS back key; Ctrl+[ goes back on Linux too.
                 "[" => Some(Action::Back),
                 _ => None,
@@ -804,6 +809,7 @@ impl View {
                 self.set_toolbar(visible);
             }
             Action::Reload => return Outcome::Reload,
+            Action::Open => return Outcome::Open,
             Action::ToggleWide => self.set_wide(!self.wide),
             Action::ToggleRemote => {
                 if self.remote_count == 0 {

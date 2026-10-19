@@ -1,13 +1,19 @@
-//! The desktop's light/dark preference: the XDG desktop portal's
-//! `org.freedesktop.appearance` `color-scheme` setting, read over the session D-Bus. winit
-//! reports no theme on Wayland, and KDE sets no `GTK_THEME`, so this is how a Plasma or GNOME
-//! dark mode is seen. A minimal client, no D-Bus crate: one connection, EXTERNAL
-//! authentication, `ReadOne` (`Read` on portals before version 2), then the `SettingChanged`
-//! signal for changes while the window is open.
+//! The XDG desktop portal over the session D-Bus, through a minimal client (no D-Bus crate:
+//! one connection, EXTERNAL authentication).
+//!
+//! The desktop's light/dark preference: the `org.freedesktop.appearance` `color-scheme`
+//! setting. winit reports no theme on Wayland, and KDE sets no `GTK_THEME`, so this is how a
+//! Plasma or GNOME dark mode is seen: `ReadOne` (`Read` on portals before version 2), then the
+//! `SettingChanged` signal for changes while the window is open.
+//!
+//! The file chooser for Open is in [`chooser`].
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
+
+mod chooser;
+pub use chooser::{Choice, choose_file};
 
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -86,6 +92,8 @@ struct Bus {
     /// The last `SettingChanged` that arrived while the latest `read_setting` waited for its
     /// reply: it may be older or newer than the value read.
     raced: Option<Option<bool>>,
+    /// This connection's unique name (`:1.42`), from `Hello`.
+    unique: Option<String>,
 }
 
 /// How long the login and `Hello` may take. Later calls and the signals wait without a limit:
@@ -127,11 +135,13 @@ impl Bus {
             serial: 0,
             dead: false,
             raced: None,
+            unique: None,
         };
         let hello = bus.call(BUS, "/org/freedesktop/DBus", BUS, "Hello", "", &[])?;
         if hello.kind != RETURN {
             return None;
         }
+        bus.unique = Reader::new(&hello.body).str().map(str::to_owned);
         // The portal may be started by the first call to it, which can take a while.
         bus.stream.set_read_timeout(None).ok()?;
         Some(bus)
@@ -264,13 +274,11 @@ impl Bus {
         sig: &str,
         args: &[&str],
     ) -> Option<Msg> {
-        if self.dead {
-            return None;
+        let mut body = Writer::default();
+        for a in args {
+            body.str(a);
         }
-        self.serial += 1;
-        let serial = self.serial;
-        let msg = method_call(serial, dest, path, iface, member, sig, args);
-        self.dead = self.stream.write_all(&msg).is_err();
+        let serial = self.send(dest, path, iface, member, sig, &body.0)?;
         while !self.dead {
             match self.recv() {
                 Ok(reply)
@@ -287,6 +295,26 @@ impl Bus {
             }
         }
         None
+    }
+
+    /// Send a method call with `body` (of signature `sig`); its serial, `None` once the
+    /// connection has failed.
+    fn send(
+        &mut self,
+        dest: &str,
+        path: &str,
+        iface: &str,
+        member: &str,
+        sig: &str,
+        body: &[u8],
+    ) -> Option<u32> {
+        if self.dead {
+            return None;
+        }
+        self.serial += 1;
+        let msg = method_call(self.serial, dest, path, iface, member, sig, body);
+        self.dead = self.stream.write_all(&msg).is_err();
+        (!self.dead).then_some(self.serial)
     }
 
     fn recv(&mut self) -> io::Result<Msg> {
@@ -313,6 +341,8 @@ impl Bus {
             kind: fixed[1],
             reply_serial: 0,
             member: String::new(),
+            path: String::new(),
+            sender: String::new(),
             directed: false,
             body,
         };
@@ -321,7 +351,9 @@ impl Bus {
             r.align(8);
             let code = r.byte().ok_or_else(bad)?;
             match (code, r.sig().ok_or_else(bad)?) {
+                (1, "o") => msg.path = r.str().ok_or_else(bad)?.to_owned(),
                 (3, "s") => msg.member = r.str().ok_or_else(bad)?.to_owned(),
+                (7, "s") => msg.sender = r.str().ok_or_else(bad)?.to_owned(),
                 (6, "s") => {
                     msg.directed = true;
                     _ = r.str().ok_or_else(bad)?;
@@ -404,6 +436,10 @@ struct Msg {
     kind: u8,
     reply_serial: u32,
     member: String,
+    /// The object path (signals, calls).
+    path: String,
+    /// The sending connection's unique name, as the bus stamped it.
+    sender: String,
     /// Addressed to one connection (a destination field), not broadcast.
     directed: bool,
     body: Vec<u8>,
@@ -418,7 +454,7 @@ fn setting_changed(msg: &Msg) -> Option<Option<bool>> {
     (r.str() == Some(NAMESPACE) && r.str() == Some(KEY)).then(|| r.variant_u32(0).and_then(scheme))
 }
 
-/// A method call with string arguments.
+/// A method call with `body`, whose signature is `sig`.
 fn method_call(
     serial: u32,
     dest: &str,
@@ -426,15 +462,11 @@ fn method_call(
     iface: &str,
     member: &str,
     sig: &str,
-    args: &[&str],
+    body: &[u8],
 ) -> Vec<u8> {
-    let mut body = Writer::default();
-    for a in args {
-        body.str(a);
-    }
     let mut m = Writer::default();
     m.0.extend_from_slice(&[b'l', 1, 0, 1]);
-    m.u32(body.0.len() as u32);
+    m.u32(body.len() as u32);
     m.u32(serial);
     m.u32(0); // the fields' length, filled in below
     let start = m.0.len();
@@ -452,7 +484,7 @@ fn method_call(
     let len = (m.0.len() - start) as u32;
     m.0[12..16].copy_from_slice(&len.to_le_bytes());
     m.pad(8);
-    m.0.extend_from_slice(&body.0);
+    m.0.extend_from_slice(body);
     m.0
 }
 
@@ -479,6 +511,29 @@ impl Writer {
         self.0.push(s.len() as u8);
         self.0.extend_from_slice(s.as_bytes());
         self.0.push(0);
+    }
+
+    /// Start an array whose elements align to `align`: the length is filled in by
+    /// [`Writer::end_array`] from what was written in between. Returns where it goes and where
+    /// the elements start.
+    fn begin_array(&mut self, align: usize) -> (usize, usize) {
+        self.u32(0);
+        let at = self.0.len() - 4;
+        self.pad(align);
+        (at, self.0.len())
+    }
+
+    fn end_array(&mut self, (at, start): (usize, usize)) {
+        let len = (self.0.len() - start) as u32;
+        self.0[at..at + 4].copy_from_slice(&len.to_le_bytes());
+    }
+
+    /// A dictionary entry's key and the variant signature of its value (`{sv}`), which the
+    /// caller then writes.
+    fn entry(&mut self, key: &str, sig: &str) {
+        self.pad(8);
+        self.str(key);
+        self.sig(sig);
     }
 
     fn field(&mut self, code: u8, ty: &str, value: &str) {
@@ -540,6 +595,64 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(s).ok()
     }
 
+    /// Skip one value of the complete type at the start of `sig` (which is advanced past it).
+    /// Arrays are skipped by their length; structs and variants nest at most 32 deep.
+    fn skip(&mut self, sig: &mut &[u8], depth: u8) -> Option<()> {
+        if depth > 32 {
+            return None;
+        }
+        let (&c, rest) = sig.split_first()?;
+        *sig = rest;
+        match c {
+            b'y' => _ = self.take(1)?,
+            b'b' | b'i' | b'u' | b'h' => _ = self.u32()?,
+            b'n' | b'q' => {
+                self.align(2);
+                self.take(2)?;
+            }
+            b'x' | b't' | b'd' => {
+                self.align(8);
+                self.take(8)?;
+            }
+            b's' | b'o' => _ = self.str()?,
+            b'g' => _ = self.sig()?,
+            b'v' => {
+                let mut inner = self.sig()?.as_bytes();
+                self.skip(&mut inner, depth + 1)?;
+                if !inner.is_empty() {
+                    return None;
+                }
+            }
+            b'a' => {
+                let n = self.u32()? as usize;
+                self.align(type_align(*sig.first()?));
+                skip_type(sig, depth)?;
+                self.take(n)?;
+            }
+            b'(' | b'{' => {
+                self.align(8);
+                let close = if c == b'(' { b')' } else { b'}' };
+                while *sig.first()? != close {
+                    self.skip(sig, depth + 1)?;
+                }
+                *sig = &sig[1..];
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// An array of strings (`as`).
+    fn str_array(&mut self) -> Option<Vec<&'a str>> {
+        let n = self.u32()? as usize;
+        let end = self.pos.checked_add(n)?;
+        let mut out = Vec::new();
+        while self.pos < end {
+            out.push(self.str()?);
+        }
+        (self.pos == end).then_some(out)
+    }
+
     /// A variant holding a `u`, possibly inside variants (`Read` wraps it once more).
     fn variant_u32(&mut self, depth: u8) -> Option<u32> {
         match self.sig()? {
@@ -547,6 +660,39 @@ impl<'a> Reader<'a> {
             "v" if depth < 4 => self.variant_u32(depth + 1),
             _ => None,
         }
+    }
+}
+
+/// The alignment of a value whose type starts with `c`.
+fn type_align(c: u8) -> usize {
+    match c {
+        b'n' | b'q' => 2,
+        b'b' | b'i' | b'u' | b'h' | b's' | b'o' | b'a' => 4,
+        b'x' | b't' | b'd' | b'(' | b'{' => 8,
+        _ => 1,
+    }
+}
+
+/// Advance `sig` past one complete type, without data.
+fn skip_type(sig: &mut &[u8], depth: u8) -> Option<()> {
+    if depth > 32 {
+        return None;
+    }
+    let (&c, rest) = sig.split_first()?;
+    *sig = rest;
+    match c {
+        b'a' => skip_type(sig, depth + 1),
+        b'(' | b'{' => {
+            let close = if c == b'(' { b')' } else { b'}' };
+            while *sig.first()? != close {
+                skip_type(sig, depth + 1)?;
+            }
+            *sig = &sig[1..];
+            Some(())
+        }
+        b'y' | b'b' | b'n' | b'q' | b'i' | b'u' | b'x' | b't' | b'd' | b'h' | b's' | b'o'
+        | b'g' | b'v' => Some(()),
+        _ => None,
     }
 }
 

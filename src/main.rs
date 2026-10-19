@@ -28,7 +28,19 @@ use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
 
 /// Idle layout runs in slices this long between events.
 const IDLE_SLICE: Duration = Duration::from_millis(4);
-const EMPTY_MESSAGE: &str = "Drop a Markdown file here";
+/// What the empty window says. Dropping a file only works on X11 (winit can't take drops on
+/// Wayland), so it is only offered there.
+fn empty_message() -> String {
+    let wayland = ["WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some_and(|v| !v.is_empty()));
+    let drop = if wayland || !cfg!(all(unix, not(target_os = "macos"))) {
+        ""
+    } else {
+        ", or drop one here"
+    };
+    format!("Press Ctrl+O to open a Markdown file{drop}")
+}
 
 enum UserEvent {
     /// A fallback font scan finished.
@@ -45,6 +57,8 @@ enum UserEvent {
     SystemDark(Option<bool>),
     /// The settings file couldn't be opened in an editor: why, for a toast.
     OpenFailed(String),
+    /// Open's dialog closed: the file picked (`None`: nothing), or why there was no dialog.
+    Chosen(Result<Option<std::path::PathBuf>, String>),
 }
 
 /// How long the first window waits for the portal's dark preference before painting with
@@ -103,7 +117,7 @@ fn load(input: &Input, origin: Origin) -> Loaded {
         Ok((text, stamp)) => Loaded {
             notice: view::large_notice(text.len()),
             doc: Doc::parse(&text),
-            message: (*input == Input::None).then(|| EMPTY_MESSAGE.to_owned()),
+            message: (*input == Input::None).then(empty_message),
             stamp,
         },
         Err(message) => {
@@ -162,6 +176,8 @@ struct App {
     /// Families (by `mono`) waiting for a lookup of their files.
     unresolved: Vec<bool>,
     resolving: bool,
+    /// Open's dialog is up (one at a time).
+    choosing: bool,
     mods: ModifiersState,
     cursor: PhysicalPosition<f64>,
     /// The pointer is over the window (hover tracking).
@@ -508,6 +524,20 @@ impl App {
         }
     }
 
+    /// Open: ask for a file (off the main thread, starting in the document's folder), then go
+    /// to it like a dropped one. A second request while the dialog is up does nothing.
+    fn choose_file(&mut self) {
+        if std::mem::replace(&mut self.choosing, true) {
+            return;
+        }
+        let folder = nav::base_dir(&self.input).and_then(|d| std::path::absolute(d).ok());
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let chosen = platform::choose_file(folder.as_deref());
+            let _ = proxy.send_event(UserEvent::Chosen(chosen));
+        });
+    }
+
     fn toast(&mut self, text: String) {
         if let Some(view) = self.view.as_mut() {
             view.show_toast(text, Instant::now());
@@ -521,6 +551,7 @@ impl App {
             Outcome::Redraw => self.redraw(),
             Outcome::Reload => self.reload(),
             Outcome::Back => self.go_back(),
+            Outcome::Open => self.choose_file(),
             Outcome::Quit => event_loop.exit(),
         }
     }
@@ -677,6 +708,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenFailed(why) => self.toast(why),
+            UserEvent::Chosen(chosen) => {
+                self.choosing = false;
+                match chosen {
+                    Ok(Some(path)) => self.go_to(Input::File(path)),
+                    Ok(None) => {}
+                    Err(why) => self.toast(format!("Can't open a file: {why}")),
+                }
+            }
             UserEvent::SystemDark(dark) => {
                 self.portal = dark;
                 if let (Some(view), Some(gfx)) = (self.view.as_mut(), self.gfx.as_ref())
@@ -936,6 +975,7 @@ fn main() {
         families: [None, None],
         unresolved: Vec::new(),
         resolving: false,
+        choosing: false,
         mods: ModifiersState::empty(),
         cursor: PhysicalPosition::new(0.0, 0.0),
         cursor_in: false,

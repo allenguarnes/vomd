@@ -44,6 +44,7 @@ fn wide_bar_shows_everything() {
         items(&s),
         [
             Item::Back,
+            Item::Open,
             Item::Settings,
             Item::Reload,
             Item::Theme,
@@ -57,6 +58,9 @@ fn wide_bar_shows_everything() {
     // Right group flush with the right edge, left to right: − % + wide theme reload settings.
     let r = |i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;
     assert_eq!(r(Item::Settings).x1, 900.0 - EDGE);
+    // Open right after Back.
+    assert_eq!(r(Item::Open).x0, r(Item::Back).x1);
+    assert_eq!(r(Item::Open).x1, EDGE + LEFT);
     assert!(r(Item::ZoomOut).x1 <= r(Item::ZoomReset).x0 + 0.01);
     assert!(r(Item::ZoomIn).x1 <= r(Item::Wide).x0 + 0.01);
     assert!(r(Item::Wide).x1 <= r(Item::Theme).x0 + 0.01);
@@ -70,12 +74,12 @@ fn wide_bar_shows_everything() {
 
 #[test]
 fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
-    let full = (EDGE + BUTTON + GAP + 2.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
+    let full = (EDGE + LEFT + GAP + 2.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
     assert!(slots(&ctx(full)).overflow.is_empty(), "exactly fits");
     let s = slots(&ctx(full - 1));
     assert_eq!(s.overflow, [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]);
     assert!(items(&s).contains(&Item::More) && items(&s).contains(&Item::Theme));
-    let s = slots(&ctx(150));
+    let s = slots(&ctx(182));
     assert_eq!(
         s.overflow,
         [
@@ -88,7 +92,7 @@ fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
     );
     // Wide layout goes before the theme: with room for the theme, reload and ⚙ only, it's in
     // the dropdown.
-    let s = slots(&ctx(200));
+    let s = slots(&ctx(232));
     assert_eq!(s.overflow.last(), Some(&Item::Wide));
     assert!(items(&s).contains(&Item::Theme));
     // Down to 320 px and below, everything stays reachable: shown or in the menu.
@@ -98,6 +102,7 @@ fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
         all.extend(&s.overflow);
         for item in [
             Item::Back,
+            Item::Open,
             Item::ZoomOut,
             Item::ZoomReset,
             Item::ZoomIn,
@@ -136,6 +141,7 @@ fn clicks_map_to_the_shortcuts_actions() {
     let mut t = Toolbar::default();
     for (item, want) in [
         (Item::Back, Command::Action(Action::Back)),
+        (Item::Open, Command::Action(Action::Open)),
         (Item::ZoomOut, Command::Action(Action::ZoomOut)),
         (Item::ZoomReset, Command::Action(Action::ZoomReset)),
         (Item::ZoomIn, Command::Action(Action::ZoomIn)),
@@ -244,7 +250,7 @@ fn nothing_outside_the_window_is_hit() {
 fn short_window_scrolls_the_dropdown() {
     let c = Ctx {
         height: 100,
-        ..ctx(150)
+        ..ctx(182)
     };
     let s = slots(&c);
     assert_eq!(
@@ -423,6 +429,7 @@ fn hidden_bar_takes_nothing() {
 fn labels_name_the_shortcut() {
     let c = ctx(900);
     assert_eq!(Item::Back.label(&c), "Back (Backspace)");
+    assert_eq!(Item::Open.label(&c), "Open a file (Ctrl+O)");
     assert!(Item::ZoomReset.label(&c).contains("100%"));
     assert_eq!(
         Item::Theme.label(&Ctx {
@@ -517,7 +524,7 @@ fn the_remote_images_button() {
     t.press(&none, x, y);
     assert_eq!(t.release(&none, x, y), (true, None));
     // Narrower: the zoom goes into `⋯` first, then it.
-    let full = (EDGE + BUTTON + GAP + 3.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
+    let full = (EDGE + LEFT + GAP + 3.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
     assert!(slots(&Ctx { width: full, ..c }).overflow.is_empty());
     let s = slots(&Ctx {
         width: full - 1,
@@ -525,7 +532,7 @@ fn the_remote_images_button() {
     });
     assert_eq!(s.overflow, [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]);
     assert!(items(&s).contains(&Item::Images));
-    let s = slots(&Ctx { width: 200, ..c });
+    let s = slots(&Ctx { width: 232, ..c });
     assert_eq!(
         s.overflow[..4],
         [Item::Images, Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]

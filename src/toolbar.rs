@@ -1,6 +1,6 @@
 //! The toolbar: one slim bar docked at the top, never over the text.
 //!
-//! Left: Back. Right: remote images (only when the document has any), zoom (− 100% +), wide
+//! Left: Back, Open. Right: remote images (only when the document has any), zoom (− 100% +), wide
 //! layout, theme, reload, settings. Buttons for features that aren't built yet are absent. On
 //! narrow windows the right group collapses into a `⋯` button with a small dropdown, the one
 //! popup in the app: zoom first, then remote images, wide layout, theme, ...
@@ -28,6 +28,8 @@ const ICON: f32 = 16.0;
 const PERCENT: f32 = 48.0;
 const EDGE: f32 = 4.0;
 const GAP: f32 = 8.0;
+/// The left group: Back and Open.
+const LEFT: f32 = 2.0 * BUTTON;
 /// Text size of the percentage, tooltips and menu rows.
 const LABEL: f32 = 13.0;
 /// Menu row height and width.
@@ -44,6 +46,7 @@ mod icon {
     pub const THEME: char = '\u{e09d}';
     pub const RELOAD: char = '\u{e149}';
     pub const SETTINGS: char = '\u{e154}';
+    pub const OPEN: char = '\u{e247}';
     pub const MORE: char = '\u{e0b6}';
     pub const IMAGE: char = '\u{e0f6}';
     /// Wide layout is off (the button widens) and on (it narrows).
@@ -54,6 +57,8 @@ mod icon {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     Back,
+    /// Choose a file to open.
+    Open,
     /// Load or hide remote images, with a badge counting them.
     Images,
     ZoomOut,
@@ -142,6 +147,7 @@ impl Item {
     pub fn label(self, ctx: &Ctx) -> String {
         match self {
             Item::Back => "Back (Backspace)".into(),
+            Item::Open => "Open a file (Ctrl+O)".into(),
             Item::Images if ctx.no_curl => "Remote images: curl not found".into(),
             Item::Images if ctx.remote_on => "Hide remote images (I)".into(),
             Item::Images => {
@@ -168,6 +174,7 @@ impl Item {
     fn icon(self, ctx: &Ctx) -> Option<char> {
         Some(match self {
             Item::Back => icon::BACK,
+            Item::Open => icon::OPEN,
             Item::Images => icon::IMAGE,
             Item::ZoomOut => icon::MINUS,
             Item::ZoomIn => icon::PLUS,
@@ -184,6 +191,7 @@ impl Item {
     fn command(self) -> Option<Command> {
         Some(match self {
             Item::Back => Command::Action(Action::Back),
+            Item::Open => Command::Action(Action::Open),
             Item::Images => Command::Action(Action::ToggleRemote),
             Item::ZoomOut => Command::Action(Action::ZoomOut),
             Item::ZoomReset => Command::Action(Action::ZoomReset),
@@ -233,7 +241,7 @@ fn collapsed(ctx: &Ctx) -> u8 {
     while first <= right.last().map_or(0, |r| r.2) {
         let rest: f32 = right.iter().filter(|r| r.2 >= first).map(|r| r.1).sum();
         let more = if first > 0 { BUTTON } else { 0.0 };
-        if (EDGE + BUTTON + GAP + rest + more + EDGE) * ctx.scale <= ctx.width as f32 {
+        if (EDGE + LEFT + GAP + rest + more + EDGE) * ctx.scale <= ctx.width as f32 {
             break;
         }
         first += 1;
@@ -241,8 +249,8 @@ fn collapsed(ctx: &Ctx) -> u8 {
     first
 }
 
-/// The bar's layout for this frame: Back on the left, the right group laid out from the right
-/// edge, and as many of its leading groups as don't fit collapsed into `⋯`.
+/// The bar's layout for this frame: Back and Open on the left, the right group laid out from
+/// the right edge, and as many of its leading groups as don't fit collapsed into `⋯`.
 pub fn slots(ctx: &Ctx) -> Slots {
     let s = ctx.scale;
     let h = BAR * s;
@@ -253,7 +261,10 @@ pub fn slots(ctx: &Ctx) -> Slots {
         x1,
         y1: h,
     };
-    let mut items = vec![(Item::Back, bar(EDGE * s, (EDGE + BUTTON) * s))];
+    let mut items = vec![
+        (Item::Back, bar(EDGE * s, (EDGE + BUTTON) * s)),
+        (Item::Open, bar((EDGE + BUTTON) * s, (EDGE + LEFT) * s)),
+    ];
     let mut x = ctx.width as f32 - EDGE * s;
     for &(item, iw, _) in right.iter().rev().filter(|r| r.2 >= first) {
         items.push((item, bar(x - iw * s, x)));
@@ -261,8 +272,9 @@ pub fn slots(ctx: &Ctx) -> Slots {
     }
     let overflow: Vec<Item> = right.iter().filter(|r| r.2 < first).map(|r| r.0).collect();
     if !overflow.is_empty() {
-        // Never over Back: in a window too narrow for both, `⋯` runs off the right edge.
-        let x0 = (x - BUTTON * s).max((EDGE + BUTTON) * s);
+        // Never over the left group: in a window too narrow for both, `⋯` runs off the right
+        // edge.
+        let x0 = (x - BUTTON * s).max((EDGE + LEFT) * s);
         items.push((Item::More, bar(x0, x0 + BUTTON * s)));
     }
     Slots { items, overflow }

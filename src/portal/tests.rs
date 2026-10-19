@@ -500,6 +500,7 @@ fn oversized_messages_end_the_connection() {
         serial: 0,
         dead: false,
         raced: None,
+        unique: None,
     };
     assert!(bus.recv().is_err());
 }

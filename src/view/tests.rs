@@ -46,6 +46,11 @@ fn keys() {
         (ch("-"), ctrl, Some(Action::ZoomOut)),
         (ch("0"), ModifiersState::SUPER, Some(Action::ZoomReset)),
         (ch("w"), ctrl, Some(Action::Quit)),
+        (ch("o"), ctrl, Some(Action::Open)),
+        (ch("O"), ctrl | shift, Some(Action::Open)),
+        (ch("o"), ModifiersState::SUPER, Some(Action::Open)),
+        // Plain `o` is no shortcut.
+        (ch("o"), none, None),
         // Shortcuts never fall through to plain keys.
         (ch("j"), ctrl, None),
         (ch("q"), ModifiersState::ALT, None),
@@ -1811,6 +1816,10 @@ mod with_fonts {
         assert_eq!(v.apply(Action::NextHeading, now), Outcome::Redraw);
         assert_eq!(v.anchor().block, blocks[1]);
         assert_eq!(v.apply(Action::Back, now), Outcome::Back);
+        // Open is the shell's: the view only asks for it.
+        let anchor = v.anchor();
+        assert_eq!(v.apply(Action::Open, now), Outcome::Open);
+        assert_eq!(v.anchor(), anchor);
     }
 
     #[test]
