@@ -1,0 +1,50 @@
+## Tables
+
+| Left | Center | Right |
+|:-----|:------:|------:|
+| a | b | c |
+| longer cell content that should wraÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿp when the window is narrow | `code` | 1,234.56 |
+| **bold** | *italic* | ~~str¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼ike~~ |
+
+|<td> Key | Action |
+|hen the window is narrow | `code` | 1,234.56 |
+| **bold** | *italic* | ~~str¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼ike~~ |
+
+|<td> Key | Action |
+|---|---|
+| `j` / `k` | Scroll one line |
+| `Space` | Scroll one page |
+| `g` / `G` | Top / bottom |
+
+- [x] Task done
+- [ ] Task pending
+
+> ---|---|
+| `j` / `k` | Scroll one line |
+| `Space` | Scroll one page |
+| `g` / `G` | Top / bottom |
+
+- [x] Task done
+- [ ] Task pending
+
+> [!NOTE]
+> GitHub-style alert witè a [link]( `code` | 1,234.56 |
+| **bold** | *italic* | ~~str¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼ike~~ at should wrap when the window is narr/sup>,
+<!oooooooooooooHTMN, autoli# Inline HTML, autolinks and­ edg ecases
+
+Keyse|
+
+|<td> Key | Action |
+|---|---|
+| `j` / `k` | Scroll one line |
+| `Space` | Scroll one page |
+| `g` / `G` | Top / bottom |
+
+- [x] Task done
+- [ ] Task pen#tables).
+
+```rust
+fn main() {
+    println!("a code block with a very long line that will need to wrap somewhere along the way because it is long");
+}
+```

@@ -1364,6 +1364,188 @@ fn segmented_parse_never_cuts_inside_blocks_that_span_blank_lines() {
     }
 }
 
+/// The line that ends an HTML block of types 1-5 is part of it, so it can't be the header of a
+/// table, even when it follows a blank line (inside the block) and a delimiter row follows it.
+/// The scan took it for one and cut the "table" between its rows: the part after the cut was
+/// a table of its own, while one parser reads the rest as a paragraph.
+#[test]
+fn segmented_parse_does_not_start_a_table_on_the_line_that_ends_an_html_block() {
+    // (opener, line that ends the block and looks like a table header)
+    let blocks = [
+        ("<!DOCTYPE html", "|a|>||"),
+        ("<!-- comment", "|a|-->|"),
+        ("<?php", "|a|?>|"),
+        ("<![CDATA[", "|a|]]>|"),
+        ("<pre>", "|a|</pre>|"),
+        ("<script>", "|a|</script>|"),
+        ("<style>", "|a|</style>|"),
+        ("<textarea>", "|a|</textarea>|"),
+    ];
+    for (open, close) in blocks {
+        let src = format!(
+            "{open} {}\n\n{close}\n|-|-|\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |\n\nAfter.\n",
+            "x".repeat(40)
+        );
+        let n = assert_same(open, &src, 1);
+        // The text is cut after the block, not inside its tail.
+        assert!(n >= 2, "{open}: {n} segments");
+    }
+    // The same after a table that is really cut, and in front of one.
+    let table = "| a | b |\n|---|---|\n".to_owned() + &"| 1 | 2 |\n".repeat(30);
+    let src = format!("{table}\n<!DOCTYPE x\n\n|y|>||\n|-|-\n||\n|l\n\n{table}");
+    for budget in [1, 16, 40, 200] {
+        assert_same("tables around an html block", &src, budget);
+    }
+}
+
+/// The input of a fuzz finding (first byte: the segment budget, 16 + 8 * 35 = 296; the rest the
+/// document, decoded lossily): the same "table" on the last line of a `<!` block, in a document
+/// with real tables, alerts and code too.
+#[test]
+fn segmented_parse_of_the_fuzz_finding_matches() {
+    let data = include_bytes!("../../fuzz/seeds/doc/html-end-line-is-not-a-table-head.bin");
+    let (&b, rest) = data.split_first().unwrap();
+    let src = String::from_utf8_lossy(rest);
+    let budget = 16 + usize::from(b) * 8;
+    assert_eq!(budget, 296);
+    let (whole, parts) = Doc::fuzz_segments(&src, budget).expect("the text is cut");
+    assert!(whole == parts, "segmented parse at {budget} differs");
+    // And at every other segment size the fuzz target can pick.
+    for budget in (16..=16 + 255 * 8).step_by(8) {
+        assert_same("fuzz finding", &src, budget);
+    }
+}
+
+/// Every kind of HTML block of types 1-5 as (opener, end text), for tests of its closing line.
+const HTML_BLOCKS: [(&str, &str); 8] = [
+    ("<!DOCTYPE html", ">"),
+    ("<!--", "-->"),
+    ("<?php", "?>"),
+    ("<![CDATA[", "]]>"),
+    ("<pre>", "</pre>"),
+    ("<script>", "</script>"),
+    ("<style>", "</style>"),
+    ("<textarea>", "</textarea>"),
+];
+
+/// The line that ends an HTML block of types 1-5 is part of it, so a fence marker at its start
+/// opens nothing. The scan took it for a fence of the top level (the single parser does not),
+/// then read the next fence as the one that closes it, and cut inside a real code block.
+#[test]
+fn segmented_parse_does_not_open_a_fence_on_the_line_that_ends_an_html_block() {
+    let code = "code line\n\n".repeat(20);
+    let tail = format!("# h\n\n{}", "para\n\n".repeat(20));
+    for (open, end) in HTML_BLOCKS {
+        for fence in ["```", "~~~"] {
+            let src = format!("{open}\n\n{fence}{end}\ntext\n\n{fence}\n{code}{tail}");
+            for budget in 1..=200 {
+                assert_same(&format!("{open} {fence}{end}"), &src, budget);
+            }
+            // The same with the fence closed, and the block closed late (the fence line inside).
+            let src =
+                format!("{open}\n\n{fence}\nx\n{end}\ntext\n\n{fence}\n{code}{fence}\n\n{tail}");
+            for budget in [1, 16, 60, 200] {
+                assert_same(&format!("{open} {fence} inside"), &src, budget);
+            }
+        }
+    }
+}
+
+/// An HTML opener on the line that ends a block is content of that block, not a new block: the
+/// scan took it for a `<pre>` that stays open, and no cut was made in the rest of the text.
+#[test]
+fn segmented_parse_goes_on_cutting_after_an_opener_on_the_line_that_ends_an_html_block() {
+    let tail = format!("text\n\n# h\n\n{}", "para\n\n".repeat(40));
+    for (open, end) in HTML_BLOCKS {
+        for (inner, _) in HTML_BLOCKS {
+            let src = format!("{open}\n\n{inner}{end}\n\n{tail}");
+            for budget in [1, 30, 100] {
+                let n = assert_same(&format!("{open} {inner}{end}"), &src, budget);
+                assert!(n >= 3, "{open} {inner}{end} @ {budget}: {n} segments");
+            }
+        }
+    }
+}
+
+/// When the opener of a block may be content of a block of type 6 or 7 (which a blank line
+/// ends) or of a list item, it is not known to be open, and the line that "ends" it may well be
+/// a fence or an opener of its own.
+#[test]
+fn segmented_parse_keeps_both_readings_of_an_opener_that_may_be_content() {
+    let code = "code line\n\n".repeat(20);
+    let tail = format!("# h\n\n{}", "para\n\n".repeat(20));
+    let prefixes = [
+        // A block of type 6 holds the opener; the blank line ends both.
+        "<div>\n{open}\n\n",
+        // A list item holds it, and ends at the lazy column-0 line.
+        "- a\n  {open}\nnext\n\n",
+        // The opener is a real block at the top level, but a list that may go on is before it.
+        "- a\n{open}\n\n",
+    ];
+    // The opener inside a list item may be the real thing: the line is then content of a block.
+    let item_code = "  code line\n\n".repeat(20);
+    for (open, end) in HTML_BLOCKS {
+        for fence in ["```", "~~~"] {
+            let src = format!(
+                "- a\n\n  {open}\n\n  {fence}{end}\n  text\n\n  {fence}\n{item_code}{tail}"
+            );
+            for budget in [1, 16, 60, 200] {
+                assert_same(&format!("item {open} {fence}{end}"), &src, budget);
+            }
+        }
+    }
+    for prefix in prefixes {
+        for (open, end) in HTML_BLOCKS {
+            let prefix = prefix.replace("{open}", open);
+            for fence in ["```", "~~~"] {
+                let src = format!("{prefix}{fence}{end}\ntext\n\n{fence}\n{code}{tail}");
+                for budget in [1, 16, 60, 200] {
+                    assert_same(&format!("{prefix:?} {fence}{end}"), &src, budget);
+                }
+            }
+            // The "end" line opens an HTML block that really is one: it holds blank lines.
+            let src = format!("{prefix}<pre>{end}\n\n{tail}</pre>\n\n{tail}");
+            for budget in [1, 16, 60, 200] {
+                assert_same(&format!("{prefix:?} <pre>{end}"), &src, budget);
+            }
+        }
+    }
+}
+
+/// A fence left open in a list item across a blank line must not make the next line's HTML
+/// block forget the fence-like line it holds.
+#[test]
+fn segmented_parse_keeps_an_html_block_after_a_fence_left_open_in_a_list_item() {
+    let src = format!(
+        "- a\n  ```\n\n<div>\n```-->\n\n````\n\n# h\n\n{}",
+        "para\n\n".repeat(20)
+    );
+    for budget in 1..=200 {
+        assert_same("fence open in a list item, then <div>", &src, budget);
+    }
+}
+
+/// Every input of a past fuzz finding (fuzz/seeds/doc/), at every segment size the target picks.
+#[test]
+fn segmented_parse_of_every_fuzz_seed_matches() {
+    let dir = format!("{}/fuzz/seeds/doc", env!("CARGO_MANIFEST_DIR"));
+    let mut seeds = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let data = std::fs::read(entry.unwrap().path()).unwrap();
+        let (&b, rest) = data.split_first().unwrap();
+        let src = String::from_utf8_lossy(rest);
+        let at = 16 + usize::from(b) * 8;
+        if let Some((whole, parts)) = Doc::fuzz_segments(&src, at) {
+            assert!(whole == parts, "segmented parse at {at} differs");
+        }
+        for budget in (16..=16 + 255 * 8).step_by(8) {
+            assert_same("fuzz seed", &src, budget);
+        }
+        seeds += 1;
+    }
+    assert!(seeds >= 2);
+}
+
 /// Deterministic pseudo-random numbers (xorshift), so failures reproduce.
 struct Rng(u64);
 

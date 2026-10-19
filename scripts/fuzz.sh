@@ -20,15 +20,15 @@ case $target in
 esac
 corpus="corpus/$target"
 mkdir -p "$corpus" "artifacts/$target"
-# Seeds: the fixtures for the Markdown targets, sample files for the settings.
-if [ -z "$(ls -A "$corpus")" ]; then
-    case $target in
-        settings) cp seeds/settings/* "$corpus/" ;;
-        *) for f in "$root"/fixtures/*.md; do
-               if [ "$(stat -c %s "$f")" -le "$max_len" ]; then cp "$f" "$corpus/"; fi
-           done ;;
-    esac
+# Seeds: the fixtures for the Markdown targets, and seeds/<target>/: the sample files of the
+# settings, and the inputs of past findings (also run as tests). The seeds go in every run, so
+# a finding is run also from a corpus that was seeded before it.
+if [ "$target" != settings ] && [ -z "$(ls -A "$corpus")" ]; then
+    for f in "$root"/fixtures/*.md; do
+        if [ "$(stat -c %s "$f")" -le "$max_len" ]; then cp "$f" "$corpus/"; fi
+    done
 fi
+if [ -d "seeds/$target" ]; then cp seeds/"$target"/* "$corpus/"; fi
 exec "target/$triple/release/$target" "$corpus" \
     -artifact_prefix="artifacts/$target/" -max_total_time="$secs" -max_len="$max_len" \
     -timeout=10 -rss_limit_mb=2048 -print_final_stats=1

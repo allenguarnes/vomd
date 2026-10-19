@@ -17,11 +17,14 @@
 //! start of the text before parsing, so a `---` here is only ever a rule or a setext underline.)
 //!
 //! **Ambiguity.** Some lines open one of those blocks only in some contexts: a fence inside a
-//! list item or an HTML block. The scan can't always tell, so it follows every reading at once (a handful of states) and cuts only where all of them agree
+//! list item or an HTML block. The scan can't always tell, so it follows every reading at once
+//! (a handful of states) and cuts only where all of them agree
 //! that nothing is open. A fence in a list item, for example, is either a real fence or part of
 //! the item (which ends at the next column-0 line); once its closing line is seen both readings
 //! agree again and cutting resumes. Only a pile-up of readings (more than [`MAX_STATES`]) makes
-//! the scan stop for good.
+//! the scan stop for good. An HTML block that is certainly open (it started at the top level,
+//! with no list that may go on and no block of type 6 or 7 around it) is not ambiguous: every
+//! line up to the one with its end text is content, and that last line opens nothing.
 //!
 //! **Tables.** A table has no blank lines, so a giant one has no safe cut. Instead a segment may
 //! end between two rows of a table whose rows all start with `|` in column 0; the next segment
@@ -294,6 +297,11 @@ struct State {
     /// like an opener might be content of a block that is open or of a list item, so every
     /// opener counts until its end text shows up (always an over-estimate).
     html: Vec<&'static str>,
+    /// The end text of an HTML block (types 1–5) that is certainly open: it started at the top
+    /// level (no list, quote or footnote that may end it early, not inside a block of type 6 or
+    /// 7, where the opener is content), and its end text hasn't come yet. Every line up to and
+    /// including the one with the end text is content of the block.
+    html_sure: Option<&'static str>,
     /// A list, quote or footnote definition may be open.
     containers: bool,
     /// A line of the current run of non-blank lines began with `<` (maybe an HTML block).
@@ -427,6 +435,7 @@ impl<'a> Scan<'a> {
             states: vec![State {
                 fence: None,
                 html: Vec::new(),
+                html_sure: None,
                 containers: false,
                 html_run: false,
                 def_run: false,
@@ -560,8 +569,18 @@ impl<'a> Scan<'a> {
             // but text within a paragraph: no telling which, so no more cuts.
             self.stopped = true;
         }
+        // Whether the line is in an HTML block of types 1–5, judged before the line's own end
+        // text closes it: the line that closes a block is part of it, so what it looks like
+        // (a table header, a fence, an opener) doesn't count.
         let in_html = !st.html.is_empty();
+        let content = st.html_sure.is_some();
         st.html.retain(|end| !contains(line.bytes, end.as_bytes()));
+        if st
+            .html_sure
+            .is_some_and(|end| contains(line.bytes, end.as_bytes()))
+        {
+            st.html_sure = None;
+        }
         if line.blank {
             // Pulldown-cmark mishandles a line of only whitespace right after a link reference
             // definition: it is part of the paragraph (a break), and in a list item it can cut
@@ -596,12 +615,14 @@ impl<'a> Scan<'a> {
             }
         }
         // The first line of a run of plain lines: after a blank line, or a block that ended.
-        let first = line.was_blank || std::mem::take(&mut st.fresh);
+        // Take `fresh` first: after a blank line it would otherwise leak to the next one.
+        let first = std::mem::take(&mut st.fresh) || line.was_blank;
         if first {
             st.html_run = false;
         }
         // An HTML block of type 6 or 7 can start wherever a block does (after a heading, a rule,
         // ...), and runs until the next blank line.
+        let in_run = st.html_run;
         st.html_run |= line.top && line.rest.first() == Some(&b'<');
 
         if line.want_cut && line.row {
@@ -614,8 +635,9 @@ impl<'a> Scan<'a> {
             st.containers = false;
         }
 
-        self.table_line(&mut st, line);
-        if !line.top {
+        self.table_line(&mut st, line, in_html);
+        // A line of a block that is certainly open, the last one included, is only content.
+        if !line.top || content {
             return out.push(st);
         }
         if let Some((c, n)) = fence_open(line.rest) {
@@ -623,7 +645,7 @@ impl<'a> Scan<'a> {
             // it opens one that ends with the item; inside an HTML block it is just content;
             // otherwise it is a fence of the top level. Each reading that is possible goes on.
             let in_item = line.indent > 0 && st.containers;
-            let in_html = st.html_run || !st.html.is_empty();
+            let in_html = st.html_run || in_html;
             if in_item {
                 let mut item = st.clone();
                 item.fence = Some(Fence {
@@ -647,6 +669,9 @@ impl<'a> Scan<'a> {
             && !st.html.contains(&end)
         {
             st.html.push(end);
+            if !in_html && !in_run && !st.containers {
+                st.html_sure = Some(end);
+            }
         }
         out.push(st);
     }
@@ -680,15 +705,17 @@ impl<'a> Scan<'a> {
     }
 
     /// Track a table whose rows all start with `|` in column 0 (so it is not inside a list
-    /// item): the header must follow a blank line and be followed by a delimiter row.
-    fn table_line(&mut self, st: &mut State, line: &Line) {
+    /// item): the header must follow a blank line and be followed by a delimiter row, and is not
+    /// the closing line of an HTML block (`in_html`: one was open before this line, whose end
+    /// text this line may hold; a line that ends an HTML block is part of it).
+    fn table_line(&mut self, st: &mut State, line: &Line, in_html: bool) {
         if let Some(table) = st.table.as_ref() {
             if line.pos >= table.body && !line.row {
                 st.table = None;
             }
             return;
         }
-        if !(line.was_blank && line.row && st.html.is_empty()) {
+        if !(line.was_blank && line.row && !in_html) {
             return;
         }
         let (src, next) = (self.src, self.next);

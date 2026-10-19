@@ -33,10 +33,12 @@ jobs:
       - name: Seed the corpus
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          if [ "${{ matrix.target }}" = settings ]; then
-            cp fuzz/seeds/settings/* fuzz/corpus/settings/
-          else
+          if [ "${{ matrix.target }}" != settings ]; then
             find fixtures -maxdepth 1 -name '*.md' -size -16k -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
+          fi
+          # Sample files and the inputs of past findings.
+          if [ -d fuzz/seeds/${{ matrix.target }} ]; then
+            cp fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
           fi
       - name: Minimize the cached corpus
         run: cargo +nightly fuzz cmin -a ${{ matrix.target }}

@@ -32,6 +32,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
   unseen. If the file can't be opened, a note in the window says why.
 - Release binaries are built on Debian 12 (glibc 2.36), so a glibc older than 2.39 no longer
   prints "weak version `GLIBC_2.39' not found" at every start.
+- Documents over 1 MB, which are parsed in pieces, render the same as when parsed whole when
+  the line that ends an HTML block looks like a table, a code fence or another HTML block, or
+  when a code fence is left open in a list item. Before, the piece could be cut inside a code
+  block or a table, and the rest of the document rendered differently.
 
 ## [1.0.0] - 2026-10-19
 
