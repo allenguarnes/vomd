@@ -32,6 +32,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Fixed
 - An image decode that started just as the images wanted changed is counted in the room the
   image cache keeps free. Before, the cache could briefly fill the memory that decode used.
+- With remote images on, a picture near the window could be fetched again and again after a
+  few arrived at once: each body let in was the first thing the next one's room was made from.
 
 ## [1.1.0] - 2026-10-19
 

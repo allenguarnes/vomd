@@ -1245,6 +1245,8 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // | keeps near the viewport)                   |                                            |                                             |
 // | `Cache::protect` / `unprotect`             | `protect`, within `request` and `poll`     | what the operation in progress is about to  |
 // | (`protect_wanted`; the results a poll took)| (cleared when it ends)                     | use: no longer than the call                |
+// | `Cache::guard_admitted` (the bodies a poll | `protect` of them, while a body is let in  | what the next body's room is not made from: |
+// | let in, around the next body's admission)  | (and `admitted`, until the poll ends)      | a decoded result evicts them like any other |
 // | `Cache::bytes_of`                          | `used` of a body: the frame                | a decode input: an image in view had its    |
 // | (`take_fetched` for an image in view; a    |                                            | body admitted, and its job holds it from the|
 // | job made)                                  |                                            | next request on (`Slot::pinned`)            |
@@ -1281,6 +1283,9 @@ struct Slot {
     painted: u64,
     /// Kept for the request being made ([`Cache::protect`]), and cleared when it is done.
     protect: bool,
+    /// A body let in by the poll in progress ([`Cache::admitted`]): kept from the room that
+    /// the next body's admission makes ([`Cache::guard_admitted`]), and from no other.
+    admitted: bool,
 }
 
 /// What a slot costs besides its buffer and its URL's string: the `Arc` and `Vec` headers of a
@@ -1551,6 +1556,7 @@ impl Cache {
             used,
             painted: 0,
             protect: false,
+            admitted: false,
         };
         // Room is made before the slot is in, so it can't be the one evicted.
         self.evict_to(slot.cost());
@@ -1585,6 +1591,28 @@ impl Cache {
     fn unprotect(&mut self) {
         for s in &mut self.slots {
             s.protect = false;
+            s.admitted = false;
+        }
+    }
+
+    /// The body of `url` was let in by the poll in progress, until [`Cache::unprotect`].
+    #[cfg(feature = "remote-images")]
+    fn admitted(&mut self, url: &Arc<str>) {
+        for s in &mut self.slots {
+            if matches!(&s.key, Key::Remote(u) if u == url) && matches!(s.data, Data::Bytes(_)) {
+                s.admitted = true;
+            }
+        }
+    }
+
+    /// Keep the bodies the poll in progress let in ([`Cache::admitted`]) from eviction, or not:
+    /// for the admission of the next body, whose room is not made out of them. Not for a decoded
+    /// result, which is stored whatever there is, and must leave the budget held beside the job
+    /// that starts next: it evicts them like any slot not in use.
+    #[cfg(feature = "remote-images")]
+    fn guard_admitted(&mut self, on: bool) {
+        for s in self.slots.iter_mut().filter(|s| s.admitted) {
+            s.protect = on;
         }
     }
 
@@ -3701,7 +3729,7 @@ impl Images {
                 Worker::taken(&worker);
             }
             #[cfg(feature = "remote-images")]
-            Done::Fetched { url, result } => self.arrived(url, result),
+            Done::Fetched { url, result } => self.arrived(url, result, page.is_some()),
         }
     }
 
@@ -3764,15 +3792,25 @@ impl Images {
     /// [`Images::admission`]), still holding the fetchers' credit, which stops them. Any other is
     /// dropped (its size is kept, it is fetched again when it is wanted).
     #[cfg(feature = "remote-images")]
-    fn arrived(&mut self, url: Arc<str>, result: crate::remote::Fetched) {
+    fn arrived(&mut self, url: Arc<str>, result: crate::remote::Fetched, polled: bool) {
         self.charge_bookkeeping();
+        // (The bodies this poll let in already are not the room for this one: there is no request
+        // between them to keep what it wants, and a body not in view, which nothing has used yet,
+        // was the first the next one's room was made from, and was fetched again, and again.)
+        self.cache.guard_admitted(true);
         let admit = self.judge(&url, &result);
         match admit {
             Admit::Wait => self.waiting.push((url, result)),
-            Admit::Yes => self.take_fetched(url, result, true),
+            Admit::Yes => {
+                self.take_fetched(url.clone(), result, true);
+                if polled {
+                    self.cache.admitted(&url);
+                }
+            }
             Admit::Drop => self.drop_fetched(url, result),
             Admit::Refuse => self.refuse_fetched(url, result),
         }
+        self.cache.guard_admitted(false);
     }
 
     /// What keeping the body of `url`, dropped for room, would have cost and what decoding it needs,

@@ -1019,6 +1019,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
         used: 0,
         painted: 0,
         protect: false,
+        admitted: false,
     };
     assert_eq!(
         slot(Data::Bytes(Arc::new(loose))).cost(),
@@ -1038,6 +1039,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
             used: 0,
             painted: 0,
             protect: false,
+            admitted: false,
         }
         .cost(),
         400 + SLOT_OVERHEAD
@@ -2256,6 +2258,207 @@ fn a_dropped_body_is_fetched_again_when_room_is_made() {
         i.pixels(2, 40, 30).is_some() && i.pixels(3, 40, 30).is_some()
     });
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fetches that finish together are taken by one poll, with no request between them to keep what
+/// it wants: a body let in is not the first thing the room for the next is made from. (Nothing
+/// has used it yet, which was all the cache went by, so the oldest body and the one that had just
+/// come were alike to it: a result for an image near the viewport was let in, evicted by the next
+/// in the same poll and fetched again, and so was that, until the viewport had a third fetch of a
+/// URL it never moved from.) What doesn't fit beside it is dropped for room, and not fetched
+/// again until it does.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_body_let_in_is_not_evicted_by_the_next_of_the_same_poll() {
+    use crate::render::Pixels;
+    let body = || {
+        let mut b = png_bytes(40, 30, |x, y| [x as u8, y as u8, 9, 255]);
+        b.extend(vec![0u8; 1 << 20]);
+        b
+    };
+    let doc = Doc::parse("![a](https://x.y/a.png) ![b](https://x.y/b.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let gate = Gate::new();
+    images.remote.set_fetcher(holding_fetcher(
+        &gate,
+        &Arc::default(),
+        png_bytes(40, 30, |_, _| [0, 0, 0, 255]),
+    ));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let (a, b): (Arc<str>, Arc<str>) = ("https://x.y/a.png".into(), "https://x.y/b.png".into());
+    // Room for one body beside what is set aside for the fetchers, and not for two. No image is
+    // in view: both are for the images near it, or nearer, and the same to the cache.
+    let sample = Arc::new(body());
+    let one = Slot::bytes_cost(&a, &sample);
+    let decode = images.decode_estimate(&a, &sample);
+    images.cache.cap =
+        images.fetch_static(true, true) + images.cache.overhead + decode + one * 3 / 2;
+    for url in [&a, &b] {
+        let result = Ok((Arc::new(body()), 40, 30));
+        images
+            .tx
+            .send(Done::Fetched {
+                url: url.clone(),
+                result,
+            })
+            .unwrap();
+    }
+    images.poll(&doc, &mut layout);
+    assert!(
+        images.cache.peek_bytes(&a).is_some(),
+        "{}",
+        images.memory_report()
+    );
+    assert!(
+        images.cache.peek_bytes(&b).is_none(),
+        "{}",
+        images.memory_report()
+    );
+    assert!(images.deferred_need(&b).is_some(), "dropped for room");
+    // The protection ends with the poll: what comes next evicts the body like any other.
+    assert!(images.cache.slots.iter().all(|s| !s.protect));
+    let result = Ok((Arc::new(body()), 40, 30));
+    images
+        .tx
+        .send(Done::Fetched {
+            url: b.clone(),
+            result,
+        })
+        .unwrap();
+    images.poll(&doc, &mut layout);
+    assert!(
+        images.cache.peek_bytes(&b).is_some(),
+        "{}",
+        images.memory_report()
+    );
+    assert!(
+        images.cache.peek_bytes(&a).is_none(),
+        "{}",
+        images.memory_report()
+    );
+    gate.open();
+    let _ = images.pixels(1, 40, 30);
+}
+
+/// A body let in earlier in the poll is kept from the next body's room and from no other: a
+/// decoded result that comes after it is stored whatever there is, and evicts it, so that the
+/// budget holds beside the job that starts next (the one the result's worker goes on to). Kept
+/// from it too, a body for an image near the viewport made the cache over its budget by the
+/// body's size for as long as that job ran: nothing evicts again until the next request.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_decoded_result_evicts_a_body_let_in_earlier_in_the_poll() {
+    use crate::render::Pixels;
+    let side = 500;
+    let pc = side as usize * side as usize * 4;
+    let body = || {
+        let mut b = png_bytes(40, 30, |x, y| [x as u8, y as u8, 9, 255]);
+        b.extend(vec![0u8; 1 << 20]);
+        b
+    };
+    let doc = Doc::parse("![a](https://x.y/a.png) ![p](https://x.y/p.png) ![q](https://x.y/q.png)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_policy(crate::settings::RemoteImages::Always);
+    let gate = Gate::new();
+    images.remote.set_fetcher(holding_fetcher(
+        &gate,
+        &Arc::default(),
+        png_bytes(40, 30, |_, _| [0, 0, 0, 255]),
+    ));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let (a, p): (Arc<str>, Arc<str>) = ("https://x.y/a.png".into(), "https://x.y/p.png".into());
+    // Their fetches are in flight, holding what they may.
+    drive(&mut images, &doc, &mut layout, &[], 0, |i| {
+        i.remote.inflight() >= 3 * 15 * (256 << 10)
+    });
+    // A worker with no thread: the job of `p` has its result sent, and `q` is queued behind it.
+    let job = |key| Job {
+        doc_gen: images.doc_gen,
+        key,
+        source: Source::Bytes(Arc::new(Vec::new())),
+        w: side,
+        h: side,
+        cost: pc,
+    };
+    let shared: Shared = Arc::default();
+    {
+        let mut q = shared.0.lock().unwrap();
+        q.busy = Some((Key::Remote(p.clone()), side, side, pc));
+        q.jobs.push(job(Key::Remote("https://x.y/q.png".into())));
+    }
+    images.worker = Some(Worker {
+        shared: shared.clone(),
+    });
+    images.cache.expect = 1;
+    // Room for one body beside the decode and what is set aside for the fetchers, and the
+    // pixels of `p` in place of it, and no more.
+    let sample = Arc::new(body());
+    let one = Slot::bytes_cost(&a, &sample);
+    images.cache.cap = images.fetch_static(true, true)
+        + images.cache.overhead
+        + pc
+        + images.decode_estimate(&a, &sample).saturating_sub(pc)
+        + one
+        + (64 << 10);
+    let bitmap = Bitmap {
+        width: side,
+        height: side,
+        data: vec![0u32; side as usize * side as usize],
+    };
+    images
+        .tx
+        .send(Done::Fetched {
+            url: a.clone(),
+            result: Ok((Arc::new(body()), 40, 30)),
+        })
+        .unwrap();
+    images
+        .tx
+        .send(Done::Decoded {
+            doc_gen: images.doc_gen,
+            key: Key::Remote(p.clone()),
+            bitmap: Some(bitmap),
+            worker: shared.clone(),
+        })
+        .unwrap();
+    images.cache.fetching = images.fetch_reserve(false);
+    images.poll(&doc, &mut layout);
+    assert!(
+        images.cache.has(&Key::Remote(p.clone()), side, side),
+        "the result is stored: {}",
+        images.memory_report()
+    );
+    // The body was let in (it was not dropped for room), and is gone for the result's.
+    assert!(
+        images.deferred_need(&a).is_none(),
+        "{}",
+        images.memory_report()
+    );
+    assert!(images.cache.peek_bytes(&a).is_none());
+    // The next job runs (the queue is the worker's own to move on).
+    {
+        let mut q = shared.0.lock().unwrap();
+        assert!(q.busy.is_none(), "the result was taken");
+        let next = q.jobs.remove(0);
+        q.busy = Some((next.key, next.w, next.h, next.cost));
+    }
+    images.refresh_reserve();
+    assert!(
+        images.cache.bytes + images.cache.held() <= images.cache.cap,
+        "{} + {} over {}\n{}",
+        images.cache.bytes,
+        images.cache.held(),
+        images.cache.cap,
+        images.memory_report()
+    );
+    assert!(images.cache.slots.iter().all(|s| !s.protect && !s.admitted));
+    gate.open();
+    let _ = images.pixels(1, 40, 30);
 }
 
 /// A body a job of the worker holds (an `Arc` clone: the decode reads it in place) stays
