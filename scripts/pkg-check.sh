@@ -8,6 +8,7 @@
 # missing dependency; a screenshot must show a page, not just VOMD's background; lintian must
 # find no errors; removal must leave nothing. The AppImage is run in another clean container
 # with only the display libraries, through --appimage-extract-and-run (containers have no FUSE).
+# For both, Ctrl+O in the empty window must open the file a (stand-in) file dialog gives.
 # Screenshots land in the printed work dir. VOMD_PKG_IMAGES overrides the images.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -62,7 +63,7 @@ fail() {
 # The display servers.
 echo "== display servers"
 server=$(start debian:13)
-apt_install "$server" xvfb weston imagemagick x11-utils
+apt_install "$server" xvfb weston imagemagick x11-utils xdotool
 dx -d "$server" Xvfb :99 -screen 0 1280x900x24 -nolisten tcp -ac
 dx -d "$server" weston --backend=headless --renderer=pixman --socket=wayland-vomd --width=1280 \
     --height=900 --idle-time=0
@@ -97,6 +98,13 @@ screenshot() { # container, name, command...
     shift 2
     dx -d "$c" timeout 8 "$@" --no-settings /fixtures/golden.md
     sleep 4
+    page "$name"
+    sleep 4
+}
+
+# The X server's screen saved as `name`, and the page of the one VOMD window on it checked.
+page() { # name
+    local name=$1
     dx "$server" import -window root "/tmp/$name.png"
     docker cp -q "$server:/tmp/$name.png" "$work/shots/$name.png"
     local geo w h x y spread
@@ -108,7 +116,43 @@ screenshot() { # container, name, command...
     spread=$(dx "$server" convert "/tmp/$name.png" -crop "${w}x$((h - toolbar))+$x+$((y + toolbar))" \
         +repage -format '%[fx:standard_deviation]' info:)
     awk -v s="$spread" 'BEGIN { exit !(s > 0.05) }' || fail "$name: blank page ($spread)"
-    sleep 4
+}
+
+# Open: Ctrl+O in the empty window (`vomd` with no file) must open the file the dialog gives.
+# The containers have no desktop portal, so VOMD falls back to zenity: here a stand-in that
+# answers with golden.md. The window then has to be titled after it and show its page.
+open_check() { # container, name, command...
+    local c=$1 name=$2
+    shift 2
+    dx "$c" sh -c 'printf "#!/bin/sh\necho /fixtures/golden.md\n" > /usr/local/bin/zenity &&
+        chmod +x /usr/local/bin/zenity'
+    dx -d "$c" timeout 30 "$@" --no-settings
+    local id="" _
+    for _ in $(seq 75); do
+        id=$(dx "$server" xdotool search --name '^vomd$' 2>/dev/null | head -1) || true
+        [ -n "$id" ] && break
+        sleep 0.2
+    done
+    [ -n "$id" ] || fail "$name: no empty window"
+    sleep 1
+    dx "$server" xdotool windowfocus --sync "$id" key ctrl+o
+    local opened=""
+    for _ in $(seq 75); do
+        dx "$server" xdotool search --name '^golden\.md$' >/dev/null 2>&1 && opened=1 && break
+        sleep 0.2
+    done
+    [ -n "$opened" ] || fail "$name: Ctrl+O didn't open the file the dialog gave"
+    sleep 2
+    page "$name"
+    # End this VOMD (the AppImage's process is AppRun) and wait for its window to go, so the
+    # next check finds only its own.
+    dx "$c" sh -c 'for p in /proc/[0-9]*; do
+        case "$(cat "$p/comm" 2>/dev/null)" in vomd | AppRun) kill "${p#/proc/}" ;; esac
+    done; rm -f /usr/local/bin/zenity'
+    for _ in $(seq 50); do
+        dx "$server" xdotool search --name '.' >/dev/null 2>&1 || break
+        sleep 0.2
+    done
 }
 
 for image in $images; do
@@ -121,6 +165,11 @@ for image in $images; do
     first_frames "$c" vomd
     screenshot "$c" "$tag-deb" vomd
     echo "   first frame on X11 and Wayland, screenshot $work/shots/$tag-deb.png"
+    open_check "$c" "$tag-deb-open" vomd
+    echo "   Ctrl+O opened the chosen file, screenshot $work/shots/$tag-deb-open.png"
+    # The file dialogs Open uses are recommended (the install above left recommends out).
+    dx "$c" dpkg-deb -f /pkg/vomd.deb Recommends | grep -q 'xdg-desktop-portal-gtk | zenity | kdialog' ||
+        fail "the .deb doesn't recommend a file dialog"
     apt_install "$c" lintian
     # Lintian errors fail, and so does lintian failing to run: its exit status decides. Warnings
     # are printed.
@@ -149,6 +198,8 @@ for image in $images; do
     first_frames "$c" env APPIMAGE_EXTRACT_AND_RUN=1 /tmp/vomd.AppImage
     screenshot "$c" "$tag-appimage" env APPIMAGE_EXTRACT_AND_RUN=1 /tmp/vomd.AppImage
     echo "   first frame on X11 and Wayland, screenshot $work/shots/$tag-appimage.png"
+    open_check "$c" "$tag-appimage-open" env APPIMAGE_EXTRACT_AND_RUN=1 /tmp/vomd.AppImage
+    echo "   Ctrl+O opened the chosen file, screenshot $work/shots/$tag-appimage-open.png"
     apt_install "$c" desktop-file-utils
     dx "$c" desktop-file-validate /tmp/squashfs-root/vomd.desktop
     docker rm -f "$c" >/dev/null
