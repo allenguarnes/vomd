@@ -146,6 +146,27 @@ enum Bench {
     Idle,
 }
 
+/// Make the toolbar's Back follow the back stack. The toolbar accepts clicks by this too, so
+/// the back stack is only ever changed through [`leave`] and [`pop`], which call it: no frame
+/// and no input sees a stale value, whatever event changed the stack (a window event, a
+/// dialog's answer, a drop).
+fn sync_back(view: &mut View, back: &BackStack) {
+    view.set_can_back(!back.is_empty());
+}
+
+/// [`BackStack::leave`], then [`sync_back`].
+fn leave(view: &mut View, back: &mut BackStack, here: nav::Entry, next: &Input) {
+    back.leave(here, next);
+    sync_back(view, back);
+}
+
+/// [`BackStack::pop`], then [`sync_back`].
+fn pop(view: &mut View, back: &mut BackStack) -> Option<nav::Entry> {
+    let entry = back.pop();
+    sync_back(view, back);
+    entry
+}
+
 struct Gfx {
     window: Arc<Window>,
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
@@ -404,12 +425,12 @@ impl App {
     /// Go to another document, leaving the current place on the back stack (see
     /// [`BackStack::leave`]).
     fn go_to(&mut self, input: Input) {
-        if let Some(view) = self.view.as_ref() {
+        if let Some(view) = self.view.as_mut() {
             let here = nav::Entry {
                 input: self.input.clone(),
                 anchor: view.anchor(),
             };
-            self.back.leave(here, &input);
+            leave(view, &mut self.back, here, &input);
         }
         self.open(input);
     }
@@ -429,7 +450,7 @@ impl App {
                     anchor: view.anchor(),
                 };
                 if view.jump_to_anchor(&fragment, now) {
-                    self.back.leave(here, &self.input);
+                    leave(view, &mut self.back, here, &self.input);
                     self.redraw();
                 }
             }
@@ -453,7 +474,10 @@ impl App {
     /// Return to the last place on the back stack, reopening its file if it's another one.
     /// (Stdin is never on the stack as a place to reopen, see [`BackStack::leave`].)
     fn go_back(&mut self) {
-        let Some(entry) = self.back.pop() else {
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+        let Some(entry) = pop(view, &mut self.back) else {
             return;
         };
         if entry.input != self.input {
@@ -642,6 +666,7 @@ impl ApplicationHandler<UserEvent> for App {
             nav::base_dir(&self.input),
         );
         view.set_notice(loaded.notice);
+        sync_back(&mut view, &self.back);
         view.set_settings_available(self.store.path().is_some());
         let proxy = Mutex::new(self.proxy.clone());
         view.set_image_wake(Arc::new(move || {
@@ -848,12 +873,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
-        // The toolbar's Back follows the back stack.
-        if let Some(view) = self.view.as_mut()
-            && view.set_can_back(!self.back.is_empty())
-        {
-            self.redraw();
-        }
         // Scrolling, zooming, resizing or a new document move what's under the pointer.
         self.update_hover();
     }
@@ -1033,8 +1052,48 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{same_family, system_dark};
+    use super::{leave, pop, same_family, system_dark};
+    use std::time::Instant;
+    use vomd::cli::Input;
+    use vomd::doc::Doc;
+    use vomd::fonts::Fonts;
+    use vomd::nav::{BackStack, Entry};
+    use vomd::toolbar::Command;
+    use vomd::view::{Action, View};
     use winit::window::Theme;
+
+    /// Open's answer (or a link, or a drop) pushes the old document on the back stack from a
+    /// user event, and a Back click may follow before any frame is painted: the toolbar must
+    /// accept it, and the next frame shows it enabled. (Likewise disabled once the stack is
+    /// empty again.)
+    #[test]
+    fn back_follows_the_stack_the_moment_it_changes() {
+        let (w, h) = (300_u32, 200_u32);
+        let mut view = View::new(Fonts::new().unwrap(), Doc::parse("Hi"), None, (w, h), 1.0);
+        view.set_toolbar(true);
+        let mut buf = vec![0; (w * h) as usize];
+        let mut back = BackStack::default();
+        let back_asks = |view: &mut View| {
+            let now = Instant::now();
+            view.press(20.0, 16.0, now);
+            view.release(now);
+            view.release_toolbar(20.0, 16.0);
+            view.take_command() == Some(Command::Action(Action::Back))
+        };
+        view.paint(&mut buf, w as usize, Instant::now());
+        assert!(!back_asks(&mut view), "nothing to go back to");
+        let here = Entry {
+            input: Input::File("a.md".into()),
+            anchor: view.anchor(),
+        };
+        leave(&mut view, &mut back, here, &Input::File("b.md".into()));
+        assert!(
+            back_asks(&mut view),
+            "navigated: Back is enabled, unpainted"
+        );
+        assert!(pop(&mut view, &mut back).is_some());
+        assert!(!back_asks(&mut view), "stack empty again");
+    }
 
     /// A family lookup in flight when the setting changes is ignored when it comes back: its
     /// result only counts while the family is still the wanted one (`Families` event).
