@@ -165,11 +165,12 @@ on. `never` removes the option.
 
 - **Linux only** for now. The code is portable and compiles for Windows and macOS, but those
   are untested and unsupported until a later release.
-- No text selection or copy yet (v1.1), and no table of contents panel (v1.2).
+- No text selection or copy yet, and no table of contents panel; both are planned.
 - No screen-reader support (AccessKit would add too much to the binary). Text scaling comes
   from the system scale factor that winit reports (`Xft.dpi` on X11, the output scale on
   Wayland).
-- Drag-and-drop works on X11 only, because winit doesn't support it on Wayland.
+- Drag-and-drop works on X11 only, because winit doesn't support it on Wayland; there, open
+  files with Ctrl+O or the toolbar's folder button.
 - SVG, GIF and WebP images show as placeholders. EXIF orientation isn't applied. Math and
   Mermaid show as text and code.
 
