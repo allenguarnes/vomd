@@ -1,7 +1,6 @@
 # Maintainer: Allen Guarnes <allen@ggbite.com>
 # Builds from the tagged source. After tagging a release: bump pkgver, run `updpkgsums` and
-# `makepkg --printsrcinfo > .SRCINFO`, then push to the AUR (sha256sums is 'SKIP' until a
-# release exists).
+# `makepkg --printsrcinfo > .SRCINFO`, then push to the AUR.
 # This package honors makepkg.conf: its RUSTFLAGS (CachyOS: `-C opt-level=3 -C target-cpu=native`)
 # override the repository's opt-level="z", so the binary is larger (about 4.9 MB) and faster
 # than the release one, and runs on the build machine's CPU only. `vomd-bin` is the small one.
@@ -28,7 +27,7 @@ optdepends=('curl: remote images, loaded only after pressing I'
             'noto-fonts-emoji: color emoji')
 options=('!lto' '!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('71537bcea6f5cdc5a8e7604cb000bccaf1312bda1dfb1a8787a864656df989b2')
 
 prepare() {
   cd "$pkgname-$pkgver"
