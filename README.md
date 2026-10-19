@@ -129,8 +129,8 @@ Each window is its own process, so opening another file starts another window.
 
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends
-one of them, and the AppImage needs one on a desktop without a portal chooser (a bare window
-manager).
+one of them, the Arch packages list them as optional dependencies, and the AppImage needs one
+on a desktop without a portal chooser (a bare window manager).
 
 ## Settings
 

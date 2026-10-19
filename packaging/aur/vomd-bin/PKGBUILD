@@ -14,8 +14,13 @@ license=('MIT' 'OFL-1.1' 'ISC')
 # session is: namcap can't see them. RELR relocations need glibc 2.36.
 depends=('glibc>=2.36' 'libgcc' 'hicolor-icon-theme' 'libxkbcommon' 'wayland'
          'libx11' 'libxcb' 'libxcursor' 'libxi' 'libxkbcommon-x11')
+# Open (Ctrl+O) needs a file dialog: KDE and GNOME already provide a portal file chooser
+# (xdg-desktop-portal-kde, -gnome); the three below are for other desktops.
 optdepends=('curl: remote images, loaded only after pressing I'
             'xdg-utils: open web links in the browser'
+            'xdg-desktop-portal-gtk: the file dialog for Open (Ctrl+O) on desktops without a portal file chooser, such as Hyprland and Sway'
+            'zenity: a file dialog for Open (Ctrl+O) when there is no portal file chooser'
+            'kdialog: a file dialog for Open (Ctrl+O) when there is no portal file chooser'
             'noto-fonts-cjk: CJK text'
             'noto-fonts-emoji: color emoji')
 provides=("$_pkgname")
