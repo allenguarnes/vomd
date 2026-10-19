@@ -45,8 +45,8 @@ sudo apt install ./vomd_*_amd64.deb
 ```
 
 **AppImage:** from v1.1.0, each release also has `vomd-<version>-x86_64.AppImage`, for any
-x86-64 distribution with glibc 2.36 or newer. It brings no libraries of its own and uses the
-system's Wayland or X11 ones, which every desktop has:
+x86-64 distribution with glibc 2.36 or newer. It bundles no libraries: it loads the system's
+Wayland or X11 ones when it starts (see the run-time libraries below):
 
 ```sh
 chmod +x vomd-*-x86_64.AppImage
@@ -58,7 +58,8 @@ It mounts itself with FUSE, which most desktops have (`fuse3`). Without it, run 
 files; an integration tool such as Gear Lever or AppImageLauncher can.
 
 **Release tarball:** each [release](https://github.com/allenguarnes/vomd/releases) has
-`vomd-<version>-x86_64-linux.tar.gz` (glibc 2.36 or newer, any x86-64 CPU):
+`vomd-<version>-x86_64-linux.tar.gz` (glibc 2.36 or newer, any x86-64 CPU). It needs the same
+run-time libraries as the AppImage (see below):
 
 ```sh
 tar xf vomd-*-x86_64-linux.tar.gz
@@ -68,6 +69,19 @@ install -Dm644 vomd.desktop ~/.local/share/applications/vomd.desktop
 install -Dm644 vomd.svg ~/.local/share/icons/hicolor/scalable/apps/vomd.svg
 # Make it the default for .md files:
 xdg-mime default vomd.desktop text/markdown
+```
+
+**Run-time libraries:** the AppImage and the tarball binary load these system libraries when
+they start: libwayland-client and libxkbcommon on Wayland, and libX11, libX11-xcb, libxcb,
+libXcursor, libXi, libxkbcommon and libxkbcommon-x11 on X11. Most desktops already have them,
+but a minimal one may not. `libxkbcommon-x11` is the one most often missing, and without it
+VOMD stops at once with "Library libxkbcommon-x11.so could not be loaded". On Debian and
+Ubuntu, install them all with (the `.deb` already depends on them):
+
+```sh
+sudo apt install libwayland-client0 libxkbcommon0 \
+  libxkbcommon-x11-0 libx11-6 libx11-xcb1 libxcb1 \
+  libxcursor1 libxi6
 ```
 
 **From source:** you need a stable Rust toolchain.
