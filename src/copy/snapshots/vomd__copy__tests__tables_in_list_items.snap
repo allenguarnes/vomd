@@ -1,0 +1,34 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"- | a | b |\\n  |---|---|\\n  | 1 | 2 |\\n- next\\n\",\n\"- item\\n\\n  | a |\\n  |---|\\n  | 1 |\\n\",\n\"1. | a |\\n   |---|\\n   | 1 |\\n\\n   after\\n\",\n\"- ```\\n  code\\n  more\\n  ```\\n- next\\n\", \"> - | a |\\n>   |---|\\n>   | 1 |\\n\",\n\"- \\n- next\\n\", \"- - nested\\n- next\\n\",])"
+---
+source: "- | a | b |\n  |---|---|\n  | 1 | 2 |\n- next\n"
+│ - a→b
+│   1→2
+│ 
+│ - next
+source: "- item\n\n  | a |\n  |---|\n  | 1 |\n"
+│ - item
+│ 
+│   a
+│   1
+source: "1. | a |\n   |---|\n   | 1 |\n\n   after\n"
+│ 1. a
+│   1
+│ 
+│   after
+source: "- ```\n  code\n  more\n  ```\n- next\n"
+│ - code
+│   more
+│ 
+│ - next
+source: "> - | a |\n>   |---|\n>   | 1 |\n"
+│ > - a
+│ >   1
+source: "- \n- next\n"
+│ - 
+│ - next
+source: "- - nested\n- next\n"
+│ - 
+│   - nested
+│ - next

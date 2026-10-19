@@ -95,9 +95,19 @@ fn main() {
         &fonts,
         &mut GlyphCache::default(),
         theme,
+        #[cfg(feature = "clipboard")]
+        None,
     );
     images.begin_frame();
-    render::paint_images(&mut frame, vp, &layout, &mut images, theme);
+    render::paint_images(
+        &mut frame,
+        vp,
+        &layout,
+        &mut images,
+        theme,
+        #[cfg(feature = "clipboard")]
+        None,
+    );
     let rgb: Vec<u8> = px
         .iter()
         .flat_map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8])

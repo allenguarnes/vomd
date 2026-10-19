@@ -1,13 +1,16 @@
-//! `cargo run --release --example paint_bench -- fixtures/readme.md [line_width]`
+//! `cargo run --release --example paint_bench -- fixtures/readme.md [line_width] [--select-all]`
 //! A full repaint of a 4K window (3840×2160 at scale 2) takes ≤ 8 ms. The first paint
 //! (cold glyph cache) is reported separately from scroll frames, each of which is timed with
-//! the layout work that keeps ahead of it (`Layout::ensure`) plus the paint.
+//! the layout work that keeps ahead of it (`Layout::ensure`) plus the paint. `--select-all`
+//! paints with the whole document selected.
 use std::time::{Duration, Instant};
 
 use vomd::doc::Doc;
 use vomd::fonts::Fonts;
 use vomd::layout::{Layout, Params};
 use vomd::render::{self, Clip, Frame, Viewport};
+#[cfg(feature = "clipboard")]
+use vomd::select::Pos;
 use vomd::text::cache::GlyphCache;
 use vomd::theme::LIGHT;
 
@@ -16,16 +19,21 @@ const H: usize = 2160;
 const FRAMES: usize = 200;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("path");
-    let src = std::fs::read_to_string(&path).expect("read");
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let select_all = args.iter().any(|a| a == "--select-all");
+    args.retain(|a| a != "--select-all");
+    let path = args.first().expect("path");
+    let src = std::fs::read_to_string(path).expect("read");
     // A wide line_width fills the whole window with text (the densest repaint).
-    let line_width = std::env::args()
-        .nth(2)
-        .map_or(Params::default().line_width, |w| {
-            w.parse().expect("line_width")
-        });
+    let line_width = args.get(1).map_or(Params::default().line_width, |w| {
+        w.parse().expect("line_width")
+    });
     let fonts = Fonts::new().unwrap();
     let doc = Doc::parse(&src);
+    #[cfg(feature = "clipboard")]
+    let select = select_all.then(|| (Pos::start(0), Pos::end(doc.blocks.len() as u32 - 1)));
+    #[cfg(not(feature = "clipboard"))]
+    assert!(!select_all, "--select-all needs the clipboard feature");
     let mut layout = Layout::new(
         &doc,
         Params {
@@ -46,7 +54,16 @@ fn main() {
     let mut paint = |layout: &Layout, cache: &mut GlyphCache, scroll: f64| {
         let mut frame = Frame::new(&mut px, W, H, W);
         let vp = Viewport { area, scroll };
-        render::paint(&mut frame, vp, layout, &fonts, cache, &LIGHT);
+        render::paint(
+            &mut frame,
+            vp,
+            layout,
+            &fonts,
+            cache,
+            &LIGHT,
+            #[cfg(feature = "clipboard")]
+            select,
+        );
         render::paint_scrollbar(&mut frame, vp, layout.total_height(), 2.0, &LIGHT);
     };
 

@@ -18,6 +18,9 @@ pub enum Role {
     AlertImportant,
     AlertWarning,
     AlertCaution,
+    /// Behind selected text.
+    #[cfg(feature = "clipboard")]
+    Selection,
 }
 
 /// `0x00RRGGBB`, the softbuffer pixel format.
@@ -35,6 +38,9 @@ pub struct Theme {
     pub quote_bar: Rgb,
     pub table_stripe: Rgb,
     pub alerts: [Rgb; 5],
+    /// Painted under selected text, which keeps its own color: a blue that reads on the page.
+    #[cfg(feature = "clipboard")]
+    pub selection: Rgb,
 }
 
 pub const LIGHT: Theme = Theme {
@@ -48,6 +54,9 @@ pub const LIGHT: Theme = Theme {
     quote_bar: 0xd1d9e0,
     table_stripe: 0xf6f8fa,
     alerts: [0x0969da, 0x1a7f37, 0x8250df, 0x9a6700, 0xcf222e],
+    // Primer's #0969da at 20% over white.
+    #[cfg(feature = "clipboard")]
+    selection: 0xcde1f8,
 };
 
 pub const DARK: Theme = Theme {
@@ -61,6 +70,9 @@ pub const DARK: Theme = Theme {
     quote_bar: 0x3d444d,
     table_stripe: 0x151b23,
     alerts: [0x4493f8, 0x3fb950, 0xab7df8, 0xd29922, 0xf85149],
+    // Primer's #388bfd at 40% over the page.
+    #[cfg(feature = "clipboard")]
+    selection: 0x1e4273,
 };
 
 impl Theme {
@@ -80,6 +92,8 @@ impl Theme {
             Role::AlertImportant => self.alerts[2],
             Role::AlertWarning => self.alerts[3],
             Role::AlertCaution => self.alerts[4],
+            #[cfg(feature = "clipboard")]
+            Role::Selection => self.selection,
         }
     }
 }

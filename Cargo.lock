@@ -1579,7 +1579,11 @@ dependencies = [
  "unicase",
  "unicode-bidi",
  "unicode-linebreak",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
+ "x11rb",
  "zune-jpeg",
 ]
 

@@ -1,0 +1,27 @@
+---
+source: src/copy/tests.rs
+expression: "between_of(&[(list, \"beta\", \"gamma\"), (list, \"alpha\", \"gam\"),\n(\"- alpha\\n- beta\\n- gamma\\n\", \"beta\", \"beta\"),\n(\"The quick brown fox.\\n\\nJumps over.\\n\\nThe dog.\\n\", \"brown\", \"Jumps\"),\n(\"> one two\\\\\\n> three four\\\\\\n> five six\\n\", \"two\", \"five\"),\n(\"# A heading here\\n\\nmore\\n\", \"heading\", \"more\"),\n(\"```\\nline one\\nline two\\nline three\\n```\\n\", \"one\", \"two\"),])"
+---
+source: "- alpha beta\n- gamma delta\n- epsilon\n [beta..gamma]"
+│ beta
+│ - gamma
+source: "- alpha beta\n- gamma delta\n- epsilon\n [alpha..gam]"
+│ - alpha beta
+│ - gam
+source: "- alpha\n- beta\n- gamma\n [beta..beta]"
+│ - beta
+source: "The quick brown fox.\n\nJumps over.\n\nThe dog.\n [brown..Jumps]"
+│ brown fox.
+│ 
+│ Jumps
+source: "> one two\\\n> three four\\\n> five six\n [two..five]"
+│ two
+│ > three four
+│ > five
+source: "# A heading here\n\nmore\n [heading..more]"
+│ heading here
+│ 
+│ more
+source: "```\nline one\nline two\nline three\n```\n [one..two]"
+│ one
+│ line two

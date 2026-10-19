@@ -1,0 +1,27 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"1. one\\n2. two\\n\\n- bullet\\n- more\\n\",\n\"- bullet\\n\\n1. one\\n2. two\\n\", \"- [ ] task\\n- bullet\\n\",\n\"1. one\\n   - nested\\n2. two\\n\", \"1. one\\n   - nested\\n\\n- bullet\\n\",])"
+---
+source: "1. one\n2. two\n\n- bullet\n- more\n"
+│ 1. one
+│ 2. two
+│ 
+│ - bullet
+│ - more
+source: "- bullet\n\n1. one\n2. two\n"
+│ - bullet
+│ 
+│ 1. one
+│ 2. two
+source: "- [ ] task\n- bullet\n"
+│ - [ ] task
+│ - bullet
+source: "1. one\n   - nested\n2. two\n"
+│ 1. one
+│   - nested
+│ 2. two
+source: "1. one\n   - nested\n\n- bullet\n"
+│ 1. one
+│   - nested
+│ 
+│ - bullet

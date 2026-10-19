@@ -235,6 +235,10 @@ pub struct Doc {
     /// Backing store for [`Block::quote_lists`]; consecutive blocks in the same quotes share
     /// one range.
     pub quote_lists: Vec<u8>,
+    /// The spans that are a footnote's "↩" link back to its reference, sorted: copying leaves
+    /// them out. None without footnotes.
+    #[cfg(feature = "clipboard")]
+    pub backlinks: Vec<u32>,
 }
 
 impl Doc {
@@ -1668,6 +1672,8 @@ impl Builder {
                     if id < referenced {
                         let link = push_id(&mut self.doc.links, format!("#{}", ids[id].1));
                         self.doc.spans[back.span].link = link;
+                        #[cfg(feature = "clipboard")]
+                        self.doc.backlinks.push(back.span as u32);
                     } else if back.own {
                         end -= 1;
                     } else {
@@ -1699,6 +1705,8 @@ impl Builder {
             noted.sort_by_key(|h| h.block);
             self.doc.headings.append(&mut noted);
         }
+        #[cfg(feature = "clipboard")]
+        self.doc.backlinks.sort_unstable();
         self.doc
     }
 }

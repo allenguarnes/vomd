@@ -1,0 +1,12 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"plain **bold** *italic* ***both*** ~~strike~~ `code` H<sub>2</sub>O x<sup>2</sup> <b>html</b>\\n\",\n\"a [link text](https://example.com) and <https://auto.example>\\n\",\n\"math $x^2$ and a [^1] mark\\n\\n[^1]: note\\n\",])"
+---
+source: "plain **bold** *italic* ***both*** ~~strike~~ `code` H<sub>2</sub>O x<sup>2</sup> <b>html</b>\n"
+│ plain bold italic both strike code H2O x2 html
+source: "a [link text](https://example.com) and <https://auto.example>\n"
+│ a link text and https://auto.example
+source: "math $x^2$ and a [^1] mark\n\n[^1]: note\n"
+│ math $x^2$ and a [1] mark
+│ 
+│ [1]: note

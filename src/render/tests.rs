@@ -530,6 +530,8 @@ mod doc {
             &fonts,
             &mut GlyphCache::default(),
             theme,
+            #[cfg(feature = "clipboard")]
+            None,
         );
         b
     }
@@ -615,7 +617,16 @@ mod doc {
             assert_eq!(range.start, k - 1, "first overlapping block");
             let mut b = Buf::new(600, 150, 600);
             let v = Viewport { area, scroll };
-            paint(&mut b.frame(), v, &layout, &fonts, &mut cache, &LIGHT);
+            paint(
+                &mut b.frame(),
+                v,
+                &layout,
+                &fonts,
+                &mut cache,
+                &LIGHT,
+                #[cfg(feature = "clipboard")]
+                None,
+            );
             assert_eq!(
                 b.at(300, 0),
                 LIGHT.code_bg,
@@ -643,7 +654,16 @@ mod doc {
         let mut paint_with = |area: Clip, scroll: f64| {
             let mut b = Buf::new(300, 120, 300);
             let v = Viewport { area, scroll };
-            paint(&mut b.frame(), v, &layout, &fonts, &mut cache, &LIGHT);
+            paint(
+                &mut b.frame(),
+                v,
+                &layout,
+                &fonts,
+                &mut cache,
+                &LIGHT,
+                #[cfg(feature = "clipboard")]
+                None,
+            );
             b
         };
         let normal = paint_with(
@@ -698,7 +718,16 @@ mod doc {
                 y1: 120,
             };
             let v = Viewport { area, scroll };
-            paint(&mut b.frame(), v, &layout, &fonts, &mut cache, &LIGHT);
+            paint(
+                &mut b.frame(),
+                v,
+                &layout,
+                &fonts,
+                &mut cache,
+                &LIGHT,
+                #[cfg(feature = "clipboard")]
+                None,
+            );
             paint_scrollbar(&mut b.frame(), v, 1000.0, 1.0, &LIGHT);
         }
     }

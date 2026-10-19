@@ -1,6 +1,10 @@
 //! VOMD — View-Only Markdown.
 
 pub mod cli;
+#[cfg(feature = "clipboard")]
+pub mod clipboard;
+#[cfg(feature = "clipboard")]
+pub mod copy;
 pub mod doc;
 pub mod fonts;
 pub mod image;
@@ -12,6 +16,8 @@ pub mod portal;
 #[cfg(feature = "remote-images")]
 pub mod remote;
 pub mod render;
+#[cfg(feature = "clipboard")]
+pub mod select;
 pub mod settings;
 pub mod text;
 pub mod theme;

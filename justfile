@@ -39,6 +39,10 @@ dist:
 aur:
     scripts/aur-check.sh
 
+# Select, copy and paste against Xvfb and a headless sway in containers (needs docker).
+clipboard:
+    scripts/clipboard-check.sh
+
 # Regenerate the render goldens (tests/golden/); review the images before committing.
 bless:
     cargo xtask bless

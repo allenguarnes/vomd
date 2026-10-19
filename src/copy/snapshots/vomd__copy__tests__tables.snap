@@ -1,0 +1,26 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"| Left | Center | Right |\\n|:-----|:------:|------:|\\n| a | b | c |\\n| *d* | `e` | f<br>g |\\n\\nafter\\n\",\n\"| a | b | c |\\n|---|---|---|\\n| 1 |\\n| | 2 | |\\n| 3 | 4 | 5 |\\n\",\n\"| a | b |\\n|---|---|\\n| x\\ty | m<br>n |\\n\",\n\"text\\n\\n| h |\\n|---|\\n| 1 |\\n\\n| h2 | h3 |\\n|---|---|\\n| 2 | 3 |\\n\",])"
+---
+source: "| Left | Center | Right |\n|:-----|:------:|------:|\n| a | b | c |\n| *d* | `e` | f<br>g |\n\nafter\n"
+│ Left→Center→Right
+│ a→b→c
+│ d→e→f g
+│ 
+│ after
+source: "| a | b | c |\n|---|---|---|\n| 1 |\n| | 2 | |\n| 3 | 4 | 5 |\n"
+│ a→b→c
+│ 1→→
+│ →2→
+│ 3→4→5
+source: "| a | b |\n|---|---|\n| x\ty | m<br>n |\n"
+│ a→b
+│ x y→m n
+source: "text\n\n| h |\n|---|\n| 1 |\n\n| h2 | h3 |\n|---|---|\n| 2 | 3 |\n"
+│ text
+│ 
+│ h
+│ 1
+│ 
+│ h2→h3
+│ 2→3

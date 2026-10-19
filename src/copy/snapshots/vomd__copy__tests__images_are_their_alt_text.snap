@@ -1,0 +1,8 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"see ![the alt text](a.png) and ![](b.png) here\\n\",\n\"[![linked **alt**](c.png)](https://example.com)\\n\",])"
+---
+source: "see ![the alt text](a.png) and ![](b.png) here\n"
+│ see the alt text and image here
+source: "[![linked **alt**](c.png)](https://example.com)\n"
+│ linked alt

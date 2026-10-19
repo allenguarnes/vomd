@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "clipboard")]
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use unicode_bidi::{BidiClass, bidi_class};
@@ -26,6 +28,9 @@ use crate::text::fallback::Found;
 use crate::text::{Align, Para, ParaLayout, TextCtx, TextStyle};
 use crate::theme::{DARK, LIGHT, Role, Theme};
 use crate::toolbar::{self, Toolbar};
+
+#[cfg(feature = "clipboard")]
+mod gesture;
 
 /// Zoom limits and step, in percent.
 pub const ZOOM_MIN: u16 = 50;
@@ -52,6 +57,24 @@ pub const BLOCKED_NOTE: &str = "Remote image blocked · press I to load";
 /// Passes [`View::bottom`] makes: measuring the last screen changes the total height.
 const BOTTOM_PASSES: usize = 4;
 
+/// The document as the view holds it: shared with the clipboard, whose copy of a large selection
+/// reads the text from it when another program asks (and so outlives a reload).
+#[cfg(feature = "clipboard")]
+type Shared = Arc<Doc>;
+#[cfg(not(feature = "clipboard"))]
+type Shared = Doc;
+
+fn share(doc: Doc) -> Shared {
+    #[cfg(feature = "clipboard")]
+    {
+        Arc::new(doc)
+    }
+    #[cfg(not(feature = "clipboard"))]
+    {
+        doc
+    }
+}
+
 /// What the user asked for. Keys of later phases (toolbar, links, images, outline)
 /// aren't mapped yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,8 +99,15 @@ pub enum Action {
     ToggleToolbar,
     /// Wide layout on or off (`W`): the text spans the window or stops at `line_width`.
     ToggleWide,
-    /// Escape: closes the toolbar's dropdown if it's open, else quits.
+    /// Escape: closes the toolbar's dropdown if it's open, else clears the selection, else
+    /// quits.
     Escape,
+    /// Select the whole document (`Ctrl+A`).
+    #[cfg(feature = "clipboard")]
+    SelectAll,
+    /// Copy the selection to the clipboard (`Ctrl+C`).
+    #[cfg(feature = "clipboard")]
+    Copy,
     /// Load remote images for this document, or hide them again (`I`).
     ToggleRemote,
     /// Choose a file to open (`Ctrl+O`).
@@ -96,6 +126,12 @@ pub enum Outcome {
     Back,
     /// Ask the user for a file and open it (the shell shows the dialog).
     Open,
+    /// Everything was selected: repaint, and offer it as the primary selection.
+    #[cfg(feature = "clipboard")]
+    Selected,
+    /// Copy the selection ([`View::copy_content`]) to the clipboard.
+    #[cfg(feature = "clipboard")]
+    Copy,
     Quit,
 }
 
@@ -150,10 +186,20 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
                 "0" => Some(Action::ZoomReset),
                 "w" | "W" => Some(Action::Quit),
                 "o" | "O" => Some(Action::Open),
+                #[cfg(feature = "clipboard")]
+                "a" | "A" => Some(Action::SelectAll),
+                // Ctrl+Shift+C is a terminal's habit, and costs nothing.
+                #[cfg(feature = "clipboard")]
+                "c" | "C" => Some(Action::Copy),
                 // Cmd+[ is the macOS back key; Ctrl+[ goes back on Linux too.
                 "[" => Some(Action::Back),
                 _ => None,
             },
+            // Ctrl+Insert is the old copy, and the Copy key is the keyboard's own.
+            #[cfg(feature = "clipboard")]
+            Key::Named(NamedKey::Insert) if mods.control_key() => Some(Action::Copy),
+            #[cfg(feature = "clipboard")]
+            Key::Named(NamedKey::Copy) => Some(Action::Copy),
             _ => None,
         };
     }
@@ -176,6 +222,8 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             NamedKey::F5 => Some(Action::Reload),
             NamedKey::Backspace => Some(Action::Back),
             NamedKey::Escape => Some(Action::Escape),
+            #[cfg(feature = "clipboard")]
+            NamedKey::Copy => Some(Action::Copy),
             _ => None,
         },
         Key::Character(c) => match c.as_str() {
@@ -363,7 +411,7 @@ struct Drag {
 }
 
 pub struct View {
-    doc: Doc,
+    doc: Shared,
     layout: Layout,
     fonts: Fonts,
     cache: GlyphCache,
@@ -428,6 +476,9 @@ pub struct View {
     /// The large-file notice and until when it shows: set by the first frame that
     /// paints it.
     notice: Option<(Option<Instant>, String)>,
+    /// The selected text, and the mouse gesture making it.
+    #[cfg(feature = "clipboard")]
+    select: gesture::Select,
 }
 
 impl View {
@@ -458,7 +509,7 @@ impl View {
         let params = params(width, hidpi, 100, text, false);
         let mut view = View {
             layout: Layout::new(&doc, params),
-            doc,
+            doc: share(doc),
             fonts,
             cache: GlyphCache::default(),
             anchor: Anchor::TOP,
@@ -501,6 +552,8 @@ impl View {
             pulse: None,
             toast: None,
             notice: None,
+            #[cfg(feature = "clipboard")]
+            select: gesture::Select::default(),
         };
         view.images.set_base(base);
         view.attach_images();
@@ -734,6 +787,8 @@ impl View {
         }
         self.set_scroll(self.scroll() + dy);
         self.fade.poke(now);
+        #[cfg(feature = "clipboard")]
+        self.follow_pointer();
     }
 
     /// One line of body text, in physical pixels.
@@ -819,6 +874,24 @@ impl View {
                 self.set_remote(on);
             }
             Action::Escape if self.close_menu() => {}
+            #[cfg(feature = "clipboard")]
+            Action::Escape if self.clear_selection() => {}
+            #[cfg(feature = "clipboard")]
+            Action::SelectAll => {
+                return if self.select_all() {
+                    Outcome::Selected
+                } else {
+                    Outcome::Nothing
+                };
+            }
+            #[cfg(feature = "clipboard")]
+            Action::Copy => {
+                return if self.selection().is_some() {
+                    Outcome::Copy
+                } else {
+                    Outcome::Nothing
+                };
+            }
             Action::Escape | Action::Quit => return Outcome::Quit,
         }
         Outcome::Redraw
@@ -852,17 +925,27 @@ impl View {
     /// scrollbar is showing. Hovering the track's column shows it (before any press, since the
     /// pointer moves there first), so only a press that arrives without a move, as from touch
     /// or a script, still reaches a link under a hidden one.
-    /// Returns true if it took the press.
+    /// Returns true if the window needs a repaint: the toolbar or the scrollbar took the press, or
+    /// the selection changed.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
         let ctx = self.toolbar_ctx();
         if self.toolbar.press(&ctx, x, y) {
             self.pressed = None;
+            #[cfg(feature = "clipboard")]
+            self.cancel_select();
             return true;
         }
         self.ensure_content();
         let taken = self.press_scrollbar(x, y, now);
         // Not the scrollbar's: remember the link under it, for a click on release.
         self.pressed = if taken { None } else { self.link_at(x, y) };
+        // Not the scrollbar's either: a press on text, which may start a selection.
+        #[cfg(feature = "clipboard")]
+        if taken {
+            self.cancel_select();
+        } else {
+            return self.press_text(x, y, now);
+        }
         taken
     }
 
@@ -977,6 +1060,9 @@ impl View {
         let ctx = self.toolbar_ctx();
         let bar = self.toolbar.pointer(&ctx, x, y, now);
         let free = self.drag.is_none() && !self.toolbar.covers(&ctx, x, y);
+        // A selection drag has no links under it: the text cursor stays.
+        #[cfg(feature = "clipboard")]
+        let free = free && !self.selecting();
         let link = if free { self.link_at(x, y) } else { None };
         let bar = bar | self.set_over_bar(free && self.bar_column(x, y).is_some(), now);
         let blocked = cfg!(feature = "remote-images")
@@ -1098,6 +1184,8 @@ impl View {
         } else {
             self.ensure();
             let vp = self.viewport();
+            #[cfg(feature = "clipboard")]
+            let sel = self.selection();
             // Whatever uses the inset paints over this.
             frame.fill_rect(0, 0, w as i32, vp.area.y0, theme.bg);
             render::paint(
@@ -1107,10 +1195,20 @@ impl View {
                 &self.fonts,
                 &mut self.cache,
                 theme,
+                #[cfg(feature = "clipboard")]
+                sel,
             );
             if cfg!(feature = "images") {
                 self.images.begin_frame();
-                render::paint_images(&mut frame, vp, &self.layout, &mut self.images, theme);
+                render::paint_images(
+                    &mut frame,
+                    vp,
+                    &self.layout,
+                    &mut self.images,
+                    theme,
+                    #[cfg(feature = "clipboard")]
+                    sel,
+                );
                 self.images_dirty = true;
             }
             if self.fade.visible(now) || self.bar_held() {
@@ -1188,6 +1286,8 @@ impl View {
             &self.fonts,
             &mut self.cache,
             theme,
+            #[cfg(feature = "clipboard")]
+            None,
         );
         frame.set_clip(prev);
     }
@@ -1240,6 +1340,8 @@ impl View {
             &self.fonts,
             &mut self.cache,
             theme,
+            #[cfg(feature = "clipboard")]
+            None,
         );
     }
 
@@ -1331,7 +1433,17 @@ impl View {
         let oy = top + ((h - top - pl.height) / 2.0).max(0.0);
         let content = BlockBox::from_para(pl, &para.styles);
         let ox = (w - max_w) / 2.0;
-        render::paint_block(frame, &content, ox, oy, &self.fonts, &mut self.cache, theme);
+        render::paint_block(
+            frame,
+            &content,
+            ox,
+            oy,
+            &self.fonts,
+            &mut self.cache,
+            theme,
+            #[cfg(feature = "clipboard")]
+            None,
+        );
     }
 
     // ---- Scrollbar timer ------------------------------------------------------------------
@@ -1343,12 +1455,17 @@ impl View {
         } else {
             self.fade.deadline()
         };
+        #[cfg(feature = "clipboard")]
+        let scroll = self.select_deadline();
+        #[cfg(not(feature = "clipboard"))]
+        let scroll = None;
         [
             fade,
             self.toolbar.deadline(&self.toolbar_ctx()),
             self.pulse,
             self.toast.as_ref().map(|t| t.0),
             self.notice.as_ref().and_then(|n| n.0),
+            scroll,
         ]
         .into_iter()
         .flatten()
@@ -1374,7 +1491,11 @@ impl View {
         if notice {
             self.notice = None;
         }
-        fade | pulse | toast | notice | self.toolbar.expire(&self.toolbar_ctx(), now)
+        #[cfg(feature = "clipboard")]
+        let scrolled = self.autoscroll(now);
+        #[cfg(not(feature = "clipboard"))]
+        let scrolled = false;
+        fade | pulse | toast | notice | scrolled | self.toolbar.expire(&self.toolbar_ctx(), now)
     }
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its
@@ -1610,7 +1731,7 @@ impl View {
     }
 
     fn open_doc(&mut self, doc: Doc, message: Option<String>) {
-        self.doc = doc;
+        self.doc = share(doc);
         self.message = message;
         self.layout = Layout::new(
             &self.doc,
@@ -1618,6 +1739,8 @@ impl View {
         );
         self.anchor = Anchor::TOP;
         self.drag = None;
+        #[cfg(feature = "clipboard")]
+        self.clear_selection();
         self.kept = None;
         self.hover = None;
         self.hover_blocked = false;
@@ -1652,11 +1775,13 @@ impl View {
             .kept
             .take()
             .unwrap_or_else(|| (self.place(), self.anchor));
-        // Link ids belong to the old document.
+        // Link ids belong to the old document, and so do the offsets of a selection.
         self.hover = None;
         self.hover_blocked = false;
         self.pressed = None;
-        self.doc = doc;
+        #[cfg(feature = "clipboard")]
+        self.clear_selection();
+        self.doc = share(doc);
         self.message = message;
         self.layout = Layout::new(
             &self.doc,

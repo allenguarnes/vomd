@@ -154,7 +154,7 @@ fn attaches_to_previous(c: char) -> bool {
 }
 
 /// Visible combining marks: they stay in their base's face, so that face must cover them too.
-fn is_combining_mark(c: char) -> bool {
+pub fn is_combining_mark(c: char) -> bool {
     !is_default_ignorable(c)
         && matches!(
             c.category(),

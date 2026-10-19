@@ -1,0 +1,19 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"before\\n\\n```rust\\nfn main() {\\n\\tlet a\\t= 1;\\n\\n    // blank above\\n}\\n```\\n\\nafter\\n\",\n\"    indented code\\n    more\\n\\ntext\\n\",])"
+---
+source: "before\n\n```rust\nfn main() {\n\tlet a\t= 1;\n\n    // blank above\n}\n```\n\nafter\n"
+│ before
+│ 
+│ fn main() {
+│ →let a→= 1;
+│ 
+│     // blank above
+│ }
+│ 
+│ after
+source: "    indented code\n    more\n\ntext\n"
+│ indented code
+│ more
+│ 
+│ text

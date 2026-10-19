@@ -19,6 +19,8 @@ use crate::fonts::{FaceId, Fonts};
 use crate::theme::Role;
 
 pub use lines::LineBreak;
+#[cfg(feature = "clipboard")]
+pub use shape::is_combining_mark;
 pub use shape::{Cluster, Glyph, Shaped};
 
 /// Text decorations drawn by the painter from [`PRect`]s.
@@ -230,7 +232,30 @@ pub struct PHit {
     pub x0: f32,
     pub x1: f32,
     pub doc: u32,
+    /// Index into the owner's style table; with `clipboard`, bit 31 says the cluster runs right
+    /// to left (see [`PHit::style_index`] and [`PHit::rtl`]).
     pub style: u32,
+}
+
+/// The bit of [`PHit::style`] that marks a right-to-left cluster. Style tables never come near
+/// 2³¹ entries. Packed into the index so a hit stays 16 bytes: there is one per cluster of
+/// every block near the viewport.
+#[cfg(feature = "clipboard")]
+const HIT_RTL: u32 = 1 << 31;
+#[cfg(not(feature = "clipboard"))]
+const HIT_RTL: u32 = 0;
+
+impl PHit {
+    /// The style's index, whatever the direction bit says.
+    pub fn style_index(&self) -> usize {
+        (self.style & !HIT_RTL) as usize
+    }
+
+    /// The cluster runs right to left, so its leading edge is on the right.
+    #[cfg(feature = "clipboard")]
+    pub fn rtl(&self) -> bool {
+        self.style & HIT_RTL != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -239,6 +264,9 @@ pub struct PBox {
     /// Top of the box.
     pub y: f32,
     pub b: InlineBox,
+    /// Doc byte offset of the box's cluster, to tell whether it is selected.
+    #[cfg(feature = "clipboard")]
+    pub doc: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]

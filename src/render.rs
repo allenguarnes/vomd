@@ -10,8 +10,12 @@ use std::time::{Duration, Instant};
 use crate::fonts::Fonts;
 use crate::image::Bitmap;
 use crate::layout::{BlockBox, Layout};
+#[cfg(feature = "clipboard")]
+use crate::select::{BlockSel, Pos};
 use crate::text::RectKind;
 use crate::text::cache::GlyphCache;
+#[cfg(feature = "clipboard")]
+use crate::theme::Role;
 use crate::theme::{Rgb, Theme};
 
 /// A pixel buffer: `height` rows of `width` pixels, `stride` pixels apart.
@@ -376,7 +380,8 @@ impl Viewport {
 }
 
 /// Paint the document area: background, then every block overlapping the viewport that has
-/// content (call [`Layout::ensure`] first). Blocks without content are left blank.
+/// content (call [`Layout::ensure`] first). Blocks without content are left blank. `sel` is the
+/// selected span, painted between each block's backgrounds and its text.
 pub fn paint(
     frame: &mut Frame,
     vp: Viewport,
@@ -384,6 +389,7 @@ pub fn paint(
     fonts: &Fonts,
     cache: &mut GlyphCache,
     theme: &Theme,
+    #[cfg(feature = "clipboard")] sel: Option<(Pos, Pos)>,
 ) {
     let prev = frame.set_clip(vp.area);
     let a = frame.clip;
@@ -401,7 +407,19 @@ pub fn paint(
                 continue;
             };
             let oy = (vp.area.y0 as f64 + layout.top(i) - scroll) as f32;
-            paint_block(frame, content, ox, oy, fonts, cache, theme);
+            #[cfg(feature = "clipboard")]
+            let sel = sel.and_then(|range| BlockSel::of(i as u32, range));
+            paint_block(
+                frame,
+                content,
+                ox,
+                oy,
+                fonts,
+                cache,
+                theme,
+                #[cfg(feature = "clipboard")]
+                sel.as_ref(),
+            );
         }
     }
     frame.set_clip(prev);
@@ -422,6 +440,7 @@ fn span(v: f32, len: f32) -> (i32, i32) {
 
 /// Paint one block's content with its origin at (`ox`, `oy`) in frame pixels (within the
 /// frame's clip). [`paint`] uses it for document blocks; the app shell for its own text.
+#[cfg_attr(feature = "clipboard", allow(clippy::too_many_arguments))]
 pub fn paint_block(
     frame: &mut Frame,
     content: &BlockBox,
@@ -430,6 +449,7 @@ pub fn paint_block(
     fonts: &Fonts,
     cache: &mut GlyphCache,
     theme: &Theme,
+    #[cfg(feature = "clipboard")] sel: Option<&BlockSel>,
 ) {
     let clip = frame.clip;
     for r in &content.rects {
@@ -449,6 +469,15 @@ pub fn paint_block(
                 255,
             ),
         }
+    }
+    #[cfg(feature = "clipboard")]
+    if let Some(sel) = sel {
+        let color = theme.color(Role::Selection);
+        // Line boxes meet, so their snapped edges do too: no seams between lines.
+        sel.rects(content, |x0, y0, x1, y1| {
+            let (x0, x1) = span(ox + x0, x1 - x0);
+            frame.fill_rect(x0, px(oy + y0), x1, px(oy + y1), color);
+        });
     }
     for g in &content.glyphs {
         let style = &content.styles[g.style as usize];
@@ -486,6 +515,10 @@ pub fn paint_block(
     }
 }
 
+/// How much of the selection color washes over a selected image, of 255 (35 %).
+#[cfg(feature = "clipboard")]
+const SELECTED_IMAGE_ALPHA: u8 = 89;
+
 /// The pixels for inline image boxes (see `image.rs`).
 pub trait Pixels {
     /// The bitmap to show in box `id`, `w` × `h` physical pixels: that size, another one
@@ -501,6 +534,7 @@ pub fn paint_images(
     layout: &Layout,
     pixels: &mut dyn Pixels,
     theme: &Theme,
+    #[cfg(feature = "clipboard")] sel: Option<(Pos, Pos)>,
 ) {
     let prev = frame.set_clip(vp.area);
     let a = frame.clip;
@@ -514,6 +548,8 @@ pub fn paint_images(
             continue;
         };
         let oy = (vp.area.y0 as f64 + layout.top(i) - scroll) as f32;
+        #[cfg(feature = "clipboard")]
+        let sel = sel.and_then(|range| BlockSel::of(i as u32, range));
         for b in &content.boxes {
             let (x0, x1) = span(ox + b.x, b.b.width);
             let (y0, y1) = span(oy + b.y, b.b.ascent + b.b.descent);
@@ -527,6 +563,12 @@ pub fn paint_images(
                     frame.fill_rect(x0, y0, x1, y1, theme.code_bg);
                     frame.rounded_rect((x0, y0, x1, y1), 0.0, Some(1.0), theme.border, 255);
                 }
+            }
+            // The box is painted after the text, so a selected one gets a wash over it.
+            #[cfg(feature = "clipboard")]
+            if sel.is_some_and(|s| s.contains(b.doc)) {
+                let color = theme.color(Role::Selection);
+                frame.rounded_rect((x0, y0, x1, y1), 0.0, None, color, SELECTED_IMAGE_ALPHA);
             }
         }
     }

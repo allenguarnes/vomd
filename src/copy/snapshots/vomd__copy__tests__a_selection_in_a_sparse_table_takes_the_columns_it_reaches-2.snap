@@ -1,0 +1,13 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[src,\n\"| a | b | c | d |\\n|---|---|---|---|\\n| | | | |\\n| | b | | |\\n| a | | | |\\n\",])"
+---
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n"
+│ a→b→c→d
+│ →bravo→→delta
+│ x→→zulu→
+source: "| a | b | c | d |\n|---|---|---|---|\n| | | | |\n| | b | | |\n| a | | | |\n"
+│ a→b→c→d
+│ →→→
+│ →b→→
+│ a→→→

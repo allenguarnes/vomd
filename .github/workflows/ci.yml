@@ -69,6 +69,17 @@ jobs:
       - name: The .deb and AppImage on Debian 12, Debian 13 and Ubuntu 24.04
         run: scripts/pkg-check.sh
 
+  # Copy and paste against real servers, in containers: Xvfb for X11, a headless sway for
+  # Wayland, and the real programs (xclip, xsel, wl-paste) on the other side.
+  clipboard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Select, copy and paste, short and 5 MB, on X11 and Wayland
+        run: scripts/clipboard-check.sh
+
   compile-check:
     strategy:
       fail-fast: false

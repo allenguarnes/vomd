@@ -142,6 +142,16 @@ fn check_invariants(doc: &Doc) {
             BlockKind::Heading(_)
         ));
     }
+    // The back-links copying leaves out are sorted spans of the "↩" links.
+    #[cfg(feature = "clipboard")]
+    {
+        assert!(doc.backlinks.windows(2).all(|w| w[0] < w[1]));
+        for &i in &doc.backlinks {
+            let span = &doc.spans[i as usize];
+            assert!(["↩", " ↩"].contains(&doc.span_text(span)));
+            assert!(doc.links[span.link as usize - 1].starts_with("#fnref-"));
+        }
+    }
 }
 
 fn parse(src: &str) -> String {
@@ -2028,6 +2038,41 @@ fn check_anchors(doc: &Doc) {
     for link in doc.links.iter().filter(|l| l.starts_with('#')) {
         assert!(seen.contains(&link[1..]), "dangling link {link:?}");
     }
+}
+
+/// The "↩" of each note something refers to is listed, in every place it can end up: the end
+/// of a paragraph, of a heading, a paragraph of its own after a code block, in a quote.
+#[cfg(feature = "clipboard")]
+#[test]
+fn footnote_back_links_are_listed() {
+    let backs = |src: &str| {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        let texts: Vec<&str> = doc
+            .backlinks
+            .iter()
+            .map(|&i| doc.span_text(&doc.spans[i as usize]))
+            .collect();
+        (
+            texts.len(),
+            doc.spans
+                .iter()
+                .filter(|s| doc.span_text(s).contains('↩'))
+                .count(),
+        )
+    };
+    assert_eq!(backs("no notes\n"), (0, 0));
+    assert_eq!(backs("a[^1] b[^2]\n\n[^1]: one\n[^2]: two\n"), (2, 2));
+    // Unreferenced: no link back, nothing listed (the span stays in the pool, unused).
+    assert_eq!(backs("a[^1]\n\n[^1]: one\n[^2]: unused\n").0, 1);
+    assert_eq!(backs("a[^1]\n\n[^1]:\n    ```\n    code\n    ```\n").0, 1);
+    assert_eq!(backs("a[^1]\n\n[^1]: > quoted\n").0, 1);
+    assert_eq!(backs("a[^1]\n\n[^1]: # head\n").0, 1);
+    // Cut into segments, the same.
+    let big = format!("{}a[^n]\n\n[^n]: note\n", "para\n\n".repeat(100));
+    let (whole, parts) = Doc::fuzz_segments(&big, 100).expect("splittable");
+    assert_eq!(whole.backlinks, parts.backlinks);
+    assert_eq!(whole.backlinks.len(), 1);
 }
 
 #[test]

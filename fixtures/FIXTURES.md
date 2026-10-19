@@ -12,4 +12,5 @@ Test documents for snapshots, goldens, and benchmarks.
 | `tables.md` | GFM tables, task lists, alerts, code |
 | `golden.md` | Every block kind, for the render goldens (`tests/golden/`) |
 | `inline.md` | Inline HTML styles, autolinks, escapes, alerts (render goldens) |
+| `selection.md` | Text selection: inline code, an image, a list, code with a tab and a blank line, a table (render goldens) |
 | `images.md`, `images/` | Local PNG/JPEG (alpha, progressive, grayscale, linked, in a table), missing and unsupported images, blocked remote ones (P10) |

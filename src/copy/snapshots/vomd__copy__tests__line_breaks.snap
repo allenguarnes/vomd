@@ -1,0 +1,8 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"soft\\nbreak and hard\\\\\\nbreak and <br> html break\\n\"])"
+---
+source: "soft\nbreak and hard\\\nbreak and <br> html break\n"
+│ soft break and hard
+│ break and 
+│  html break

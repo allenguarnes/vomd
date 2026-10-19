@@ -1,0 +1,23 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"> [!NOTE]\\n> Useful information.\\n\\nplain\\n\\n> [!WARNING]\\n> Careful.\\n>\\n> Second paragraph.\\n\",\n\"> [!TIP]\\n> one\\n\\n> [!IMPORTANT]\\n> two\\n\\n> [!CAUTION]\\n> three\\n\",])"
+---
+source: "> [!NOTE]\n> Useful information.\n\nplain\n\n> [!WARNING]\n> Careful.\n>\n> Second paragraph.\n"
+│ > Note
+│ > Useful information.
+│ 
+│ plain
+│ 
+│ > Warning
+│ > Careful.
+│ >
+│ > Second paragraph.
+source: "> [!TIP]\n> one\n\n> [!IMPORTANT]\n> two\n\n> [!CAUTION]\n> three\n"
+│ > Tip
+│ > one
+│ 
+│ > Important
+│ > two
+│ 
+│ > Caution
+│ > three

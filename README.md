@@ -3,7 +3,7 @@
 # VOMD: View-Only Markdown
 
 A tiny, fast Markdown viewer for the Linux desktop. Double-click a `.md` file and it appears,
-rendered the way GitHub shows it, in well under a tenth of a second. It is one 3.7 MB binary
+rendered the way GitHub shows it, in well under a tenth of a second. It is one 3.9 MB binary
 with its fonts built in. It doesn't use a web engine or a GUI toolkit, and it never touches
 the network unless you ask it to.
 
@@ -14,6 +14,9 @@ the network unless you ask it to.
 - **Links**: `#anchors` scroll, relative `.md` links open in the same window (Back returns),
   and web links open in your browser.
 - **Images**: local PNG and JPEG, decoded lazily. Remote images load only after you press `I`.
+- **Selecting and copying text**: drag, double-click a word, triple-click a block, or press
+  `Ctrl+A`; `Ctrl+C` copies it as plain text, and what you select is also pasted by a middle
+  click (X11 and Wayland).
 - **Live reload**: when the window gets focus, a document that changed on disk is shown again
   at the same place.
 - **Large files**: a 5 MB document opens in under 100 ms. Files over 10 MB still render, with
@@ -34,7 +37,7 @@ makepkg -si
 
 `vomd-bin` installs the release binary, which is small and runs on any x86-64 CPU. To build from
 source instead, use `packaging/aur/vomd`. It follows your `makepkg.conf`, so with CachyOS's
-`RUSTFLAGS` (`-C opt-level=3 -C target-cpu=native`) the binary is larger (about 4.9 MB) and
+`RUSTFLAGS` (`-C opt-level=3 -C target-cpu=native`) the binary is larger (about 5.2 MB) and
 faster, and runs only on the CPU it was built on.
 
 **Debian, Ubuntu:** from v1.1.0, each [release](https://github.com/allenguarnes/vomd/releases)
@@ -93,8 +96,8 @@ cargo build --release
 cargo build --release --no-default-features
 ```
 
-The Cargo features are `images` (PNG/JPEG), `remote-images` (via the system `curl`) and
-`embed-fonts`. All three are on by default.
+The Cargo features are `images` (PNG/JPEG), `remote-images` (via the system `curl`),
+`embed-fonts` and `clipboard` (selecting and copying text). All four are on by default.
 
 ## Usage
 
@@ -123,9 +126,25 @@ Each window is its own process, so opening another file starts another window.
 | `I` | Load remote images for this document (press again to hide them) |
 | `R`, `F5` | Reload |
 | Click a link | Follow it; hover shows where it goes |
+| Drag | Select text (a drag that starts on a link selects, and doesn't follow it) |
+| Double-click, triple-click | Select a word, a paragraph (or a heading, code block, table row) |
+| `Shift` + click | Extend the selection |
+| `Ctrl+A` | Select everything |
+| `Ctrl+C`, `Ctrl+Insert` | Copy the selection |
 | `Backspace`, `Alt+←`, `Ctrl+[` | Back |
 | `Ctrl+O` | Open a file (the desktop's file dialog) |
-| `Esc`, `Q`, `Ctrl+W` | Quit |
+| `Esc` | Close the open menu, else clear the selection, else quit |
+| `Q`, `Ctrl+W` | Quit |
+
+**Copying.** `Ctrl+C` copies the selected text to the clipboard as plain text: the text as it
+shows, with `- ` before list items, `> ` before quoted lines, a tab between table cells, an image's
+alt text, and a link's text (not its address). Text that is selected with the mouse (and
+`Ctrl+A`) is also offered as the primary selection, which a middle click pastes in programs that
+use it (see `primary_selection` below). A long selection is made only when something pastes it,
+so copying all of a very large document costs nothing until then. Dragging past the top or bottom
+of the window scrolls. On X11 a selection goes with the window that owns it, so as the window
+closes VOMD asks the clipboard manager (the desktop's, if it runs one) to keep the clipboard; on
+Wayland the compositor's own manager does that.
 
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends
@@ -148,6 +167,7 @@ it with every key listed and commented out:
 | `font_size` | `16` (10–32) |
 | `line_width` | `80` (40–200 characters) |
 | `wide` | `false`, `true` (the text spans the window; `line_width` is ignored) |
+| `primary_selection` | `on`, `off` (selecting text offers it for a middle click; `Ctrl+C` is not affected) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed family such as `Noto Sans` |
 
 Theme, zoom, toolbar, wide layout and window size are saved automatically when you change them.
@@ -165,7 +185,10 @@ on. `never` removes the option.
 
 - **Linux only** for now. The code is portable and compiles for Windows and macOS, but those
   are untested and unsupported until a later release.
-- No text selection or copy yet, and no table of contents panel; both are planned.
+- No table of contents panel yet; it is planned.
+- Selecting and copying work on X11 and Wayland only; there is no keyboard selection (Shift
+  and the arrows), and a word is a run of letters, digits and marks (a run of Chinese or Japanese
+  characters counts as one word).
 - No screen-reader support (AccessKit would add too much to the binary). Text scaling comes
   from the system scale factor that winit reports (`Xft.dpi` on X11, the output scale on
   Wayland).
@@ -179,7 +202,9 @@ on. `never` removes the option.
 `just ci` runs formatting, clippy (every feature set), the tests, and Windows/macOS compile
 checks. `cargo xtask budgets` measures every performance budget against a release build (it
 needs a display). `just fuzz <doc|layout|settings> [seconds]` fuzzes on the stable toolchain.
-`scripts/aur-check.sh` builds and checks both AUR packages offline. `scripts/pkg-build.sh` builds
+`scripts/aur-check.sh` builds and checks both AUR packages offline. `scripts/clipboard-check.sh`
+selects, copies and pastes against Xvfb and a headless sway in containers, with the real `xclip`,
+`xsel` and `wl-paste` (it needs docker). `scripts/pkg-build.sh` builds
 the release files (tarball, `.deb`, AppImage) in a Debian 12 container as CI does, and
 `scripts/pkg-check.sh` installs and runs the `.deb` and AppImage on Debian 12, Debian 13 and
 Ubuntu 24.04 (both need docker).

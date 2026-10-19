@@ -1,0 +1,18 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"Text[^a] more[^b].\\n\\n[^a]: First note.\\n[^b]: Second note\\n    over two lines\\n\\n    and a second paragraph.\\n\",\n\"Ref[^x]\\n\\n[^x]:\\n    ```\\n    code\\n    ```\\n\",])"
+---
+source: "Text[^a] more[^b].\n\n[^a]: First note.\n[^b]: Second note\n    over two lines\n\n    and a second paragraph.\n"
+│ Text[1] more[2].
+│ 
+│ [1]: First note.
+│ 
+│ [2]: Second note over two lines
+│ 
+│ and a second paragraph.
+source: "Ref[^x]\n\n[^x]:\n    ```\n    code\n    ```\n"
+│ Ref[1]
+│ 
+│ [1]: 
+│ 
+│ code

@@ -1,0 +1,28 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"> one\\n>\\n> two\\n\\nafter\\n\\n> separate\\n\",\n\"> outer\\n>\\n> > inner\\n> > more\\n>\\n> back\\n\",\n\"> - item one\\n> - item two\\n>   continued\\\\\\n>   line\\n\",\n\"- > quote in an item\\n  > more\\n- next\\n\", \"> a hard\\\\\\n> break\\n\",])"
+---
+source: "> one\n>\n> two\n\nafter\n\n> separate\n"
+│ > one
+│ >
+│ > two
+│ 
+│ after
+│ 
+│ > separate
+source: "> outer\n>\n> > inner\n> > more\n>\n> back\n"
+│ > outer
+│ >
+│ > > inner more
+│ >
+│ > back
+source: "> - item one\n> - item two\n>   continued\\\n>   line\n"
+│ > - item one
+│ > - item two continued
+│ >   line
+source: "- > quote in an item\n  > more\n- next\n"
+│ - > quote in an item more
+│ - next
+source: "> a hard\\\n> break\n"
+│ > a hard
+│ > break

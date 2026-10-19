@@ -20,6 +20,8 @@ use winit::raw_window_handle::{
 use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use vomd::cli::{self, Cli, Input};
+#[cfg(feature = "clipboard")]
+use vomd::clipboard::{Clipboard, Which};
 use vomd::doc::Doc;
 use vomd::fonts::Fonts;
 use vomd::nav::{self, BackStack, Target};
@@ -50,8 +52,8 @@ fn is_wayland(display: Option<RawDisplayHandle>) -> bool {
 
 /// The portal's name for `window`, for its dialog to belong to (`x11:<id in hex>`). Empty on
 /// Wayland: a parent there is a handle exported through xdg-foreign, which needs the Wayland
-/// protocol crates (`wayland-client`, `wayland-protocols`) that VOMD doesn't link; the dialog
-/// then has no parent, as it did before.
+/// protocol crates (`wayland-client`, `wayland-protocols`), which VOMD links for the clipboard
+/// only (and not in the smallest build); the dialog then has no parent.
 fn portal_parent(window: &Window) -> String {
     parent_name(window.window_handle().map(|h| h.as_raw()).ok())
 }
@@ -230,6 +232,15 @@ struct App {
     cursor_in: bool,
     /// The pointer cursor shows a hand (over a link).
     pointer: bool,
+    /// The pointer cursor shows the text cursor (over text, or while selecting).
+    #[cfg(feature = "clipboard")]
+    text_cursor: bool,
+    /// Where copies go (made with the window, which has the display).
+    #[cfg(feature = "clipboard")]
+    clipboard: Option<Clipboard>,
+    /// A selection is offered as the primary selection (`primary_selection`).
+    #[cfg(feature = "clipboard")]
+    primary: bool,
     back: BackStack,
     /// The toolbar's visibility as last applied from or saved to the settings.
     toolbar_shown: bool,
@@ -298,6 +309,10 @@ impl App {
         view.set_theme_mode(prefs.theme);
         view.set_layout(prefs.zoom, prefs.font_size, prefs.line_width, prefs.wide);
         view.set_remote_policy(prefs.remote_images);
+        #[cfg(feature = "clipboard")]
+        {
+            self.primary = prefs.primary_selection;
+        }
         if view.toolbar_visible() != prefs.toolbar {
             view.set_toolbar(prefs.toolbar);
         }
@@ -533,14 +548,30 @@ impl App {
             view.hover_end()
         };
         let update = view::hover_change(self.pointer, view.hovered().is_some(), changed);
-        if update.set_cursor {
+        #[cfg(feature = "clipboard")]
+        let text = self.cursor_in && view.text_cursor(self.cursor.x, self.cursor.y);
+        #[cfg(feature = "clipboard")]
+        let set_cursor = update.set_cursor || text != self.text_cursor;
+        #[cfg(not(feature = "clipboard"))]
+        let set_cursor = update.set_cursor;
+        if set_cursor {
+            #[cfg(feature = "clipboard")]
+            let text_icon = text && !update.pointer;
+            #[cfg(not(feature = "clipboard"))]
+            let text_icon = false;
             gfx.window.set_cursor(if update.pointer {
                 CursorIcon::Pointer
+            } else if text_icon {
+                CursorIcon::Text
             } else {
                 CursorIcon::Default
             });
         }
         self.pointer = update.pointer;
+        #[cfg(feature = "clipboard")]
+        {
+            self.text_cursor = text;
+        }
         if update.redraw {
             gfx.window.request_redraw();
         }
@@ -605,6 +636,19 @@ impl App {
         }
     }
 
+    /// Offer the selection as the clipboard or the primary selection (which only if the setting
+    /// allows). Nothing is copied now: a long selection is made when a program pastes it.
+    #[cfg(feature = "clipboard")]
+    fn offer(&mut self, which: Which) {
+        if which == Which::Primary && !self.primary {
+            return;
+        }
+        let content = self.view.as_ref().and_then(View::copy_content);
+        if let (Some(content), Some(clipboard)) = (content, self.clipboard.as_mut()) {
+            clipboard.set(which, content);
+        }
+    }
+
     fn outcome(&mut self, outcome: Outcome, event_loop: &ActiveEventLoop) {
         match outcome {
             Outcome::Nothing => {}
@@ -612,6 +656,13 @@ impl App {
             Outcome::Reload => self.reload(),
             Outcome::Back => self.go_back(),
             Outcome::Open => self.choose_file(),
+            #[cfg(feature = "clipboard")]
+            Outcome::Selected => {
+                self.redraw();
+                self.offer(Which::Primary);
+            }
+            #[cfg(feature = "clipboard")]
+            Outcome::Copy => self.offer(Which::Clipboard),
             Outcome::Quit => event_loop.exit(),
         }
     }
@@ -682,6 +733,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         self.wayland = is_wayland(window.display_handle().ok().map(|h| h.as_raw()));
+        #[cfg(feature = "clipboard")]
+        {
+            self.clipboard = window
+                .display_handle()
+                .ok()
+                .map(|h| Clipboard::new(h.as_raw()));
+        }
         let loaded = match self.parse.take().map(JoinHandle::join) {
             Some(Ok(loaded)) => loaded,
             _ => Loaded {
@@ -828,7 +886,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             // Changes made here are in the file before another window (or an editor) is used.
-            WindowEvent::Focused(false) => self.save(|s| s.flush()),
+            WindowEvent::Focused(false) => {
+                // A button released elsewhere isn't seen: the drag ends here.
+                #[cfg(feature = "clipboard")]
+                view.release_select();
+                self.save(|s| s.flush());
+            }
             WindowEvent::Focused(true) => {
                 // (`reload` keeps a pipe's document: its stamp says nothing.)
                 if let Input::File(path) = &self.input
@@ -844,6 +907,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::DroppedFile(path) => self.go_to(Input::File(path)),
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
+                #[cfg(feature = "clipboard")]
+                view.set_shift(self.mods.shift_key());
                 if !(self.mods.control_key() || self.mods.super_key()) {
                     view.zoom_wheel_end();
                 }
@@ -876,7 +941,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 self.cursor_in = true;
-                if view.drag_to(position.y, now) {
+                let moved = view.drag_to(position.y, now);
+                #[cfg(feature = "clipboard")]
+                let moved = view.select_to(position.x, position.y, now) | moved;
+                if moved {
                     self.redraw();
                 }
             }
@@ -887,10 +955,16 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 let (x, y) = (self.cursor.x, self.cursor.y);
+                #[cfg(feature = "clipboard")]
+                let mut offer_primary = false;
                 let (changed, clicked, command) = match state {
                     ElementState::Pressed => (view.press(x, y, now), None, None),
                     ElementState::Released => {
                         let bar = view.release_toolbar(x, y);
+                        #[cfg(feature = "clipboard")]
+                        {
+                            offer_primary = view.release_select();
+                        }
                         (
                             view.release(now) | bar,
                             view.click(x, y),
@@ -906,6 +980,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(command) = command {
                     self.command(command, event_loop, now);
+                }
+                // A selection made with the mouse is done when the button is up.
+                #[cfg(feature = "clipboard")]
+                if offer_primary {
+                    self.offer(Which::Primary);
                 }
             }
             _ => {}
@@ -931,6 +1010,10 @@ impl ApplicationHandler<UserEvent> for App {
             self.store.record_window(logical, Instant::now());
         }
         self.save(|s| s.flush());
+        #[cfg(feature = "clipboard")]
+        if let Some(clipboard) = self.clipboard.as_ref() {
+            clipboard.save();
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1038,6 +1121,12 @@ fn main() {
         cursor: PhysicalPosition::new(0.0, 0.0),
         cursor_in: false,
         pointer: false,
+        #[cfg(feature = "clipboard")]
+        text_cursor: false,
+        #[cfg(feature = "clipboard")]
+        clipboard: None,
+        #[cfg(feature = "clipboard")]
+        primary: false,
         back: BackStack::default(),
         toolbar_shown: true,
         wide_set: false,

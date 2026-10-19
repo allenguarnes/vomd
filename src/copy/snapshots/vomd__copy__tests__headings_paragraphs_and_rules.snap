@@ -1,0 +1,14 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"# Title\\n\\nFirst paragraph.\\n\\n---\\n\\n## Sub *heading*\\n\\nSecond.\\n\\n***\\n\\nlast\"])"
+---
+source: "# Title\n\nFirst paragraph.\n\n---\n\n## Sub *heading*\n\nSecond.\n\n***\n\nlast"
+│ Title
+│ 
+│ First paragraph.
+│ 
+│ Sub heading
+│ 
+│ Second.
+│ 
+│ last

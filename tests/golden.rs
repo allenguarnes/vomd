@@ -11,8 +11,11 @@ use std::time::{Duration, Instant};
 
 use vomd::doc::Doc;
 use vomd::fonts::Fonts;
-use vomd::layout::{Anchor, Layout, Params};
-use vomd::render::{self, Clip, Frame, Viewport};
+use vomd::image::Bitmap;
+use vomd::layout::{Anchor, ImageSize, Layout, Params};
+use vomd::render::{self, Clip, Frame, Pixels, Viewport};
+#[cfg(feature = "clipboard")]
+use vomd::select::Pos;
 use vomd::text::cache::GlyphCache;
 use vomd::theme::{DARK, LIGHT, Theme};
 
@@ -32,6 +35,9 @@ struct Case {
     /// `Some(h)`: a window `h` logical pixels tall scrolled to the middle of the document, with
     /// the scrollbar painted. `None`: the whole document from the top, no scrollbar.
     view: Option<f32>,
+    /// `Some((from, to))`: the text from the start of the first `from` to the end of the first
+    /// `to` is selected, and images are shown.
+    select: Option<(&'static str, &'static str)>,
 }
 
 const CASES: &[Case] = &[
@@ -42,6 +48,7 @@ const CASES: &[Case] = &[
         scale: 1.0,
         theme: &LIGHT,
         view: None,
+        select: None,
     },
     Case {
         name: "golden-dark",
@@ -50,6 +57,7 @@ const CASES: &[Case] = &[
         scale: 1.0,
         theme: &DARK,
         view: None,
+        select: None,
     },
     Case {
         name: "golden-light-2x",
@@ -58,6 +66,7 @@ const CASES: &[Case] = &[
         scale: 2.0,
         theme: &LIGHT,
         view: None,
+        select: None,
     },
     Case {
         name: "golden-narrow",
@@ -66,6 +75,7 @@ const CASES: &[Case] = &[
         scale: 1.0,
         theme: &LIGHT,
         view: None,
+        select: None,
     },
     Case {
         name: "golden-scrolled-1.5x",
@@ -74,6 +84,7 @@ const CASES: &[Case] = &[
         scale: 1.5,
         theme: &LIGHT,
         view: Some(600.0),
+        select: None,
     },
     Case {
         name: "tables-dark",
@@ -82,6 +93,7 @@ const CASES: &[Case] = &[
         scale: 1.0,
         theme: &DARK,
         view: None,
+        select: None,
     },
     Case {
         name: "inline",
@@ -90,6 +102,7 @@ const CASES: &[Case] = &[
         scale: 1.0,
         theme: &LIGHT,
         view: None,
+        select: None,
     },
     Case {
         name: "tiny",
@@ -98,6 +111,51 @@ const CASES: &[Case] = &[
         scale: 1.0,
         theme: &LIGHT,
         view: None,
+        select: None,
+    },
+    // From inside the first paragraph to the middle of the table: the image washed, the list's
+    // bullets, the code block's tab and blank line, the marked line ends.
+    #[cfg(feature = "clipboard")]
+    Case {
+        name: "selection-light",
+        fixture: "selection.md",
+        width: 640.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+        select: Some(("middle", "three")),
+    },
+    #[cfg(feature = "clipboard")]
+    Case {
+        name: "selection-dark",
+        fixture: "selection.md",
+        width: 640.0,
+        scale: 1.0,
+        theme: &DARK,
+        view: None,
+        select: Some(("middle", "three")),
+    },
+    // Bidi: from the Arabic paragraph through the Hebrew one into the mixed line.
+    #[cfg(feature = "clipboard")]
+    Case {
+        name: "selection-rtl",
+        fixture: "rtl.md",
+        width: 640.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+        select: Some(("لغة", "means")),
+    },
+    // HiDPI 2× at 150% zoom: the rectangles snap to whole pixels.
+    #[cfg(feature = "clipboard")]
+    Case {
+        name: "selection-2x",
+        fixture: "selection.md",
+        width: 400.0,
+        scale: 3.0,
+        theme: &LIGHT,
+        view: None,
+        select: Some(("inline", "wrap onto")),
     },
 ];
 
@@ -118,6 +176,12 @@ fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
             ..Params::default()
         },
     );
+    // The images of a selection case are shown, at a size of their own.
+    if case.select.is_some() {
+        for id in 1..=doc.images.len() as u32 {
+            layout.set_image(&doc, id, ImageSize::Pixels(120, 60));
+        }
+    }
     while !layout.idle(&doc, fonts, Instant::now() + Duration::from_secs(1)) {}
     let total = layout.total_height();
     let h = match case.view {
@@ -148,6 +212,13 @@ fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
         scroll: f64::from(scroll),
     };
     let mut frame = Frame::new(&mut px, w, h, w);
+    #[cfg(feature = "clipboard")]
+    let sel = case.select.map(|(from, to)| {
+        // The caret before the first character of `from`, after the last of `to`.
+        (pos_of(&doc, from, false), pos_of(&doc, to, true))
+    });
+    #[cfg(not(feature = "clipboard"))]
+    assert!(case.select.is_none());
     render::paint(
         &mut frame,
         vp,
@@ -155,12 +226,61 @@ fn render_case(case: &Case, fonts: &Fonts) -> (usize, usize, Vec<u32>) {
         fonts,
         &mut GlyphCache::default(),
         case.theme,
+        #[cfg(feature = "clipboard")]
+        sel,
     );
+    if case.select.is_some() {
+        render::paint_images(
+            &mut frame,
+            vp,
+            &layout,
+            &mut Gradient(None),
+            case.theme,
+            #[cfg(feature = "clipboard")]
+            sel,
+        );
+    }
     if case.view.is_some() {
         assert!(total > h as f32, "{}: the window must scroll", case.name);
         render::paint_scrollbar(&mut frame, vp, total, case.scale, case.theme);
     }
     (w, h, px)
+}
+
+/// The caret before (`end` false) or after the first `needle` of the document's text.
+#[cfg(feature = "clipboard")]
+fn pos_of(doc: &Doc, needle: &str, end: bool) -> Pos {
+    let start = doc.text.find(needle).expect("the needle is in the text");
+    let off = start + if end { needle.len() } else { 0 };
+    // The block holding the character the caret is next to.
+    let at = if end { off - 1 } else { off } as u32;
+    let holds = |spans: &[vomd::doc::Span]| spans.iter().any(|s| s.start <= at && at < s.end);
+    let block = doc
+        .blocks
+        .iter()
+        .position(|b| holds(doc.block_spans(b)) || doc.row_cells(b).any(|(_, s)| holds(s)))
+        .expect("a block holds it");
+    Pos::new(block as u32, off as u32)
+}
+
+/// A bitmap that shades from blue to orange, for the images that are shown.
+struct Gradient(Option<Bitmap>);
+
+impl Pixels for Gradient {
+    fn pixels(&mut self, _: u32, w: u32, h: u32) -> Option<&Bitmap> {
+        let data = (0..w * h)
+            .map(|i| {
+                let t = (i % w) * 255 / w.max(1);
+                0xff00_0000 | (255 - t) << 16 | (t / 2 + 90) << 8 | t
+            })
+            .collect();
+        self.0 = Some(Bitmap {
+            width: w,
+            height: h,
+            data,
+        });
+        self.0.as_ref()
+    }
 }
 
 fn to_rgb(px: &[u32]) -> Vec<u8> {

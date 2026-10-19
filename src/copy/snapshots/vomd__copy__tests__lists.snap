@@ -1,0 +1,39 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"- one\\n- two\\n  - nested\\n    - deeper\\n  - nested two\\n- three\\n\\ntext after\\n\",\n\"3. third\\n4. fourth\\n   1. inner\\n10. tenth\\n\", \"- [x] done\\n- [ ] open\\n\",\n\"1. first item\\n\\n   its second paragraph\\n\\n2. second item\\n3. third\\n\",\n\"- item\\n\\n  ```\\n  code\\ttab\\n  more\\n  ```\\n\\n- next\\n\",\n\"- a line\\\\\\n  after a break\\n- b\\n\",])"
+---
+source: "- one\n- two\n  - nested\n    - deeper\n  - nested two\n- three\n\ntext after\n"
+│ - one
+│ - two
+│   - nested
+│     - deeper
+│   - nested two
+│ - three
+│ 
+│ text after
+source: "3. third\n4. fourth\n   1. inner\n10. tenth\n"
+│ 3. third
+│ 4. fourth
+│   1. inner
+│ 5. tenth
+source: "- [x] done\n- [ ] open\n"
+│ - [x] done
+│ - [ ] open
+source: "1. first item\n\n   its second paragraph\n\n2. second item\n3. third\n"
+│ 1. first item
+│ 
+│   its second paragraph
+│ 
+│ 2. second item
+│ 3. third
+source: "- item\n\n  ```\n  code\ttab\n  more\n  ```\n\n- next\n"
+│ - item
+│ 
+│   code→tab
+│   more
+│ 
+│ - next
+source: "- a line\\\n  after a break\n- b\n"
+│ - a line
+│   after a break
+│ - b

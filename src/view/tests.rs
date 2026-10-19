@@ -1588,17 +1588,19 @@ mod with_fonts {
             (f64::NAN, ly),
             (lx, f64::NAN),
         ];
-        for (x, y) in outside {
+        // (Seconds apart: presses in a quick row are a double click, which doesn't follow.)
+        for (n, (x, y)) in outside.into_iter().enumerate() {
             assert_eq!(v.link_at(x, y), None, "({x}, {y})");
             assert!(v.hover(lx, ly) || v.hovered().is_some());
             v.hover(x, y);
             assert_eq!(v.hovered(), None, "hover at ({x}, {y})");
-            v.press(lx, ly, now);
+            v.press(lx, ly, now + Duration::from_secs(n as u64));
             assert_eq!(v.click(x, y), None, "released at ({x}, {y})");
         }
         // Inside still works.
         assert!(v.hover(lx, ly));
         assert_eq!(v.hovered(), Some("https://example.com/x"));
+        let now = now + Duration::from_secs(60);
         v.press(lx, ly, now);
         assert_eq!(v.click(lx, ly).as_deref(), Some("https://example.com/x"));
         v.set_top_inset(20);

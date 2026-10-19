@@ -184,7 +184,13 @@ pub struct Prefs {
     /// Faces cached for the families above.
     pub font_sans_path: Option<FontPaths>,
     pub font_mono_path: Option<FontPaths>,
+    /// Selecting text offers it as the primary selection (pasted with the middle button).
+    pub primary_selection: bool,
 }
+
+/// What `primary_selection` is without a line for it: on where there is a primary selection (X11
+/// and Wayland). Windows and macOS have none and will say off, here and in [`TEMPLATE`].
+pub const DEFAULT_PRIMARY: bool = cfg!(all(unix, not(any(target_os = "macos", target_os = "ios"))));
 
 pub const DEFAULT_WINDOW: (u32, u32) = (900, 1000);
 pub const ZOOM_RANGE: (u16, u16) = (50, 300);
@@ -208,6 +214,7 @@ impl Default for Prefs {
             font_mono: None,
             font_sans_path: None,
             font_mono_path: None,
+            primary_selection: DEFAULT_PRIMARY,
         }
     }
 }
@@ -289,6 +296,10 @@ impl Prefs {
             }),
             font_sans,
             font_mono,
+            primary_selection: s
+                .get("primary_selection")
+                .and_then(parse_bool)
+                .unwrap_or(d.primary_selection),
         }
     }
 }
@@ -783,9 +794,12 @@ impl Store {
     }
 }
 
-/// The file written by the ⚙ action when there is none: every key commented out at its
-/// default, with a line of explanation.
-pub const TEMPLATE: &str = "\
+/// The template with the default of `primary_selection` the platform has (see
+/// [`DEFAULT_PRIMARY`]): `on` or `off`.
+macro_rules! template {
+    ($primary:literal) => {
+        concat!(
+            "\
 # VOMD settings. Remove the # in front of a line to change it; delete a line to go back to
 # the default. VOMD re-reads this file when its window gets focus. Comments go on a line of
 # their own: after a value, a # is part of the value.
@@ -819,12 +833,28 @@ pub const TEMPLATE: &str = "\
 # Wide layout: the text spans the window instead of stopping at line_width (W toggles it).
 # wide = false
 
+# Selecting text with the mouse (or Ctrl+A) offers it as the primary selection, which a middle
+# click pastes elsewhere: on or off. Ctrl+C copies to the clipboard either way.
+# primary_selection = ",
+            $primary,
+            "
+
 # Fonts: default (built in) or the name of an installed family, e.g. Noto Sans. VOMD finds
 # the files once and remembers them below as font_sans_path / font_mono_path. A family that
 # isn't installed falls back to the built-in font.
 # font_sans = default
 # font_mono = default
-";
+"
+        )
+    };
+}
+
+/// The file written by the ⚙ action when there is none: every key commented out at its
+/// default, with a line of explanation.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+pub const TEMPLATE: &str = template!("on");
+#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
+pub const TEMPLATE: &str = template!("off");
 
 /// Create the file from [`TEMPLATE`] if it doesn't exist (a dangling symlink gets the file at
 /// its target). Returns true if it was created.

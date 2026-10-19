@@ -1,0 +1,16 @@
+---
+source: src/copy/tests.rs
+expression: "between_of(&[(src, \"avo\", \"del\"), (src, \"avo\", \"foxtrot\"),\n(src, \"harl\", \"harl\"), (src, \"golf\", \"golf\"), (src, \"h2\", \"alpha\"),])"
+---
+source: "| h1 | h2 | h3 | h4 |\n|---|---|---|---|\n| alpha | bravo | charlie | delta |\n| echo | foxtrot | golf | hotel |\n [avo..del]"
+│ avo→charlie→del
+source: "| h1 | h2 | h3 | h4 |\n|---|---|---|---|\n| alpha | bravo | charlie | delta |\n| echo | foxtrot | golf | hotel |\n [avo..foxtrot]"
+│ avo→charlie→delta
+│ echo→foxtrot
+source: "| h1 | h2 | h3 | h4 |\n|---|---|---|---|\n| alpha | bravo | charlie | delta |\n| echo | foxtrot | golf | hotel |\n [harl..harl]"
+│ harl
+source: "| h1 | h2 | h3 | h4 |\n|---|---|---|---|\n| alpha | bravo | charlie | delta |\n| echo | foxtrot | golf | hotel |\n [golf..golf]"
+│ golf
+source: "| h1 | h2 | h3 | h4 |\n|---|---|---|---|\n| alpha | bravo | charlie | delta |\n| echo | foxtrot | golf | hotel |\n [h2..alpha]"
+│ h2→h3→h4
+│ alpha

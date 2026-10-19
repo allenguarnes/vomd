@@ -361,7 +361,7 @@ fn style_indices_are_not_capped_at_16_bits() {
     assert_eq!(p.styles[last.style as usize].link, N);
     assert_eq!(l.glyphs.last().unwrap().style, N - 1);
     for h in l.hits.iter().step_by(997) {
-        assert_eq!(p.styles[h.style as usize].link, h.doc / 2 + 1);
+        assert_eq!(p.styles[h.style_index()].link, h.doc / 2 + 1);
     }
 }
 
@@ -696,7 +696,7 @@ fn lam_alef_links(ctx: &mut TextCtx, fonts: &Fonts) {
         let h: Vec<&PHit> = l
             .hits
             .iter()
-            .filter(|h| p.styles[h.style as usize].link == n)
+            .filter(|h| p.styles[h.style_index()].link == n)
             .collect();
         assert_eq!(h.len(), 1, "link {n}: {:?}", l.hits);
         *h[0]

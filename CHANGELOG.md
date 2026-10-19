@@ -5,6 +5,21 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Select and copy text. Drag to select (a drag that starts on a link selects, and a click
+  still follows it), double-click for a word, triple-click for a paragraph, heading, code block
+  or table row, `Shift`+click to extend, `Ctrl+A` for everything, and drag past the top or bottom
+  of the window to scroll. `Ctrl+C` (also `Ctrl+Insert`, `Ctrl+Shift+C` and the Copy key) copies
+  plain text: list items start with `- `, quoted lines with `> `, table cells are tab-separated,
+  an image is its alt text and a link its text. The text is made only when a program pastes it,
+  so copying a whole 5 MB document costs no memory until then (X11 INCR and Wayland pipes, in
+  pieces of 64 KiB). On X11 and Wayland a selection made with the mouse (and `Ctrl+A`) is also the
+  primary selection, pasted with a middle click; the new `primary_selection = on|off` setting
+  turns that off. As the window closes on X11 the clipboard manager, if there is one, is asked to
+  keep the clipboard.
+  Needs the new `clipboard` feature, on by default; the smallest build leaves it out.
+- `Esc` clears the selection before it quits (after closing the toolbar's menu, as before).
+
 ### Fixed
 - An image decode that started just as the images wanted changed is counted in the room the
   image cache keeps free. Before, the cache could briefly fill the memory that decode used.

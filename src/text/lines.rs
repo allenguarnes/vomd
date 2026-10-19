@@ -6,7 +6,7 @@ use std::ops::Range;
 use unicode_linebreak::{BreakOpportunity, linebreaks};
 
 use super::shape::{Cluster, Segment, Shaped, flags};
-use super::{Align, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, deco};
+use super::{Align, HIT_RTL, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, deco};
 use crate::fonts::Fonts;
 use crate::theme::Role;
 
@@ -240,6 +240,8 @@ pub fn position(
                     x: pen,
                     y: baseline - style.shift - b.ascent,
                     b,
+                    #[cfg(feature = "clipboard")]
+                    doc: para.doc_offset(c.start),
                 });
                 pen += b.width;
             } else {
@@ -286,12 +288,13 @@ pub fn position(
 /// advance by weight, laid out in visual order (the reverse of logical in RTL clusters).
 fn cluster_hits(para: &Para, shaped: &Shaped, c: &Cluster, x0: f32, x1: f32, hits: &mut Vec<PHit>) {
     let segs = &shaped.segments[c.segs.start as usize..c.segs.end as usize];
+    let dir = if c.level % 2 == 1 { HIT_RTL } else { 0 };
     if segs.is_empty() {
         hits.push(PHit {
             x0,
             x1,
             doc: para.doc_offset(c.start),
-            style: c.style,
+            style: c.style | dir,
         });
         return;
     }
@@ -309,7 +312,7 @@ fn cluster_hits(para: &Para, shaped: &Shaped, c: &Cluster, x0: f32, x1: f32, hit
             x0: x,
             x1: end,
             doc: para.doc_offset(s.start),
-            style: s.style,
+            style: s.style | dir,
         });
         x = end;
     };
@@ -324,9 +327,9 @@ fn cluster_hits(para: &Para, shaped: &Shaped, c: &Cluster, x0: f32, x1: f32, hit
 fn decorations(fonts: &Fonts, para: &Para, hits: &[PHit], baseline: f32, rects: &mut Vec<PRect>) {
     let mut i = 0;
     while i < hits.len() {
-        let style = &para.styles[hits[i].style as usize];
+        let style = &para.styles[hits[i].style_index()];
         let j = (i..hits.len())
-            .find(|&j| hits[j].style != hits[i].style)
+            .find(|&j| hits[j].style_index() != hits[i].style_index())
             .unwrap_or(hits.len());
         if style.deco != 0 {
             let (x0, x1) = (
@@ -438,7 +441,7 @@ mod tests {
         let h = hits(&para, &shaped);
         let links: Vec<u32> = h
             .iter()
-            .map(|h| para.styles[h.style as usize].link)
+            .map(|h| para.styles[h.style_index()].link)
             .collect();
         assert_eq!(links, [1, 2]);
         assert_eq!(
@@ -458,7 +461,7 @@ mod tests {
         let h = hits(&para, &shaped);
         let links: Vec<u32> = h
             .iter()
-            .map(|h| para.styles[h.style as usize].link)
+            .map(|h| para.styles[h.style_index()].link)
             .collect();
         assert_eq!(links, [2, 1]);
         assert_eq!(
@@ -466,6 +469,20 @@ mod tests {
             (100.0, 120.0, 120.0, 130.0)
         );
         assert_eq!((h[0].doc, h[1].doc), (50, 10));
+        #[cfg(feature = "clipboard")]
+        assert!(h.iter().all(PHit::rtl));
+    }
+
+    /// The direction is only a bit of the style index: the index reads the same.
+    #[cfg(feature = "clipboard")]
+    #[test]
+    fn the_direction_bit_leaves_the_style_index_alone() {
+        let (para, shaped) = spanning(0, [1, 1]);
+        assert!(hits(&para, &shaped).iter().all(|h| !h.rtl()));
+        let (para, shaped) = spanning(1, [1, 1]);
+        let h = hits(&para, &shaped);
+        assert_eq!(h.iter().map(PHit::style_index).collect::<Vec<_>>(), [1, 0]);
+        assert!(h.iter().all(|h| h.style >> 31 == 1));
     }
 
     #[test]

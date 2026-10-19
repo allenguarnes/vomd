@@ -746,7 +746,17 @@ fn paint_label(
     // UI text takes the given color whatever role its style names.
     let mut t = *theme;
     t.text = color;
-    render::paint_block(frame, &placed.content, placed.x, placed.y, fonts, cache, &t);
+    render::paint_block(
+        frame,
+        &placed.content,
+        placed.x,
+        placed.y,
+        fonts,
+        cache,
+        &t,
+        #[cfg(feature = "clipboard")]
+        None,
+    );
 }
 
 /// The count of remote images in a small pill at the top right of their button.

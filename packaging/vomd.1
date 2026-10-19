@@ -73,6 +73,24 @@ Load the remote images of this document (again to hide them).
 .BR R ", " F5
 Reload.
 .TP
+Drag
+Select text.
+A drag that starts on a link selects, and does not follow it.
+Dragging past the top or bottom of the window scrolls.
+.TP
+.RB "Double-click, triple-click, " Shift "+click"
+Select a word, a block (a paragraph, heading, code block or table row), or extend the selection.
+.TP
+.B Ctrl+A
+Select everything.
+.TP
+.BR Ctrl+C ", " Ctrl+Insert
+Copy the selection to the clipboard, as plain text.
+The selection made with the mouse (or by Ctrl+A) is also offered as the primary selection, which
+a middle click pastes (X11 and Wayland); the
+.B primary_selection
+setting turns that off.
+.TP
 .BR Backspace ", " Alt+Left ", " Ctrl+[
 Back, after following a link to another document.
 .TP
@@ -83,7 +101,10 @@ or
 .BR kdialog (1)),
 so a bare window manager needs one of them installed.
 .TP
-.BR Esc ", " Q ", " Ctrl+W
+.B Esc
+Close the toolbar's menu if it is open, else clear the selection, else quit.
+.TP
+.BR Q ", " Ctrl+W
 Quit.
 .SH FILES
 .TP

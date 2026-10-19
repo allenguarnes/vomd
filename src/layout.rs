@@ -23,6 +23,8 @@ use crate::text::{
 use crate::theme::Role;
 
 mod heights;
+#[cfg(feature = "clipboard")]
+mod locate;
 
 use heights::Heights;
 
@@ -116,6 +118,10 @@ pub struct BlockBox {
     pub lines: Vec<PLine>,
     pub hits: Vec<PHit>,
     pub boxes: Vec<PBox>,
+    /// The box (`x0, y0, x1, y1`) around the marker or alert title, which has no hits: it is
+    /// selected and copied along with the block's start.
+    #[cfg(feature = "clipboard")]
+    pub decor: Option<[f32; 4]>,
 }
 
 impl BlockBox {
@@ -178,6 +184,12 @@ impl BlockBox {
             style,
             ..*g
         }));
+    }
+
+    /// Note the box of the block's decoration, for selecting it.
+    #[cfg(feature = "clipboard")]
+    fn set_decor(&mut self, (x0, y0, x1, y1): (f32, f32, f32, f32)) {
+        self.decor = Some([x0, y0, x1, y1]);
     }
 
     fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, role: Role) {
@@ -898,7 +910,7 @@ impl Layout {
         {
             let hits = &content.hits[line.hits.start as usize..line.hits.end as usize];
             if let Some(h) = hits.iter().find(|h| h.x0 <= lx && lx < h.x1) {
-                let link = content.styles[h.style as usize].link;
+                let link = content.styles[h.style_index()].link;
                 return Some(Hit {
                     block: i as u32,
                     doc: h.doc,
@@ -1073,6 +1085,8 @@ impl Layout {
                 );
                 let s = out.push_style(style);
                 out.append_decor(&pl, s, indent + text_x, gap);
+                #[cfg(feature = "clipboard")]
+                out.set_decor((indent, gap, indent + text_x + pl.width, gap + pl.height));
                 if let Some(line) = pl.lines.first() {
                     // Centered on the label's capitals: about 0.36 em above the baseline.
                     let top = gap + line.baseline - 0.36 * em - icon / 2.0;
@@ -1295,6 +1309,8 @@ impl Layout {
                         RectKind::Stroke(self.hairline())
                     },
                 });
+                #[cfg(feature = "clipboard")]
+                out.set_decor((x, y, x + size, y + size));
                 if !checked {
                     return;
                 }
@@ -1327,7 +1343,10 @@ impl Layout {
         missing.extend_from_slice(&pl.missing);
         let dy = baseline - pl.lines.first().map_or(0.0, |l| l.baseline);
         let s = out.push_style(style);
-        out.append_decor(&pl, s, gutter - 0.5 * em - pl.width, dy);
+        let x = gutter - 0.5 * em - pl.width;
+        out.append_decor(&pl, s, x, dy);
+        #[cfg(feature = "clipboard")]
+        out.set_decor((x, dy, x + pl.width, dy + pl.height));
     }
 
     #[allow(clippy::too_many_arguments)]

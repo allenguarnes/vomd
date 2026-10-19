@@ -1,0 +1,20 @@
+---
+source: src/copy/tests.rs
+expression: "between_of(&[(src, \"bravo\", \"bravo\"), (src, \"delta\", \"delta\"),\n(src, \"bravo\", \"delta\"), (src, \"b\", \"bravo\"), (src, \"bravo\", \"zulu\"),\n(src, \"zulu\", \"zulu\"), (src, \"x\", \"zulu\"),])"
+---
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n [bravo..bravo]"
+│ bravo
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n [delta..delta]"
+│ delta
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n [bravo..delta]"
+│ bravo→→delta
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n [b..bravo]"
+│ b→c→d
+│ →bravo
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n [bravo..zulu]"
+│ bravo→→delta
+│ x→→zulu
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n [zulu..zulu]"
+│ zulu
+source: "| a | b | c | d |\n|---|---|---|---|\n| | bravo | | delta |\n| x | | zulu | |\n [x..zulu]"
+│ x→→zulu

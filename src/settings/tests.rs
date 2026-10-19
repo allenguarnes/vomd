@@ -88,6 +88,74 @@ fn wide_is_a_bool_and_bad_values_are_ignored() {
     assert!(TEMPLATE.contains("# wide = false"));
 }
 
+/// `primary_selection` is on or off like the other switches, is on without a line for it, and
+/// every value that isn't a switch leaves the default.
+#[test]
+fn primary_selection_is_a_switch_with_a_platform_default() {
+    let p = |v: &str| Prefs::from_settings(&Settings::parse(&format!("primary_selection = {v}")));
+    for (v, want) in [
+        ("on", true),
+        ("OFF", false),
+        ("true", true),
+        ("no", false),
+        ("1", true),
+        ("0", false),
+    ] {
+        assert_eq!(p(v).primary_selection, want, "{v}");
+    }
+    for v in ["maybe", "", "2", "middle"] {
+        assert_eq!(p(v).primary_selection, DEFAULT_PRIMARY, "{v:?} is ignored");
+    }
+    assert_eq!(Prefs::default().primary_selection, DEFAULT_PRIMARY);
+    assert_eq!(
+        Prefs::from_settings(&Settings::default()).primary_selection,
+        DEFAULT_PRIMARY
+    );
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+    const {
+        assert!(DEFAULT_PRIMARY, "on where there is a primary selection")
+    };
+    // The template documents it at that default, and writing it replaces the template's line
+    // and keeps the rest of the file.
+    let line = format!(
+        "# primary_selection = {}",
+        if DEFAULT_PRIMARY { "on" } else { "off" }
+    );
+    assert!(TEMPLATE.lines().any(|l| l == line));
+    let mut s = Settings::parse(TEMPLATE);
+    assert!(s.set(
+        "primary_selection",
+        if DEFAULT_PRIMARY { "off" } else { "on" }
+    ));
+    assert!(!s.text().contains(&line));
+    assert_eq!(s.text().lines().count(), TEMPLATE.lines().count());
+    assert_eq!(Prefs::from_settings(&s).primary_selection, !DEFAULT_PRIMARY);
+}
+
+/// A change of the setting in the file is a change of the preferences (applied on focus, like
+/// the others), and a save of something else leaves its line alone.
+#[test]
+fn primary_selection_is_reloaded_and_survives_saves() {
+    let dir = temp_dir("primary");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.ini");
+    std::fs::write(&path, "# mine\nprimary_selection = off\nzoom = 120\n").unwrap();
+    let mut store = Store::open(Some(path.clone()));
+    assert!(!store.prefs().primary_selection);
+    store.set("zoom", "130", Instant::now());
+    store.flush().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("# mine\nprimary_selection = off\nzoom = 130"),
+        "{text}"
+    );
+    // Edited in an editor: the next look at the file sees it.
+    std::fs::write(&path, "primary_selection = on\nzoom = 130\n").unwrap();
+    let prefs = store.refresh().expect("the file changed");
+    assert!(prefs.primary_selection);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn prefs_defaults_and_bad_values() {
     assert_eq!(Prefs::from_settings(&Settings::default()), Prefs::default());
@@ -291,6 +359,7 @@ fn template_is_all_defaults() {
         "font_size",
         "line_width",
         "wide",
+        "primary_selection",
         "font_sans",
         "font_mono",
     ] {
