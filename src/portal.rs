@@ -96,8 +96,9 @@ struct Bus {
     unique: Option<String>,
 }
 
-/// How long the login and `Hello` may take. Later calls and the signals wait without a limit:
-/// the portal may take seconds to start at login, and the thread has nothing else to do.
+/// How long the login and `Hello` may take. Later calls and the signals wait without a limit
+/// (the file chooser bounds its own calls): the portal may take seconds to start at login, and
+/// the thread has nothing else to do.
 const HANDSHAKE: Duration = Duration::from_secs(5);
 
 impl Bus {
@@ -315,6 +316,16 @@ impl Bus {
         let msg = method_call(self.serial, dest, path, iface, member, sig, body);
         self.dead = self.stream.write_all(&msg).is_err();
         (!self.dead).then_some(self.serial)
+    }
+
+    /// The next message, or `None` if none has started to arrive by `at`. Once one has, it is
+    /// read whole, without a limit.
+    fn recv_by(&mut self, at: Instant) -> io::Result<Option<Msg>> {
+        if self.ready(at) {
+            self.recv().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn recv(&mut self) -> io::Result<Msg> {

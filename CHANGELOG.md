@@ -13,8 +13,19 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A Debian package (`vomd_<version>-1_amd64.deb`, Debian 12+ and Ubuntu 24.04+) with a man
   page, and an AppImage for any x86-64 distribution with glibc 2.36 or newer, both attached to
   each release and checked by CI on Debian 12, Debian 13 and Ubuntu 24.04, on X11 and Wayland.
+- The Arch packages list the file dialogs Open can use as optional dependencies:
+  `xdg-desktop-portal-gtk`, `zenity` and `kdialog`. KDE and GNOME already have a portal file
+  chooser.
 
 ### Fixed
+- On X11 the portal's file dialog belongs to the VOMD window, so the desktop keeps it in front
+  of it. (On Wayland it still has no parent window.)
+- A portal that crashes or stops answering no longer blocks Ctrl+O: the dialog's calls give
+  up after 25 seconds, and if the portal leaves the session bus while its dialog is up, the
+  window says so and Ctrl+O works again. Before, "A file dialog is already open" stayed until
+  VOMD was restarted.
+- The empty window offers dropping a file only on X11, decided by the display VOMD connected
+  to, not by environment variables.
 - The toolbar's settings button opens `settings.ini` in a terminal editor set as the default
   (`Terminal=true`, such as Neovim) through `xdg-terminal-exec`. Before, on desktops
   `xdg-open` doesn't know (Hyprland, Sway) the editor started with no terminal and waited

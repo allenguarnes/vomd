@@ -37,14 +37,18 @@ pub const MARKDOWN_GLOBS: [&str; 5] = ["*.md", "*.markdown", "*.mdown", "*.mkd",
 const OPEN_TITLE: &str = "Open a Markdown file";
 
 /// Ask the user for a file to open, starting in `folder`: the desktop portal's file chooser,
-/// else `zenity` or `kdialog`. Blocks until the dialog closes: run it off the main thread.
+/// else `zenity` or `kdialog`. `parent` names the window the portal's dialog belongs to
+/// (`x11:<id>`; empty for none). Blocks until the dialog closes: run it off the main thread.
 /// `Ok(None)` when the user picked nothing; `Err` says, in words for the window, why there was
 /// no dialog.
-pub fn choose_file(folder: Option<&std::path::Path>) -> Result<Option<std::path::PathBuf>, String> {
+pub fn choose_file(
+    parent: &str,
+    folder: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use crate::portal::Choice;
-        match crate::portal::choose_file(OPEN_TITLE, folder) {
+        match crate::portal::choose_file(OPEN_TITLE, parent, folder) {
             Choice::Picked(path) => Ok(Some(path)),
             Choice::Cancelled => Ok(None),
             Choice::Failed(why) => Err(why),
@@ -54,7 +58,7 @@ pub fn choose_file(folder: Option<&std::path::Path>) -> Result<Option<std::path:
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     {
         // TODO(P14): the native dialogs.
-        let _ = (folder, OPEN_TITLE);
+        let _ = (parent, folder, OPEN_TITLE);
         Err("Open has no file dialog on this system yet".into())
     }
 }

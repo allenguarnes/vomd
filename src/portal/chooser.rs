@@ -9,11 +9,25 @@
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use super::{Bus, ERROR, Msg, PORTAL, PORTAL_PATH, RETURN, Reader, SIGNAL, Writer};
+use super::{BUS, Bus, ERROR, Msg, PORTAL, PORTAL_PATH, RETURN, Reader, SIGNAL, Writer};
 
 const FILE_CHOOSER: &str = "org.freedesktop.portal.FileChooser";
 const REQUEST: &str = "org.freedesktop.portal.Request";
+
+/// How long a method call may wait for its reply: the D-Bus default. The `Response` is not
+/// held to it, the user may browse for as long as they like.
+const REPLY_WAIT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(25)
+};
+
+/// The most `Response` signals kept from before the replies; older ones are dropped. Only the
+/// portal's own gets answered (one, in practice), so a flood of them can't grow without bound.
+/// (The portal's leaving is kept besides, once.)
+const EARLY_MAX: usize = 16;
 
 /// What the chooser gave.
 #[derive(Debug, PartialEq, Eq)]
@@ -29,11 +43,12 @@ pub enum Choice {
     Failed(String),
 }
 
-/// Ask the portal for a file to open, starting in `folder`. Blocks until the dialog closes:
-/// run it off the main thread.
-pub fn choose_file(title: &str, folder: Option<&Path>) -> Choice {
+/// Ask the portal for a file to open, starting in `folder`, as a dialog of the window `parent`
+/// names (`x11:<id>`; empty for none). Blocks until the dialog closes: run it off the main
+/// thread.
+pub fn choose_file(title: &str, parent: &str, folder: Option<&Path>) -> Choice {
     match Bus::connect() {
-        Some(mut bus) => open_file(&mut bus, title, folder, &token()),
+        Some(mut bus) => open_file(&mut bus, title, parent, folder, &token()),
         None => Choice::Unavailable,
     }
 }
@@ -67,11 +82,43 @@ fn response_rule(path: &str) -> String {
     format!("type='signal',interface='{REQUEST}',member='Response',path='{path}'")
 }
 
-/// `OpenFile`'s arguments (`ssa{sv}`): no parent window, the title, and the options: the
+/// The rule for the bus's word that the connection `name` has left it.
+fn gone_rule(name: &str) -> String {
+    format!(
+        "type='signal',sender='{BUS}',interface='{BUS}',member='NameOwnerChanged',arg0='{name}'"
+    )
+}
+
+/// Whether `m` says `owner`, the connection that held `name`, has left the bus
+/// (`NameOwnerChanged`: name, old owner, new owner, the new one empty). Only the bus's own word
+/// counts, and only about `owner`: the bus delivers a connection's own messages before the
+/// word of its leaving, so an earlier owner's leave can come ahead of a new one's reply.
+fn has_left(m: &Msg, name: &str, owner: &str) -> bool {
+    let mut r = Reader::new(&m.body);
+    m.kind == SIGNAL
+        && m.member == "NameOwnerChanged"
+        && m.sender == BUS
+        && r.str() == Some(name)
+        && r.str() == Some(owner)
+        && r.str() == Some("")
+}
+
+/// Whether `m` is the bus's word that some owner of the portal's name has left, whoever it was.
+fn is_leave(m: &Msg) -> bool {
+    let mut r = Reader::new(&m.body);
+    m.kind == SIGNAL
+        && m.member == "NameOwnerChanged"
+        && m.sender == BUS
+        && r.str() == Some(PORTAL)
+        && r.str().is_some()
+        && r.str() == Some("")
+}
+
+/// `OpenFile`'s arguments (`ssa{sv}`): the parent window, the title, and the options: the
 /// token, a Markdown filter and an all-files one, and the folder to start in.
-fn open_file_body(title: &str, folder: Option<&Path>, token: &str) -> Vec<u8> {
+fn open_file_body(title: &str, parent: &str, folder: Option<&Path>, token: &str) -> Vec<u8> {
     let mut w = Writer::default();
-    w.str("");
+    w.str(parent);
     w.str(title);
     let options = w.begin_array(8);
     w.entry("handle_token", "s");
@@ -105,17 +152,29 @@ fn open_file_body(title: &str, folder: Option<&Path>, token: &str) -> Vec<u8> {
 }
 
 /// Call `OpenFile` and wait for the `Response`.
-fn open_file(bus: &mut Bus, title: &str, folder: Option<&Path>, token: &str) -> Choice {
+fn open_file(
+    bus: &mut Bus,
+    title: &str,
+    parent: &str,
+    folder: Option<&Path>,
+    token: &str,
+) -> Choice {
     let Some(unique) = bus.unique.clone() else {
         return Choice::Unavailable;
     };
     let mut path = request_path(&unique, token);
     // Signals that come before the replies are kept: the portal's frontend may answer at once.
     let mut early = Vec::new();
-    if !subscribe(bus, &path, &mut early) {
+    if !subscribe(bus, &response_rule(&path), &mut early) {
         return Choice::Unavailable;
     }
-    let body = open_file_body(title, folder, token);
+    // The wait for the `Response` has no limit, so a portal that dies would hold it for good:
+    // its name losing its owner ends it. Subscribed before the call, so the portal can't go
+    // between its reply and the subscription unseen.
+    if !subscribe(bus, &gone_rule(PORTAL), &mut early) {
+        return Choice::Unavailable;
+    }
+    let body = open_file_body(title, parent, folder, token);
     let Some(serial) = bus.send(
         PORTAL,
         PORTAL_PATH,
@@ -126,8 +185,11 @@ fn open_file(bus: &mut Bus, title: &str, folder: Option<&Path>, token: &str) -> 
     ) else {
         return Choice::Unavailable;
     };
-    let Some(reply) = reply_to(bus, serial, &mut early) else {
-        return Choice::Unavailable;
+    let reply = match reply_to(bus, serial, &mut early) {
+        Ok(reply) => reply,
+        // The portal has the request and may still show its dialog: no second one.
+        Err(NoReply::TimedOut) => return failed("the file dialog didn't answer"),
+        Err(NoReply::Lost) => return Choice::Unavailable,
     };
     // An error: no portal, or no backend with a file chooser (`UnknownMethod`).
     if reply.kind != RETURN || reply.sender.is_empty() {
@@ -139,7 +201,7 @@ fn open_file(bus: &mut Bus, title: &str, folder: Option<&Path>, token: &str) -> 
     };
     // Portals before version 0.9 make up their own request path.
     if handle != path {
-        if !subscribe(bus, &handle, &mut early) {
+        if !subscribe(bus, &response_rule(&handle), &mut early) {
             return failed("the file dialog's answer couldn't be received");
         }
         path = handle;
@@ -148,37 +210,67 @@ fn open_file(bus: &mut Bus, title: &str, folder: Option<&Path>, token: &str) -> 
     if let Some(m) = early.iter().find(|m| ours(m)) {
         return response(&m.body);
     }
+    if early.iter().any(|m| has_left(m, PORTAL, &reply.sender)) {
+        return failed("the file dialog went away");
+    }
     loop {
         match bus.recv() {
             Ok(m) if m.kind == SIGNAL && ours(&m) => return response(&m.body),
+            Ok(m) if has_left(&m, PORTAL, &reply.sender) => {
+                return failed("the file dialog went away");
+            }
             Ok(_) => {}
             Err(_) => return failed("the connection to the file dialog was lost"),
         }
     }
 }
 
-/// The reply to call `serial`, keeping the `Response` signals that arrive first in `early`.
-/// `None` if the connection fails.
-fn reply_to(bus: &mut Bus, serial: u32, early: &mut Vec<Msg>) -> Option<Msg> {
+/// Why a call has no reply.
+enum NoReply {
+    /// The connection failed.
+    Lost,
+    /// `REPLY_WAIT` passed.
+    TimedOut,
+}
+
+/// The reply to call `serial`, keeping the latest `EARLY_MAX` `Response` signals that arrive
+/// first in `early`, and each distinct word of the portal's leaving: whose it is, the caller
+/// tells once it knows who replied.
+fn reply_to(bus: &mut Bus, serial: u32, early: &mut Vec<Msg>) -> Result<Msg, NoReply> {
+    let until = Instant::now() + REPLY_WAIT;
     loop {
-        match bus.recv() {
-            Ok(m) if matches!(m.kind, RETURN | ERROR) && m.reply_serial == serial => {
-                return Some(m);
+        match bus.recv_by(until) {
+            Ok(Some(m)) if matches!(m.kind, RETURN | ERROR) && m.reply_serial == serial => {
+                return Ok(m);
             }
-            Ok(m) if m.kind == SIGNAL && m.member == "Response" => early.push(m),
-            Ok(_) => {}
-            Err(_) => return None,
+            Ok(Some(m)) if m.kind == SIGNAL && m.member == "Response" => {
+                let is_response = |m: &Msg| m.member == "Response";
+                if early.iter().filter(|m| is_response(m)).count() == EARLY_MAX
+                    && let Some(oldest) = early.iter().position(is_response)
+                {
+                    early.remove(oldest);
+                }
+                early.push(m);
+            }
+            Ok(Some(m)) if is_leave(&m) => {
+                if !early.iter().any(|e| is_leave(e) && e.body == m.body) {
+                    early.push(m);
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(NoReply::TimedOut),
+            Err(_) => return Err(NoReply::Lost),
         }
     }
 }
 
-/// Ask for the `Response` signals on `path`; whether the bus agreed.
-fn subscribe(bus: &mut Bus, path: &str, early: &mut Vec<Msg>) -> bool {
+/// Ask the bus for the signals `rule` names; whether it agreed in time.
+fn subscribe(bus: &mut Bus, rule: &str, early: &mut Vec<Msg>) -> bool {
     let mut body = Writer::default();
-    body.str(&response_rule(path));
+    body.str(rule);
     let bus_path = "/org/freedesktop/DBus";
-    bus.send(super::BUS, bus_path, super::BUS, "AddMatch", "s", &body.0)
-        .and_then(|serial| reply_to(bus, serial, early))
+    bus.send(BUS, bus_path, BUS, "AddMatch", "s", &body.0)
+        .and_then(|serial| reply_to(bus, serial, early).ok())
         .is_some_and(|m| m.kind == RETURN)
 }
 

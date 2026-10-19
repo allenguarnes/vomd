@@ -257,26 +257,38 @@ pub fn choose_with_tools(title: &str, folder: Option<&Path>) -> Result<Option<Pa
 /// outlive it with nobody to hear its answer. Linux only (`PR_SET_PDEATHSIG`); elsewhere the
 /// dialog stays up.
 fn die_with_vomd(cmd: &mut Command) {
+    die_with(cmd, std::process::id());
+}
+
+/// [`die_with_vomd`] for the process `parent`, taken before the fork: the death signal only
+/// covers a parent that ends after `prctl`, so a parent that ended before it is noticed by the
+/// child's parent not being `parent` any more, and the child never runs.
+fn die_with(cmd: &mut Command, parent: u32) {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::{CommandExt, parent_id};
         unsafe extern "C" {
             fn prctl(option: i32, ...) -> i32;
         }
         const PR_SET_PDEATHSIG: i32 = 1;
         const SIGTERM: std::ffi::c_ulong = 15;
-        // SAFETY: prctl is async-signal-safe and takes plain integers. The death signal follows
-        // the thread that forked, not the process: that is the thread waiting on the child, which
-        // lives until the child is done, and VOMD exiting ends it either way.
+        const ESRCH: i32 = 3;
+        // SAFETY: prctl and getppid are async-signal-safe and take plain integers. The death
+        // signal follows the thread that forked, not the process: that is the thread waiting on
+        // the child, which lives until the child is done, and VOMD exiting ends it either way.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 prctl(PR_SET_PDEATHSIG, SIGTERM);
+                if parent_id() != parent {
+                    // No allocation after fork: `other` would box a String.
+                    return Err(io::Error::from_raw_os_error(ESRCH));
+                }
                 Ok(())
             });
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = cmd;
+    let _ = (cmd, parent);
 }
 
 /// Run a dialog that prints the chosen path: exit 0 with the path, 1 when cancelled.
@@ -397,6 +409,27 @@ Terminal=false
         assert_eq!(find_entry("../nvim.desktop", &dirs), None);
         assert_eq!(find_entry("", &dirs), None);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A child whose parent has gone by the time it is set up (here: not the process named)
+    /// never runs, instead of outliving it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dialog_never_starts_for_a_parent_that_is_gone() {
+        let file = std::env::temp_dir().join(format!("vomd-gone-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let mut cmd = Command::new("touch");
+        cmd.arg(&file);
+        die_with(&mut cmd, std::process::id() + 1);
+        assert!(cmd.status().is_err());
+        assert!(!file.exists());
+        // The right parent runs it.
+        let mut cmd = Command::new("touch");
+        cmd.arg(&file);
+        die_with(&mut cmd, std::process::id());
+        assert!(cmd.status().unwrap().success());
+        assert!(file.exists());
+        std::fs::remove_file(&file).unwrap();
     }
 
     /// A dialog (here `sleep`) is killed when the process that ran it from a thread exits. The

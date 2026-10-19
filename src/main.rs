@@ -14,6 +14,9 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
+use winit::raw_window_handle::{
+    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+};
 use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 use vomd::cli::{self, Cli, Input};
@@ -30,16 +33,35 @@ use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
 const IDLE_SLICE: Duration = Duration::from_millis(4);
 /// What the empty window says. Dropping a file only works on X11 (winit can't take drops on
 /// Wayland), so it is only offered there.
-fn empty_message() -> String {
-    let wayland = ["WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
-        .iter()
-        .any(|v| std::env::var_os(v).is_some_and(|v| !v.is_empty()));
+fn empty_message(wayland: bool) -> String {
     let drop = if wayland || !cfg!(all(unix, not(target_os = "macos"))) {
         ""
     } else {
         ", or drop one here"
     };
     format!("Press Ctrl+O to open a Markdown file{drop}")
+}
+
+/// Whether the window system is Wayland, by the connection winit made (not by the environment,
+/// which can name a Wayland socket that winit then didn't use).
+fn is_wayland(display: Option<RawDisplayHandle>) -> bool {
+    matches!(display, Some(RawDisplayHandle::Wayland(_)))
+}
+
+/// The portal's name for `window`, for its dialog to belong to (`x11:<id in hex>`). Empty on
+/// Wayland: a parent there is a handle exported through xdg-foreign, which needs the Wayland
+/// protocol crates (`wayland-client`, `wayland-protocols`) that VOMD doesn't link; the dialog
+/// then has no parent, as it did before.
+fn portal_parent(window: &Window) -> String {
+    parent_name(window.window_handle().map(|h| h.as_raw()).ok())
+}
+
+fn parent_name(handle: Option<RawWindowHandle>) -> String {
+    match handle {
+        Some(RawWindowHandle::Xlib(h)) => format!("x11:{:x}", h.window),
+        Some(RawWindowHandle::Xcb(h)) => format!("x11:{:x}", h.window),
+        _ => String::new(),
+    }
 }
 
 enum UserEvent {
@@ -106,6 +128,7 @@ fn system_dark(portal: Option<bool>, winit: Option<Theme>, gtk: impl FnOnce() ->
 /// The document as read and parsed off the main thread.
 struct Loaded {
     doc: Doc,
+    /// Why there's no document (an error). The empty window's invitation is [`App::message`]'s.
     message: Option<String>,
     stamp: Option<Stamp>,
     /// The large-file notice.
@@ -117,7 +140,7 @@ fn load(input: &Input, origin: Origin) -> Loaded {
         Ok((text, stamp)) => Loaded {
             notice: view::large_notice(text.len()),
             doc: Doc::parse(&text),
-            message: (*input == Input::None).then(empty_message),
+            message: None,
             stamp,
         },
         Err(message) => {
@@ -199,6 +222,8 @@ struct App {
     resolving: bool,
     /// Open's dialog is up (one at a time).
     choosing: bool,
+    /// The window system is Wayland (known once the window exists).
+    wayland: bool,
     mods: ModifiersState,
     cursor: PhysicalPosition<f64>,
     /// The pointer is over the window (hover tracking).
@@ -393,6 +418,12 @@ impl App {
         });
     }
 
+    /// What the window says in place of `input`'s document: `message` if there is one, else the
+    /// invitation to open a file when there is no input.
+    fn message(&self, input: &Input, message: Option<String>) -> Option<String> {
+        message.or_else(|| (*input == Input::None).then(|| empty_message(self.wayland)))
+    }
+
     /// Re-read the document, keeping the reading position.
     fn reload(&mut self) {
         // A pipe named on the command line was read once: keep what it gave.
@@ -401,8 +432,9 @@ impl App {
         }
         let loaded = load(&self.input, Origin::Navigation);
         self.stamp = loaded.stamp;
+        let message = self.message(&self.input, loaded.message);
         if let Some(view) = self.view.as_mut() {
-            view.replace(loaded.doc, loaded.message);
+            view.replace(loaded.doc, message);
         }
         self.redraw();
     }
@@ -410,10 +442,11 @@ impl App {
     /// Open a document in place of the current one (the back stack is the caller's business).
     fn open(&mut self, input: Input) {
         let loaded = load(&input, Origin::Navigation);
+        let message = self.message(&input, loaded.message);
         self.input = input;
         self.stamp = loaded.stamp;
         if let Some(view) = self.view.as_mut() {
-            view.open_in(loaded.doc, loaded.message, nav::base_dir(&self.input));
+            view.open_in(loaded.doc, message, nav::base_dir(&self.input));
             view.set_notice(loaded.notice);
         }
         if let Some(g) = &self.gfx {
@@ -556,9 +589,11 @@ impl App {
             return;
         }
         let folder = nav::base_dir(&self.input).and_then(|d| std::path::absolute(d).ok());
+        let parent = self.gfx.as_ref().map(|g| portal_parent(&g.window));
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let chosen = platform::choose_file(folder.as_deref());
+            let chosen =
+                platform::choose_file(parent.as_deref().unwrap_or_default(), folder.as_deref());
             let _ = proxy.send_event(UserEvent::Chosen(chosen));
         });
     }
@@ -646,6 +681,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        self.wayland = is_wayland(window.display_handle().ok().map(|h| h.as_raw()));
         let loaded = match self.parse.take().map(JoinHandle::join) {
             Some(Ok(loaded)) => loaded,
             _ => Loaded {
@@ -656,11 +692,12 @@ impl ApplicationHandler<UserEvent> for App {
             },
         };
         self.stamp = loaded.stamp;
+        let message = self.message(&self.input, loaded.message);
         let px = window.inner_size();
         let mut view = View::with_base(
             fonts,
             loaded.doc,
-            loaded.message,
+            message,
             (px.width, px.height),
             window.scale_factor(),
             nav::base_dir(&self.input),
@@ -996,6 +1033,7 @@ fn main() {
         unresolved: Vec::new(),
         resolving: false,
         choosing: false,
+        wayland: false,
         mods: ModifiersState::empty(),
         cursor: PhysicalPosition::new(0.0, 0.0),
         cursor_in: false,
@@ -1052,7 +1090,8 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{leave, pop, same_family, system_dark};
+    use super::{empty_message, is_wayland, leave, parent_name, pop, same_family, system_dark};
+    use std::ptr::NonNull;
     use std::time::Instant;
     use vomd::cli::Input;
     use vomd::doc::Doc;
@@ -1060,7 +1099,51 @@ mod tests {
     use vomd::nav::{BackStack, Entry};
     use vomd::toolbar::Command;
     use vomd::view::{Action, View};
+    use winit::raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+        XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
+    };
     use winit::window::Theme;
+
+    #[test]
+    fn the_empty_window_offers_a_drop_only_on_x11() {
+        assert_eq!(
+            empty_message(false),
+            if cfg!(all(unix, not(target_os = "macos"))) {
+                "Press Ctrl+O to open a Markdown file, or drop one here"
+            } else {
+                "Press Ctrl+O to open a Markdown file"
+            }
+        );
+        assert_eq!(empty_message(true), "Press Ctrl+O to open a Markdown file");
+    }
+
+    /// Wayland is what the display handle says, whatever the environment names.
+    #[test]
+    fn wayland_is_decided_by_the_display_handle() {
+        let wayland = WaylandDisplayHandle::new(NonNull::dangling());
+        assert!(is_wayland(Some(RawDisplayHandle::Wayland(wayland))));
+        let xlib = RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0));
+        assert!(!is_wayland(Some(xlib)));
+        let xcb = RawDisplayHandle::Xcb(XcbDisplayHandle::new(None, 0));
+        assert!(!is_wayland(Some(xcb)));
+        assert!(!is_wayland(None));
+    }
+
+    #[test]
+    fn the_portal_parent_is_an_x11_window_id_in_hex() {
+        let xlib = RawWindowHandle::Xlib(XlibWindowHandle::new(0x4a0_0007));
+        assert_eq!(parent_name(Some(xlib)), "x11:4a00007");
+        let id = std::num::NonZeroU32::new(0xff).unwrap();
+        assert_eq!(
+            parent_name(Some(RawWindowHandle::Xcb(XcbWindowHandle::new(id)))),
+            "x11:ff"
+        );
+        // Wayland has no parent to give, and no handle gives none.
+        let wayland = WaylandWindowHandle::new(NonNull::dangling());
+        assert_eq!(parent_name(Some(RawWindowHandle::Wayland(wayland))), "");
+        assert_eq!(parent_name(None), "");
+    }
 
     /// Open's answer (or a link, or a drop) pushes the old document on the back stack from a
     /// user event, and a Back click may follow before any frame is painted: the toolbar must
