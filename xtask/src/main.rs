@@ -693,6 +693,14 @@ fn dist(release: bool) -> bool {
         return false;
     }
     let bin = cargo_build(&[], "target");
+    // The binary that ships is held to the budget here, where it is built (in the Debian 12
+    // container for a release), not only where `budgets` builds one.
+    let len = fs::metadata(&bin).expect("binary").len();
+    let budget = SIZE_BUDGET[0];
+    if len > budget {
+        eprintln!("error: the binary is {len} bytes, over the {budget} budget");
+        return false;
+    }
     // The newest glibc the binary can't run without (weak symbols are optional).
     let floor = glibc_floor(&bin);
     match floor {
@@ -761,13 +769,25 @@ fn dist(release: bool) -> bool {
         fs::copy(root().join(from), to).unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
     }
     let tarball = dist.join(format!("{name}.tar.gz"));
-    let ok = Command::new("tar")
+    // Reproducible, as the packages are: the same entry order, owner and time, and a gzip with
+    // no name or time.
+    let tar = Command::new("tar")
         .current_dir(&dist)
-        .args(["--owner=0", "--group=0", "--numeric-owner", "-czf"])
-        .arg(&tarball)
+        .args([
+            "--format=gnu",
+            "--sort=name",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+        ])
+        .arg(format!("--mtime=@{}", pkg::source_date()))
+        .args(["-cf", "-"])
         .arg(&name)
-        .status()
-        .is_ok_and(|s| s.success());
+        .output();
+    let ok = match tar {
+        Ok(out) if out.status.success() => pkg::gzip(&out.stdout, &tarball),
+        _ => false,
+    };
     if !ok {
         let _ = fs::remove_dir_all(&stage);
         eprintln!("tar failed");

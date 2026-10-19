@@ -41,7 +41,7 @@ fn run(cmd: &mut Command) -> bool {
 
 /// Seconds since the epoch for every timestamp in the packages: `SOURCE_DATE_EPOCH`, else the
 /// last commit's time, so the same commit gives the same files.
-fn source_date() -> String {
+pub fn source_date() -> String {
     if let Ok(v) = std::env::var("SOURCE_DATE_EPOCH") {
         return v;
     }
@@ -169,7 +169,7 @@ fn copyright(stage: &Path) -> String {
 
 /// Writes `bytes` to `out` compressed with `gzip -9n` (no name or time: Debian policy, and
 /// reproducible), mode 0644.
-fn gzip(bytes: &[u8], out: &Path) -> bool {
+pub fn gzip(bytes: &[u8], out: &Path) -> bool {
     fs::create_dir_all(out.parent().unwrap()).expect("create a package directory");
     let status = Command::new("sh")
         .arg("-c")

@@ -34,12 +34,14 @@ jobs:
       - run: cargo test --workspace --locked
       # A shared runner is two to three times slower than the machine the time budgets are
       # for, so start and scroll times are reported here, not gated; size and memory still are.
+      # The size measured here is the runner's binary, not the one that ships: that one is built
+      # in Debian 12 below, where `cargo xtask dist` fails if it is over the same size budget.
       # `cargo xtask budgets` on an idle machine gates them all before a release.
       - name: Budgets
         run: |
           xvfb-run -a -s "-screen 0 3840x2160x24" \
             cargo xtask budgets --timings-advisory --report budgets.md
-      - name: Tarball, .deb and AppImage, built in Debian 12 (fails on glibc newer than 2.36)
+      - name: Tarball, .deb and AppImage, built in Debian 12 (fails on newer glibc or an oversized binary)
         run: scripts/pkg-build.sh
       - name: The .deb and AppImage on Debian 12, Debian 13 and Ubuntu 24.04
         run: scripts/pkg-check.sh
