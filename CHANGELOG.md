@@ -3,7 +3,7 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-20
 
 ### Added
 - Select and copy text. Drag to select (a drag that starts on a link selects, and a click
@@ -108,6 +108,6 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
-[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.1.0...HEAD
+[1.2.0]: https://github.com/allenguarnes/vomd/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/allenguarnes/vomd/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/allenguarnes/vomd/releases/tag/v1.0.0
