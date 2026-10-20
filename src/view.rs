@@ -1252,13 +1252,14 @@ impl View {
     }
 
     /// The mouse button came up at (`x`, `y`): the target of the link clicked (pressed and
-    /// released on the same link), if any. A click on a row of the contents panel gives the
-    /// `#anchor` of its heading, which the shell follows like a link of the document.
+    /// released on the same link), if any. A click on a row of the contents panel is no link:
+    /// it waits for [`View::take_jump`].
     pub fn click(&mut self, x: f64, y: f64) -> Option<String> {
-        // A click on the contents panel is a link to a heading, whatever else was pressed.
+        // A click on the contents panel is for the panel, whatever else was pressed.
         #[cfg(feature = "toc")]
         if let Some(row) = self.toc.pressed.take() {
-            return self.click_toc(row, x, y);
+            self.click_toc(row, x, y);
+            return None;
         }
         let pressed = self.pressed.take()?;
         self.ensure_content();
@@ -1273,11 +1274,16 @@ impl View {
         let Some(block) = crate::nav::find_anchor(&self.doc, fragment) else {
             return false;
         };
+        self.jump_to_block(block, now);
+        true
+    }
+
+    /// Scroll to `block`, a heading or a footnote.
+    pub fn jump_to_block(&mut self, block: u32, now: Instant) {
         self.set_anchor(Anchor { block, frac: 0.0 });
         #[cfg(feature = "toc")]
         self.toc_aim(block);
         self.fade.poke(now);
-        true
     }
 
     /// Go to a reading position (from the back stack), kept inside the document.
@@ -1316,10 +1322,7 @@ impl View {
         let Some(block) = target else {
             return false;
         };
-        self.set_anchor(Anchor { block, frac: 0.0 });
-        #[cfg(feature = "toc")]
-        self.toc_aim(block);
-        self.fade.poke(now);
+        self.jump_to_block(block, now);
         true
     }
 
@@ -2029,11 +2032,17 @@ impl View {
             .filter(|(_, h)| h.block <= at)
             .max_by_key(|(_, h)| h.block)?;
         let paths = heading_paths(&self.doc);
+        // A bare heading has no slug to find it by (see `Heading::bare`).
+        let slug = if h.bare {
+            String::new()
+        } else {
+            h.slug.clone()
+        };
         let ordinal = paths[..i].iter().filter(|p| **p == paths[i]).count();
         let of = ordinal + paths[i..].iter().filter(|p| **p == paths[i]).count();
         Some(Place {
             path: paths[i].clone(),
-            slug: h.slug.clone(),
+            slug,
             ordinal,
             of,
             block: h.block,
@@ -2060,7 +2069,11 @@ impl View {
         } else {
             same.into_iter().min_by_key(|h| h.block.abs_diff(p.block))
         };
-        by_path.or_else(|| self.doc.headings.iter().find(|h| h.slug == p.slug))
+        // A bare heading is no match for a slug, nor is it a slug to match (see `place`).
+        by_path.or_else(|| {
+            let slug = Some(p.slug.as_str()).filter(|s| !s.is_empty())?;
+            self.doc.headings.iter().find(|h| !h.bare && h.slug == slug)
+        })
     }
 }
 

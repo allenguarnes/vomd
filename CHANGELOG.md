@@ -20,6 +20,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   when you toggle the panel. Needs the new `toc` feature, on by default; the smallest build leaves
   it out.
 
+### Fixed
+- A heading of nothing but punctuation or emoji (`## !!!`, `## 🚀`) was skipped: `[` and `]`
+  passed over it, it was missing from the contents panel, and a reload kept your place from the
+  heading before it. Such headings are headings now, with the ids GitHub gives them (none for the
+  first, which `#` can't name, then `-1`, `-2`, ...), so links to those ids written for GitHub
+  work too. A heading with no text at all is still left out of the panel.
+
 ## [1.2.0] - 2026-10-20
 
 ### Added

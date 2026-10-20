@@ -538,6 +538,22 @@ impl App {
         }
     }
 
+    /// Scroll to a heading's block (a row of the contents panel), leaving the place on the back
+    /// stack as following a link to its anchor does.
+    #[cfg(feature = "toc")]
+    fn jump_to(&mut self, block: u32, now: Instant) {
+        let Some(view) = self.view.as_mut() else {
+            return;
+        };
+        let here = nav::Entry {
+            input: self.input.clone(),
+            anchor: view.anchor(),
+        };
+        view.jump_to_block(block, now);
+        leave(view, &mut self.back, here, &self.input);
+        self.redraw();
+    }
+
     /// Return to the last place on the back stack, reopening its file if it's another one.
     /// (Stdin is never on the stack as a place to reopen, see [`BackStack::leave`].)
     fn go_back(&mut self) {
@@ -1032,6 +1048,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(href) = clicked {
                     self.follow(&href, now);
+                }
+                #[cfg(feature = "toc")]
+                if let Some(block) = self.view.as_mut().and_then(View::take_jump) {
+                    self.jump_to(block, now);
                 }
                 if let Some(command) = command {
                     self.command(command, event_loop, now);

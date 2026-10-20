@@ -203,8 +203,12 @@ pub struct Heading {
     /// Index into [`Doc::blocks`]. Headings inside footnote definitions come after the others,
     /// in the order the definitions are listed.
     pub block: u32,
-    /// GitHub-compatible anchor slug (also present in [`Doc::anchors`]).
+    /// GitHub-compatible anchor slug (also present in [`Doc::anchors`], unless it is empty: the
+    /// first heading of nothing but punctuation or emoji has no anchor).
     pub slug: String,
+    /// The heading's text has no letters or digits, so its slug is `""` or a generated `-1`,
+    /// `-2`, ... that an edit hands to another heading, not a name to find the heading by.
+    pub bare: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -407,9 +411,9 @@ struct Footnotes {
     /// Anchors that point into `blocks` (references and headings inside definitions) until
     /// `finish` moves the definitions into the document.
     local: Vec<usize>,
-    /// Headings inside definitions, as (index into `blocks`, level, slug): they follow the
+    /// Headings inside definitions, as (index into `blocks`, level, slug, bare): they follow the
     /// headings of the main flow, in the order the definitions end up in (see `finish`).
-    headings: Vec<(usize, u8, String)>,
+    headings: Vec<(usize, u8, String, bool)>,
     /// Anchor and link targets that name a footnote by number. Their ids are allocated in
     /// `finish`, after every heading, so a heading's slug is never taken from it.
     ref_anchors: Vec<(usize, u32)>,
@@ -1102,23 +1106,34 @@ impl Builder {
             return;
         }
         let first_block = self.block_count();
-        if let BlockKind::Heading(level) = kind
-            && let Some(slug) = self.slug(spans.clone())
-        {
+        if let BlockKind::Heading(level) = kind {
+            let (slug, bare) = self.slug(spans.clone());
             // Anchors point at the first chunk of a split heading.
             let block = first_block as u32;
+            // A heading with no letters or digits has an empty slug, which is no anchor: a `#`
+            // link is the top of the document, as on GitHub.
+            let anchored = !slug.is_empty();
             if self.footnotes.active {
                 // A heading in a footnote has its id like any other (GitHub renders one), but the
                 // block index is into the definitions' blocks for now: `finish` moves the
                 // definitions and the anchor and heading with them.
-                self.footnotes.local.push(self.doc.anchors.len());
+                if anchored {
+                    self.footnotes.local.push(self.doc.anchors.len());
+                    self.doc.anchors.push((slug.clone(), block));
+                }
                 self.footnotes
                     .headings
-                    .push((first_block, level, slug.clone()));
-                self.doc.anchors.push((slug, block));
+                    .push((first_block, level, slug, bare));
             } else {
-                self.doc.anchors.push((slug.clone(), block));
-                self.doc.headings.push(Heading { level, block, slug });
+                if anchored {
+                    self.doc.anchors.push((slug.clone(), block));
+                }
+                self.doc.headings.push(Heading {
+                    level,
+                    block,
+                    slug,
+                    bare,
+                });
             }
         }
         let block_spans = &self.doc.spans[spans.start as usize..];
@@ -1334,8 +1349,9 @@ impl Builder {
     /// GitHub-compatible heading anchor (github-slugger): lowercase, keep letters, numbers,
     /// combining marks (a virama or an accent is part of its word), connector punctuation (`_`)
     /// and `-`, spaces become `-`, everything else goes; duplicates get the first unused
-    /// suffix (see `unique_id`).
-    fn slug(&mut self, spans: Range<u32>) -> Option<String> {
+    /// suffix (see `unique_id`). A heading of nothing but punctuation or emoji gets the empty
+    /// slug, the first time, and `-1`, `-2`, ... after that, as on GitHub; the flag says so.
+    fn slug(&mut self, spans: Range<u32>) -> (String, bool) {
         let mut slug = String::new();
         for span in &self.doc.spans[spans.start as usize..spans.end as usize] {
             for c in self.doc.text[span.start as usize..span.end as usize].chars() {
@@ -1346,7 +1362,8 @@ impl Builder {
                 }
             }
         }
-        (!slug.is_empty()).then(|| self.unique_id(slug))
+        let bare = slug.is_empty();
+        (self.unique_id(slug), bare)
     }
 
     /// Claim `id` as an anchor id: itself if nobody has it, else the first unused `-1`, `-2`,
@@ -1700,10 +1717,11 @@ impl Builder {
             }
             let mut noted: Vec<Heading> = std::mem::take(&mut self.footnotes.headings)
                 .into_iter()
-                .map(|(at, level, slug)| Heading {
+                .map(|(at, level, slug, bare)| Heading {
                     level,
                     block: moved[at],
                     slug,
+                    bare,
                 })
                 .collect();
             noted.sort_by_key(|h| h.block);

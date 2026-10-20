@@ -64,8 +64,6 @@ pub(super) struct Entry {
     /// The heading's block (its first chunk, for a heading cut into several).
     pub block: u32,
     pub level: u8,
-    /// Its index in [`Doc::headings`], where its slug is.
-    pub heading: u32,
 }
 
 /// The document's headings of the main flow, in order, and the shallowest level among them (the
@@ -78,17 +76,17 @@ pub(super) struct List {
 
 impl List {
     /// The headings of `doc`, without those inside footnote definitions, which are appended to
-    /// [`Doc::headings`] after the others and listed in the footnotes' own order.
+    /// [`Doc::headings`] after the others and listed in the footnotes' own order, and without
+    /// those with no text at all (an empty `##`), which would be blank rows.
     pub fn of(doc: &Doc) -> List {
         let entries: Vec<Entry> = doc
             .headings
             .iter()
             .take(doc.main_headings)
-            .enumerate()
-            .map(|(i, h)| Entry {
+            .filter(|h| !heading_text(doc, h.block).is_empty())
+            .map(|h| Entry {
                 block: h.block,
                 level: h.level,
-                heading: i as u32,
             })
             .collect();
         let shallowest = entries.iter().map(|e| e.level).min().unwrap_or(1);
@@ -279,6 +277,8 @@ pub(super) struct Panel {
     /// stays there, that heading is the current one, even one too near the document's end to
     /// come up to the window's top.
     pub aimed: Option<(u32, Anchor)>,
+    /// The heading block a click on a row asked for, waiting for [`View::take_jump`].
+    pub jump: Option<u32>,
 }
 
 impl Panel {
@@ -402,19 +402,27 @@ impl View {
         false
     }
 
-    /// The mouse button came up at (`x`, `y`) after a press on row `row`: the anchor of its
-    /// heading if it is still on that row, for the shell to follow as it follows a link of the
-    /// document. A panel over the document closes.
-    pub(super) fn click_toc(&mut self, row: usize, x: f64, y: f64) -> Option<String> {
+    /// The mouse button came up at (`x`, `y`) after a press on row `row`: if it is still on
+    /// that row, the heading's block waits for [`View::take_jump`]. A heading is jumped to by
+    /// its block, not by its `#anchor`: one of nothing but punctuation or emoji may have none.
+    /// A panel over the document closes.
+    pub(super) fn click_toc(&mut self, row: usize, x: f64, y: f64) {
         if self.toc_row_at(x, y) != Some(row) {
-            return None;
+            return;
         }
-        let entry = *self.toc.list.as_ref()?.entries.get(row)?;
-        let href = format!("#{}", self.doc.headings[entry.heading as usize].slug);
+        let Some(entry) = self.toc.list.as_ref().and_then(|l| l.entries.get(row)) else {
+            return;
+        };
+        self.toc.jump = Some(entry.block);
         if !self.toc_pushes() {
             self.set_toc(false);
         }
-        Some(href)
+    }
+
+    /// The heading a click on a row asked for, if anything since the last call: the shell
+    /// scrolls to it as it does for a link to an anchor, leaving the place on the back stack.
+    pub fn take_jump(&mut self) -> Option<u32> {
+        self.toc.jump.take()
     }
 
     /// The wheel or the trackpad scrolled by `dy` pixels: the panel scrolls, and the document

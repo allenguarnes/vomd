@@ -169,8 +169,8 @@ so Back returns. The wheel over the panel scrolls it and not the document. In a 
 740 logical pixels wide the panel sits beside the document, which is laid out in the room that
 is left, keeping your place; in a narrower one it covers the document's edge, and a click on a
 heading, a click on the document or `Esc` closes it. A document without headings says so.
-Headings inside footnotes are not listed. The panel's size follows the display's scale and not
-the zoom.
+Headings inside footnotes, and headings with no text, are not listed. The panel's size
+follows the display's scale and not the zoom.
 
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends

@@ -69,10 +69,6 @@ fn entries_leave_out_the_headings_of_footnotes() {
         .map(|e| heading_text(&doc, e.block))
         .collect();
     assert_eq!(texts, ["One", "Two"]);
-    assert_eq!(
-        list.entries.iter().map(|e| e.heading).collect::<Vec<_>>(),
-        [0, 1]
-    );
     // Without footnotes, and without headings.
     assert_eq!(List::of(&Doc::parse("# A\n\n# B\n")).entries.len(), 2);
     assert!(List::of(&Doc::parse("plain\n")).entries.is_empty());
@@ -581,4 +577,52 @@ fn the_panel_is_painted_at_the_left_with_the_current_row_marked() {
     let buf = paint(&mut empty, now);
     assert!((0..60).any(|y| (12..90).any(|x| buf[y * 1000 + x] != LIGHT.code_bg)));
     assert!(empty.toc_rows() == 0 && !empty.over_toc());
+}
+
+#[test]
+fn headings_without_a_slug_are_listed_unless_they_have_no_text() {
+    let doc = Doc::parse("# A\n\n## !!!\n\n## 🚀\n\n##\n\n#### \n\n## B\n");
+    let slugs: Vec<&str> = doc.headings.iter().map(|h| h.slug.as_str()).collect();
+    // Every heading has an entry in the document's list, whatever its text.
+    assert_eq!(slugs, ["a", "", "-1", "-2", "-3", "b"]);
+    // The panel lists those with something to show.
+    let list = List::of(&doc);
+    let texts: Vec<String> = list
+        .entries
+        .iter()
+        .map(|e| heading_text(&doc, e.block))
+        .collect();
+    assert_eq!(texts, ["A", "!!!", "🚀", "B"]);
+}
+
+#[test]
+fn keys_and_the_aimed_mark_reach_headings_without_a_slug() {
+    let now = Instant::now();
+    let pad = "Padding words of a paragraph.\n\n".repeat(12);
+    let src = format!("# Top\n\n{pad}## !!!\n\n{pad}## 🚀\n\n{pad}## Last\n\n{pad}");
+    let mut v = view(&src, 1000, 300);
+    v.set_toc(true);
+    settle(&mut v);
+    paint(&mut v, now);
+    let slugs: Vec<&str> = v.doc.headings.iter().map(|h| h.slug.as_str()).collect();
+    assert_eq!(slugs, ["top", "", "-1", "last"]);
+    assert_eq!(v.toc_rows(), 4);
+    // The next-heading key steps onto them one by one, and the panel marks each.
+    for i in 1..4 {
+        assert!(v.heading(1, now));
+        paint(&mut v, now);
+        assert_eq!(v.anchor().block, v.doc.headings[i].block);
+        assert_eq!(v.toc_current(), Some(i));
+    }
+    assert!(!v.heading(1, now));
+    for i in (0..3).rev() {
+        assert!(v.heading(-1, now));
+        assert_eq!(v.anchor().block, v.doc.headings[i].block);
+    }
+    // A jump by block, as a click on a row asks for, aims the mark at a heading with no anchor.
+    let block = v.doc.headings[1].block;
+    v.jump_to_block(block, now);
+    paint(&mut v, now);
+    assert_eq!(v.toc.aimed, Some((block, v.anchor())));
+    assert_eq!(v.toc_current(), Some(1));
 }

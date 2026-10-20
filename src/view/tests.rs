@@ -1204,6 +1204,133 @@ mod with_fonts {
         );
     }
 
+    /// Headings of nothing but punctuation or emoji have an empty slug, or one that moves with
+    /// the others: the position follows their texts, and an empty slug is no match of its own.
+    #[test]
+    fn reload_among_headings_without_a_slug() {
+        let sec = |h: &str| format!("## {h}\n\nbody {h}\n\nmore {h}\n\n");
+        let end = format!("# End\n\n{}", paras(30));
+        let src = format!("# A\n\n{}{}{}{end}", sec("!!!"), sec("🚀"), sec("!!!"));
+        let mut v = view(&src, 600, 100);
+        settle(&mut v);
+        for text in ["more !!!", "more 🚀"] {
+            let before = read_at(&mut v, text, 2.0);
+            v.replace(Doc::parse(&src), None);
+            assert_eq!(v.anchor(), before, "{text}");
+        }
+        // The same text, the second of two with the same path, stays the second.
+        let blocks: Vec<u32> = (0..v.doc().blocks.len() as u32)
+            .filter(|&b| block_text(&v, b) == "more !!!")
+            .collect();
+        v.set_scroll(v.layout().top(blocks[1] as usize));
+        v.replace(
+            Doc::parse(&src.replace("# End", "# Fin\n\nx\n\n# End")),
+            None,
+        );
+        assert_eq!(v.anchor().block, blocks[1]);
+        // The heading being read renamed: the empty slug it had is not the slug of the next
+        // heading to lose its text, so the position stays at its block rather than jumping.
+        let src = format!("# A\n\n{}{}{end}", sec("!!!"), sec("🚀"));
+        v.replace(Doc::parse(&src), None);
+        let before = read_at(&mut v, "more !!!", 2.0);
+        assert_eq!(v.doc().headings[1].slug, "");
+        v.replace(Doc::parse(&src.replacen("## !!!", "## Alpha", 1)), None);
+        assert_eq!(v.doc().headings[2].slug, "");
+        assert_eq!(
+            v.anchor(),
+            before,
+            "no jump to the heading that is now `\"\"`"
+        );
+        // The same for the generated `-1`, `-2`: renaming the second of three leaves the third
+        // with `-1`, which isn't the heading being read.
+        let src = format!("# A\n\n{}{}{}{end}", sec("!!!"), sec("🚀"), sec("???"));
+        v.replace(Doc::parse(&src), None);
+        let before = read_at(&mut v, "more 🚀", 2.0);
+        assert_eq!(v.doc().headings[2].slug, "-1");
+        v.replace(Doc::parse(&src.replacen("## 🚀", "## Alpha", 1)), None);
+        assert_eq!(v.doc().headings[3].slug, "-1");
+        assert_eq!(
+            v.anchor(),
+            before,
+            "no jump to the heading that is now `-1`"
+        );
+        // A heading actually named `-1` is found by its slug, though.
+        let src = format!("# A\n\n{}{}{end}", sec("-1"), sec("Two"));
+        v.replace(Doc::parse(&src), None);
+        let before = read_at(&mut v, "more -1", 2.0);
+        v.replace(
+            Doc::parse(
+                &src.replacen("## Two", "## Also", 1)
+                    .replacen("# A", "# B", 1),
+            ),
+            None,
+        );
+        assert_eq!(v.anchor().block, before.block);
+    }
+
+    /// What the parser knows about a heading's slug is what reload goes by, not its text as laid
+    /// out: a footnote's backlink, a split heading's later chunks and a literal `-1` all fooled a
+    /// slug worked out again from the text in the path.
+    #[test]
+    fn reload_among_bare_headings_by_what_the_parser_knew() {
+        let end = format!("# End\n\n{}", paras(30));
+        // A footnote ending in a heading has a backlink after it, which the slug never saw.
+        let note =
+            |label: &str, h: &str| format!("[^{label}]:\n    text {label}\n\n    ## {h}\n\n");
+        let src = format!(
+            "# A\n\nx[^a] y[^b] z[^c]\n\n{}{}{}{}{end}",
+            paras(10),
+            note("a", "!!!"),
+            note("b", "🚀"),
+            note("c", "???"),
+        );
+        let mut v = view(&src, 600, 100);
+        settle(&mut v);
+        let rocket = (0..v.doc().blocks.len() as u32)
+            .find(|&b| block_text(&v, b).starts_with("🚀"))
+            .unwrap();
+        v.set_scroll(v.layout().top(rocket as usize) + 2.0);
+        let before = v.anchor();
+        assert_eq!(before.block, rocket);
+        let at = v.doc().headings.iter().position(|h| h.block == rocket);
+        assert!(v.doc().headings[at.unwrap()].bare);
+        v.replace(Doc::parse(&src.replacen("## 🚀", "## Alpha", 1)), None);
+        assert_eq!(v.anchor().block, rocket, "no jump to the heading now `-1`");
+
+        // A split heading is slugged whole, though the path holds its first chunk only.
+        let split = format!("## {}Target", "!".repeat(16_384));
+        let src = format!("# A\n\n{split}\n\nbelow the heading\n\n{end}");
+        let mut v = view(&src, 600, 100);
+        settle(&mut v);
+        let target = v.doc().headings[1].clone();
+        assert_eq!(target.slug, "target");
+        assert!(!target.bare);
+        let before = read_at(&mut v, "below the heading", 2.0);
+        let src = src.replacen("# A", "# B", 1).replacen(
+            &split,
+            &format!("para one\n\npara two\n\n{split}"),
+            1,
+        );
+        v.replace(Doc::parse(&src), None);
+        assert_eq!(v.anchor().block, before.block + 2, "follows the slug");
+
+        // A heading literally named `-1` is not the `-1` generated for an empty one.
+        let literal = "## -1\n\nfirst literal\n\nmore literal\n\n## Two\n\nmore two\n\n";
+        let src = format!("# A\n\n{literal}{end}");
+        let mut v = view(&src, 600, 100);
+        settle(&mut v);
+        let before = read_at(&mut v, "more literal", 2.0);
+        let src = format!("# B\n\n## !!!\n\nfirst bare\n\n## ???\n\nsecond bare\n\n{literal}{end}");
+        let doc = Doc::parse(&src);
+        let slugs: Vec<_> = doc.headings.iter().map(|h| h.slug.as_str()).collect();
+        assert_eq!(slugs[1..4], ["", "-1", "-1-1"]);
+        v.replace(doc, None);
+        // The heading path is gone and no slug names the heading: the block position stays,
+        // not the section of the `-1` that is now somebody else's.
+        assert_eq!(block_text(&v, v.anchor().block), "???");
+        assert_eq!(v.anchor(), before);
+    }
+
     /// The path gone from the new text: the slug if it is still there, else the block.
     #[test]
     fn reload_falls_back_from_the_path_to_the_slug_to_the_block() {
@@ -2526,6 +2653,12 @@ mod with_fonts {
             v.click(x, y)
         }
 
+        /// Click on (`x`, `y`) as [`click`] does, and the heading block a row asked to jump to.
+        fn click_row(v: &mut View, at: (f64, f64), now: Instant) -> Option<u32> {
+            assert_eq!(click(v, at, now), None, "a row is no link");
+            v.take_jump()
+        }
+
         /// A view of `n` sections with the panel open, painted once.
         fn open_view(n: usize, w: u32, h: u32) -> View {
             let mut v = view(&sections(n), w, h);
@@ -2669,7 +2802,7 @@ mod with_fonts {
         }
 
         #[test]
-        fn clicking_a_row_follows_its_anchor() {
+        fn clicking_a_row_jumps_to_its_heading() {
             let now = Instant::now();
             let mut v = open_view(40, 1000, 400);
             // Rows light up and show the hand under the pointer.
@@ -2679,11 +2812,12 @@ mod with_fonts {
             assert_eq!(v.hovered(), None, "no URL preview for a row");
             assert!(v.hover_end());
             assert!(!v.over_toc());
-            // The click is the heading's `#anchor`, which the shell follows like a link.
-            let href = click(&mut v, p, now).unwrap();
-            assert_eq!(href, "#s3");
-            assert!(v.jump_to_anchor("s3", now));
-            assert_eq!(v.anchor().block, v.doc().headings[3].block);
+            // The click asks for the heading's block, which the shell jumps to like a link.
+            let block = click_row(&mut v, p, now).unwrap();
+            assert_eq!(block, v.doc().headings[3].block);
+            assert_eq!(v.take_jump(), None, "once");
+            v.jump_to_block(block, now);
+            assert_eq!(v.anchor().block, block);
             assert!(v.toc_open(), "a panel beside the document stays");
             // Pressed on one row and released on another, or off the panel: no click.
             let q = row_point(&v, 5);
@@ -2695,13 +2829,36 @@ mod with_fonts {
             let mut short = open_view(3, 1000, 400);
             let last = row_point(&short, 2);
             assert!(short.toc_row_at(last.0, last.1).is_some());
-            assert_eq!(click(&mut short, (40.0, last.1 + 40.0), now), None);
+            assert_eq!(click_row(&mut short, (40.0, last.1 + 40.0), now), None);
             // Over the document: a click follows links as ever.
             settle(&mut v);
             let block = link_block(&v);
             let (x, y) = point_at(&v, block, "link");
             let href = click(&mut v, (x + 260.0, y), now).unwrap();
             assert!(href.starts_with("https://a.example/"), "{href}");
+        }
+
+        /// A heading of punctuation or emoji has no anchor to follow, but its row jumps to it.
+        #[test]
+        fn clicking_a_row_without_an_anchor_jumps_to_its_heading() {
+            let now = Instant::now();
+            let pad = "Padding words of a paragraph.\n\n".repeat(12);
+            let src = format!("# Top\n\n{pad}## !!!\n\n{pad}## 🚀\n\n{pad}## Last\n\n{pad}");
+            let mut v = view(&src, 1000, 300);
+            v.set_toc(true);
+            settle(&mut v);
+            paint(&mut v, now);
+            for row in [1, 2] {
+                let block = v.doc().headings[row].block;
+                let p = row_point(&v, row);
+                assert_eq!(click_row(&mut v, p, now), Some(block));
+                v.jump_to_block(block, now);
+                settle(&mut v);
+                paint(&mut v, now);
+                assert_eq!(v.anchor().block, block);
+                assert_eq!(v.toc_current(), Some(row), "the row is marked");
+            }
+            assert_eq!(v.toc.aimed.map(|(b, _)| b), Some(v.doc().headings[2].block));
         }
 
         /// Over the document, a click on a row closes the panel as it follows the link, and a
@@ -2712,7 +2869,8 @@ mod with_fonts {
             let mut v = open_view(40, 600, 400);
             assert!(!v.toc_pushes());
             let p = row_point(&v, 4);
-            assert_eq!(click(&mut v, p, now).as_deref(), Some("#s4"));
+            let want = v.doc().headings[4].block;
+            assert_eq!(click_row(&mut v, p, now), Some(want));
             assert!(!v.toc_open(), "a click on a heading closes it");
             // A click on the document outside the panel closes it, and follows no link.
             v.set_toc(true);

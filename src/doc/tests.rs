@@ -3950,3 +3950,103 @@ fn script_end_tag_search_is_linear() {
         }
     });
 }
+
+#[test]
+fn headings_without_letters_or_digits_still_have_a_slug() {
+    let slugs = |src: &str| -> Vec<String> {
+        Doc::parse(src)
+            .headings
+            .into_iter()
+            .map(|h| h.slug)
+            .collect()
+    };
+    // github-slugger: nothing is kept, so the slug is empty; the next ones take `-1`, `-2`.
+    assert_eq!(slugs("## !!!\n"), [""]);
+    assert_eq!(slugs("## 🚀\n"), [""]);
+    assert_eq!(slugs("## ---?\n"), ["---"]);
+    assert_eq!(slugs("# …\n"), [""]);
+    assert_eq!(slugs("# !!!\n## 🚀\n### ?\n"), ["", "-1", "-2"]);
+    // Normal slugs keep their own count, apart from the empty ones.
+    assert_eq!(
+        slugs("# a\n# !\n# a\n# ?\n# a\n# *\n"),
+        ["a", "", "a-1", "-1", "a-2", "-2"]
+    );
+    // A heading written as `-1` is taken as an id like any other (one shared registry): the
+    // next empty slug skips it, and a `-1` after an empty one is renamed.
+    assert_eq!(slugs("# !\n# -1\n# ?\n"), ["", "-1", "-2"]);
+    assert_eq!(slugs("# !\n# ?\n# -1\n"), ["", "-1", "-1-1"]);
+    assert_eq!(slugs("# -1\n# !\n# ?\n"), ["-1", "", "-2"]);
+    // Footnote headings take part, in the order the text hands them out.
+    let doc = Doc::parse("# !\n\nx[^n]\n\n# ?\n\n[^n]:\n    # *\n\n    text\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    let slugs: Vec<_> = doc.headings.iter().map(|h| h.slug.as_str()).collect();
+    assert_eq!(slugs, ["", "-1", "-2"]);
+    assert_eq!(doc.main_headings, 2);
+    assert!(doc.headings.windows(2).all(|w| w[0].block < w[1].block));
+}
+
+#[test]
+fn an_empty_slug_is_no_anchor() {
+    let doc = Doc::parse("# !!!\n\ntext\n\n# 🚀\n\n[a](#) [b](#-1)\n");
+    check_invariants(&doc);
+    let ids: Vec<_> = doc.anchors.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["-1"], "the empty slug is left out, `-1` is there");
+    let at = doc.anchors[0].1;
+    assert_eq!(at, doc.headings[1].block);
+    // A `#` link is the top of the document, as on GitHub.
+    assert_eq!(crate::nav::find_anchor(&doc, ""), Some(0));
+    assert_eq!(crate::nav::find_anchor(&doc, "-1"), Some(at));
+    // The same in a footnote: the heading is listed, the empty slug has no anchor.
+    let doc = Doc::parse("x[^n]\n\n[^n]:\n    # !!!\n\n    text\n    # ??\n");
+    check_invariants(&doc);
+    check_anchors(&doc);
+    assert_eq!(doc.headings.len(), 2);
+    let heading = &doc.headings[1];
+    assert_eq!(heading.slug, "-1");
+    let (_, block) = doc.anchors.iter().find(|(id, _)| id == "-1").unwrap();
+    assert_eq!(*block, heading.block);
+    assert!(doc.anchors.iter().all(|(id, _)| !id.is_empty()));
+    let src = "x[^n]\n\n[^n]:\n    # !!!\n";
+    assert_eq!(Doc::parse_whole(src), Doc::parse(src));
+}
+
+#[test]
+fn a_heading_of_no_letters_or_digits_is_bare() {
+    let bare = |src: &str| -> Vec<(String, bool)> {
+        Doc::parse(src)
+            .headings
+            .into_iter()
+            .map(|h| (h.slug, h.bare))
+            .collect()
+    };
+    let b = |slug: &str, bare| (slug.to_owned(), bare);
+    // The empty slug and the generated `-1`, `-2` are bare; a heading written as `-1` is not,
+    // whatever its slug turns out to be.
+    assert_eq!(
+        bare("# !\n# ?\n# 🚀\n# a\n"),
+        [b("", true), b("-1", true), b("-2", true), b("a", false)]
+    );
+    assert_eq!(bare("# -1\n"), [b("-1", false)]);
+    assert_eq!(
+        bare("# !\n# ?\n# -1\n"),
+        [b("", true), b("-1", true), b("-1-1", false)]
+    );
+    assert_eq!(bare("# ---?\n"), [b("---", false)]);
+    // Footnote headings too, and the backlink after the last one is no text of the heading.
+    assert_eq!(
+        bare("x[^n]\n\n[^n]:\n    # 🚀\n"),
+        [b("", true)],
+        "a backlink does not make the heading a word"
+    );
+    // A heading split into chunks is taken whole.
+    let long = format!("# {}Target\n", "!".repeat(16_384));
+    assert_eq!(bare(&long), [b("target", false)]);
+    let long = format!("# {}\n", "!".repeat(16_384));
+    assert_eq!(bare(&long), [b("", true)]);
+    // The one parser and the one cut into segments agree.
+    let src = "# !\n\ntext\n\n# ?\n\nx[^n]\n\n[^n]:\n    # 🚀\n";
+    let (whole, parts) = Doc::fuzz_segments(src, 8).unwrap();
+    assert_eq!(whole, parts);
+    assert_eq!(whole.headings.iter().filter(|h| h.bare).count(), 3);
+}
