@@ -26,6 +26,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   heading before it. Such headings are headings now, with the ids GitHub gives them (none for the
   first, which `#` can't name, then `-1`, `-2`, ...), so links to those ids written for GitHub
   work too. A heading with no text at all is still left out of the panel.
+- Documents over 1 MB, which are parsed in pieces, render the same as when parsed whole when a
+  piece that refers to a footnote defined in another piece has a control character such as U+0001
+  between square brackets: it came out as a link.
 
 ## [1.2.0] - 2026-10-20
 

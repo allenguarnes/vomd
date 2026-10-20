@@ -103,13 +103,15 @@ impl Plan {
     /// The text to parse for segment `n`: the segment itself, preceded by the header of the table
     /// it continues, and by the footnote `stubs` (labels defined in other segments, which this
     /// one's parser needs to see footnote references where they are, not text). The builder
-    /// drops the events of the stubs, which come first. A reference definition ends the last stub (indented text after it would continue
-    /// it) and defines nothing anyone refers to.
-    pub fn text<'a>(&self, src: &'a str, n: usize, stubs: &[String]) -> Cow<'a, str> {
+    /// drops the events of the stubs, which come first. A reference definition ends the last stub
+    /// (indented text after it would continue it) and defines nothing anyone refers to: its label
+    /// is a control character the text doesn't have, so no reference in it (or definition of its
+    /// own) can be taken for that one. `None` if it has all of them: it is not cut.
+    pub fn text<'a>(&self, src: &'a str, n: usize, stubs: &[String]) -> Option<Cow<'a, str>> {
         let seg = &self.segments[n];
         let body = &src[seg.range.clone()];
         if seg.head.is_none() && stubs.is_empty() {
-            return Cow::Borrowed(body);
+            return Some(Cow::Borrowed(body));
         }
         let head = seg.head.clone().map_or("", |h| &src[h]);
         let mut text = String::with_capacity(head.len() + body.len() + 16 * stubs.len());
@@ -119,11 +121,18 @@ impl Plan {
             text.push_str("]: x\n");
         }
         if !stubs.is_empty() {
-            text.push_str("\n[\u{1}]: x\n\n");
+            // (Controls other than the blanks and line breaks, U+0009 to U+000D, which no label
+            // is made of.)
+            let used = head.bytes().chain(body.bytes()).filter(|&b| b < 32);
+            let used = used.fold(0u32, |all, b| all | 1 << b);
+            let mark = (1..9u8).chain(14..32).find(|&b| used >> b & 1 == 0)?;
+            text.push_str("\n[");
+            text.push(char::from(mark));
+            text.push_str("]: x\n\n");
         }
         text.push_str(head);
         text.push_str(body);
-        Cow::Owned(text)
+        Some(Cow::Owned(text))
     }
 
     /// Every link reference definition and footnote definition in the text, in document order
@@ -139,7 +148,7 @@ impl Plan {
             if !links {
                 continue;
             }
-            let text = self.text(src, n, &[]);
+            let text = self.text(src, n, &[])?;
             // Building the parser finds the link definitions; the footnote definitions only show
             // in the events.
             let mut parser = Parser::new_ext(&text, opts);

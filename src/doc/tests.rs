@@ -1553,7 +1553,29 @@ fn segmented_parse_of_every_fuzz_seed_matches() {
         }
         seeds += 1;
     }
-    assert!(seeds >= 2);
+    assert!(seeds >= 3);
+}
+
+/// The definition that ends the footnote stubs in front of a segment has a label the segment's
+/// text doesn't use (fuzz finding: a `[\u{1}]` in the text was a link to that definition, where
+/// one parser reads the plain text it is). Each character the label may be made of is tried in
+/// the text, as a reference and as a definition of its own; a text that has all of them is not
+/// cut.
+#[test]
+fn the_definition_that_ends_the_stubs_is_not_one_the_text_can_mean() {
+    let filler = filler(30);
+    for c in (1..9u8).chain(14..32).map(char::from) {
+        let used = format!("see[^n] [{c}] and [ {c} ]\n\n{filler}[^n]: note\n");
+        let defined = format!("see[^n] [{c}]\n\n[{c}]: /mine\n\n{filler}[^n]: note\n");
+        for src in [used, defined] {
+            assert!(assert_same("stubs end", &src, 400) >= 2, "{c:?}: not cut");
+        }
+    }
+    let all: String = (1..9u8).chain(14..32).map(char::from).collect();
+    let src = format!("see[^n] {all}\n\n{filler}[^n]: note\n");
+    assert!(segment::plan(&src, 400).is_some());
+    assert!(Doc::parse_segments(&src, 400).is_none());
+    assert_same("stubs end", &src, 400);
 }
 
 /// Deterministic pseudo-random numbers (xorshift), so failures reproduce.

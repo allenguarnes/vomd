@@ -298,19 +298,24 @@ impl Doc {
         let total = plan.segments.len();
         let stubs_and_text = |n: usize| {
             let stubs = defs.footnote_stubs(&src[plan.segments[n].range.clone()]);
-            let text = plan.text(src, n, &stubs);
-            (stubs.len(), text)
+            let text = plan.text(src, n, &stubs)?;
+            Some((stubs.len(), text))
         };
         let done = if pipeline.workers == 0 {
             // Each segment's parser is dropped before the next one starts.
             (0..total).all(|n| {
-                let (stubs, text) = stubs_and_text(n);
+                let Some((stubs, text)) = stubs_and_text(n) else {
+                    return false;
+                };
                 let events = marked(&text, segment_events(&text, &defs.links, opts));
                 feed.segment(n, stubs, text.len(), events).is_some()
             })
         } else {
             let (fed, done) = pipeline::ordered(total, pipeline, feed, |n, turn| {
-                let (stubs, text) = stubs_and_text(n);
+                let Some((stubs, text)) = stubs_and_text(n) else {
+                    turn.take(|_| ControlFlow::Break(()));
+                    return;
+                };
                 let events: Vec<_> =
                     marked(&text, segment_events(&text, &defs.links, opts)).collect();
                 let text_len = text.len();
