@@ -587,6 +587,43 @@ fn store_saves_the_wide_toggle_and_keeps_comments() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn toc_is_a_bool_saved_like_the_wide_toggle() {
+    assert!(!Prefs::default().toc);
+    for (v, want) in [("true", true), ("ON", true), ("1", true), ("no", false)] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("toc = {v}")));
+        assert_eq!(p.toc, want, "{v}");
+    }
+    for v in ["", "maybe", "2"] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("toc = {v}")));
+        assert!(!p.toc, "{v:?} is ignored");
+    }
+    assert!(TEMPLATE.contains("# toc = false"));
+    assert!(TEMPLATE.contains("(C toggles it)"));
+    let dir = temp_dir("toc");
+    let path = dir.join("settings.ini");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = "# my settings\ntheme = dark\n\n# toc = false\nzoom = 120\n";
+    std::fs::write(&path, file).unwrap();
+    let mut st = Store::open(Some(path.clone()));
+    assert!(!st.prefs().toc);
+    st.set("toc", "true", Instant::now());
+    st.flush().unwrap();
+    // The template's commented default is replaced in place; the rest is untouched.
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# my settings\ntheme = dark\n\ntoc = true\nzoom = 120\n"
+    );
+    // Read again by another run: the value is kept.
+    let mut again = Store::open(Some(path.clone()));
+    assert!(again.prefs().toc);
+    assert_eq!(again.prefs().zoom, 120);
+    again.set("toc", "false", Instant::now());
+    again.flush().unwrap();
+    assert!(!Store::open(Some(path)).prefs().toc);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 // ---- Parser details ---------------------------------------------------------------------------
 
 #[test]

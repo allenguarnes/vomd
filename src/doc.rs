@@ -230,6 +230,9 @@ pub struct Doc {
     pub links: Vec<String>,
     pub images: Vec<ImageRef>,
     pub headings: Vec<Heading>,
+    /// How many of the leading entries of [`Doc::headings`] belong to the main flow: the rest are
+    /// inside footnote definitions.
+    pub main_headings: usize,
     /// `#fragment` targets (heading slugs, footnotes) → block index.
     pub anchors: Vec<(String, u32)>,
     /// Backing store for [`Block::quote_lists`]; consecutive blocks in the same quotes share
@@ -1597,6 +1600,7 @@ impl Builder {
     fn finish(mut self) -> Doc {
         self.flush_text();
         self.close();
+        self.doc.main_headings = self.doc.headings.len();
         let mut fn_blocks = std::mem::take(&mut self.footnotes.blocks);
         if !fn_blocks.is_empty() {
             self.push_block(BlockKind::Rule, 0..0);

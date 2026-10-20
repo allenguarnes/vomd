@@ -1,6 +1,6 @@
 //! The toolbar: one slim bar docked at the top, never over the text.
 //!
-//! Left: Back, Open. Right: remote images (only when the document has any), zoom (− 100% +), wide
+//! Left: Back, Open, contents. Right: remote images (only when the document has any), zoom (− 100% +), wide
 //! layout, theme, reload, settings. Buttons for features that aren't built yet are absent. On
 //! narrow windows the right group collapses into a `⋯` button with a small dropdown, the one
 //! popup in the app: zoom first, then remote images, wide layout, theme, ...
@@ -49,6 +49,9 @@ pub(crate) mod icon {
     pub const OPEN: char = '\u{e247}';
     pub const MORE: char = '\u{e0b6}';
     pub const IMAGE: char = '\u{e0f6}';
+    /// The contents panel.
+    #[cfg(feature = "toc")]
+    pub const LIST: char = '\u{e106}';
     /// Wide layout is off (the button widens) and on (it narrows).
     pub const UNFOLD: char = '\u{e43d}';
     pub const FOLD: char = '\u{e43b}';
@@ -64,6 +67,9 @@ pub enum Item {
     Back,
     /// Choose a file to open.
     Open,
+    /// Show or hide the contents panel.
+    #[cfg(feature = "toc")]
+    Contents,
     /// Load or hide remote images, with a badge counting them.
     Images,
     ZoomOut,
@@ -101,6 +107,9 @@ pub struct Ctx {
     pub theme: ThemeMode,
     /// Wide layout is on.
     pub wide: bool,
+    /// The contents panel is open.
+    #[cfg(feature = "toc")]
+    pub toc: bool,
     /// There is a settings file to open (not with `--no-settings`).
     pub settings: bool,
     /// Remote images in the document (0: no remote-images button).
@@ -153,6 +162,10 @@ impl Item {
         match self {
             Item::Back => "Back (Backspace)".into(),
             Item::Open => "Open a file (Ctrl+O)".into(),
+            #[cfg(feature = "toc")]
+            Item::Contents if ctx.toc => "Hide contents (C)".into(),
+            #[cfg(feature = "toc")]
+            Item::Contents => "Contents (C)".into(),
             Item::Images if ctx.no_curl => "Remote images: curl not found".into(),
             Item::Images if ctx.remote_on => "Hide remote images (I)".into(),
             Item::Images => {
@@ -180,6 +193,8 @@ impl Item {
         Some(match self {
             Item::Back => icon::BACK,
             Item::Open => icon::OPEN,
+            #[cfg(feature = "toc")]
+            Item::Contents => icon::LIST,
             Item::Images => icon::IMAGE,
             Item::ZoomOut => icon::MINUS,
             Item::ZoomIn => icon::PLUS,
@@ -197,6 +212,8 @@ impl Item {
         Some(match self {
             Item::Back => Command::Action(Action::Back),
             Item::Open => Command::Action(Action::Open),
+            #[cfg(feature = "toc")]
+            Item::Contents => Command::Action(Action::ToggleToc),
             Item::Images => Command::Action(Action::ToggleRemote),
             Item::ZoomOut => Command::Action(Action::ZoomOut),
             Item::ZoomReset => Command::Action(Action::ZoomReset),
@@ -234,6 +251,10 @@ const RIGHT: [(Item, f32, u8); 8] = [
     (Item::Settings, BUTTON, 5),
 ];
 
+/// The contents button's collapse group: it goes last, after everything of the right group, since
+/// it sits with Back and Open at the left.
+const CONTENTS_GROUP: u8 = 6;
+
 /// The right group's items in this window.
 fn right_items(ctx: &Ctx) -> &'static [(Item, f32, u8)] {
     &RIGHT[usize::from(ctx.remote == 0)..7 + usize::from(ctx.settings)]
@@ -242,11 +263,17 @@ fn right_items(ctx: &Ctx) -> &'static [(Item, f32, u8)] {
 /// How many of the right group's leading groups don't fit and collapse into `⋯`.
 fn collapsed(ctx: &Ctx) -> u8 {
     let right = right_items(ctx);
+    let last = right.last().map_or(0, |r| r.2);
+    let last = if cfg!(feature = "toc") {
+        last.max(CONTENTS_GROUP)
+    } else {
+        last
+    };
     let mut first = 0;
-    while first <= right.last().map_or(0, |r| r.2) {
+    while first <= last {
         let rest: f32 = right.iter().filter(|r| r.2 >= first).map(|r| r.1).sum();
         let more = if first > 0 { BUTTON } else { 0.0 };
-        if (EDGE + LEFT + GAP + rest + more + EDGE) * ctx.scale <= ctx.width as f32 {
+        if (EDGE + left_width(first) + GAP + rest + more + EDGE) * ctx.scale <= ctx.width as f32 {
             break;
         }
         first += 1;
@@ -254,8 +281,18 @@ fn collapsed(ctx: &Ctx) -> u8 {
     first
 }
 
-/// The bar's layout for this frame: Back and Open on the left, the right group laid out from
-/// the right edge, and as many of its leading groups as don't fit collapsed into `⋯`.
+/// The left group's width, in logical pixels, when the groups below `first` are collapsed: Back
+/// and Open, and the contents button while it is still there.
+fn left_width(first: u8) -> f32 {
+    if cfg!(feature = "toc") && first <= CONTENTS_GROUP {
+        LEFT + BUTTON
+    } else {
+        LEFT
+    }
+}
+
+/// The bar's layout for this frame: Back, Open and contents on the left, the right group laid out
+/// from the right edge, and as many of its leading groups as don't fit collapsed into `⋯`.
 pub fn slots(ctx: &Ctx) -> Slots {
     let s = ctx.scale;
     let h = BAR * s;
@@ -270,16 +307,28 @@ pub fn slots(ctx: &Ctx) -> Slots {
         (Item::Back, bar(EDGE * s, (EDGE + BUTTON) * s)),
         (Item::Open, bar((EDGE + BUTTON) * s, (EDGE + LEFT) * s)),
     ];
+    #[cfg(feature = "toc")]
+    if first <= CONTENTS_GROUP {
+        items.push((
+            Item::Contents,
+            bar((EDGE + LEFT) * s, (EDGE + LEFT + BUTTON) * s),
+        ));
+    }
     let mut x = ctx.width as f32 - EDGE * s;
     for &(item, iw, _) in right.iter().rev().filter(|r| r.2 >= first) {
         items.push((item, bar(x - iw * s, x)));
         x -= iw * s;
     }
-    let overflow: Vec<Item> = right.iter().filter(|r| r.2 < first).map(|r| r.0).collect();
+    let mut overflow: Vec<Item> = Vec::new();
+    #[cfg(feature = "toc")]
+    if first > CONTENTS_GROUP {
+        overflow.push(Item::Contents);
+    }
+    overflow.extend(right.iter().filter(|r| r.2 < first).map(|r| r.0));
     if !overflow.is_empty() {
         // Never over the left group: in a window too narrow for both, `⋯` runs off the right
         // edge.
-        let x0 = (x - BUTTON * s).max((EDGE + LEFT) * s);
+        let x0 = (x - BUTTON * s).max((EDGE + left_width(first)) * s);
         items.push((Item::More, bar(x0, x0 + BUTTON * s)));
     }
     Slots { items, overflow }
@@ -536,6 +585,8 @@ impl Toolbar {
         };
         for &(item, rect) in &slots.items {
             let on = (item == Item::More && open) || (item == Item::Images && ctx.remote_on);
+            #[cfg(feature = "toc")]
+            let on = on || (item == Item::Contents && ctx.toc);
             if cfg!(feature = "remote-images") && item == pulse_on && ctx.pulse {
                 let inset = 3.0 * s;
                 let r = Rect {

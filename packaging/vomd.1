@@ -63,6 +63,17 @@ Theme: system, light, dark.
 .B B
 Show or hide the toolbar.
 .TP
+.B C
+Show or hide the contents panel: the document's headings at the window's left, with the one being
+read marked.
+A click on a heading jumps to it, as a link to its anchor does, and the wheel over the panel
+scrolls the panel.
+In a window at least 740 logical pixels wide the panel sits beside the document; in a narrower one
+it covers the document's edge, and a click on a heading or on the document closes it.
+The
+.B toc
+setting starts with the panel open.
+.TP
 .B W
 Wide layout on or off: the text spans the window instead of stopping at
 .BR line_width .
@@ -109,7 +120,8 @@ or
 so a bare window manager needs one of them installed.
 .TP
 .B Esc
-Close the toolbar's menu if it is open, else clear the selection, else quit.
+Close the toolbar's menu if it is open, else the contents panel if it covers the document, else
+clear the selection, else quit.
 .TP
 .BR Q ", " Ctrl+W
 Quit.
@@ -122,7 +134,7 @@ by default): plain
 .I key = value
 lines, applied when the window gets focus.
 The toolbar's settings button creates it with every key listed and commented out.
-Theme, zoom, toolbar, wide layout and window size are saved when they change.
+Theme, zoom, toolbar, contents panel, wide layout and window size are saved when they change.
 .SH PRIVACY
 .B vomd
 makes no network requests of its own.

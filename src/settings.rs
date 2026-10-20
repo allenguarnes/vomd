@@ -813,7 +813,7 @@ macro_rules! template {
 # Show the toolbar (B toggles it).
 # toolbar = true
 
-# Show the table of contents panel (O toggles it).
+# Show the table of contents panel (C toggles it).
 # toc = false
 
 # Window size in logical pixels, saved when the window closes.

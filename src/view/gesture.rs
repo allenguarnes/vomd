@@ -127,24 +127,15 @@ impl View {
         DRAG_THRESHOLD * self.hidpi
     }
 
-    /// The point is in the document area.
-    pub(super) fn in_area(&self, x: f64, y: f64) -> bool {
-        (0.0..f64::from(self.width)).contains(&x)
-            && (f64::from(self.top_inset)..f64::from(self.height)).contains(&y)
-    }
-
-    /// Document y of window y, for a point in the area.
-    pub(super) fn doc_y(&self, y: f64) -> f64 {
-        self.scroll() + (y - f64::from(self.top_inset))
-    }
-
-    /// The caret position nearest window point (`x`, `y`): a point outside the area counts as at
-    /// its nearest edge.
+    /// The caret position nearest window point (`x`, `y`): a point outside the area (or under the
+    /// contents panel) counts as at its nearest edge.
     fn caret_at(&self, x: f64, y: f64) -> Pos {
-        let x = x.clamp(0.0, (f64::from(self.width) - 1.0).max(0.0));
+        let left = f64::from(self.panel_width());
+        let x = x.clamp(left, (f64::from(self.width) - 1.0).max(left));
         let top = f64::from(self.top_inset);
         let y = y.clamp(top, (f64::from(self.height) - 1.0).max(top));
-        self.layout.locate(x as f32, self.doc_y(y) as f32)
+        self.layout
+            .locate(self.doc_x(x) as f32, self.doc_y(y) as f32)
     }
 
     /// The position of the character under window point (`x`, `y`), if there is one.
@@ -152,7 +143,9 @@ impl View {
         if !self.in_area(x, y) {
             return None;
         }
-        let hit = self.layout.hit(x as f32, self.doc_y(y) as f32)?;
+        let hit = self
+            .layout
+            .hit(self.doc_x(x) as f32, self.doc_y(y) as f32)?;
         Some(Pos::new(hit.block, hit.doc))
     }
 

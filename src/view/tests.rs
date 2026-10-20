@@ -63,6 +63,17 @@ fn keys() {
         (ch("W"), shift, Some(Action::ToggleWide)),
         (ch("W"), ctrl, Some(Action::Quit)),
         (ch("w"), ModifiersState::ALT, None),
+        // Contents; Ctrl+C stays Copy (or nothing without selection support).
+        #[cfg(feature = "toc")]
+        (ch("c"), none, Some(Action::ToggleToc)),
+        #[cfg(feature = "toc")]
+        (ch("C"), none, Some(Action::ToggleToc)),
+        #[cfg(feature = "toc")]
+        (ch("C"), shift, Some(Action::ToggleToc)),
+        #[cfg(not(feature = "toc"))]
+        (ch("c"), none, None),
+        #[cfg(feature = "toc")]
+        (ch("c"), ModifiersState::ALT, None),
         (ch("["), none, Some(Action::PrevHeading)),
         (ch("]"), none, Some(Action::NextHeading)),
         (Key::Named(NamedKey::Backspace), none, Some(Action::Back)),
@@ -2016,6 +2027,7 @@ mod with_fonts {
     }
 
     /// Paint, then let the loop run after the first frame (images are asked for).
+    #[cfg(feature = "images")]
     fn frame(v: &mut View, now: Instant) {
         let (w, h) = v.size();
         let mut buf = vec![0u32; (w * h) as usize];
@@ -2453,6 +2465,539 @@ mod with_fonts {
             assert!(v.toast.is_none());
             frame(&mut v, now + TOAST);
             assert!(v.toast.is_none());
+        }
+    }
+
+    /// The contents panel.
+    #[cfg(feature = "toc")]
+    mod contents {
+        use super::*;
+        #[cfg(feature = "clipboard")]
+        use crate::doc::BlockKind;
+
+        /// `n` sections, each a heading `S0`, `S1`, ... and a paragraph with a link.
+        fn sections(n: usize) -> String {
+            (0..n)
+                .map(|i| {
+                    format!(
+                        "## S{i}\n\nPadding words to push the text far right of any panel. \
+                         [link {i}](https://a.example/{i}) of section {i}.\n\n"
+                    )
+                })
+                .collect()
+        }
+
+        /// A block on screen with a link in it.
+        fn link_block(v: &View) -> usize {
+            let h = f64::from(v.height);
+            v.layout()
+                .range_exact(v.scroll(), v.scroll() + h)
+                .find(|&b| {
+                    v.layout().geoms()[b].content.is_some()
+                        && v.doc()
+                            .block_spans(&v.doc().blocks[b])
+                            .iter()
+                            .any(|s| s.link != 0)
+                })
+                .expect("a link on screen")
+        }
+
+        fn paint(v: &mut View, now: Instant) -> Vec<u32> {
+            let (w, h) = v.size();
+            let mut buf = vec![0; (w * h) as usize];
+            v.paint(&mut buf, w as usize, now);
+            buf
+        }
+
+        /// A window point on row `i` of the panel.
+        fn row_point(v: &View, i: usize) -> (f64, f64) {
+            let g = v.toc_geom();
+            (40.0, g.top(i, v.toc.scroll) + g.row() / 2.0)
+        }
+
+        /// Press and release on (`x`, `y`) as the shell does, and what the click returned.
+        fn click(v: &mut View, (x, y): (f64, f64), now: Instant) -> Option<String> {
+            v.hover_at(x, y, now);
+            v.press(x, y, now);
+            v.release_toolbar(x, y);
+            #[cfg(feature = "clipboard")]
+            v.release_select();
+            v.release(now);
+            v.click(x, y)
+        }
+
+        /// A view of `n` sections with the panel open, painted once.
+        fn open_view(n: usize, w: u32, h: u32) -> View {
+            let mut v = view(&sections(n), w, h);
+            v.set_toc(true);
+            settle(&mut v);
+            paint(&mut v, Instant::now());
+            v
+        }
+
+        #[test]
+        fn the_key_the_action_and_the_toolbar_toggle_it() {
+            let now = Instant::now();
+            let mut v = view(&sections(5), 1000, 400);
+            assert!(!v.toc_open());
+            let action = key_action(&ch("c"), ModifiersState::empty()).unwrap();
+            assert_eq!(action, Action::ToggleToc);
+            assert_eq!(v.apply(action, now), Outcome::Redraw);
+            assert!(v.toc_open());
+            assert_eq!(v.apply(Action::ToggleToc, now), Outcome::Redraw);
+            assert!(!v.toc_open());
+            // The toolbar's button asks for the same action, and the bar shows its state.
+            v.set_toolbar(true);
+            let button = |v: &View| {
+                let ctx = v.toolbar_ctx();
+                let slots = toolbar::slots(&ctx);
+                let r = slots
+                    .items
+                    .iter()
+                    .find(|(i, _)| *i == toolbar::Item::Contents)
+                    .unwrap()
+                    .1;
+                (
+                    f64::from((r.x0 + r.x1) / 2.0),
+                    f64::from((r.y0 + r.y1) / 2.0),
+                )
+            };
+            let (x, y) = button(&v);
+            assert!(v.press(x, y, now));
+            assert!(v.release_toolbar(x, y));
+            assert_eq!(
+                v.take_command(),
+                Some(toolbar::Command::Action(Action::ToggleToc))
+            );
+            assert!(!v.toolbar_ctx().toc);
+            v.apply(Action::ToggleToc, now);
+            assert!(v.toolbar_ctx().toc);
+            // Below the bar, from the bar's bottom to the window's: the panel's rectangle.
+            let g = v.toc_geom();
+            assert_eq!((g.y0, g.y1, g.width), (32.0, 400.0, 260.0));
+            // No Ctrl, Alt or Super: Ctrl+C is not it.
+            assert_ne!(
+                key_action(&ch("c"), ModifiersState::CONTROL),
+                Some(Action::ToggleToc)
+            );
+            assert_ne!(
+                key_action(&ch("c"), ModifiersState::SUPER),
+                Some(Action::ToggleToc)
+            );
+        }
+
+        #[test]
+        fn a_wide_window_is_pushed_aside_keeping_the_position() {
+            let now = Instant::now();
+            let mut v = view(&sections(200), 1000, 400);
+            settle(&mut v);
+            v.set_scroll(v.layout().top(120) + 5.0);
+            let anchor = v.anchor();
+            assert_eq!(v.layout().params().width, 1000.0);
+            v.set_toc(true);
+            assert!(v.toc_pushes());
+            assert_eq!(v.area_x(), 260);
+            assert_eq!(v.layout().params().width, 740.0, "laid out in what is left");
+            assert_eq!(v.anchor(), anchor, "the reading position is kept");
+            // The document is painted from the panel's edge, and what hits it is shifted too.
+            let area = v.viewport().area;
+            assert_eq!((area.x0, area.x1), (260, 1000));
+            let (col_x, col_w) = v.layout().column();
+            assert!(col_x + col_w <= 740.0);
+            // Nothing of the document is under the panel: the panel is the page's neighbour.
+            settle(&mut v);
+            let block = link_block(&v);
+            let (x, y) = point_at(&v, block, "link");
+            let (x, y) = (x + 260.0, y);
+            assert!(
+                v.link_at(x, y).is_some(),
+                "the link is where the page shows it"
+            );
+            assert_eq!(v.link_at(x - 260.0, y), None, "and not where it was");
+            assert!(x > 260.0);
+            // Closing gives the width back, with the position.
+            v.apply(Action::ToggleToc, now);
+            assert_eq!(v.area_x(), 0);
+            assert_eq!(v.layout().params().width, 1000.0);
+            assert_eq!(v.anchor(), anchor);
+            // Wide enough or not is decided by the window: resizing across the limit relays out.
+            v.set_toc(true);
+            v.resize(739, 400);
+            assert!(!v.toc_pushes());
+            assert_eq!(v.layout().params().width, 739.0);
+            assert_eq!(v.anchor(), anchor);
+            v.resize(740, 400);
+            assert!(v.toc_pushes());
+            assert_eq!(v.layout().params().width, 480.0);
+            assert_eq!(v.anchor(), anchor);
+            // The panel scales with the display, not the zoom.
+            v.resize(1480, 400);
+            v.set_hidpi(2.0);
+            assert_eq!(v.toc_width(), 520);
+            assert!(v.toc_pushes());
+            v.set_zoom(150);
+            assert_eq!(v.toc_width(), 520);
+            v.set_hidpi(1.0);
+            v.set_zoom(100);
+        }
+
+        #[test]
+        fn a_narrow_window_is_covered_not_laid_out_again() {
+            let now = Instant::now();
+            let mut v = view(&sections(50), 700, 400);
+            settle(&mut v);
+            let (x, y) = point_at(&v, 1, "link");
+            assert!(v.link_at(x, y).is_some());
+            v.set_toc(true);
+            assert!(!v.toc_pushes());
+            assert_eq!(v.area_x(), 0);
+            assert_eq!(v.toc_width(), 260);
+            assert_eq!(v.layout().params().width, 700.0, "no relayout");
+            // The document keeps its place, but what is under the panel can't be reached.
+            assert!(x > 260.0 || v.link_at(x, y).is_none());
+            for probe in [(20.0, 100.0), (259.0, 300.0)] {
+                assert_eq!(v.link_at(probe.0, probe.1), None);
+                assert!(v.toc_covers(probe.0, probe.1));
+                assert!(!v.in_area(probe.0, probe.1));
+            }
+            assert!(!v.toc_covers(261.0, 100.0));
+            assert!(v.in_area(261.0, 100.0));
+            // What the document paints on top of the panel's neighbours stays right of it.
+            paint(&mut v, now);
+            v.apply(Action::ToggleToc, now);
+            assert_eq!(v.layout().params().width, 700.0);
+        }
+
+        #[test]
+        fn clicking_a_row_follows_its_anchor() {
+            let now = Instant::now();
+            let mut v = open_view(40, 1000, 400);
+            // Rows light up and show the hand under the pointer.
+            let p = row_point(&v, 3);
+            assert!(v.hover_at(p.0, p.1, now));
+            assert!(v.over_toc());
+            assert_eq!(v.hovered(), None, "no URL preview for a row");
+            assert!(v.hover_end());
+            assert!(!v.over_toc());
+            // The click is the heading's `#anchor`, which the shell follows like a link.
+            let href = click(&mut v, p, now).unwrap();
+            assert_eq!(href, "#s3");
+            assert!(v.jump_to_anchor("s3", now));
+            assert_eq!(v.anchor().block, v.doc().headings[3].block);
+            assert!(v.toc_open(), "a panel beside the document stays");
+            // Pressed on one row and released on another, or off the panel: no click.
+            let q = row_point(&v, 5);
+            v.press(p.0, p.1, now);
+            assert_eq!(v.click(q.0, q.1), None);
+            v.press(p.0, p.1, now);
+            assert_eq!(v.click(600.0, 100.0), None);
+            // The space below the last row is no row.
+            let mut short = open_view(3, 1000, 400);
+            let last = row_point(&short, 2);
+            assert!(short.toc_row_at(last.0, last.1).is_some());
+            assert_eq!(click(&mut short, (40.0, last.1 + 40.0), now), None);
+            // Over the document: a click follows links as ever.
+            settle(&mut v);
+            let block = link_block(&v);
+            let (x, y) = point_at(&v, block, "link");
+            let href = click(&mut v, (x + 260.0, y), now).unwrap();
+            assert!(href.starts_with("https://a.example/"), "{href}");
+        }
+
+        /// Over the document, a click on a row closes the panel as it follows the link, and a
+        /// click on the document closes it and does nothing more.
+        #[test]
+        fn an_overlaid_panel_closes_on_a_click() {
+            let now = Instant::now();
+            let mut v = open_view(40, 600, 400);
+            assert!(!v.toc_pushes());
+            let p = row_point(&v, 4);
+            assert_eq!(click(&mut v, p, now).as_deref(), Some("#s4"));
+            assert!(!v.toc_open(), "a click on a heading closes it");
+            // A click on the document outside the panel closes it, and follows no link.
+            v.set_toc(true);
+            settle(&mut v);
+            paint(&mut v, now);
+            let block = link_block(&v);
+            let (x, y) = point_at(&v, block, "link");
+            assert!(x > 260.0, "the link is beside the panel: {x}");
+            assert!(v.link_at(x, y).is_some());
+            assert!(v.press(x, y, now), "the press is taken");
+            assert!(!v.toc_open());
+            assert_eq!(v.click(x, y), None, "no link followed");
+            #[cfg(feature = "clipboard")]
+            {
+                assert!(!v.release_select());
+                assert_eq!(v.selection(), None);
+            }
+            // The toolbar's own clicks don't count as the document's.
+            v.set_toolbar(true);
+            v.set_toc(true);
+            assert!(v.press(20.0, 16.0, now));
+            assert!(v.toc_open(), "the toolbar took the press");
+        }
+
+        #[test]
+        fn escape_closes_the_menu_then_a_covering_panel_then_the_selection() {
+            let now = Instant::now();
+            // The dropdown first, over a panel that covers the whole narrow window.
+            let mut v = open_menu_view(now);
+            v.set_toc(true);
+            assert_eq!(v.apply(Action::Escape, now), Outcome::Redraw);
+            assert!(v.toc_open(), "the menu went first");
+            assert_eq!(v.apply(Action::Escape, now), Outcome::Redraw);
+            assert!(!v.toc_open());
+            assert_eq!(v.apply(Action::Escape, now), Outcome::Quit);
+            // A selection stays until the panel over the document is gone.
+            #[cfg(feature = "clipboard")]
+            {
+                let mut v = view(&sections(10), 600, 400);
+                v.set_toc(true);
+                assert_eq!(v.apply(Action::SelectAll, now), Outcome::Selected);
+                assert_eq!(v.apply(Action::Escape, now), Outcome::Redraw);
+                assert!(!v.toc_open() && v.selection().is_some());
+                assert_eq!(v.apply(Action::Escape, now), Outcome::Redraw);
+                assert_eq!(v.selection(), None);
+                assert_eq!(v.apply(Action::Escape, now), Outcome::Quit);
+            }
+            // A panel beside the document is not covering it: Escape leaves it.
+            let mut v = view(&sections(10), 1000, 400);
+            v.set_toc(true);
+            assert_eq!(v.apply(Action::Escape, now), Outcome::Quit);
+            assert!(v.toc_open());
+        }
+
+        #[cfg(feature = "clipboard")]
+        #[test]
+        fn a_selection_does_not_start_in_the_panel() {
+            let now = Instant::now();
+            let mut v = open_view(20, 1000, 400);
+            let p = row_point(&v, 2);
+            assert!(v.press(p.0, p.1, now));
+            assert!(
+                !v.select_to(600.0, 200.0, now),
+                "a drag from the panel selects nothing"
+            );
+            assert!(!v.selecting());
+            assert_eq!(v.selection(), None);
+            assert!(!v.release_select());
+            // Double and triple presses on a row select no word or block either.
+            for _ in 0..3 {
+                v.press(p.0, p.1, now);
+                v.release_select();
+                assert_eq!(v.selection(), None);
+            }
+            // A drag that starts in the document and runs over the panel goes on: the pointer
+            // counts as at the panel's edge, where the document starts.
+            settle(&mut v);
+            let (_, sy) = point_at(&v, 1, "Padding");
+            v.press(700.0, sy, now);
+            assert!(v.select_to(262.0, sy + 20.0, now));
+            assert!(v.selecting());
+            let at_edge = v.selection().unwrap();
+            v.select_to(30.0, sy + 20.0, now);
+            assert_eq!(
+                v.selection(),
+                Some(at_edge),
+                "clamped to the document's edge"
+            );
+            assert!(v.release_select());
+            // In a narrow window the same press closes the panel instead, and starts nothing.
+            let mut v = open_view(20, 600, 400);
+            assert!(v.press(400.0, 100.0, now));
+            assert!(!v.select_to(100.0, 200.0, now));
+            assert_eq!(v.selection(), None);
+        }
+
+        #[test]
+        fn the_wheel_over_the_panel_scrolls_it_and_not_the_document() {
+            let now = Instant::now();
+            let mut v = open_view(100, 1000, 300);
+            let before = v.scroll();
+            let p = row_point(&v, 2);
+            v.hover_at(p.0, p.1, now);
+            v.wheel_lines(3.0, now);
+            assert_eq!(v.scroll(), before, "the document stays");
+            assert!(v.toc.scroll > 0.0);
+            let scrolled = v.toc.scroll;
+            v.wheel_by(40.0, now);
+            assert_eq!(v.scroll(), before);
+            assert_eq!(v.toc.scroll, scrolled + 40.0);
+            v.wheel_by(-1.0e9, now);
+            assert_eq!(v.toc.scroll, 0.0, "it stops at the top");
+            v.wheel_by(1.0e9, now);
+            assert_eq!(v.toc.scroll, v.toc_geom().max_scroll(100), "and at the end");
+            assert_eq!(v.scroll(), before);
+            // Over the document it is the document's, and the panel is left.
+            v.toc.scroll = 100.0;
+            v.hover_at(600.0, 100.0, now);
+            v.wheel_lines(3.0, now);
+            assert!(v.scroll() > before);
+            assert_eq!(v.toc.scroll, 100.0);
+            // The keys scroll the document whatever the pointer is over.
+            v.hover_at(p.0, p.1, now);
+            let at = v.scroll();
+            v.apply(Action::Lines(2), now);
+            assert!(v.scroll() > at);
+            assert_eq!(v.toc.scroll, 100.0);
+            // A pointer that left the window leaves the panel its own.
+            v.hover_end();
+            v.wheel_by(50.0, now);
+            assert_eq!(v.toc.scroll, 100.0);
+        }
+
+        #[test]
+        fn a_notch_over_the_panel_is_rows_of_its_own_whatever_the_zoom() {
+            let now = Instant::now();
+            let mut v = open_view(100, 1000, 300);
+            let step = 3.0 * v.toc_geom().row();
+            let p = row_point(&v, 2);
+            v.hover_at(p.0, p.1, now);
+            v.wheel_lines(2.0, now);
+            assert_eq!(v.toc.scroll, 2.0 * step);
+            v.set_zoom(v.zoom() * 2);
+            v.toc.scroll = 0.0;
+            v.hover_at(p.0, p.1, now);
+            v.wheel_lines(2.0, now);
+            assert_eq!(
+                v.toc.scroll,
+                2.0 * step,
+                "the document's zoom doesn't change it"
+            );
+        }
+
+        #[test]
+        fn reload_keeps_the_panel_and_a_new_document_resets_it() {
+            let now = Instant::now();
+            let mut v = open_view(100, 1000, 300);
+            v.hover_at(50.0, 100.0, now);
+            v.wheel_by(600.0, now);
+            let kept = v.toc.scroll;
+            assert!(kept > 0.0);
+            v.replace(Doc::parse(&sections(100)), None);
+            paint(&mut v, now);
+            assert!(v.toc_open());
+            assert_eq!(v.toc.scroll, kept);
+            // A message in place of the document hides the panel and gives the room back; the
+            // next good version brings it back, with its scroll.
+            v.replace(Doc::parse(""), Some("Cannot open x".into()));
+            assert!(v.toc_open());
+            assert_eq!((v.toc_width(), v.area_x()), (0, 0));
+            assert_eq!(v.layout().params().width, 1000.0);
+            paint(&mut v, now);
+            assert!(!v.over_toc());
+            v.replace(Doc::parse(&sections(100)), None);
+            assert_eq!(v.toc_width(), 260);
+            assert_eq!(v.layout().params().width, 740.0);
+            paint(&mut v, now);
+            assert_eq!(v.toc.scroll, kept);
+            // Another document starts the panel at its top and keeps it open.
+            v.open(Doc::parse(&sections(30)), None);
+            assert!(v.toc_open());
+            assert_eq!(v.toc.scroll, 0.0);
+            assert_eq!(v.toc_rows(), 30);
+            paint(&mut v, now);
+            assert_eq!(v.toc_rows(), 30);
+            // The empty window has no panel; the setting is only remembered.
+            let mut v = view("", 1000, 400);
+            v.replace(Doc::parse(""), Some("Drop a file".into()));
+            v.set_toc(true);
+            assert!(v.toc_open());
+            assert_eq!(v.toc_width(), 0);
+            assert!(!v.toc_covers(10.0, 100.0));
+            paint(&mut v, now);
+        }
+
+        /// The scrollbar, the URL preview, the toast and the notice live in the document's area.
+        #[test]
+        fn the_documents_extras_keep_right_of_the_panel() {
+            let now = Instant::now();
+            let mut v = open_view(100, 1000, 400);
+            v.set_theme_mode(ThemeMode::Light);
+            settle(&mut v);
+            v.set_scroll(v.layout().top(30));
+            v.ensure();
+            // The scrollbar is at the window's right edge, and only there.
+            let thumb = v.thumb_at(v.scroll()).unwrap();
+            assert!(thumb.x1 <= 1000 && thumb.x0 > 260);
+            // A hovered link's preview, a toast and a notice sit in the area right of the panel.
+            let block = link_block(&v);
+            let (x, y) = point_at(&v, block, "link");
+            v.hover_at(x + 260.0, y, now);
+            v.show_toast("A toast".into(), now);
+            v.set_notice(Some("A notice".into()));
+            let buf = paint(&mut v, now);
+            let border = LIGHT.border;
+            // In the panel's columns only its separator (at x = 259) has the border's color,
+            // beside the (current row's) accent bar and nothing else of the boxes' outlines.
+            for y in 32..400 {
+                for x in 0..259 {
+                    assert_ne!(buf[y * 1000 + x], border, "({x}, {y})");
+                }
+            }
+            assert!(
+                (300..400).any(|y| (261..500).any(|x| buf[y * 1000 + x] == border)),
+                "the preview"
+            );
+            assert_eq!(v.panel_width(), 260);
+        }
+
+        #[test]
+        fn the_copy_button_and_image_placeholders_follow_the_shifted_document() {
+            let now = Instant::now();
+            let src = "Intro.\n\n```\nfn main() {\n    let x = 1;\n    let y = 2;\n}\n```\n\n## After\n\nMore text here.\n";
+            let mut v = view(src, 1000, 400);
+            v.set_toc(true);
+            settle(&mut v);
+            paint(&mut v, now);
+            #[cfg(feature = "clipboard")]
+            {
+                let b = v
+                    .doc()
+                    .blocks
+                    .iter()
+                    .position(|b| b.kind == BlockKind::Code)
+                    .unwrap();
+                let c = v.layout().geoms()[b].content.as_deref().unwrap();
+                let r = c.rects.iter().find(|r| r.role == Role::CodeBg).unwrap();
+                let (col_x, _) = v.layout().column();
+                let inside = (
+                    f64::from(260.0 + col_x + r.x + r.w / 2.0),
+                    v.layout().top(b) + f64::from(r.y + r.h / 2.0),
+                );
+                let button = v.copy_button_at(inside.0, inside.1).expect("a button");
+                assert!(button.x0 > 260.0, "the button is on the page: {button:?}");
+                assert!(v.press(button.x0 as f64 + 3.0, button.y0 as f64 + 3.0, now));
+                assert!(
+                    v.release_copy(button.x0 as f64 + 3.0, button.y0 as f64 + 3.0)
+                        .is_some()
+                );
+                // The same point without the shift is the panel's: no code block there.
+                assert!(
+                    v.copy_button_at(inside.0 - 260.0, inside.1).is_none()
+                        || inside.0 - 260.0 >= 260.0
+                );
+            }
+            #[cfg(feature = "remote-images")]
+            {
+                use crate::settings::RemoteImages;
+                // Nothing listens on the discard port; the image is blocked anyway.
+                let mut v = view("Text ![r](http://127.0.0.1:9/a.png) more.\n", 1000, 400);
+                v.set_remote_policy(RemoteImages::Ask);
+                v.set_toc(true);
+                settle(&mut v);
+                paint(&mut v, now);
+                let hit = (0..1000)
+                    .flat_map(|x| (32..80).map(move |y| (f64::from(x), f64::from(y))))
+                    .find(|&(x, y)| v.image_at(x, y) == Some(1))
+                    .expect("a placeholder on screen");
+                assert!(hit.0 > 260.0, "the placeholder is on the page: {hit:?}");
+                assert!(v.hover_at(hit.0, hit.1, now));
+                assert!(v.hover_blocked);
+                // Under the panel the document is out of reach, hit or not.
+                assert!(v.hover_at(hit.0 - 260.0, hit.1, now));
+                assert!(!v.hover_blocked);
+            }
         }
     }
 }

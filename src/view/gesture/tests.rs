@@ -711,8 +711,8 @@ fn the_copy_keys() {
         key(&Key::Named(NamedKey::Copy), ModifiersState::empty()),
         Some(Action::Copy)
     );
-    // Plain `c` and Insert alone are no shortcuts.
-    assert_eq!(key(&c, ModifiersState::empty()), None);
+    // Insert alone is no shortcut, and plain `c` is the contents panel's, not a copy.
+    assert_ne!(key(&c, ModifiersState::empty()), Some(Action::Copy));
     assert_eq!(
         key(&Key::Named(NamedKey::Insert), ModifiersState::empty()),
         None

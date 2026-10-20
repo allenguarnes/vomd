@@ -33,6 +33,8 @@ use crate::toolbar::{self, Toolbar};
 mod copybtn;
 #[cfg(feature = "clipboard")]
 mod gesture;
+#[cfg(feature = "toc")]
+mod toc;
 
 #[cfg(feature = "clipboard")]
 pub use copybtn::CodeCopy;
@@ -104,8 +106,11 @@ pub enum Action {
     ToggleToolbar,
     /// Wide layout on or off (`W`): the text spans the window or stops at `line_width`.
     ToggleWide,
-    /// Escape: closes the toolbar's dropdown if it's open, else clears the selection, else
-    /// quits.
+    /// Show or hide the table of contents panel (`C`).
+    #[cfg(feature = "toc")]
+    ToggleToc,
+    /// Escape: closes the toolbar's dropdown if it's open, else the contents panel if it covers
+    /// the document, else clears the selection, else quits.
     Escape,
     /// Select the whole document (`Ctrl+A`).
     #[cfg(feature = "clipboard")]
@@ -247,6 +252,8 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             "]" => Some(Action::NextHeading),
             "b" | "B" => Some(Action::ToggleToolbar),
             "w" | "W" => Some(Action::ToggleWide),
+            #[cfg(feature = "toc")]
+            "c" | "C" => Some(Action::ToggleToc),
             "i" | "I" if cfg!(feature = "remote-images") => Some(Action::ToggleRemote),
             _ => None,
         },
@@ -487,6 +494,9 @@ pub struct View {
     /// The copy button on the code block under the pointer.
     #[cfg(feature = "clipboard")]
     copy: copybtn::CopyButton,
+    /// The contents panel: whether it is open, and what it lists.
+    #[cfg(feature = "toc")]
+    toc: toc::Panel,
 }
 
 impl View {
@@ -564,6 +574,8 @@ impl View {
             select: gesture::Select::default(),
             #[cfg(feature = "clipboard")]
             copy: copybtn::CopyButton::default(),
+            #[cfg(feature = "toc")]
+            toc: toc::Panel::default(),
         };
         view.images.set_base(base);
         view.attach_images();
@@ -660,6 +672,8 @@ impl View {
     /// loaded (the defaults are used).
     pub fn set_family(&mut self, mono: bool, faces: Option<&[Option<(PathBuf, u32)>; 4]>) -> bool {
         let ok = self.fonts.set_family(mono, faces);
+        #[cfg(feature = "toc")]
+        self.toc.forget_rows();
         self.layout.invalidate_all();
         self.ensure();
         ok
@@ -727,6 +741,8 @@ impl View {
             zoom: self.zoom,
             theme: self.theme,
             wide: self.wide,
+            #[cfg(feature = "toc")]
+            toc: self.toc.open,
             settings: self.settings,
             remote: self.remote_count,
             remote_on: self.images.remote_on(),
@@ -738,6 +754,68 @@ impl View {
     /// The document area's height.
     fn area_height(&self) -> u32 {
         self.height.saturating_sub(self.top_inset)
+    }
+
+    /// Width of the contents panel in physical pixels: 0 while it isn't showing.
+    fn panel_width(&self) -> u32 {
+        #[cfg(feature = "toc")]
+        {
+            self.toc_width()
+        }
+        #[cfg(not(feature = "toc"))]
+        {
+            0
+        }
+    }
+
+    /// Where the document area starts: right of the panel when it pushes the document aside, at
+    /// the window's edge when it covers it (or there is none).
+    fn area_x(&self) -> u32 {
+        #[cfg(feature = "toc")]
+        {
+            if self.toc_pushes() {
+                self.toc_width()
+            } else {
+                0
+            }
+        }
+        #[cfg(not(feature = "toc"))]
+        {
+            0
+        }
+    }
+
+    /// The width the document is laid out in: the area's.
+    fn layout_width(&self) -> u32 {
+        self.width.saturating_sub(self.area_x())
+    }
+
+    /// The layout parameters for the window as it is.
+    fn layout_params(&self) -> Params {
+        params(
+            self.layout_width(),
+            self.hidpi,
+            self.zoom,
+            self.text,
+            self.wide,
+        )
+    }
+
+    /// The point is in the part of the document area that shows the document: not on the
+    /// toolbar, and not under the contents panel.
+    pub(super) fn in_area(&self, x: f64, y: f64) -> bool {
+        (f64::from(self.panel_width())..f64::from(self.width)).contains(&x)
+            && (f64::from(self.top_inset)..f64::from(self.height)).contains(&y)
+    }
+
+    /// Document x of window x: layout coordinates start at the area's left edge.
+    pub(super) fn doc_x(&self, x: f64) -> f64 {
+        x - f64::from(self.area_x())
+    }
+
+    /// Document y of window y, for a point in the area.
+    pub(super) fn doc_y(&self, y: f64) -> f64 {
+        self.scroll() + (y - f64::from(self.top_inset))
     }
 
     /// The window was resized (physical pixels).
@@ -767,9 +845,7 @@ impl View {
     /// estimates in the new column, nothing rewrapped), so a window that got narrower and taller
     /// would seem to end above the position, and clamping against that would throw it away.
     fn relayout(&mut self) {
-        self.layout.set_params(params(
-            self.width, self.hidpi, self.zoom, self.text, self.wide,
-        ));
+        self.layout.set_params(self.layout_params());
         self.ensure();
     }
 
@@ -814,7 +890,22 @@ impl View {
 
     /// Wheel notches (line deltas, positive = down).
     pub fn wheel_lines(&mut self, lines: f64, now: Instant) {
-        self.scroll_by(lines * WHEEL_LINES * self.line(), now);
+        #[cfg(feature = "toc")]
+        if self.toc_wheel_lines(lines) {
+            return;
+        }
+        self.wheel_by(lines * WHEEL_LINES * self.line(), now);
+    }
+
+    /// Trackpad or wheel scrolling by `dy` physical pixels: the contents panel takes it when
+    /// the pointer is over it, else the document (and the toolbar's dropdown) does, as in
+    /// [`View::scroll_by`].
+    pub fn wheel_by(&mut self, dy: f64, now: Instant) {
+        #[cfg(feature = "toc")]
+        if self.toc_wheel(dy) {
+            return;
+        }
+        self.scroll_by(dy, now);
     }
 
     /// Ctrl + trackpad scroll by `pixels` (positive = zoom in): a zoom step for every
@@ -876,6 +967,8 @@ impl View {
             Action::Reload => return Outcome::Reload,
             Action::Open => return Outcome::Open,
             Action::ToggleWide => self.set_wide(!self.wide),
+            #[cfg(feature = "toc")]
+            Action::ToggleToc => self.set_toc(!self.toc.open),
             Action::ToggleRemote => {
                 if self.remote_count == 0 {
                     return Outcome::Nothing;
@@ -884,6 +977,8 @@ impl View {
                 self.set_remote(on);
             }
             Action::Escape if self.close_menu() => {}
+            #[cfg(feature = "toc")]
+            Action::Escape if self.toc_escape() => {}
             #[cfg(feature = "clipboard")]
             Action::Escape if self.clear_selection() => {}
             #[cfg(feature = "clipboard")]
@@ -912,7 +1007,7 @@ impl View {
     fn viewport(&self) -> Viewport {
         Viewport {
             area: Clip {
-                x0: 0,
+                x0: self.area_x().min(i32::MAX as u32) as i32,
                 y0: self.top_inset.min(i32::MAX as u32) as i32,
                 x1: self.width.min(i32::MAX as u32) as i32,
                 y1: self.height.min(i32::MAX as u32) as i32,
@@ -942,6 +1037,14 @@ impl View {
         self.cancel_copy();
         let ctx = self.toolbar_ctx();
         if self.toolbar.press(&ctx, x, y) {
+            self.pressed = None;
+            #[cfg(feature = "clipboard")]
+            self.cancel_select();
+            return true;
+        }
+        // The contents panel's, or the click outside it that closes it over the document.
+        #[cfg(feature = "toc")]
+        if self.press_toc(x, y) {
             self.pressed = None;
             #[cfg(feature = "clipboard")]
             self.cancel_select();
@@ -1020,13 +1123,18 @@ impl View {
         self.anchor != before
     }
 
-    /// The mouse button was released. Returns true if a drag ended.
+    /// The mouse button was released. Returns true if a drag ended, or a press on the contents
+    /// panel did (its row stops looking pressed, whether or not it was a click).
     pub fn release(&mut self, now: Instant) -> bool {
+        #[cfg(feature = "toc")]
+        let row = self.toc.pressed.is_some();
+        #[cfg(not(feature = "toc"))]
+        let row = false;
         if self.drag.take().is_some() {
             self.fade.poke(now);
             return true;
         }
-        false
+        row
     }
 
     /// The mouse button came up at (`x`, `y`) after a press the toolbar took. Returns true if
@@ -1056,16 +1164,16 @@ impl View {
 
     /// The link (1-based id into `Doc::links`) under window point (`x`, `y`), if any. Only
     /// blocks near the viewport have content to hit, which covers everything on screen; a point
-    /// outside the document area (a press-drag goes on reporting the pointer beyond the window)
-    /// hits nothing even where cached content continues, and neither does NaN.
+    /// outside the document area (a press-drag goes on reporting the pointer beyond the window,
+    /// and the contents panel may cover the document's edge) hits nothing even where cached
+    /// content continues, and neither does NaN.
     pub fn link_at(&self, x: f64, y: f64) -> Option<u32> {
-        let inside = (0.0..f64::from(self.width)).contains(&x)
-            && (f64::from(self.top_inset)..f64::from(self.height)).contains(&y);
-        if self.message.is_some() || !inside {
+        if self.message.is_some() || !self.in_area(x, y) {
             return None;
         }
-        let doc_y = self.scroll() + (y - f64::from(self.top_inset));
-        let hit = self.layout.hit(x as f32, doc_y as f32)?;
+        let hit = self
+            .layout
+            .hit(self.doc_x(x) as f32, self.doc_y(y) as f32)?;
         (hit.link != 0).then_some(hit.link)
     }
 
@@ -1084,6 +1192,12 @@ impl View {
         // A selection drag has no links under it: the text cursor stays.
         #[cfg(feature = "clipboard")]
         let free = free && !self.selecting();
+        // The contents panel's rows light up under the pointer, and the document under it is
+        // out of reach.
+        #[cfg(feature = "toc")]
+        let bar = bar | self.toc_pointer(Some((x, y)), free);
+        #[cfg(feature = "toc")]
+        let free = free && !self.toc_covers(x, y);
         let link = if free { self.link_at(x, y) } else { None };
         let bar = bar | self.set_over_bar(free && self.bar_column(x, y).is_some(), now);
         let blocked = cfg!(feature = "remote-images")
@@ -1102,6 +1216,8 @@ impl View {
     pub fn hover_end(&mut self) -> bool {
         let note = std::mem::take(&mut self.hover_blocked);
         let bar = self.set_over_bar(false, Instant::now());
+        #[cfg(feature = "toc")]
+        let bar = bar | self.toc_pointer(None, false);
         #[cfg(feature = "clipboard")]
         let note = note | self.copy_pointer(None);
         self.hover.take().is_some() | self.toolbar.leave() | note | bar
@@ -1126,8 +1242,14 @@ impl View {
     }
 
     /// The mouse button came up at (`x`, `y`): the target of the link clicked (pressed and
-    /// released on the same link), if any.
+    /// released on the same link), if any. A click on a row of the contents panel gives the
+    /// `#anchor` of its heading, which the shell follows like a link of the document.
     pub fn click(&mut self, x: f64, y: f64) -> Option<String> {
+        // A click on the contents panel is a link to a heading, whatever else was pressed.
+        #[cfg(feature = "toc")]
+        if let Some(row) = self.toc.pressed.take() {
+            return self.click_toc(row, x, y);
+        }
         let pressed = self.pressed.take()?;
         self.ensure_content();
         if self.link_at(x, y) != Some(pressed) {
@@ -1256,6 +1378,8 @@ impl View {
                 until.get_or_insert(now + NOTICE);
                 self.paint_toast(&mut frame, &text, theme, true);
             }
+            #[cfg(feature = "toc")]
+            self.paint_toc(&mut frame, theme);
         }
         let ctx = self.toolbar_ctx();
         self.toolbar.paint(
@@ -1272,6 +1396,8 @@ impl View {
     /// an ellipsis when it doesn't fit.
     fn paint_preview(&mut self, frame: &mut Frame, url: &str, theme: &Theme) {
         let (w, h) = (frame.width() as f32, frame.height() as f32);
+        // The box sits in what shows of the document, right of the contents panel.
+        let left = self.panel_width() as f32;
         let scale = self.scale();
         let size = PREVIEW_SIZE * scale;
         let style = TextStyle {
@@ -1285,13 +1411,15 @@ impl View {
             link: 0,
         };
         let (pad_x, pad_y, margin) = (0.5 * size, 0.3 * size, (4.0 * scale).round());
-        let max_w = (w * 0.6).min(w - 2.0 * (margin + pad_x)).max(size);
+        let max_w = ((w - left) * 0.6)
+            .min(w - left - 2.0 * (margin + pad_x))
+            .max(size);
         let (para, pl) = self.fit_preview(url, style, max_w);
         self.msg_missing
             .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
         let box_w = pl.width.min(max_w) + 2.0 * pad_x;
         let box_h = pl.height + 2.0 * pad_y;
-        let (x0, y1) = (margin, h - margin);
+        let (x0, y1) = (left + margin, h - margin);
         let y0 = y1 - box_h;
         let px = |v: f32| v.round() as i32;
         let r = (0.3 * size).round();
@@ -1324,6 +1452,7 @@ impl View {
     /// toolbar (`top`: the large-file notice).
     fn paint_toast(&mut self, frame: &mut Frame, text: &str, theme: &Theme, top: bool) {
         let (w, h) = (frame.width() as f32, frame.height() as f32);
+        let left = self.panel_width() as f32;
         let scale = self.hidpi as f32;
         let size = 13.0 * scale;
         let style = TextStyle {
@@ -1339,7 +1468,7 @@ impl View {
         let mut para = Para::default();
         para.push_text(text, 0, style);
         let (pad_x, pad_y, margin) = (0.8 * size, 0.5 * size, (12.0 * scale).round());
-        let max_w = (w - 2.0 * (margin + pad_x)).max(size);
+        let max_w = (w - left - 2.0 * (margin + pad_x)).max(size);
         let pl = self
             .msg_ctx
             .layout(&self.fonts, &para, max_w, Align::Start, 1.4);
@@ -1348,9 +1477,9 @@ impl View {
         let (box_w, box_h) = (pl.width + 2.0 * pad_x, pl.height + 2.0 * pad_y);
         let (x0, y0) = if top {
             let y0 = self.top_inset as f32 + margin;
-            (((w - box_w) / 2.0).max(0.0), y0)
+            (left + ((w - left - box_w) / 2.0).max(0.0), y0)
         } else {
-            ((w - margin - box_w).max(0.0), h - margin - box_h)
+            ((w - margin - box_w).max(left), h - margin - box_h)
         };
         let (x1, y1) = ((x0 + box_w).min(w), y0 + box_h);
         let px = |v: f32| v.round() as i32;
@@ -1372,21 +1501,33 @@ impl View {
         );
     }
 
-    /// `url` laid out in one line no wider than `max_w`: cut short with a trailing `…` when it
-    /// is wider, at the longest prefix that fits when measured (character counts say little
-    /// about width: CJK and wide hosts take twice the room of ASCII). Invisible characters
-    /// (bidi controls, zero-width ones) are shown as `\u{202E}`, never acted on, and a URL that
-    /// starts with right-to-left text is still laid out left to right.
+    /// A link's target laid out for the URL preview: see [`View::fit_line`], with the invisible
+    /// characters shown.
     fn fit_preview(&mut self, url: &str, style: TextStyle, max_w: f32) -> (Para, ParaLayout) {
-        // Characters narrower than a fifth of an em are rare, so a longer URL is cut to this
+        self.fit_line(url, style, max_w, true)
+    }
+
+    /// `raw` laid out in one line no wider than `max_w`: cut short with a trailing `…` when it
+    /// is wider, at the longest prefix that fits when measured (character counts say little
+    /// about width: CJK and wide hosts take twice the room of ASCII). With `escape`, invisible
+    /// characters (bidi controls, zero-width ones) are shown as `\u{202E}`, never acted on, as
+    /// a URL's must be; text that starts with right-to-left text is still laid out left to right.
+    fn fit_line(
+        &mut self,
+        raw: &str,
+        style: TextStyle,
+        max_w: f32,
+        escape: bool,
+    ) -> (Para, ParaLayout) {
+        // Characters narrower than a fifth of an em are rare, so a longer line is cut to this
         // many before measuring: a huge link isn't laid out whole on every paint.
         let most = (max_w / (0.2 * style.size)) as usize + 1;
         // The first `most` characters as shown, and where each one ends in `text`: a cut never
         // falls inside an escape.
         let (mut text, mut ends) = (String::new(), Vec::new());
-        let mut chars = url.chars();
+        let mut chars = raw.chars();
         for c in chars.by_ref().take(most) {
-            if crate::nav::is_invisible(c) {
+            if escape && crate::nav::is_invisible(c) {
                 text.push_str(&format!("\\u{{{:04X}}}", c as u32));
             } else {
                 text.push(c);
@@ -1582,6 +1723,8 @@ impl View {
             added |= self.fonts.add_fallback(&f.path, f.index).is_some();
         }
         if added {
+            #[cfg(feature = "toc")]
+            self.toc.forget_rows();
             self.layout.invalidate_missing(&self.doc);
         }
         added
@@ -1732,13 +1875,12 @@ impl View {
 
     /// The image whose placeholder or box is at window point (`x`, `y`), if any.
     fn image_at(&self, x: f64, y: f64) -> Option<u32> {
-        let inside = (0.0..f64::from(self.width)).contains(&x)
-            && (f64::from(self.top_inset)..f64::from(self.height)).contains(&y);
-        if self.message.is_some() || !inside {
+        if self.message.is_some() || !self.in_area(x, y) {
             return None;
         }
-        let doc_y = self.scroll() + (y - f64::from(self.top_inset));
-        let hit = self.layout.hit(x as f32, doc_y as f32)?;
+        let hit = self
+            .layout
+            .hit(self.doc_x(x) as f32, self.doc_y(y) as f32)?;
         let block = &self.doc.blocks[hit.block as usize];
         let cells = self.doc.row_cells(block).map(|(_, spans)| spans);
         std::iter::once(self.doc.block_spans(block))
@@ -1765,12 +1907,11 @@ impl View {
     fn open_doc(&mut self, doc: Doc, message: Option<String>) {
         self.doc = share(doc);
         self.message = message;
-        self.layout = Layout::new(
-            &self.doc,
-            params(self.width, self.hidpi, self.zoom, self.text, self.wide),
-        );
+        self.layout = Layout::new(&self.doc, self.layout_params());
         self.anchor = Anchor::TOP;
         self.drag = None;
+        #[cfg(feature = "toc")]
+        self.forget_toc();
         #[cfg(feature = "clipboard")]
         {
             self.clear_selection();
@@ -1821,10 +1962,9 @@ impl View {
         }
         self.doc = share(doc);
         self.message = message;
-        self.layout = Layout::new(
-            &self.doc,
-            params(self.width, self.hidpi, self.zoom, self.text, self.wide),
-        );
+        self.layout = Layout::new(&self.doc, self.layout_params());
+        #[cfg(feature = "toc")]
+        self.refresh_toc();
         // A reload keeps remote images on.
         self.attach_images();
         self.anchor = Anchor::TOP;

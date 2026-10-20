@@ -18,6 +18,8 @@ the network unless you ask it to.
   `Ctrl+A`; `Ctrl+C` copies it as plain text, and what you select is also pasted by a middle
   click (X11 and Wayland). A code block shows a copy button, as on GitHub, when the pointer is
   over it.
+- **Contents panel**: `C` shows the headings in a panel at the left, with the current one
+  marked; a click jumps to a heading.
 - **Live reload**: when the window gets focus, a document that changed on disk is shown again
   at the same place.
 - **Large files**: a 5 MB document opens in under 100 ms. Files over 10 MB still render, with
@@ -98,7 +100,8 @@ cargo build --release --no-default-features
 ```
 
 The Cargo features are `images` (PNG/JPEG), `remote-images` (via the system `curl`),
-`embed-fonts` and `clipboard` (selecting and copying text). All four are on by default.
+`embed-fonts`, `clipboard` (selecting and copying text) and `toc` (the contents panel). All five
+are on by default.
 
 ## Usage
 
@@ -123,6 +126,7 @@ Each window is its own process, so opening another file starts another window.
 | `Ctrl` + `=` `-` `0`, `Ctrl` + wheel | Zoom in / out / reset |
 | `T` | Theme: system → light → dark |
 | `B` | Show / hide the toolbar |
+| `C` | Show / hide the contents panel |
 | `W` | Wide layout on / off: the text spans the window instead of stopping at `line_width` |
 | `I` | Load remote images for this document (press again to hide them) |
 | `R`, `F5` | Reload |
@@ -135,7 +139,7 @@ Each window is its own process, so opening another file starts another window.
 | `Ctrl+C`, `Ctrl+Insert` | Copy the selection |
 | `Backspace`, `Alt+←`, `Ctrl+[` | Back |
 | `Ctrl+O` | Open a file (the desktop's file dialog) |
-| `Esc` | Close the open menu, else clear the selection, else quit |
+| `Esc` | Close the open menu, else the contents panel if it covers the document, else clear the selection, else quit |
 | `Q`, `Ctrl+W` | Quit |
 
 **Copying.** `Ctrl+C` copies the selected text to the clipboard as plain text: the text as it
@@ -158,6 +162,16 @@ taller than the window keeps its button at its top, where it scrolls away with t
 there is no clipboard to copy to, a note in the window says so. The button needs the pointer;
 `Ctrl+A` and `Ctrl+C` are the keyboard's way to copy.
 
+**Contents.** `C` (or the toolbar's list button) shows a panel at the window's left with the
+document's headings, h1 to h6, indented by level; the heading you are reading is marked, and the
+panel follows it as you scroll. A click on a heading jumps to it, as a link to its `#anchor` does,
+so Back returns. The wheel over the panel scrolls it and not the document. In a window at least
+740 logical pixels wide the panel sits beside the document, which is laid out in the room that
+is left, keeping your place; in a narrower one it covers the document's edge, and a click on a
+heading, a click on the document or `Esc` closes it. A document without headings says so.
+Headings inside footnotes are not listed. The panel's size follows the display's scale and not
+the zoom.
+
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends
 one of them, the Arch packages list them as optional dependencies, and the AppImage needs one
@@ -174,6 +188,7 @@ it with every key listed and commented out:
 | `theme` | `system`, `light`, `dark` |
 | `zoom` | `100` (50–300) |
 | `toolbar` | `true`, `false` |
+| `toc` | `false`, `true` (the contents panel; `C` toggles it) |
 | `window_width`, `window_height` | `900`, `1000` (logical pixels; saved on close) |
 | `remote_images` | `ask`, `never`, `always` |
 | `font_size` | `16` (10–32) |
@@ -182,7 +197,8 @@ it with every key listed and commented out:
 | `primary_selection` | `on`, `off` (selecting text offers it for a middle click; `Ctrl+C` is not affected) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed family such as `Noto Sans` |
 
-Theme, zoom, toolbar, wide layout and window size are saved automatically when you change them.
+Theme, zoom, toolbar, contents panel, wide layout and window size are saved automatically when you
+change them.
 
 ## Privacy
 
@@ -197,7 +213,6 @@ on. `never` removes the option.
 
 - **Linux only** for now. The code is portable and compiles for Windows and macOS, but those
   are untested and unsupported until a later release.
-- No table of contents panel yet; it is planned.
 - Selecting and copying, and the code blocks' copy button, work on X11 and Wayland only; there
   is no keyboard selection (Shift and the arrows), the button can't be reached from the
   keyboard, and a word is a run of letters, digits and marks (a run of Chinese or Japanese

@@ -1,5 +1,8 @@
 use super::*;
 
+/// The contents button's width in the left group (none without the feature).
+const TOC: f32 = if cfg!(feature = "toc") { BUTTON } else { 0.0 };
+
 fn ctx(width: u32) -> Ctx {
     Ctx {
         width,
@@ -9,6 +12,8 @@ fn ctx(width: u32) -> Ctx {
         zoom: 100,
         theme: ThemeMode::System,
         wide: false,
+        #[cfg(feature = "toc")]
+        toc: false,
         settings: true,
         remote: 0,
         remote_on: false,
@@ -45,6 +50,8 @@ fn wide_bar_shows_everything() {
         [
             Item::Back,
             Item::Open,
+            #[cfg(feature = "toc")]
+            Item::Contents,
             Item::Settings,
             Item::Reload,
             Item::Theme,
@@ -61,6 +68,12 @@ fn wide_bar_shows_everything() {
     // Open right after Back.
     assert_eq!(r(Item::Open).x0, r(Item::Back).x1);
     assert_eq!(r(Item::Open).x1, EDGE + LEFT);
+    #[cfg(feature = "toc")]
+    {
+        // The contents button follows Open.
+        assert_eq!(r(Item::Contents).x0, r(Item::Open).x1);
+        assert_eq!(r(Item::Contents).x1, EDGE + LEFT + BUTTON);
+    }
     assert!(r(Item::ZoomOut).x1 <= r(Item::ZoomReset).x0 + 0.01);
     assert!(r(Item::ZoomIn).x1 <= r(Item::Wide).x0 + 0.01);
     assert!(r(Item::Wide).x1 <= r(Item::Theme).x0 + 0.01);
@@ -74,12 +87,12 @@ fn wide_bar_shows_everything() {
 
 #[test]
 fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
-    let full = (EDGE + LEFT + GAP + 2.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
+    let full = (EDGE + LEFT + TOC + GAP + 2.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
     assert!(slots(&ctx(full)).overflow.is_empty(), "exactly fits");
     let s = slots(&ctx(full - 1));
     assert_eq!(s.overflow, [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]);
     assert!(items(&s).contains(&Item::More) && items(&s).contains(&Item::Theme));
-    let s = slots(&ctx(182));
+    let s = slots(&ctx(182 + TOC as u32));
     assert_eq!(
         s.overflow,
         [
@@ -92,7 +105,7 @@ fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
     );
     // Wide layout goes before the theme: with room for the theme, reload and ⚙ only, it's in
     // the dropdown.
-    let s = slots(&ctx(232));
+    let s = slots(&ctx(232 + TOC as u32));
     assert_eq!(s.overflow.last(), Some(&Item::Wide));
     assert!(items(&s).contains(&Item::Theme));
     // Down to 320 px and below, everything stays reachable: shown or in the menu.
@@ -103,6 +116,8 @@ fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
         for item in [
             Item::Back,
             Item::Open,
+            #[cfg(feature = "toc")]
+            Item::Contents,
             Item::ZoomOut,
             Item::ZoomReset,
             Item::ZoomIn,
@@ -142,6 +157,8 @@ fn clicks_map_to_the_shortcuts_actions() {
     for (item, want) in [
         (Item::Back, Command::Action(Action::Back)),
         (Item::Open, Command::Action(Action::Open)),
+        #[cfg(feature = "toc")]
+        (Item::Contents, Command::Action(Action::ToggleToc)),
         (Item::ZoomOut, Command::Action(Action::ZoomOut)),
         (Item::ZoomReset, Command::Action(Action::ZoomReset)),
         (Item::ZoomIn, Command::Action(Action::ZoomIn)),
@@ -250,7 +267,7 @@ fn nothing_outside_the_window_is_hit() {
 fn short_window_scrolls_the_dropdown() {
     let c = Ctx {
         height: 100,
-        ..ctx(182)
+        ..ctx(182 + TOC as u32)
     };
     let s = slots(&c);
     assert_eq!(
@@ -307,7 +324,7 @@ fn short_window_scrolls_the_dropdown() {
 /// A press on another bar button closes the dropdown and still acts.
 #[test]
 fn another_button_closes_the_dropdown() {
-    let c = ctx(200);
+    let c = ctx(200 + TOC as u32);
     let s = slots(&c);
     let mut t = Toolbar::default();
     let (mx, my) = center(&s, Item::More);
@@ -362,7 +379,7 @@ fn dropdown_without_overflow_is_closed() {
 /// A tooltip isn't due the moment the dropdown closes: the timer only runs while it's shut.
 #[test]
 fn no_tooltip_timer_under_the_dropdown() {
-    let c = ctx(200);
+    let c = ctx(200 + TOC as u32);
     let s = slots(&c);
     let mut t = Toolbar::default();
     let (mx, my) = center(&s, Item::More);
@@ -437,6 +454,44 @@ fn labels_name_the_shortcut() {
             ..c
         }),
         "Theme: dark (T)"
+    );
+}
+
+/// The contents button sits with Back and Open, names its shortcut either way round, and goes into
+/// the dropdown last of all, at the top of it.
+#[cfg(feature = "toc")]
+#[test]
+fn the_contents_button_goes_last() {
+    let c = ctx(900);
+    assert_eq!(Item::Contents.label(&c), "Contents (C)");
+    assert_eq!(
+        Item::Contents.label(&Ctx { toc: true, ..c }),
+        "Hide contents (C)"
+    );
+    // One pixel short of the room for all of it, the right group's leading groups are in `⋯`
+    // and the button is still where it was; narrower than the left group and `⋯`, it joins them.
+    let s = slots(&ctx(200 + TOC as u32));
+    assert!(items(&s).contains(&Item::Contents));
+    assert!(!s.overflow.contains(&Item::Contents));
+    let edge = (EDGE + LEFT + TOC + GAP + BUTTON + EDGE) as u32;
+    let s = slots(&ctx(edge));
+    assert!(items(&s).contains(&Item::Contents), "{:?}", s.overflow);
+    let s = slots(&ctx(edge - 1));
+    assert_eq!(s.overflow.first(), Some(&Item::Contents));
+    assert!(!items(&s).contains(&Item::Contents));
+    let more = center(&s, Item::More);
+    // The dropdown's first row is the button, and its click is the toggle.
+    let mut t = Toolbar::default();
+    let c = ctx(edge - 1);
+    t.press(&c, more.0, more.1);
+    t.release(&c, more.0, more.1);
+    let rows = menu_rows(&c, &s, 0.0);
+    assert_eq!(rows[0].0, Item::Contents);
+    let (x, y) = (f64::from(rows[0].1.x0 + 5.0), f64::from(rows[0].1.y0 + 5.0));
+    t.press(&c, x, y);
+    assert_eq!(
+        t.release(&c, x, y),
+        (true, Some(Command::Action(Action::ToggleToc)))
     );
 }
 
@@ -524,7 +579,7 @@ fn the_remote_images_button() {
     t.press(&none, x, y);
     assert_eq!(t.release(&none, x, y), (true, None));
     // Narrower: the zoom goes into `⋯` first, then it.
-    let full = (EDGE + LEFT + GAP + 3.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
+    let full = (EDGE + LEFT + TOC + GAP + 3.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
     assert!(slots(&Ctx { width: full, ..c }).overflow.is_empty());
     let s = slots(&Ctx {
         width: full - 1,

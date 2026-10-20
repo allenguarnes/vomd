@@ -98,7 +98,10 @@ impl View {
         let content = self.layout.geoms()[i].content.as_deref()?;
         let (rx, ry, rw, rh) = code_rect(content)?;
         let (col_x, _) = self.layout.column();
-        let (lx, ly) = (x as f32 - col_x, (doc_y - self.layout.top(i)) as f32);
+        let (lx, ly) = (
+            self.doc_x(x) as f32 - col_x,
+            (doc_y - self.layout.top(i)) as f32,
+        );
         if !(rx..rx + rw).contains(&lx) || !(ry..ry + rh).contains(&ly) {
             return None;
         }
@@ -122,7 +125,7 @@ impl View {
         if f64::from(hw) < room || height < room {
             return None;
         }
-        let right = f64::from(col_x + hx + hw) - inset;
+        let right = f64::from(self.area_x()) + f64::from(col_x + hx + hw) - inset;
         let y0 = f64::from(self.top_inset) + top + inset - self.scroll();
         let button = Rect {
             x0: (right - size) as f32,

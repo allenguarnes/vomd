@@ -248,6 +248,9 @@ struct App {
     toolbar_shown: bool,
     /// The wide layout as last applied from or saved to the settings.
     wide_set: bool,
+    /// The contents panel as last applied from or saved to the settings.
+    #[cfg(feature = "toc")]
+    toc_set: bool,
     shown: bool,
     exit_code: i32,
 }
@@ -320,6 +323,11 @@ impl App {
         }
         self.toolbar_shown = prefs.toolbar;
         self.wide_set = prefs.wide;
+        #[cfg(feature = "toc")]
+        {
+            view.set_toc(prefs.toc);
+            self.toc_set = prefs.toc;
+        }
         for mono in [false, true] {
             let (family, cached) = if mono {
                 (&prefs.font_mono, &prefs.font_mono_path)
@@ -393,6 +401,15 @@ impl App {
                 self.wide_set = wide;
                 self.store
                     .set("wide", if wide { "true" } else { "false" }, now);
+            }
+            #[cfg(feature = "toc")]
+            {
+                let toc = view.toc_open();
+                if toc != self.toc_set {
+                    self.toc_set = toc;
+                    self.store
+                        .set("toc", if toc { "true" } else { "false" }, now);
+                }
             }
         }
     }
@@ -549,11 +566,14 @@ impl App {
         } else {
             view.hover_end()
         };
-        // The hand is for what a click acts on: a link, a code block's copy button.
+        // The hand is for what a click acts on: a link, a code block's copy button, a row of the
+        // contents panel.
         #[cfg(feature = "clipboard")]
         let hand = view.hovered().is_some() || view.over_copy();
         #[cfg(not(feature = "clipboard"))]
         let hand = view.hovered().is_some();
+        #[cfg(feature = "toc")]
+        let hand = hand || view.over_toc();
         let update = view::hover_change(self.pointer, hand, changed);
         #[cfg(feature = "clipboard")]
         let text = self.cursor_in && view.text_cursor(self.cursor.x, self.cursor.y);
@@ -958,7 +978,7 @@ impl ApplicationHandler<UserEvent> for App {
                     (MouseScrollDelta::LineDelta(_, y), false) => {
                         view.wheel_lines(-f64::from(y), now)
                     }
-                    (MouseScrollDelta::PixelDelta(p), false) => view.scroll_by(-p.y, now),
+                    (MouseScrollDelta::PixelDelta(p), false) => view.wheel_by(-p.y, now),
                     (delta, true) => view.zoom_wheel(
                         match delta {
                             MouseScrollDelta::LineDelta(_, y) => f64::from(y) * view::ZOOM_PIXELS,
@@ -1025,6 +1045,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(copy) = code {
                     self.copy_code(copy, now);
                 }
+                // A click can close the contents panel (a row, or the document it covers).
+                self.record(now);
             }
             _ => {}
         }
@@ -1169,6 +1191,8 @@ fn main() {
         back: BackStack::default(),
         toolbar_shown: true,
         wide_set: false,
+        #[cfg(feature = "toc")]
+        toc_set: false,
         shown: false,
         exit_code: 0,
     };
