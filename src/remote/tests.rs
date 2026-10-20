@@ -173,6 +173,15 @@ const SMALL: Limits = Limits {
     redirects: 5,
 };
 
+/// [`SMALL`] with a time cap a loaded machine won't reach: for a local server that answers.
+const ROOMY: Limits = Limits { secs: 120, ..SMALL };
+
+/// [`LIMITS`] with the time cap of [`ROOMY`].
+const ROOMY_BIG: Limits = Limits {
+    secs: 120,
+    ..LIMITS
+};
+
 #[test]
 fn only_http_urls_are_handed_to_curl() {
     assert!(fetchable("https://x.y/a.png"));
@@ -241,25 +250,25 @@ fn fetching_follows_the_rules() {
     }
     let port = server();
     let url = |p: &str| format!("http://127.0.0.1:{port}{p}");
-    assert_eq!(fetch(&url("/ok.png"), SMALL), Ok(png()));
+    assert_eq!(fetch(&url("/ok.png"), ROOMY), Ok(png()));
     // A path that looks like an option stays a URL (it comes after `--`).
-    assert_eq!(fetch(&url("/-o"), SMALL), Ok(png()));
+    assert_eq!(fetch(&url("/-o"), ROOMY), Ok(png()));
     // At most 5 redirects.
-    assert_eq!(fetch(&url("/r/5"), SMALL), Ok(png()));
-    assert_eq!(fetch(&url("/r/6"), SMALL), Err(Error::Failed));
+    assert_eq!(fetch(&url("/r/5"), ROOMY), Ok(png()));
+    assert_eq!(fetch(&url("/r/6"), ROOMY), Err(Error::Failed));
     // Redirects only to http(s).
-    assert_eq!(fetch(&url("/to-file"), SMALL), Err(Error::Failed));
-    assert_eq!(fetch(&url("/to-ftp"), SMALL), Err(Error::Failed));
+    assert_eq!(fetch(&url("/to-file"), ROOMY), Err(Error::Failed));
+    assert_eq!(fetch(&url("/to-ftp"), ROOMY), Err(Error::Failed));
     // The size cap, declared or not.
-    assert_eq!(fetch(&url("/big-declared"), SMALL), Err(Error::Failed));
+    assert_eq!(fetch(&url("/big-declared"), ROOMY), Err(Error::Failed));
     // (Recent curl cuts an undeclared size off itself; the pipe is cut too, see below.)
-    let streamed = fetch(&url("/big-stream"), SMALL);
+    let streamed = fetch(&url("/big-stream"), ROOMY);
     assert!(
         matches!(streamed, Err(Error::Failed | Error::TooLarge)),
         "{streamed:?}"
     );
     // HTTP errors fail.
-    assert_eq!(fetch(&url("/missing"), SMALL), Err(Error::Failed));
+    assert_eq!(fetch(&url("/missing"), ROOMY), Err(Error::Failed));
     // The time cap.
     // (A server that doesn't answer until it is told to: the fetch ends by its time cap, and
     // never has the image.)
@@ -267,7 +276,7 @@ fn fetching_follows_the_rules() {
     *SLOW_GATE.0.lock().unwrap() = true;
     SLOW_GATE.1.notify_all();
     // Only images are kept.
-    assert!(fetch(&url("/page.html"), SMALL).is_ok());
+    assert!(fetch(&url("/page.html"), ROOMY).is_ok());
     assert_eq!(
         fetch_image(&url("/page.html"), &|_| true),
         Err(Error::NotAnImage)
@@ -290,7 +299,7 @@ fn a_small_body_keeps_only_what_it_needs() {
     let bytes = fetch_with(
         "curl",
         &format!("http://127.0.0.1:{port}/ok.png"),
-        LIMITS,
+        ROOMY_BIG,
         &|n| {
             taken.fetch_add(n, Ordering::SeqCst);
             true
@@ -310,7 +319,7 @@ fn a_small_body_keeps_only_what_it_needs() {
     let big = fetch_with(
         "curl",
         &format!("http://127.0.0.1:{port}/big/0"),
-        LIMITS,
+        ROOMY_BIG,
         &|n| {
             taken.fetch_add(n, Ordering::SeqCst);
             true
@@ -324,7 +333,7 @@ fn a_small_body_keeps_only_what_it_needs() {
     let got = fetch_with(
         "curl",
         &format!("http://127.0.0.1:{port}/big/0"),
-        LIMITS,
+        ROOMY_BIG,
         &|_| false,
     );
     assert_eq!(got, Err(Error::Yielded));
@@ -385,7 +394,7 @@ fn a_jpeg_that_is_tiny_without_its_metadata_is_cut_to_size_after() {
     let port = server();
     let url = format!("http://127.0.0.1:{port}/tiny-meta.jpg");
     // What is read is as it comes, with its credit's buffer: nothing is cut yet.
-    let raw = fetch_with("curl", &url, LIMITS, &|_| true).unwrap();
+    let raw = fetch_with("curl", &url, ROOMY_BIG, &|_| true).unwrap();
     assert_eq!(raw.len(), tiny_jpeg_with_exif().len());
     assert!(raw.capacity() >= raw.len());
     let (bytes, w, h) = fetch_image(&url, &|_| true).expect("an image");
@@ -433,7 +442,7 @@ fn glob_urls_are_fetched_literally() {
     let port = server();
     let before = GLOB_HITS.load(Ordering::SeqCst);
     for path in ["/glob[1-5].png", "/glob{a,b,c}.png"] {
-        let _ = fetch(&format!("http://127.0.0.1:{port}{path}"), SMALL);
+        let _ = fetch(&format!("http://127.0.0.1:{port}{path}"), ROOMY);
     }
     // (The server answers them all 404: what counts is how many it saw.)
     let hits = GLOB_HITS.load(Ordering::SeqCst) - before;
@@ -885,8 +894,10 @@ fn real_bodies_stop_at_the_budget() {
     }
     let port = server();
     let (tx, rx) = std::sync::mpsc::channel();
+    // (With the time cap of [`ROOMY_BIG`]: 15 s is too short when the CPUs are busy.)
     let mut r = Remote {
         on: true,
+        fetcher: Arc::new(|url, grant| image_of(fetch_with("curl", url, ROOMY_BIG, grant)?)),
         ..Remote::default()
     };
     let all: Vec<Arc<str>> = (0..16)

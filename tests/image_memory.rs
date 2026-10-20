@@ -1448,7 +1448,10 @@ fn stopping_the_fetch_queue_gives_back_its_room() {
     images.set_policy(vomd::settings::RemoteImages::Always);
     let release = Arc::new(AtomicBool::new(false));
     let gate = release.clone();
+    let started = Arc::new(AtomicUsize::new(0));
+    let begun = started.clone();
     images.set_test_body(Arc::new(move |_| {
+        begun.fetch_add(1, Relaxed);
         while !gate.load(Relaxed) {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1465,7 +1468,13 @@ fn stopping_the_fetch_queue_gives_back_its_room() {
         images.set_remote(true, &doc, &mut layout);
         images.begin_frame();
         images.request(&[], 0);
-        // The four fetchers have their URLs; the rest waits in the queue.
+        // The four fetchers have their URLs; the rest waits in the queue. (Stopped before the
+        // threads have taken theirs, the queue would leave fewer than four transfers to wait for.)
+        let t = Instant::now();
+        while started.load(Relaxed) < vomd::remote::FETCHERS {
+            assert!(t.elapsed() < Duration::from_secs(60), "timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         images.set_remote(false, &doc, &mut layout);
         release.store(true, Relaxed);
         frames(
@@ -1934,8 +1943,10 @@ fn a_request_makes_room_before_it_allocates() {
         "{over} bytes live over the start at most, {CACHE_BYTES} allowed"
     );
     // And the way a window gets them: a screen at a time, frame after frame.
-    for chunk in boxes.chunks(25).take(8) {
-        let done = images.stats().decoded + chunk.len();
+    for (n, chunk) in boxes.chunks(25).take(8).enumerate() {
+        // (What the request for all of them had decoded already is part of it: the screens that
+        // came before are decoded, and so, by now, may be some of this one.)
+        let done = (n + 1) * chunk.len();
         frames(
             &mut images,
             &doc,
@@ -1943,7 +1954,7 @@ fn a_request_makes_room_before_it_allocates() {
             chunk,
             chunk.len(),
             Duration::ZERO,
-            |i| i.stats().decoded >= done.min(200),
+            |i| i.stats().decoded >= done,
         );
     }
     let over = peak_over(start);
@@ -2261,8 +2272,9 @@ fn quiesce(
     on_screen: usize,
 ) {
     let t = Instant::now();
-    frame(images, boxes, on_screen);
+    // (A wake that comes while the frame is still being made is the window's to poll for too.)
     let mut seen = images.wakes();
+    frame(images, boxes, on_screen);
     let mut idle_since: Option<Instant> = None;
     loop {
         assert!(
@@ -4052,8 +4064,11 @@ mod mix {
         let stats = images.stats();
         drop((images, state, pool, log));
         let _ = std::fs::remove_dir_all(&dir);
+        // (The threads are not joined, and one that was in the middle of a job when the quit
+        // came ends after it: on a machine under load that is longer than a fixed few seconds.
+        // The wait ends the moment the bytes are back, and only a leak waits it out.)
         let t = Instant::now();
-        while live() > before + LEFT && t.elapsed() < Duration::from_secs(10) {
+        while live() > before + LEFT && t.elapsed() < Duration::from_secs(60) {
             std::thread::sleep(Duration::from_millis(20));
         }
         let left = live().saturating_sub(before);
@@ -4094,7 +4109,7 @@ mod mix {
 
         /// Whether the wakes and fetches since were no storm.
         fn storm(&self, dir: &Path, images: &Images) -> Result<(), String> {
-            let (fetches, per_url) = tagged(Tag::Driver, || {
+            let (fetches, per_url, log) = tagged(Tag::Driver, || {
                 let log = std::fs::read(dir.join("curl.log")).unwrap_or_default();
                 let log = String::from_utf8_lossy(log.get(self.log as usize..).unwrap_or(&[]))
                     .into_owned();
@@ -4107,7 +4122,7 @@ mod mix {
                     .iter()
                     .max_by_key(|(_, n)| **n)
                     .map(|(u, n)| (u.to_string(), *n));
-                (log.lines().count(), worst)
+                (log.lines().count(), worst, log)
             });
             if let Some((_, n)) = &per_url {
                 MOST_FETCHES.fetch_max(*n, Relaxed);
@@ -4119,8 +4134,16 @@ mod mix {
             if let Some((url, n)) = per_url
                 && n > bound
             {
+                // (The last runs, in the order they began.)
+                let last: Vec<_> = log.lines().rev().take(24).collect();
+                let last: Vec<_> = last
+                    .iter()
+                    .rev()
+                    .map(|l| l.rsplit('/').next().unwrap())
+                    .collect();
                 return Err(format!(
-                    "{url} was fetched {n} times in a viewport that did not change ({fetches} runs in all)"
+                    "{url} was fetched {n} times in a viewport that did not change ({fetches} runs in all, the last ones {})",
+                    last.join(" ")
                 ));
             }
             let stats = images.stats();
