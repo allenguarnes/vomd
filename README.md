@@ -229,7 +229,10 @@ on. `never` removes the option.
 
 `just ci` runs formatting, clippy (every feature set), the tests, and Windows/macOS compile
 checks. `cargo xtask budgets` measures every performance budget against a release build (it
-needs a display). `just fuzz <doc|layout|settings> [seconds]` fuzzes on the stable toolchain.
+needs a display). `cargo xtask images` runs the image memory tests, each in its own process and
+as many at once as there are CPUs (`-j N`, `--runs K` to repeat), much faster than
+`cargo test` on a machine with several cores. `just fuzz <doc|layout|settings> [seconds]` fuzzes
+on the stable toolchain.
 `scripts/aur-check.sh` builds and checks both AUR packages offline. `scripts/clipboard-check.sh`
 selects, copies and pastes against Xvfb and a headless sway in containers, with the real `xclip`,
 `xsel` and `wl-paste` (it needs docker); the copy button is clicked on X11 only, because a

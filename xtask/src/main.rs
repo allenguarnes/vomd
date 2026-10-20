@@ -1,10 +1,12 @@
-//! Dev tooling: `cargo xtask <size|bench|budgets|dist|fixtures|bless>`. Never shipped.
+//! Dev tooling: `cargo xtask <size|bench|budgets|dist|fixtures|bless|images>`. Never shipped.
 //! `budgets [--timings-advisory] [--report <file.md>]`.
+//! `images [-j N] [--runs K] [--keep-going] [--no-default-features] [--features F]`.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
@@ -64,11 +66,13 @@ fn main() {
         Some("dist") => dist(arg(1) == Some("--release")),
         Some("fixtures") => fixtures(),
         Some("bless") => bless(),
+        Some("images") => images(&args[1..]),
         _ => {
             eprintln!(
                 "usage: cargo xtask <size | bench [fixture] | budgets [--report FILE] | \
                  dist [--release] | \
-                 fixtures | bless>"
+                 fixtures | bless | images [-j N] [--runs K] [--keep-going] \
+                 [--no-default-features] [--features F]>"
             );
             false
         }
@@ -848,6 +852,195 @@ fn bless() -> bool {
         .status()
         .expect("run cargo")
         .success()
+}
+
+/// The image_memory tests that take longest in a debug build; they are started first, so the
+/// run ends when the longest does, not after it.
+const IMAGE_SLOWEST: &[&str] = &[
+    "distinct_images_above_the_viewport_cap",
+    "seven_hundred_remote_images",
+    "mix::",
+];
+
+/// The `image_memory` test binary, built once with cargo's `features` arguments; its path is
+/// in cargo's JSON output.
+fn image_binary(features: &[String]) -> Option<PathBuf> {
+    let out = Command::new(env!("CARGO"))
+        .current_dir(root())
+        .args(["test", "--locked", "--test", "image_memory", "--no-run"])
+        .args(["--message-format=json-render-diagnostics"])
+        .args(features)
+        .stderr(Stdio::inherit())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("\"reason\":\"compiler-artifact\"") && l.contains("\"test\":true"))
+        .filter(|l| l.contains("\"name\":\"image_memory\""))
+        .find_map(|l| {
+            let rest = &l[l.find("\"executable\":\"")? + 14..];
+            Some(PathBuf::from(&rest[..rest.find('"')?]))
+        })
+}
+
+/// The test names `bin` lists, as `--list` prints them; with `--ignored` only the ignored ones.
+fn image_tests(bin: &Path, ignored: bool) -> Option<Vec<String>> {
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(root()).args(["--list", "--format=terse"]);
+    if ignored {
+        cmd.arg("--ignored");
+    }
+    let out = cmd.output().ok()?;
+    out.status.success().then(|| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_suffix(": test"))
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+/// Run the image_memory tests, each in its own process, `jobs` at a time. The tests share a
+/// lock in one process, because they read a counting allocator that is process-wide; in
+/// their own processes they don't, and the longest ones overlap. Returns each failure's name
+/// and output.
+fn image_run(bin: &Path, tests: &[String], jobs: usize, keep_going: bool) -> Vec<(String, String)> {
+    let queue = Mutex::new(tests.iter().collect::<Vec<_>>().into_iter());
+    let failures = Mutex::new(Vec::new());
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..jobs.min(tests.len()) {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(name) = queue.lock().unwrap().next() else {
+                        break;
+                    };
+                    let out = Command::new(bin)
+                        .current_dir(root())
+                        .args(["--exact", name])
+                        .output();
+                    let failed = match &out {
+                        // "1 passed" is there so a name that matches no test cannot pass.
+                        Ok(o) => {
+                            !o.status.success()
+                                || !String::from_utf8_lossy(&o.stdout).contains("1 passed")
+                        }
+                        Err(_) => true,
+                    };
+                    if failed {
+                        let text = match out {
+                            Ok(o) => format!(
+                                "{}{}",
+                                String::from_utf8_lossy(&o.stdout),
+                                String::from_utf8_lossy(&o.stderr)
+                            ),
+                            Err(e) => format!("could not run: {e}\n"),
+                        };
+                        failures.lock().unwrap().push((name.clone(), text));
+                        stop.store(!keep_going, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    failures.into_inner().unwrap()
+}
+
+/// `images [-j N] [--runs K] [--keep-going] [--no-default-features] [--features F]`: the
+/// image_memory tests, one process each and N at once (the CPU count), K times over. The
+/// tests are the slowest in the repository, and measure memory per process, so they can overlap.
+fn images(args: &[String]) -> bool {
+    let (mut jobs, mut runs, mut keep_going) = (
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+        1usize,
+        false,
+    );
+    let mut features = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut number = |into: &mut usize| match it.next().and_then(|v| v.parse().ok()) {
+            Some(n) if n > 0 => {
+                *into = n;
+                true
+            }
+            _ => {
+                eprintln!("error: {a} takes a number of at least 1");
+                false
+            }
+        };
+        let ok = match a.as_str() {
+            "-j" => number(&mut jobs),
+            "--runs" => number(&mut runs),
+            "--keep-going" => {
+                keep_going = true;
+                true
+            }
+            "--no-default-features" => {
+                features.push(a.clone());
+                true
+            }
+            "--features" => {
+                features.push(a.clone());
+                features.extend(it.next().cloned());
+                true
+            }
+            _ if a.starts_with("--features=") => {
+                features.push(a.clone());
+                true
+            }
+            _ => {
+                eprintln!("error: unknown argument {a}");
+                false
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    let Some(bin) = image_binary(&features) else {
+        eprintln!("error: could not build or find the image_memory test binary");
+        return false;
+    };
+    let (Some(mut tests), Some(ignored)) = (image_tests(&bin, false), image_tests(&bin, true))
+    else {
+        eprintln!("error: could not list the image_memory tests");
+        return false;
+    };
+    tests.retain(|t| !ignored.contains(t));
+    if tests.is_empty() {
+        eprintln!("error: no image_memory tests to run (is the `images` feature on?)");
+        return false;
+    }
+    tests.sort_by_key(|t| !IMAGE_SLOWEST.iter().any(|s| t.contains(s)));
+    let mut passed = 0;
+    for run in 1..=runs {
+        let start = Instant::now();
+        let failures = image_run(&bin, &tests, jobs, keep_going);
+        let secs = start.elapsed().as_secs_f64();
+        if failures.is_empty() {
+            passed += 1;
+            println!(
+                "PASS run {run}/{runs}: {} tests, {jobs} at a time, {secs:.1} s",
+                tests.len()
+            );
+            continue;
+        }
+        for (name, output) in &failures {
+            println!("FAIL {name}\n{output}");
+        }
+        println!(
+            "FAIL run {run}/{runs}: {} of {} tests failed after {secs:.1} s ({passed} of {runs} runs passed)",
+            failures.len(),
+            tests.len()
+        );
+        if !keep_going {
+            return false;
+        }
+    }
+    passed == runs
 }
 
 /// Generate the large fixtures that aren't committed: `huge.md` (5 MB) and `medium.md` (the

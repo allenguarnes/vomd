@@ -27,6 +27,10 @@ size:
 budgets:
     cargo xtask budgets
 
+# The image memory tests, one process each and in parallel (-j N, --runs K, --keep-going).
+images *args:
+    cargo xtask images {{args}}
+
 # Fuzz a target (doc, layout, settings) on stable for SECONDS.
 fuzz target seconds="60":
     scripts/fuzz.sh {{target}} {{seconds}}
