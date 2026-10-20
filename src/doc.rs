@@ -263,7 +263,7 @@ impl Doc {
     fn parse_whole(src: &str) -> Doc {
         let src = &src[front_matter_len(src)..];
         let mut b = Builder::new(src.len());
-        for (event, decoded) in marked(src, Parser::new_ext(src, options())) {
+        for (event, decoded) in marked(src, parser(src, options(), None)) {
             b.event_marked(event, decoded);
         }
         b.finish()
@@ -1773,6 +1773,20 @@ fn marked<'a>(
     })
 }
 
+/// The parser's broken-link callback, boxed. Every parser here has this one type (also without a
+/// callback), so pulldown-cmark's generic inline pass is compiled once, not once per callback
+/// type: about 16 KB less in the smallest build.
+type Resolver<'a> = Box<dyn FnMut(BrokenLink<'a>) -> Option<(CowStr<'a>, CowStr<'a>)> + 'a>;
+
+/// A parser over `text`; `resolve` looks up the references that have no definition in `text`.
+fn parser<'a>(
+    text: &'a str,
+    opts: Options,
+    resolve: Option<Resolver<'a>>,
+) -> Parser<'a, Resolver<'a>> {
+    Parser::new_with_broken_link_callback(text, opts, resolve)
+}
+
 /// The events of one segment's text, with the document's link definitions (by label) behind the
 /// parser's broken-link callback.
 fn segment_events<'a>(
@@ -1780,13 +1794,14 @@ fn segment_events<'a>(
     links: &'a HashMap<UniCase<String>, (String, String)>,
     opts: Options,
 ) -> impl Iterator<Item = Event<'a>> + 'a {
-    let resolve = move |link: BrokenLink<'a>| {
-        let (dest, title) = links.get(&UniCase::new(link.reference.into_string()))?;
-        Some((CowStr::from(dest.clone()), CowStr::from(title.clone())))
-    };
     // Without definitions there is nothing to look up (and no callback to make).
-    let resolve = (!links.is_empty()).then_some(resolve);
-    Parser::new_with_broken_link_callback(text, opts, resolve)
+    let resolve = (!links.is_empty()).then(|| -> Resolver<'a> {
+        Box::new(move |link: BrokenLink<'a>| {
+            let (dest, title) = links.get(&UniCase::new(link.reference.into_string()))?;
+            Some((CowStr::from(dest.clone()), CowStr::from(title.clone())))
+        })
+    });
+    parser(text, opts, resolve)
 }
 
 /// The second pass of [`Doc::parse_segments`]: segments' events, in order, into the builder.

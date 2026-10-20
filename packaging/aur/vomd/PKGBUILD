@@ -40,7 +40,9 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   # makepkg.conf's RUSTFLAGS replace the repository's .cargo/config.toml flags: keep its
-  # packed relocations (RELR, smaller binary).
+  # packed relocations (RELR, smaller binary). The config's inline-threshold flag is left out on
+  # purpose: this build honours the user's makepkg flags (e.g. opt-level=3), which a low inline
+  # threshold would fight.
   export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-z,pack-relative-relocs"
   cargo build --frozen --release --package vomd
 }

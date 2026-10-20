@@ -99,13 +99,15 @@ fn baseline_cpu() -> bool {
     true
 }
 
-/// The rustflags of every release build: nothing but RELR, set through
-/// `CARGO_ENCODED_RUSTFLAGS` (unit-separator-joined), which overrides `[build] rustflags` and
-/// `[target] rustflags` in every config file, so no `target-cpu` from `~/.cargo/config.toml`
-/// or a parent directory's reaches the binary.
-const RELR_FLAGS: &str = "-C\x1flink-arg=-Wl,-z,pack-relative-relocs";
+/// The rustflags of every release build: RELR and the inline threshold (both explained in
+/// `.cargo/config.toml`, whose flags these repeat), set through `CARGO_ENCODED_RUSTFLAGS`
+/// (unit-separator-joined), which overrides `[build] rustflags` and `[target] rustflags` in
+/// every config file, so no `target-cpu` from `~/.cargo/config.toml` or a parent directory's
+/// reaches the binary.
+const RELEASE_FLAGS: &str =
+    "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1fllvm-args=-inline-threshold=10";
 
-/// A cargo command in the repository with [`RELR_FLAGS`] for what it builds.
+/// A cargo command in the repository with [`RELEASE_FLAGS`] for what it builds.
 fn release_cargo() -> Command {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.current_dir(root());
@@ -113,7 +115,7 @@ fn release_cargo() -> Command {
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )) {
-        cmd.env("CARGO_ENCODED_RUSTFLAGS", RELR_FLAGS);
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", RELEASE_FLAGS);
     }
     cmd
 }

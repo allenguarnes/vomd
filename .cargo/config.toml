@@ -4,8 +4,12 @@
 xtask = "run --quiet --package xtask --"
 
 # Packed relative relocations (RELR): −260 to −340 KB, keeps PIE/ASLR. Needs glibc ≥ 2.36.
+# An explicit LLVM inline threshold of 10 (opt-level "z" alone uses 5 with other limits): −27 KB
+# in the smallest build, −33 KB in the default one; 25 and up is larger, 100 is +300 KB. The flag
+# also applies to test builds (about 7% slower; stable cargo has no per-profile rustflags), and
+# xtask repeats it for release builds.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs"]
+rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=10"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs"]
+rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=10"]

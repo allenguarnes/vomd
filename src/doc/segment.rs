@@ -60,7 +60,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, Options, Tag};
 use unicase::UniCase;
 
 /// Most readings of the text the scan follows at once. More than that (a stack of lines that are
@@ -151,7 +151,7 @@ impl Plan {
             let text = self.text(src, n, &[])?;
             // Building the parser finds the link definitions; the footnote definitions only show
             // in the events.
-            let mut parser = Parser::new_ext(&text, opts);
+            let mut parser = super::parser(&text, opts, None);
             if notes {
                 let mut open = 0i64;
                 for event in parser.by_ref() {
@@ -803,7 +803,7 @@ fn cells_at_least(row: &[u8], exact: bool) -> usize {
 
 /// Whether pulldown-cmark reads `head` (a header and delimiter row) as a table.
 fn valid_head(src: &str, head: &Range<usize>) -> bool {
-    let mut parser = Parser::new_ext(&src[head.clone()], super::options());
+    let mut parser = super::parser(&src[head.clone()], super::options(), None);
     matches!(parser.next(), Some(Event::Start(Tag::Table(_))))
 }
 
