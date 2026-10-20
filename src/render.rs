@@ -7,6 +7,10 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "find")]
+use crate::doc::Doc;
+#[cfg(feature = "find")]
+use crate::find::{BlockMarks, Marks};
 use crate::fonts::Fonts;
 use crate::image::Bitmap;
 use crate::layout::{BlockBox, Layout};
@@ -14,7 +18,7 @@ use crate::layout::{BlockBox, Layout};
 use crate::select::{BlockSel, Pos};
 use crate::text::RectKind;
 use crate::text::cache::GlyphCache;
-#[cfg(feature = "clipboard")]
+#[cfg(any(feature = "clipboard", feature = "find"))]
 use crate::theme::Role;
 use crate::theme::{Rgb, Theme};
 
@@ -381,7 +385,9 @@ impl Viewport {
 
 /// Paint the document area: background, then every block overlapping the viewport that has
 /// content (call [`Layout::ensure`] first). Blocks without content are left blank. `sel` is the
-/// selected span, painted between each block's backgrounds and its text.
+/// selected span, and `finds` the matches of a find with the document they are in; both are
+/// painted between each block's backgrounds and its text, the selection over the matches.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     frame: &mut Frame,
     vp: Viewport,
@@ -390,6 +396,7 @@ pub fn paint(
     cache: &mut GlyphCache,
     theme: &Theme,
     #[cfg(feature = "clipboard")] sel: Option<(Pos, Pos)>,
+    #[cfg(feature = "find")] finds: Option<(&Doc, Marks)>,
 ) {
     let prev = frame.set_clip(vp.area);
     let a = frame.clip;
@@ -409,7 +416,9 @@ pub fn paint(
             let oy = (vp.area.y0 as f64 + layout.top(i) - scroll) as f32;
             #[cfg(feature = "clipboard")]
             let sel = sel.and_then(|range| BlockSel::of(i as u32, range));
-            paint_block(
+            #[cfg(feature = "find")]
+            let marks = finds.and_then(|(doc, marks)| marks.of_block(doc, i as u32));
+            paint_block_marked(
                 frame,
                 content,
                 ox,
@@ -419,6 +428,8 @@ pub fn paint(
                 theme,
                 #[cfg(feature = "clipboard")]
                 sel.as_ref(),
+                #[cfg(feature = "find")]
+                marks.as_ref(),
             );
         }
     }
@@ -451,6 +462,34 @@ pub fn paint_block(
     theme: &Theme,
     #[cfg(feature = "clipboard")] sel: Option<&BlockSel>,
 ) {
+    paint_block_marked(
+        frame,
+        content,
+        ox,
+        oy,
+        fonts,
+        cache,
+        theme,
+        #[cfg(feature = "clipboard")]
+        sel,
+        #[cfg(feature = "find")]
+        None,
+    );
+}
+
+/// [`paint_block`] with the matches of a find in the block washed behind the text.
+#[allow(clippy::too_many_arguments)]
+fn paint_block_marked(
+    frame: &mut Frame,
+    content: &BlockBox,
+    ox: f32,
+    oy: f32,
+    fonts: &Fonts,
+    cache: &mut GlyphCache,
+    theme: &Theme,
+    #[cfg(feature = "clipboard")] sel: Option<&BlockSel>,
+    #[cfg(feature = "find")] marks: Option<&BlockMarks>,
+) {
     let clip = frame.clip;
     for r in &content.rects {
         let (x0, x1) = span(ox + r.x, r.w);
@@ -469,6 +508,18 @@ pub fn paint_block(
                 255,
             ),
         }
+    }
+    #[cfg(feature = "find")]
+    if let Some(marks) = marks {
+        marks.rects(content, |x0, y0, x1, y1, current| {
+            let color = theme.color(if current {
+                Role::FindCurrent
+            } else {
+                Role::FindMatch
+            });
+            let (x0, x1) = span(ox + x0, x1 - x0);
+            frame.fill_rect(x0, px(oy + y0), x1, px(oy + y1), color);
+        });
     }
     #[cfg(feature = "clipboard")]
     if let Some(sel) = sel {

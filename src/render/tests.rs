@@ -532,6 +532,8 @@ mod doc {
             theme,
             #[cfg(feature = "clipboard")]
             None,
+            #[cfg(feature = "find")]
+            None,
         );
         b
     }
@@ -626,6 +628,8 @@ mod doc {
                 &LIGHT,
                 #[cfg(feature = "clipboard")]
                 None,
+                #[cfg(feature = "find")]
+                None,
             );
             assert_eq!(
                 b.at(300, 0),
@@ -662,6 +666,8 @@ mod doc {
                 &mut cache,
                 &LIGHT,
                 #[cfg(feature = "clipboard")]
+                None,
+                #[cfg(feature = "find")]
                 None,
             );
             b
@@ -726,6 +732,8 @@ mod doc {
                 &mut cache,
                 &LIGHT,
                 #[cfg(feature = "clipboard")]
+                None,
+                #[cfg(feature = "find")]
                 None,
             );
             paint_scrollbar(&mut b.frame(), v, 1000.0, 1.0, &LIGHT);

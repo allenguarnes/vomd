@@ -74,6 +74,17 @@ The
 .B toc
 setting starts with the panel open.
 .TP
+.B Ctrl+F
+Find in the document.
+A bar below the toolbar takes what is typed, and every match is marked in the text, the current one
+more strongly, with its place among the matches ("3 / 17") in the bar.
+While the bar is open the letter keys are text, Backspace deletes, and
+.BR Enter ", " F3 " and " Ctrl+G
+go to the next match and with Shift to the previous.
+A short selection of one line is the query when the bar opens.
+.B Esc
+or the bar's close button closes it.
+.TP
 .B W
 Wide layout on or off: the text spans the window instead of stopping at
 .BR line_width .
@@ -120,8 +131,8 @@ or
 so a bare window manager needs one of them installed.
 .TP
 .B Esc
-Close the toolbar's menu if it is open, else the contents panel if it covers the document, else
-clear the selection, else quit.
+Close the toolbar's menu if it is open, else the find bar, else the contents panel if it covers the
+document, else clear the selection, else quit.
 .TP
 .BR Q ", " Ctrl+W
 Quit.

@@ -2,6 +2,8 @@ use super::*;
 
 /// The contents button's width in the left group (none without the feature).
 const TOC: f32 = if cfg!(feature = "toc") { BUTTON } else { 0.0 };
+/// The find button's, in the right group.
+const FIND: f32 = if cfg!(feature = "find") { BUTTON } else { 0.0 };
 
 fn ctx(width: u32) -> Ctx {
     Ctx {
@@ -14,6 +16,8 @@ fn ctx(width: u32) -> Ctx {
         wide: false,
         #[cfg(feature = "toc")]
         toc: false,
+        #[cfg(feature = "find")]
+        find: false,
         settings: true,
         remote: 0,
         remote_on: false,
@@ -53,6 +57,8 @@ fn wide_bar_shows_everything() {
             #[cfg(feature = "toc")]
             Item::Contents,
             Item::Settings,
+            #[cfg(feature = "find")]
+            Item::Find,
             Item::Reload,
             Item::Theme,
             Item::Wide,
@@ -62,7 +68,7 @@ fn wide_bar_shows_everything() {
         ]
     );
     assert!(s.overflow.is_empty());
-    // Right group flush with the right edge, left to right: − % + wide theme reload settings.
+    // Right group flush with the right edge, left to right: − % + wide theme reload find settings.
     let r = |i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;
     assert_eq!(r(Item::Settings).x1, 900.0 - EDGE);
     // Open right after Back.
@@ -87,12 +93,13 @@ fn wide_bar_shows_everything() {
 
 #[test]
 fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
-    let full = (EDGE + LEFT + TOC + GAP + 2.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
+    let full =
+        (EDGE + LEFT + TOC + GAP + 2.0 * BUTTON + PERCENT + 4.0 * BUTTON + FIND + EDGE) as u32;
     assert!(slots(&ctx(full)).overflow.is_empty(), "exactly fits");
     let s = slots(&ctx(full - 1));
     assert_eq!(s.overflow, [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]);
     assert!(items(&s).contains(&Item::More) && items(&s).contains(&Item::Theme));
-    let s = slots(&ctx(182 + TOC as u32));
+    let s = slots(&ctx(182 + (TOC + FIND) as u32));
     assert_eq!(
         s.overflow,
         [
@@ -103,9 +110,9 @@ fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
             Item::Theme
         ]
     );
-    // Wide layout goes before the theme: with room for the theme, reload and ⚙ only, it's in
-    // the dropdown.
-    let s = slots(&ctx(232 + TOC as u32));
+    // Wide layout goes before the theme: with room for the theme, reload, find and ⚙ only, it's
+    // in the dropdown.
+    let s = slots(&ctx(232 + (TOC + FIND) as u32));
     assert_eq!(s.overflow.last(), Some(&Item::Wide));
     assert!(items(&s).contains(&Item::Theme));
     // Down to 320 px and below, everything stays reachable: shown or in the menu.
@@ -124,6 +131,8 @@ fn narrow_bar_collapses_zoom_first_then_wide_then_theme() {
             Item::Wide,
             Item::Theme,
             Item::Reload,
+            #[cfg(feature = "find")]
+            Item::Find,
             Item::Settings,
         ] {
             assert!(all.contains(&item), "{item:?} at {w}");
@@ -165,6 +174,8 @@ fn clicks_map_to_the_shortcuts_actions() {
         (Item::Wide, Command::Action(Action::ToggleWide)),
         (Item::Theme, Command::Action(Action::CycleTheme)),
         (Item::Reload, Command::Action(Action::Reload)),
+        #[cfg(feature = "find")]
+        (Item::Find, Command::Action(Action::ToggleFind)),
         (Item::Settings, Command::Settings),
     ] {
         let (x, y) = center(&s, item);
@@ -207,7 +218,7 @@ fn dropdown_opens_selects_and_closes() {
     // The open menu covers what's under it.
     let (item, r) = rows[0];
     let (rx, ry) = (f64::from(r.x0 + 5.0), f64::from((r.y0 + r.y1) / 2.0));
-    assert!(t.covers(&c, rx, ry));
+    assert!(t.covers(&c, rx, ry) && t.menu_covers(&c, rx, ry));
     t.press(&c, rx, ry);
     assert_eq!(t.release(&c, rx, ry), (true, item.command()));
     assert!(!t.menu_open(&c), "closes on selection");
@@ -215,6 +226,9 @@ fn dropdown_opens_selects_and_closes() {
     t.press(&c, mx, my);
     t.release(&c, mx, my);
     assert!(t.menu_open(&c));
+    // The bar is not the dropdown: only the box below it is.
+    assert!(t.covers(&c, 5.0, 5.0) && !t.menu_covers(&c, 5.0, 5.0));
+    assert!(!t.menu_covers(&c, 100.0, 500.0));
     assert!(t.press(&c, 100.0, 500.0));
     assert!(!t.menu_open(&c));
     assert_eq!(t.release(&c, 100.0, 500.0), (false, None));
@@ -267,7 +281,7 @@ fn nothing_outside_the_window_is_hit() {
 fn short_window_scrolls_the_dropdown() {
     let c = Ctx {
         height: 100,
-        ..ctx(182 + TOC as u32)
+        ..ctx(182 + (TOC + FIND) as u32)
     };
     let s = slots(&c);
     assert_eq!(
@@ -324,7 +338,7 @@ fn short_window_scrolls_the_dropdown() {
 /// A press on another bar button closes the dropdown and still acts.
 #[test]
 fn another_button_closes_the_dropdown() {
-    let c = ctx(200 + TOC as u32);
+    let c = ctx(200 + (TOC + FIND) as u32);
     let s = slots(&c);
     let mut t = Toolbar::default();
     let (mx, my) = center(&s, Item::More);
@@ -379,7 +393,7 @@ fn dropdown_without_overflow_is_closed() {
 /// A tooltip isn't due the moment the dropdown closes: the timer only runs while it's shut.
 #[test]
 fn no_tooltip_timer_under_the_dropdown() {
-    let c = ctx(200 + TOC as u32);
+    let c = ctx(200 + (TOC + FIND) as u32);
     let s = slots(&c);
     let mut t = Toolbar::default();
     let (mx, my) = center(&s, Item::More);
@@ -579,7 +593,8 @@ fn the_remote_images_button() {
     t.press(&none, x, y);
     assert_eq!(t.release(&none, x, y), (true, None));
     // Narrower: the zoom goes into `⋯` first, then it.
-    let full = (EDGE + LEFT + TOC + GAP + 3.0 * BUTTON + PERCENT + 4.0 * BUTTON + EDGE) as u32;
+    let full =
+        (EDGE + LEFT + TOC + GAP + 3.0 * BUTTON + PERCENT + 4.0 * BUTTON + FIND + EDGE) as u32;
     assert!(slots(&Ctx { width: full, ..c }).overflow.is_empty());
     let s = slots(&Ctx {
         width: full - 1,
@@ -587,7 +602,10 @@ fn the_remote_images_button() {
     });
     assert_eq!(s.overflow, [Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]);
     assert!(items(&s).contains(&Item::Images));
-    let s = slots(&Ctx { width: 232, ..c });
+    let s = slots(&Ctx {
+        width: 232 + FIND as u32,
+        ..c
+    });
     assert_eq!(
         s.overflow[..4],
         [Item::Images, Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]
@@ -688,5 +706,62 @@ fn wide_button_names_and_draws_the_layout_it_switches_to() {
     assert_eq!(
         Item::Wide.command(),
         Some(Command::Action(Action::ToggleWide))
+    );
+}
+
+/// The find button sits between reload and ⚙, names its shortcut either way round, and lights up
+/// while the bar is open like the contents button does.
+#[cfg(feature = "find")]
+#[test]
+fn the_find_button_shows_whether_the_bar_is_open() {
+    let c = ctx(900);
+    assert_eq!(Item::Find.label(&c), "Find (Ctrl+F)");
+    assert_eq!(
+        Item::Find.label(&Ctx { find: true, ..c }),
+        "Close find (Esc)"
+    );
+    let s = slots(&c);
+    let r = |i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;
+    assert_eq!(r(Item::Find).x1, r(Item::Settings).x0);
+    assert_eq!(r(Item::Reload).x1, r(Item::Find).x0);
+    // It goes into the dropdown after reload and before ⚙ is lost: a window with room for ⚙, find
+    // and `⋯` only has reload and the rest in it.
+    let narrow = ctx((EDGE + LEFT + TOC + GAP + 2.0 * BUTTON + BUTTON + EDGE) as u32);
+    let s = slots(&narrow);
+    assert!(items(&s).contains(&Item::Find) && items(&s).contains(&Item::Settings));
+    assert!(s.overflow.contains(&Item::Reload));
+}
+
+#[cfg(all(feature = "find", feature = "embed-fonts"))]
+#[test]
+fn the_find_button_is_lit_while_the_bar_is_open() {
+    use crate::theme::LIGHT;
+    let fonts = Fonts::new().unwrap();
+    let (mut cache, mut text) = (GlyphCache::default(), TextCtx::default());
+    let mut paint = |c: &Ctx| {
+        let mut buf = vec![LIGHT.bg; 900 * 40];
+        let mut f = Frame::new(&mut buf, 900, 40, 900);
+        Toolbar::default().paint(&mut f, c, &fonts, &mut cache, &mut text, &LIGHT);
+        buf
+    };
+    let c = ctx(900);
+    let (off, on) = (paint(&c), paint(&Ctx { find: true, ..c }));
+    let r = slots(&c)
+        .items
+        .iter()
+        .find(|(i, _)| *i == Item::Find)
+        .unwrap()
+        .1;
+    // The button's corner area differs (the tint), nothing else does.
+    let tint = |buf: &[u32]| buf[(r.y0 as usize + 8) * 900 + r.x0 as usize + 5];
+    assert_ne!(tint(&off), tint(&on));
+    let changed = off.iter().zip(&on).filter(|(a, b)| a != b).count();
+    assert!(changed > 0);
+    let outside = |i: usize| i % 900 < r.x0 as usize || i % 900 >= r.x1 as usize;
+    assert!(
+        off.iter()
+            .zip(&on)
+            .enumerate()
+            .all(|(i, (a, b))| !outside(i) || a == b)
     );
 }

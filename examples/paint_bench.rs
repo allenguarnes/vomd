@@ -63,6 +63,8 @@ fn main() {
             &LIGHT,
             #[cfg(feature = "clipboard")]
             select,
+            #[cfg(feature = "find")]
+            None,
         );
         render::paint_scrollbar(&mut frame, vp, layout.total_height(), 2.0, &LIGHT);
     };

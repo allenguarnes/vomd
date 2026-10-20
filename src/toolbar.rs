@@ -1,7 +1,7 @@
 //! The toolbar: one slim bar docked at the top, never over the text.
 //!
 //! Left: Back, Open, contents. Right: remote images (only when the document has any), zoom (− 100% +), wide
-//! layout, theme, reload, settings. Buttons for features that aren't built yet are absent. On
+//! layout, theme, reload, find, settings. Buttons for features that aren't built yet are absent. On
 //! narrow windows the right group collapses into a `⋯` button with a small dropdown, the one
 //! popup in the app: zoom first, then remote images, wide layout, theme, ...
 //! A tooltip with the name and shortcut appears after 500 ms. Icons are glyphs of an embedded
@@ -60,6 +60,15 @@ pub(crate) mod icon {
     pub const COPY: char = '\u{e09e}';
     #[cfg(feature = "clipboard")]
     pub const CHECK: char = '\u{e06c}';
+    /// The find button, and the find bar's previous and next match and close buttons.
+    #[cfg(feature = "find")]
+    pub const SEARCH: char = '\u{e151}';
+    #[cfg(feature = "find")]
+    pub const CHEVRON_UP: char = '\u{e070}';
+    #[cfg(feature = "find")]
+    pub const CHEVRON_DOWN: char = '\u{e06d}';
+    #[cfg(feature = "find")]
+    pub const CLOSE: char = '\u{e1b2}';
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +89,9 @@ pub enum Item {
     Wide,
     Theme,
     Reload,
+    /// Show or hide the find bar.
+    #[cfg(feature = "find")]
+    Find,
     Settings,
     /// `⋯`: opens the dropdown with the items that didn't fit.
     More,
@@ -110,6 +122,9 @@ pub struct Ctx {
     /// The contents panel is open.
     #[cfg(feature = "toc")]
     pub toc: bool,
+    /// The find bar is open.
+    #[cfg(feature = "find")]
+    pub find: bool,
     /// There is a settings file to open (not with `--no-settings`).
     pub settings: bool,
     /// Remote images in the document (0: no remote-images button).
@@ -184,6 +199,10 @@ impl Item {
             }
             .into(),
             Item::Reload => "Reload (R)".into(),
+            #[cfg(feature = "find")]
+            Item::Find if ctx.find => "Close find (Esc)".into(),
+            #[cfg(feature = "find")]
+            Item::Find => "Find (Ctrl+F)".into(),
             Item::Settings => "Settings".into(),
             Item::More => "More".into(),
         }
@@ -202,6 +221,8 @@ impl Item {
             Item::Wide => icon::UNFOLD,
             Item::Theme => icon::THEME,
             Item::Reload => icon::RELOAD,
+            #[cfg(feature = "find")]
+            Item::Find => icon::SEARCH,
             Item::Settings => icon::SETTINGS,
             Item::More => icon::MORE,
             Item::ZoomReset => return None,
@@ -221,6 +242,8 @@ impl Item {
             Item::Wide => Command::Action(Action::ToggleWide),
             Item::Theme => Command::Action(Action::CycleTheme),
             Item::Reload => Command::Action(Action::Reload),
+            #[cfg(feature = "find")]
+            Item::Find => Command::Action(Action::ToggleFind),
             Item::Settings => Command::Settings,
             Item::More => return None,
         })
@@ -239,7 +262,20 @@ impl Item {
 /// lowest group collapses into `⋯` first. The remote-images button is the first, and only there
 /// when the document has remote images; it goes after the zoom (collapsed alone, `⋯` would take
 /// its place for nothing). Wide layout goes just before the theme and collapses just before it.
-/// ⚙ is the last, and only there with a settings file.
+/// Find goes after reload, and ⚙ is the last, and only there with a settings file.
+#[cfg(feature = "find")]
+const RIGHT: [(Item, f32, u8); 9] = [
+    (Item::Images, BUTTON, 1),
+    (Item::ZoomOut, BUTTON, 0),
+    (Item::ZoomReset, PERCENT, 0),
+    (Item::ZoomIn, BUTTON, 0),
+    (Item::Wide, BUTTON, 2),
+    (Item::Theme, BUTTON, 3),
+    (Item::Reload, BUTTON, 4),
+    (Item::Find, BUTTON, 5),
+    (Item::Settings, BUTTON, 6),
+];
+#[cfg(not(feature = "find"))]
 const RIGHT: [(Item, f32, u8); 8] = [
     (Item::Images, BUTTON, 1),
     (Item::ZoomOut, BUTTON, 0),
@@ -248,16 +284,16 @@ const RIGHT: [(Item, f32, u8); 8] = [
     (Item::Wide, BUTTON, 2),
     (Item::Theme, BUTTON, 3),
     (Item::Reload, BUTTON, 4),
-    (Item::Settings, BUTTON, 5),
+    (Item::Settings, BUTTON, 6),
 ];
 
 /// The contents button's collapse group: it goes last, after everything of the right group, since
 /// it sits with Back and Open at the left.
-const CONTENTS_GROUP: u8 = 6;
+const CONTENTS_GROUP: u8 = 7;
 
 /// The right group's items in this window.
 fn right_items(ctx: &Ctx) -> &'static [(Item, f32, u8)] {
-    &RIGHT[usize::from(ctx.remote == 0)..7 + usize::from(ctx.settings)]
+    &RIGHT[usize::from(ctx.remote == 0)..RIGHT.len() - 1 + usize::from(ctx.settings)]
 }
 
 /// How many of the right group's leading groups don't fit and collapse into `⋯`.
@@ -442,10 +478,15 @@ impl Toolbar {
         if self.hidden {
             return false;
         }
-        if y >= 0.0 && y < f64::from(self.height(ctx.scale)) {
-            return true;
-        }
-        self.menu.is_some() && menu_box(ctx, &slots(ctx)).is_some_and(|b| b.contains(x, y))
+        (y >= 0.0 && y < f64::from(self.height(ctx.scale))) || self.menu_covers(ctx, x, y)
+    }
+
+    /// The point is on the open dropdown, which hangs over whatever is below the bar: the find
+    /// bar, the contents panel, the document.
+    pub fn menu_covers(&self, ctx: &Ctx, x: f64, y: f64) -> bool {
+        !self.hidden
+            && self.menu.is_some()
+            && menu_box(ctx, &slots(ctx)).is_some_and(|b| b.contains(x, y))
     }
 
     /// The pointer moved to (`x`, `y`). Returns true if the toolbar needs a repaint.
@@ -524,6 +565,12 @@ impl Toolbar {
         self.open(ctx)
     }
 
+    /// How far the dropdown's rows are scrolled, if it is open.
+    #[cfg(all(test, feature = "find", feature = "embed-fonts"))]
+    pub(crate) fn menu_scroll(&self) -> Option<f32> {
+        self.menu
+    }
+
     /// The wheel (or an arrow key) moves the dropdown's rows by `dy` pixels when the window
     /// cuts it short. Returns true if the dropdown is open: it takes the scrolling.
     pub fn scroll_menu(&mut self, ctx: &Ctx, dy: f32) -> bool {
@@ -587,6 +634,8 @@ impl Toolbar {
             let on = (item == Item::More && open) || (item == Item::Images && ctx.remote_on);
             #[cfg(feature = "toc")]
             let on = on || (item == Item::Contents && ctx.toc);
+            #[cfg(feature = "find")]
+            let on = on || (item == Item::Find && ctx.find);
             if cfg!(feature = "remote-images") && item == pulse_on && ctx.pulse {
                 let inset = 3.0 * s;
                 let r = Rect {
@@ -866,9 +915,10 @@ fn paint_badge(
     paint_label(frame, fonts, cache, &placed, theme.bg, theme);
 }
 
-/// The tooltip: a small box under the hovered button, kept inside the window.
+/// The tooltip: a small box under the hovered button, kept inside the window (the find bar's
+/// buttons have them too).
 #[allow(clippy::too_many_arguments)]
-fn paint_tooltip(
+pub(crate) fn paint_tooltip(
     frame: &mut Frame,
     ctx: &Ctx,
     fonts: &Fonts,

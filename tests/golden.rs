@@ -18,7 +18,7 @@ use vomd::render::{self, Clip, Frame, Pixels, Viewport};
 use vomd::select::Pos;
 use vomd::text::cache::GlyphCache;
 use vomd::theme::{DARK, LIGHT, Theme};
-#[cfg(feature = "clipboard")]
+#[cfg(any(feature = "clipboard", feature = "find"))]
 use vomd::view::{ThemeMode, View};
 
 /// Tallest golden image; documents are cut off below this.
@@ -232,6 +232,43 @@ const BUTTON_CASES: &[ButtonCase] = &[
     },
 ];
 
+/// The find bar open on `selection.md`, with its toolbar: the second match of `query` current.
+#[cfg(feature = "find")]
+struct FindCase {
+    name: &'static str,
+    /// Logical width of the window, and the window system's scale.
+    width: f32,
+    scale: f32,
+    dark: bool,
+    query: &'static str,
+}
+
+#[cfg(feature = "find")]
+const FIND_CASES: &[FindCase] = &[
+    FindCase {
+        name: "find-light",
+        width: 640.0,
+        scale: 1.0,
+        dark: false,
+        query: "in",
+    },
+    FindCase {
+        name: "find-dark",
+        width: 640.0,
+        scale: 1.0,
+        dark: true,
+        query: "in",
+    },
+    // HiDPI 2×: the bar, its field and the washes scale with the window.
+    FindCase {
+        name: "find-2x",
+        width: 420.0,
+        scale: 2.0,
+        dark: false,
+        query: "line",
+    },
+];
+
 /// An image: width, height and pixels.
 type Rendered = (usize, usize, Vec<u32>);
 
@@ -304,6 +341,8 @@ fn render_case(case: &Case, fonts: &Fonts) -> Rendered {
         case.theme,
         #[cfg(feature = "clipboard")]
         sel,
+        #[cfg(feature = "find")]
+        None,
     );
     if case.select.is_some() {
         render::paint_images(
@@ -386,6 +425,45 @@ fn render_button(case: &ButtonCase) -> Rendered {
     }
     let mut px = vec![0; w as usize * h as usize];
     view.paint(&mut px, w as usize, now + Duration::from_millis(100));
+    (w as usize, h as usize, px)
+}
+
+/// The find case painted: `(width, height, pixels)`, the whole of `selection.md` below the toolbar
+/// and the bar.
+#[cfg(feature = "find")]
+fn render_find(case: &FindCase) -> Rendered {
+    let src = std::fs::read_to_string(root().join("fixtures/selection.md")).unwrap();
+    let doc = Doc::parse(&src);
+    let w = (case.width * case.scale).round() as u32;
+    let mut view = View::new(
+        Fonts::new().unwrap(),
+        doc,
+        None,
+        (w, MAX_H as u32),
+        f64::from(case.scale),
+    );
+    view.set_theme_mode(if case.dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    });
+    view.set_toolbar(true);
+    view.set_find(true);
+    view.find_type(case.query);
+    let now = Instant::now();
+    view.find_step(1, now);
+    assert!(
+        view.find_matches().len() >= 2 && view.find_current() == Some(1),
+        "{}: the query has matches to step through",
+        case.name
+    );
+    while !view.idle(Instant::now() + Duration::from_secs(1)) {}
+    view.ensure();
+    let h = (view.layout().total_height().ceil() as u32 + view.top_inset()).clamp(1, MAX_H as u32);
+    view.resize(w, h);
+    view.ensure();
+    let mut px = vec![0; w as usize * h as usize];
+    view.paint(&mut px, w as usize, now);
     (w as usize, h as usize, px)
 }
 
@@ -495,6 +573,8 @@ fn goldens() {
             .iter()
             .map(|case| (case.name, render_button(case))),
     );
+    #[cfg(feature = "find")]
+    let cases = cases.chain(FIND_CASES.iter().map(|case| (case.name, render_find(case))));
     for (name, (w, h, px)) in cases {
         let rgb = to_rgb(&px);
         let golden: PathBuf = root().join("tests/golden").join(format!("{name}.png"));

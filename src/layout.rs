@@ -108,6 +108,31 @@ impl Default for Params {
     }
 }
 
+/// Call `rect(x0, x1, key)` for each run of consecutive `hits` whose clusters share a `key`
+/// (`key(offset)` of the cluster's byte offset in the document's text; `None` leaves it out):
+/// the run's extent from its leftmost edge to its rightmost, whichever way its clusters run.
+pub fn runs<K: Copy + PartialEq>(
+    hits: &[crate::text::PHit],
+    key: impl Fn(u32) -> Option<K>,
+    mut rect: impl FnMut(f32, f32, K),
+) {
+    let mut run: Option<(f32, f32, K)> = None;
+    for h in hits {
+        let (a, b) = (h.x0.min(h.x1), h.x0.max(h.x1));
+        run = match (run, key(h.doc)) {
+            (Some((x0, x1, k)), Some(now)) if k == now => Some((x0.min(a), x1.max(b), k)),
+            (Some((x0, x1, k)), now) => {
+                rect(x0, x1, k);
+                now.map(|k| (a, b, k))
+            }
+            (None, now) => now.map(|k| (a, b, k)),
+        };
+    }
+    if let Some((x0, x1, k)) = run {
+        rect(x0, x1, k);
+    }
+}
+
 /// A block's laid-out content, in block coordinates (x from the content column's left edge,
 /// y from the block's top). Draw order: rects, then glyphs, then boxes.
 #[derive(Clone, Debug, Default, PartialEq)]

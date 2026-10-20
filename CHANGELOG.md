@@ -3,6 +3,27 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Find in page. `Ctrl+F` or the toolbar's search button opens a bar below the toolbar, and every
+  match of what you type is marked in the text as you type it: all in yellow (a muted amber in the
+  dark theme), the current one in orange, with its place among them in the bar ("3 / 17", "No
+  matches"). The query starts as the text you had selected, if that is one short line; the first
+  match from where you are reading is the current one, and the document scrolls to put it a third of
+  the way down unless it is in view already, however far it is. `Enter`, `F3` and `Ctrl+G` go to the
+  next match and `Shift` with them to the previous, around the ends, as the bar's buttons do; the
+  wheel over the bar does nothing, and `Esc` or its close button closes the bar and clears the marks
+  (the query is kept, shown selected, for the next time). While it is open the letter keys are typed
+  into it, `Backspace` and `Ctrl+Backspace` delete a character or a word, an input method's text is
+  typed too, and the `Ctrl` shortcuts, the arrows and the page keys still work on the document. Case
+  is ignored for every script. Only the text shown is searched, never markup or an address, and no
+  match runs from one block into another or from one table cell into the next; a very long
+  paragraph's pieces count as one block. Every match is counted, but only the 10,000 around the
+  current one are marked. A reload keeps the bar open and the query and searches the new text. The
+  bar is chrome, so it scales with the display and not the zoom. Needs the new `find` feature, on by
+  default; the smallest build leaves it out.
+
 ## [1.3.0] - 2026-10-21
 
 ### Added
@@ -137,6 +158,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.3.0...HEAD
 [1.3.0]: https://github.com/allenguarnes/vomd/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/allenguarnes/vomd/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/allenguarnes/vomd/compare/v1.0.0...v1.1.0

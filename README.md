@@ -20,6 +20,8 @@ the network unless you ask it to.
   over it.
 - **Contents panel**: `C` shows the headings in a panel at the left, with the current one
   marked; a click jumps to a heading.
+- **Find**: `Ctrl+F` opens a bar below the toolbar, and every match of what you type is
+  marked in the text as you type it, with a count and `Enter` to step through them.
 - **Live reload**: when the window gets focus, a document that changed on disk is shown again
   at the same place.
 - **Large files**: a 5 MB document opens in under 100 ms. Files over 10 MB still render, with
@@ -100,8 +102,8 @@ cargo build --release --no-default-features
 ```
 
 The Cargo features are `images` (PNG/JPEG), `remote-images` (via the system `curl`),
-`embed-fonts`, `clipboard` (selecting and copying text) and `toc` (the contents panel). All five
-are on by default.
+`embed-fonts`, `clipboard` (selecting and copying text), `toc` (the contents panel) and `find`
+(find in page). All six are on by default.
 
 ## Usage
 
@@ -127,6 +129,8 @@ Each window is its own process, so opening another file starts another window.
 | `T` | Theme: system → light → dark |
 | `B` | Show / hide the toolbar |
 | `C` | Show / hide the contents panel |
+| `Ctrl+F` | Find in the document: open the find bar, or select its query to type a new one |
+| `Enter` `Shift+Enter`, `F3` `Shift+F3`, `Ctrl+G` `Ctrl+Shift+G` | In the find bar: next / previous match |
 | `W` | Wide layout on / off: the text spans the window instead of stopping at `line_width` |
 | `I` | Load remote images for this document (press again to hide them) |
 | `R`, `F5` | Reload |
@@ -139,7 +143,7 @@ Each window is its own process, so opening another file starts another window.
 | `Ctrl+C`, `Ctrl+Insert` | Copy the selection |
 | `Backspace`, `Alt+←`, `Ctrl+[` | Back |
 | `Ctrl+O` | Open a file (the desktop's file dialog) |
-| `Esc` | Close the open menu, else the contents panel if it covers the document, else clear the selection, else quit |
+| `Esc` | Close the open menu, else the find bar if it is open, else the contents panel if it covers the document, else clear the selection, else quit |
 | `Q`, `Ctrl+W` | Quit |
 
 **Copying.** `Ctrl+C` copies the selected text to the clipboard as plain text: the text as it
@@ -171,6 +175,23 @@ is left, keeping your place; in a narrower one it covers the document's edge, an
 heading, a click on the document or `Esc` closes it. A document without headings says so.
 Headings inside footnotes, and headings with no text, are not listed. The panel's size
 follows the display's scale and not the zoom.
+
+**Find.** `Ctrl+F` (or the toolbar's search button) opens a bar below the toolbar and puts what
+you type into it, with the text you had selected if that was one short line. Every match in the
+text shows, in yellow, and the current one in orange, with its place among them in the bar ("3 /
+17", or "No matches"); the first one from where you are reading is the current one, and the
+document scrolls to put it about a third of the way down unless it is in view already. `Enter` (or
+`F3`, `Ctrl+G`, or the bar's ˅ button) goes to the next match and `Shift+Enter` (the ˄ button) to
+the previous one, around the ends; the wheel and the scroll keys move the page and leave the
+current match as it is. Case does not matter, and only the text you read is searched, never a
+link's address or the markup; a match never runs from one paragraph, heading or table cell into
+another. Every match is counted, but in a text with more than 10,000 only the 10,000 around the
+current one are marked. While the bar is open the letters you type go into it, so `Q`, `C` and the
+other letter keys are text, and `Ctrl+` shortcuts, the arrows and the page keys still work on the
+document. `Backspace` deletes a character, `Ctrl+Backspace` a word. `Esc` or the bar's ✕ closes it
+and clears the marks; the query is kept, shown selected, for the next `Ctrl+F`. A reload keeps the
+bar open and searches the new text again. The bar is as high as the toolbar and follows the
+display's scale and not the zoom.
 
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends

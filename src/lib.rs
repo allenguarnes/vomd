@@ -6,6 +6,8 @@ pub mod clipboard;
 #[cfg(feature = "clipboard")]
 pub mod copy;
 pub mod doc;
+#[cfg(feature = "find")]
+pub mod find;
 pub mod fonts;
 pub mod image;
 pub mod layout;

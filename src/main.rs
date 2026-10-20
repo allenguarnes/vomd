@@ -10,7 +10,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
+#[cfg(feature = "find")]
+use winit::dpi::PhysicalSize;
 use winit::dpi::{LogicalSize, PhysicalPosition};
+#[cfg(feature = "find")]
+use winit::event::Ime;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
@@ -251,6 +255,10 @@ struct App {
     /// The contents panel as last applied from or saved to the settings.
     #[cfg(feature = "toc")]
     toc_set: bool,
+    /// The window takes input method text, as it does while the find bar is open, with the area
+    /// last given for its window.
+    #[cfg(feature = "find")]
+    ime: Option<(u32, u32, u32, u32)>,
     shown: bool,
     exit_code: i32,
 }
@@ -302,6 +310,9 @@ impl App {
         }
         self.scan_fonts();
         self.resolve_families();
+        // The caret has moved when the query has.
+        #[cfg(feature = "find")]
+        self.sync_ime();
     }
 
     /// Apply preferences from the settings file (at startup and when it changes). Font
@@ -570,6 +581,27 @@ impl App {
             view.set_anchor(entry.anchor);
         }
         self.redraw();
+    }
+
+    /// Take text from an input method while the find bar is open, and not otherwise (so the
+    /// window has no input method's cursor over the document), with its window by the query.
+    #[cfg(feature = "find")]
+    fn sync_ime(&mut self) {
+        let (Some(view), Some(gfx)) = (self.view.as_ref(), self.gfx.as_ref()) else {
+            return;
+        };
+        let area = view.find_open().then(|| view.find_ime_area());
+        if let Some((x, y, w, h)) = area
+            && self.ime != area
+        {
+            gfx.window
+                .set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(w, h));
+        }
+        let (was, open) = (self.ime.is_some(), area.is_some());
+        self.ime = area;
+        if was != open {
+            gfx.window.set_ime_allowed(open);
+        }
     }
 
     /// Track the link under the pointer: the hand cursor and the URL preview follow it.
@@ -982,11 +1014,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if let Some(action) = view::key_action(&event.logical_key, self.mods) {
-                    let outcome = view.apply(action, now);
+                // The find bar, when open, has the keys that are text first.
+                #[cfg(feature = "find")]
+                let typed =
+                    view.find_key(&event.logical_key, event.text.as_deref(), self.mods, now);
+                #[cfg(not(feature = "find"))]
+                let typed: Option<Outcome> = None;
+                let outcome = typed.or_else(|| {
+                    let action = view::key_action(&event.logical_key, self.mods)?;
+                    Some(view.apply(action, now))
+                });
+                if let Some(outcome) = outcome {
                     self.outcome(outcome, event_loop);
                     self.record(now);
                 }
+            }
+            // What an input method committed goes to the find bar's query.
+            #[cfg(feature = "find")]
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                view.find_type(&text);
+                self.redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let zoom = self.mods.control_key() || self.mods.super_key();
@@ -1072,6 +1119,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // Scrolling, zooming, resizing or a new document move what's under the pointer.
         self.update_hover();
+        #[cfg(feature = "find")]
+        self.sync_ime();
     }
 
     /// However the window goes (close button, quit keys), save its size and anything else
@@ -1213,6 +1262,8 @@ fn main() {
         wide_set: false,
         #[cfg(feature = "toc")]
         toc_set: false,
+        #[cfg(feature = "find")]
+        ime: None,
         shown: false,
         exit_code: 0,
     };

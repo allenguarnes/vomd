@@ -31,6 +31,8 @@ use crate::toolbar::{self, Toolbar};
 
 #[cfg(feature = "clipboard")]
 mod copybtn;
+#[cfg(feature = "find")]
+mod find;
 #[cfg(feature = "clipboard")]
 mod gesture;
 #[cfg(feature = "toc")]
@@ -109,8 +111,14 @@ pub enum Action {
     /// Show or hide the table of contents panel (`C`).
     #[cfg(feature = "toc")]
     ToggleToc,
-    /// Escape: closes the toolbar's dropdown if it's open, else the contents panel if it covers
-    /// the document, else clears the selection, else quits.
+    /// Open the find bar, or focus it again (`Ctrl+F`).
+    #[cfg(feature = "find")]
+    Find,
+    /// Show or hide the find bar (the toolbar's button).
+    #[cfg(feature = "find")]
+    ToggleFind,
+    /// Escape: closes the find bar if it's open, else the toolbar's dropdown if it's open, else
+    /// the contents panel if it covers the document, else clears the selection, else quits.
     Escape,
     /// Select the whole document (`Ctrl+A`).
     #[cfg(feature = "clipboard")]
@@ -196,6 +204,8 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
                 "0" => Some(Action::ZoomReset),
                 "w" | "W" => Some(Action::Quit),
                 "o" | "O" => Some(Action::Open),
+                #[cfg(feature = "find")]
+                "f" | "F" => Some(Action::Find),
                 #[cfg(feature = "clipboard")]
                 "a" | "A" => Some(Action::SelectAll),
                 // Ctrl+Shift+C is a terminal's habit, and costs nothing.
@@ -497,6 +507,9 @@ pub struct View {
     /// The contents panel: whether it is open, and what it lists.
     #[cfg(feature = "toc")]
     toc: toc::Panel,
+    /// The find bar: whether it is open, the query and the matches.
+    #[cfg(feature = "find")]
+    find: find::Bar,
 }
 
 impl View {
@@ -576,6 +589,8 @@ impl View {
             copy: copybtn::CopyButton::default(),
             #[cfg(feature = "toc")]
             toc: toc::Panel::default(),
+            #[cfg(feature = "find")]
+            find: find::Bar::default(),
         };
         view.images.set_base(base);
         view.attach_images();
@@ -702,7 +717,17 @@ impl View {
     /// keeping the reading position.
     pub fn set_toolbar(&mut self, visible: bool) {
         self.toolbar.set_visible(visible);
-        self.set_top_inset(self.toolbar.height(self.hidpi as f32));
+        self.set_top_inset(self.chrome_inset());
+    }
+
+    /// The height of what the document area starts below: the toolbar and the find bar, in
+    /// physical pixels.
+    fn chrome_inset(&self) -> u32 {
+        #[cfg(feature = "find")]
+        let find = self.find_height();
+        #[cfg(not(feature = "find"))]
+        let find = 0;
+        self.toolbar.height(self.hidpi as f32) + find
     }
 
     pub fn toolbar_visible(&self) -> bool {
@@ -743,6 +768,8 @@ impl View {
             wide: self.wide,
             #[cfg(feature = "toc")]
             toc: self.toc.open,
+            #[cfg(feature = "find")]
+            find: self.find.open,
             settings: self.settings,
             remote: self.remote_count,
             remote_on: self.images.remote_on(),
@@ -834,8 +861,8 @@ impl View {
         if std::mem::replace(&mut self.hidpi, hidpi) != hidpi {
             self.close_menu();
         }
-        // The toolbar scales with the window, not the zoom.
-        self.top_inset_wanted = self.toolbar.height(self.hidpi as f32);
+        // The toolbar and the find bar scale with the window, not the zoom.
+        self.top_inset_wanted = self.chrome_inset();
         self.top_inset = self.top_inset_wanted.min(self.height);
         self.relayout();
     }
@@ -911,6 +938,11 @@ impl View {
     /// the pointer is over it, else the document (and the toolbar's dropdown) does, as in
     /// [`View::scroll_by`].
     pub fn wheel_by(&mut self, dy: f64, now: Instant) {
+        // The find bar has nothing to scroll, and the document below it is out of reach.
+        #[cfg(feature = "find")]
+        if self.find_wheel() {
+            return;
+        }
         #[cfg(feature = "toc")]
         if self.toc_wheel(dy) {
             return;
@@ -979,6 +1011,10 @@ impl View {
             Action::ToggleWide => self.set_wide(!self.wide),
             #[cfg(feature = "toc")]
             Action::ToggleToc => self.set_toc(!self.toc.open),
+            #[cfg(feature = "find")]
+            Action::Find => self.find_focus(),
+            #[cfg(feature = "find")]
+            Action::ToggleFind => self.set_find(!self.find.open),
             Action::ToggleRemote => {
                 if self.remote_count == 0 {
                     return Outcome::Nothing;
@@ -987,6 +1023,8 @@ impl View {
                 self.set_remote(on);
             }
             Action::Escape if self.close_menu() => {}
+            #[cfg(feature = "find")]
+            Action::Escape if self.find_escape() => {}
             #[cfg(feature = "toc")]
             Action::Escape if self.toc_escape() => {}
             #[cfg(feature = "clipboard")]
@@ -1047,6 +1085,14 @@ impl View {
         self.cancel_copy();
         let ctx = self.toolbar_ctx();
         if self.toolbar.press(&ctx, x, y) {
+            self.pressed = None;
+            #[cfg(feature = "clipboard")]
+            self.cancel_select();
+            return true;
+        }
+        // The find bar's: its buttons, and the rest of it, which does nothing.
+        #[cfg(feature = "find")]
+        if self.press_find(x, y) {
             self.pressed = None;
             #[cfg(feature = "clipboard")]
             self.cancel_select();
@@ -1155,6 +1201,9 @@ impl View {
         if command.is_some() {
             self.command = command;
         }
+        // The find bar's buttons act on their own, with no command for the shell.
+        #[cfg(feature = "find")]
+        let handled = handled | self.release_find(x, y, Instant::now());
         handled
     }
 
@@ -1199,6 +1248,12 @@ impl View {
         let ctx = self.toolbar_ctx();
         let bar = self.toolbar.pointer(&ctx, x, y, now);
         let free = self.drag.is_none() && !self.toolbar.covers(&ctx, x, y);
+        // The find bar takes the pointer as the toolbar does: no link under it, a tooltip on its
+        // buttons.
+        #[cfg(feature = "find")]
+        let bar = bar | self.find_pointer(self.drag.is_none().then_some((x, y)), now);
+        #[cfg(feature = "find")]
+        let free = free && !self.find_covers(x, y);
         // A selection drag has no links under it: the text cursor stays.
         #[cfg(feature = "clipboard")]
         let free = free && !self.selecting();
@@ -1226,6 +1281,8 @@ impl View {
     pub fn hover_end(&mut self) -> bool {
         let note = std::mem::take(&mut self.hover_blocked);
         let bar = self.set_over_bar(false, Instant::now());
+        #[cfg(feature = "find")]
+        let bar = bar | self.find_pointer(None, Instant::now());
         #[cfg(feature = "toc")]
         let bar = bar | self.toc_pointer(None, false);
         #[cfg(feature = "clipboard")]
@@ -1358,6 +1415,13 @@ impl View {
             let sel = self.selection();
             // Whatever uses the inset paints over this.
             frame.fill_rect(0, 0, w as i32, vp.area.y0, theme.bg);
+            #[cfg(feature = "find")]
+            let finds = {
+                let doc: &Doc = &self.doc;
+                let found = &self.find.found;
+                (self.find.open && !found.matches.is_empty())
+                    .then(|| (doc, found.marks(self.find.current)))
+            };
             render::paint(
                 &mut frame,
                 vp,
@@ -1367,6 +1431,8 @@ impl View {
                 theme,
                 #[cfg(feature = "clipboard")]
                 sel,
+                #[cfg(feature = "find")]
+                finds,
             );
             if cfg!(feature = "images") {
                 self.images.begin_frame();
@@ -1404,6 +1470,9 @@ impl View {
             #[cfg(feature = "toc")]
             self.paint_toc(&mut frame, theme);
         }
+        // Under the toolbar's dropdown, which hangs over it.
+        #[cfg(feature = "find")]
+        self.paint_find(&mut frame, theme);
         let ctx = self.toolbar_ctx();
         self.toolbar.paint(
             &mut frame,
@@ -1654,6 +1723,10 @@ impl View {
         let checked = self.copy_deadline();
         #[cfg(not(feature = "clipboard"))]
         let checked = None;
+        #[cfg(feature = "find")]
+        let tip = self.find_deadline();
+        #[cfg(not(feature = "find"))]
+        let tip = None;
         [
             fade,
             self.toolbar.deadline(&self.toolbar_ctx()),
@@ -1662,6 +1735,7 @@ impl View {
             self.notice.as_ref().and_then(|n| n.0),
             scroll,
             checked,
+            tip,
         ]
         .into_iter()
         .flatten()
@@ -1691,6 +1765,8 @@ impl View {
         let scrolled = self.autoscroll(now) | self.copy_expire(now);
         #[cfg(not(feature = "clipboard"))]
         let scrolled = false;
+        #[cfg(feature = "find")]
+        let scrolled = scrolled | self.find_expire(now);
         fade | pulse | toast | notice | scrolled | self.toolbar.expire(&self.toolbar_ctx(), now)
     }
 
@@ -1935,6 +2011,8 @@ impl View {
         self.drag = None;
         #[cfg(feature = "toc")]
         self.forget_toc();
+        #[cfg(feature = "find")]
+        self.find_again();
         #[cfg(feature = "clipboard")]
         {
             self.clear_selection();
@@ -1991,12 +2069,18 @@ impl View {
         // A reload keeps remote images on.
         self.attach_images();
         self.anchor = Anchor::TOP;
+        // The matches are those of the new text, and the current one is the first from where the
+        // position ends up: nothing scrolls.
         if self.message.is_some() {
             self.kept = Some((place, old));
+            #[cfg(feature = "find")]
+            self.find_again();
             return;
         }
         let n = self.doc.blocks.len();
         if n == 0 {
+            #[cfg(feature = "find")]
+            self.find_again();
             return;
         }
         let found = place.and_then(|p| {
@@ -2016,6 +2100,8 @@ impl View {
         });
         // Measures around the position, and settles at the end if the new text is shorter.
         self.ensure();
+        #[cfg(feature = "find")]
+        self.find_again();
     }
 
     /// Where the reading position is relative to the heading at or above it.

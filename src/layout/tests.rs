@@ -2092,3 +2092,44 @@ fn wide_in_a_narrow_window_keeps_the_measured_blocks() {
     });
     assert!(!l.complete());
 }
+
+#[test]
+fn runs_join_neighbours_with_one_key_and_split_on_another_or_none() {
+    use crate::text::PHit;
+    let hit = |x0: f32, x1: f32, doc: u32| PHit {
+        x0,
+        x1,
+        doc,
+        style: 0,
+    };
+    // Clusters 0..6 across 60 px; the key is the cluster's offset divided by two, none from 4.
+    let hits: Vec<PHit> = (0..6)
+        .map(|i| hit(i as f32 * 10.0, i as f32 * 10.0 + 10.0, i))
+        .collect();
+    let mut out = Vec::new();
+    runs(
+        &hits,
+        |off| (off < 4).then_some(off / 2),
+        |a, b, k| out.push((a, b, k)),
+    );
+    assert_eq!(out, [(0.0, 20.0, 0), (20.0, 40.0, 1)]);
+    // The same key again after a gap is another run; a run reaches the end of the hits.
+    out.clear();
+    runs(
+        &hits,
+        |off| (off != 2).then_some(()),
+        |a, b, ()| out.push((a, b, 0)),
+    );
+    assert_eq!(out, [(0.0, 20.0, 0), (30.0, 60.0, 0)]);
+    // Right-to-left clusters (x1 before x0) give the same extents.
+    let rtl: Vec<PHit> = hits.iter().map(|h| hit(h.x1, h.x0, h.doc)).collect();
+    out.clear();
+    runs(
+        &rtl,
+        |off| (off != 2).then_some(()),
+        |a, b, ()| out.push((a, b, 0)),
+    );
+    assert_eq!(out, [(0.0, 20.0, 0), (30.0, 60.0, 0)]);
+    // No hits, no runs.
+    runs(&[], |_| Some(()), |_, _, ()| panic!("a run from nothing"));
+}

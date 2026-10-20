@@ -24,6 +24,11 @@ fn keys() {
         (Key::Named(NamedKey::PageUp), none, Some(Action::Pages(-1))),
         (Key::Named(NamedKey::Space), none, Some(Action::Pages(1))),
         (Key::Named(NamedKey::Space), shift, Some(Action::Pages(-1))),
+        #[cfg(feature = "find")]
+        (ch("f"), ctrl, Some(Action::Find)),
+        #[cfg(feature = "find")]
+        (ch("F"), ctrl | shift, Some(Action::Find)),
+        (ch("f"), none, None),
         (ch("g"), none, Some(Action::Top)),
         (ch("G"), shift, Some(Action::Bottom)),
         (ch("g"), shift, Some(Action::Bottom)),
@@ -2136,8 +2141,9 @@ mod with_fonts {
             (y0 as i32 + y1 as i32 - (32 + 400)).abs() <= 12,
             "{y0}..{y1}"
         );
-        // Reload sits at the right edge (no settings file here).
-        let (x, y) = (600.0 - 4.0 - 16.0, 16.0);
+        // Reload sits at the right edge, or just left of the find button (no settings file here).
+        let find = if cfg!(feature = "find") { 32.0 } else { 0.0 };
+        let (x, y) = (600.0 - 4.0 - 16.0 - find, 16.0);
         assert!(v.hover_at(x, y, now));
         assert_eq!(v.deadline(), Some(now + toolbar::TOOLTIP_DELAY));
         assert!(v.press(x, y, now));

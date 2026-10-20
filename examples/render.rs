@@ -97,6 +97,8 @@ fn main() {
         theme,
         #[cfg(feature = "clipboard")]
         None,
+        #[cfg(feature = "find")]
+        None,
     );
     images.begin_frame();
     render::paint_images(

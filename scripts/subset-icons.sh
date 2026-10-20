@@ -14,8 +14,9 @@ out=$(cd "$(dirname "$0")/.." && pwd)/assets/fonts
 #   settings E154, ellipsis E0B6, image E0F6 (remote images, P10), unfold-horizontal E43D and
 #   fold-horizontal E43B (wide layout on and off), folder-open E247 (open a file), copy E09E and
 #   check E06C (the copy button on code blocks, and its "copied" mark), list E106 (the contents
-#   panel). Buttons of later phases add theirs when they land: search E151 (find).
-icons="U+E048,U+E11C,U+E13D,U+E09D,U+E149,U+E154,U+E0B6,U+E0F6,U+E43D,U+E43B,U+E247,U+E09E,U+E06C,U+E106"
+#   panel), search E151 (find), chevron-up E070 and chevron-down E06D (the find bar's previous
+#   and next match) and x E1B2 (its close button).
+icons="U+E048,U+E11C,U+E13D,U+E09D,U+E149,U+E154,U+E0B6,U+E0F6,U+E43D,U+E43B,U+E247,U+E09E,U+E06C,U+E106,U+E151,U+E070,U+E06D,U+E1B2"
 
 # The tables a renderer doesn't need are dropped (OS/2, name, post), and the em is cut from 1000
 # to 128 units: 8 units per pixel at toolbar sizes, and the smaller outline deltas take fewer bytes.

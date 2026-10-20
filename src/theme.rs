@@ -21,6 +21,11 @@ pub enum Role {
     /// Behind selected text.
     #[cfg(feature = "clipboard")]
     Selection,
+    /// Behind the matches of a find, and behind the current one.
+    #[cfg(feature = "find")]
+    FindMatch,
+    #[cfg(feature = "find")]
+    FindCurrent,
 }
 
 /// `0x00RRGGBB`, the softbuffer pixel format.
@@ -41,6 +46,12 @@ pub struct Theme {
     /// Painted under selected text, which keeps its own color: a blue that reads on the page.
     #[cfg(feature = "clipboard")]
     pub selection: Rgb,
+    /// Painted under the matches of a find, and under the current match: a soft yellow, and a
+    /// stronger orange, that text still reads on.
+    #[cfg(feature = "find")]
+    pub find_match: Rgb,
+    #[cfg(feature = "find")]
+    pub find_current: Rgb,
 }
 
 pub const LIGHT: Theme = Theme {
@@ -57,6 +68,10 @@ pub const LIGHT: Theme = Theme {
     // Primer's #0969da at 20% over white.
     #[cfg(feature = "clipboard")]
     selection: 0xcde1f8,
+    #[cfg(feature = "find")]
+    find_match: 0xffe98f,
+    #[cfg(feature = "find")]
+    find_current: 0xffb25c,
 };
 
 pub const DARK: Theme = Theme {
@@ -73,6 +88,10 @@ pub const DARK: Theme = Theme {
     // Primer's #388bfd at 40% over the page.
     #[cfg(feature = "clipboard")]
     selection: 0x1e4273,
+    #[cfg(feature = "find")]
+    find_match: 0x5c4a14,
+    #[cfg(feature = "find")]
+    find_current: 0x9c5a14,
 };
 
 impl Theme {
@@ -94,6 +113,10 @@ impl Theme {
             Role::AlertCaution => self.alerts[4],
             #[cfg(feature = "clipboard")]
             Role::Selection => self.selection,
+            #[cfg(feature = "find")]
+            Role::FindMatch => self.find_match,
+            #[cfg(feature = "find")]
+            Role::FindCurrent => self.find_current,
         }
     }
 }

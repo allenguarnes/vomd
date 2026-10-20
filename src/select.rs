@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use crate::doc::{Block, BlockKind, Doc, Span};
-use crate::layout::BlockBox;
+use crate::layout::{BlockBox, runs};
 use crate::text::{PHit, is_combining_mark};
 
 /// The offset that means the end of a block, whatever its text.
@@ -389,18 +389,13 @@ impl BlockSel {
                 }
                 continue;
             };
-            let mut run: Option<(f32, f32)> = None;
-            for h in hits {
-                if self.has(h.doc) {
-                    let (a, b) = (h.x0.min(h.x1), h.x0.max(h.x1));
-                    run = Some(run.map_or((a, b), |(x0, x1)| (x0.min(a), x1.max(b))));
-                } else if let Some((x0, x1)) = run.take() {
+            runs(
+                hits,
+                |off| self.has(off).then_some(()),
+                |x0, x1, ()| {
                     rect(x0, y0, x1, y1);
-                }
-            }
-            if let Some((x0, x1)) = run {
-                rect(x0, y0, x1, y1);
-            }
+                },
+            );
             // The end of the line is marked when the selection reaches the next line (the space
             // between them hangs, with no cluster of its own) or the next block.
             let continues = next_doc(k).map_or(self.past, |d| self.to >= d);
