@@ -9,14 +9,16 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - A table of contents panel. `C`, the toolbar's list button or `toc = true` in the settings shows
   the document's headings, h1 to h6 and indented by level, in a panel at the window's left, from
   below the toolbar down. The heading being read is marked and the panel scrolls to keep it in
-  view; a click on a heading jumps to it as a link to its `#anchor` does (Back returns), and the
-  wheel over the panel scrolls the panel alone. In a window at least 740 logical pixels wide the
-  panel pushes the document aside and the document is laid out in the rest, keeping your place; in
-  a narrower one it covers the document, and a click on a heading, a click on the document or
-  `Esc` closes it. Headings inside footnotes are left out, a document without headings says so,
-  and the panel stays open (and keeps its place) through a reload. It is chrome, so it scales with
-  the display and not the zoom. The `toc` setting is saved when you toggle the panel. Needs the new
-  `toc` feature, on by default; the smallest build leaves it out.
+  view; a heading you jump to stays marked until you scroll, even one too near the end to come up
+  to the top (`[` and `]` then step on from it); a click on a heading jumps to it as a link to its
+  `#anchor` does (Back returns), and the wheel over the panel scrolls the panel alone. In a window
+  at least 740 logical pixels wide the panel pushes the document aside and the document is laid
+  out in the rest, keeping your place; in a narrower one it covers the document, and a click on a
+  heading, a click on the document or `Esc` closes it. Headings inside footnotes are left out, a
+  document without headings says so, and the panel stays open (and keeps its place) through a
+  reload. It is chrome, so it scales with the display and not the zoom. The `toc` setting is saved
+  when you toggle the panel. Needs the new `toc` feature, on by default; the smallest build leaves
+  it out.
 
 ## [1.2.0] - 2026-10-20
 

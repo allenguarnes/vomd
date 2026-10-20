@@ -862,7 +862,17 @@ impl View {
 
     pub fn set_scroll(&mut self, y: f64) {
         let y = if y.is_nan() { 0.0 } else { y };
-        self.anchor = self.layout.anchor_exact(y.clamp(0.0, self.max_scroll()));
+        let anchor = self.layout.anchor_exact(y.clamp(0.0, self.max_scroll()));
+        self.move_to(anchor);
+    }
+
+    /// Move the reading position. Leaving the one a ToC jump ended at drops that jump's mark.
+    fn move_to(&mut self, anchor: Anchor) {
+        #[cfg(feature = "toc")]
+        if self.toc.aimed.is_some_and(|(_, at)| at != anchor) {
+            self.toc.aimed = None;
+        }
+        self.anchor = anchor;
     }
 
     /// Scroll by `dy` physical pixels; the toolbar's open dropdown takes it instead of the
@@ -942,7 +952,7 @@ impl View {
             Action::Lines(n) => self.scroll_by(f64::from(n) * self.line(), now),
             Action::Pages(n) => self.scroll_by(f64::from(n) * self.page(), now),
             Action::Top => {
-                self.anchor = Anchor::TOP;
+                self.move_to(Anchor::TOP);
                 self.fade.poke(now);
             }
             Action::Bottom => {
@@ -1264,6 +1274,8 @@ impl View {
             return false;
         };
         self.set_anchor(Anchor { block, frac: 0.0 });
+        #[cfg(feature = "toc")]
+        self.toc_aim(block);
         self.fade.poke(now);
         true
     }
@@ -1271,14 +1283,14 @@ impl View {
     /// Go to a reading position (from the back stack), kept inside the document.
     pub fn set_anchor(&mut self, anchor: Anchor) {
         let n = self.doc.blocks.len() as u32;
-        self.anchor = if n == 0 {
+        self.move_to(if n == 0 {
             Anchor::TOP
         } else {
             Anchor {
                 block: anchor.block.min(n - 1),
                 frac: anchor.frac.clamp(0.0, 1.0),
             }
-        };
+        });
         self.ensure();
     }
 
@@ -1286,6 +1298,12 @@ impl View {
     /// false if there's none that way.
     pub fn heading(&mut self, dir: i32, now: Instant) -> bool {
         let at = self.scroll();
+        // From a heading just jumped to that couldn't come up to the top (near the end), not
+        // from the top of the window.
+        #[cfg(feature = "toc")]
+        let at = self
+            .toc_aimed()
+            .map_or(at, |block| self.layout.top(block as usize));
         let mut blocks: Vec<u32> = self.doc.headings.iter().map(|h| h.block).collect();
         blocks.sort_unstable();
         blocks.dedup();
@@ -1299,6 +1317,8 @@ impl View {
             return false;
         };
         self.set_anchor(Anchor { block, frac: 0.0 });
+        #[cfg(feature = "toc")]
+        self.toc_aim(block);
         self.fade.poke(now);
         true
     }

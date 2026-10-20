@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::doc::{Doc, MAX_BLOCK_BYTES};
 use crate::fonts::Fonts;
+use crate::layout::Anchor;
+use crate::view::Action;
 
 fn view(src: &str, w: u32, h: u32) -> View {
     let mut v = View::new(Fonts::new().unwrap(), Doc::parse(src), None, (w, h), 1.0);
@@ -369,6 +371,142 @@ fn the_panel_follows_the_current_heading_when_it_changes() {
     paint(&mut v, now);
     let top = g.top(8, v.toc.scroll);
     assert!(top >= g.y0 && top + g.row() <= g.y1, "row 8 shows at {top}");
+}
+
+#[test]
+fn a_heading_jumped_to_near_the_end_is_current_until_the_reader_scrolls() {
+    let now = Instant::now();
+    let mut v = view(&sections(30), 1000, 400);
+    v.set_toc(true);
+    settle(&mut v);
+    // The last headings can't come up to the window's top: the jump stops at the end.
+    assert!(v.jump_to_anchor("s29", now));
+    settle(&mut v);
+    paint(&mut v, now);
+    let last = v.layout.top(v.doc.headings[29].block as usize);
+    assert!(
+        v.scroll() + v.line() < last,
+        "s29 is below the window's top"
+    );
+    assert_eq!(v.toc_current(), Some(29));
+    // Another of them, by its row or by the next heading key: that one is marked.
+    assert!(v.jump_to_anchor("s27", now));
+    paint(&mut v, now);
+    assert_eq!(v.toc_current(), Some(27));
+    assert!(v.heading(1, now));
+    paint(&mut v, now);
+    assert_eq!(v.toc_current(), Some(28));
+    assert!(v.heading(-1, now));
+    paint(&mut v, now);
+    assert_eq!(v.toc_current(), Some(27));
+    assert!(v.heading(1, now) && v.heading(1, now));
+    assert_eq!(v.toc_current(), Some(29));
+    assert!(!v.heading(1, now), "nothing after the last");
+    // The reader scrolls: the position says which heading is current again.
+    v.scroll_by(-5.0, now);
+    paint(&mut v, now);
+    let at = v.scroll() + 0.5 * v.line();
+    let expected = (0..30)
+        .rev()
+        .find(|&i| v.layout.top(v.doc.headings[i].block as usize) <= at);
+    assert_eq!(v.toc_current(), expected);
+    assert!(expected < Some(27));
+}
+
+/// The heading the normal rule gives: the last at or above the window's top, half a line down.
+fn by_position(v: &View) -> Option<usize> {
+    let at = v.scroll() + 0.5 * v.line();
+    (0..v.doc.headings.len())
+        .rev()
+        .find(|&i| v.layout.top(v.doc.headings[i].block as usize) <= at)
+}
+
+#[test]
+fn a_jumped_to_heading_is_not_marked_once_a_longer_document_pushes_it_off_screen() {
+    let now = Instant::now();
+    let long = (0..30)
+        .map(|i| {
+            format!(
+                "## S{i}\n\n{}\n\n",
+                "A long paragraph of words. ".repeat(30)
+            )
+        })
+        .collect::<String>();
+    let changes: [fn(&mut View); 2] = [|v| v.set_zoom(250), |v| v.resize(260, 600)];
+    for change in changes {
+        let mut v = view(&long, 1000, 600);
+        v.set_toc(true);
+        settle(&mut v);
+        assert!(v.jump_to_anchor("s29", now));
+        settle(&mut v);
+        assert_eq!(v.toc_current(), Some(29));
+        // The reading position stays, the document grows below it.
+        change(&mut v);
+        settle(&mut v);
+        let top = v.layout.top(v.doc.headings[29].block as usize);
+        assert!(
+            top >= v.scroll() + f64::from(v.area_height()),
+            "s29 is off screen"
+        );
+        assert_eq!(v.toc_current(), by_position(&v));
+        assert_ne!(v.toc_current(), Some(29));
+        // The keys step from the window, not from the heading that is no longer there.
+        let before = v.scroll();
+        assert!(v.heading(-1, now));
+        assert!(v.scroll() < before, "[ goes up");
+        v.set_scroll(before);
+        assert!(v.heading(1, now));
+        assert!(v.scroll() > before, "] goes down");
+    }
+}
+
+#[test]
+fn the_mark_does_not_come_back_when_the_reader_scrolls_to_the_same_place() {
+    let now = Instant::now();
+    let mut v = view(&sections(30), 1000, 400);
+    v.set_toc(true);
+    settle(&mut v);
+    assert!(v.jump_to_anchor("s29", now));
+    settle(&mut v);
+    assert_eq!(v.toc_current(), Some(29));
+    // Up and back to the end, to the very same position.
+    let end = v.scroll();
+    v.scroll_by(-500.0, now);
+    v.set_scroll(end);
+    paint(&mut v, now);
+    assert_eq!(v.toc_current(), by_position(&v));
+    assert!(v.toc_current() < Some(29));
+}
+
+#[test]
+fn the_mark_does_not_come_back_after_leaving_by_home_or_a_set_position() {
+    let now = Instant::now();
+    let leaves: [fn(&mut View, Instant); 2] = [
+        |v, now| {
+            v.apply(Action::Top, now);
+        },
+        |v, _| v.set_anchor(Anchor::TOP),
+    ];
+    for leave in leaves {
+        let mut v = view(&sections(30), 1000, 400);
+        v.set_toc(true);
+        settle(&mut v);
+        assert!(v.jump_to_anchor("s29", now));
+        settle(&mut v);
+        assert_eq!(v.toc_current(), Some(29));
+        // To the top and back to the end, to the very same position.
+        leave(&mut v, now);
+        settle(&mut v);
+        assert_eq!(v.toc_current(), Some(0));
+        v.apply(Action::Bottom, now);
+        paint(&mut v, now);
+        assert_eq!(v.toc_current(), by_position(&v));
+        let here = v.toc_current();
+        assert!(here < Some(29));
+        // The keys step from the window, to the heading after the one it is in.
+        assert!(v.heading(1, now));
+        assert_eq!(v.toc_current(), here.map(|i| i + 1));
+    }
 }
 
 #[test]

@@ -18,7 +18,7 @@ use std::ops::Range;
 
 use super::View;
 use crate::doc::Doc;
-use crate::layout::BlockBox;
+use crate::layout::{Anchor, BlockBox};
 use crate::render::{self, Clip, Frame, Viewport};
 use crate::text::TextStyle;
 use crate::theme::{Role, Theme};
@@ -274,6 +274,11 @@ pub(super) struct Panel {
     /// panel scrolls to the current heading when this changes, and not otherwise, so a panel the
     /// reader scrolled is left where it is.
     pub seen: Option<Option<usize>>,
+    /// The heading block the reader last jumped to (a row, a `#anchor` link, the next or
+    /// previous heading key) and the reading position the jump settled at: while the position
+    /// stays there, that heading is the current one, even one too near the document's end to
+    /// come up to the window's top.
+    pub aimed: Option<(u32, Anchor)>,
 }
 
 impl Panel {
@@ -452,6 +457,7 @@ impl View {
         self.toc.scroll = 0.0;
         self.toc.pressed = None;
         self.toc.seen = None;
+        self.toc.aimed = None;
         self.toc_look();
     }
 
@@ -461,14 +467,41 @@ impl View {
         self.toc.list = None;
         self.toc.forget_rows();
         self.toc.pressed = None;
+        self.toc.aimed = None;
         self.toc_look();
+    }
+
+    /// The reader jumped to the heading at `block`, and the reading position is where that
+    /// left it: the heading counts as the current one until the position moves.
+    pub(super) fn toc_aim(&mut self, block: u32) {
+        self.toc.aimed = Some((block, self.anchor));
+    }
+
+    /// The block of the heading last jumped to, while the reading position is where that left it
+    /// and the heading is in the window: a longer document (zoom, a narrower column) can leave
+    /// the same position with the heading far below.
+    pub(super) fn toc_aimed(&self) -> Option<u32> {
+        let (block, at) = self.toc.aimed?;
+        if at != self.anchor {
+            return None;
+        }
+        let top = self.layout.top(block as usize);
+        let scroll = self.scroll();
+        (scroll - 0.5 <= top && top < scroll + f64::from(self.area_height())).then_some(block)
     }
 
     /// The heading the reading position is in the section of: the last at or above the top of
     /// the window, a half line down, so a heading just scrolled to counts as the current one.
-    /// `None` before the first heading, or before the panel has the list.
+    /// A heading just jumped to is the current one while the position stays where the jump left
+    /// it, so one near the end that can't reach the top is still marked. `None` before the first
+    /// heading, or before the panel has the list.
     pub(super) fn toc_current(&self) -> Option<usize> {
         let list = self.toc.list.as_ref()?;
+        if let Some(block) = self.toc_aimed()
+            && let Ok(i) = list.entries.binary_search_by_key(&block, |e| e.block)
+        {
+            return Some(i);
+        }
         let at = self.scroll() + 0.5 * self.line();
         current(
             list.entries.len(),
