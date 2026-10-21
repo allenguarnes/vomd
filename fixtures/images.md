@@ -14,8 +14,13 @@ A linked image: [![gradient](images/gradient.jpg)](https://example.com/)
 |---|---|
 | ![plasma](images/wide.jpg) | The image is no wider than its cell. |
 
+An SVG, a GIF and a WebP: ![logo](images/logo-viewbox.svg) ![gif](images/anim.gif)
+![webp](images/lossy.webp)
+
 Missing and unsupported images show their alt text: ![missing file](images/none.png),
-![svg](images/x.svg), ![data URL](data:image/png;base64,iVBORw0KGgo=).
+![missing svg](images/x.svg), ![data URL](data:image/png;base64,iVBORw0KGgo=).
+
+Over the limits, with a click to load: ![huge](images/huge-header.png)
 
 Remote images are blocked until `I`: ![badge](https://img.shields.io/badge/vomd-P10-blue.png)
 ![remote photo](https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png)

@@ -132,6 +132,10 @@ impl View {
     /// Shift held a press extends the selection. Returns true if the selection changed (repaint).
     pub(super) fn press_text(&mut self, x: f64, y: f64, now: Instant) -> bool {
         self.select.press = None;
+        // Shift+click is the selection's, with or without one yet: it loads no image.
+        if self.select.shift {
+            self.pressed_image = None;
+        }
         if self.message.is_some() || self.doc.blocks.is_empty() || !self.in_area(x, y) {
             self.select.last.reset();
             return false;
@@ -196,6 +200,7 @@ impl View {
             (press.dragging, press.made) = (true, true);
             self.select.sel = Some(Selection::caret(press.anchor));
             self.pressed = None;
+            self.pressed_image = None;
             changed = true;
         }
         // Armed once; the steps keep their own pace until the pointer comes back.

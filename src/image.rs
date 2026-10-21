@@ -1,5 +1,6 @@
-//! Images: where an image's file is, its size, decoding PNG and JPEG,
-//! and the cache of decoded images with the worker thread that fills it.
+//! Images: where an image's file is, its size, decoding PNG, JPEG, GIF (the first frame) and
+//! WebP, turned upright by their EXIF orientation, and drawing SVG (`svg.rs`), and the cache of
+//! decoded images with the worker thread that fills it.
 //!
 //! Layout only needs an image's size, which comes from its header (a few bytes, read when its
 //! block is first measured), so the page doesn't jump when the pixels arrive. Pixels are decoded
@@ -11,15 +12,40 @@
 // Without decoders nothing is ever queued: the worker and the cache are dead code.
 #![cfg_attr(not(feature = "images"), allow(dead_code))]
 
-use std::io::Read;
+use std::io::{Cursor, Read, Seek};
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::doc::{Doc, ImageRef};
-use crate::layout::{ImageSize, Layout};
+use crate::layout::{ImageSize, Layout, Refusal};
 use crate::settings::RemoteImages;
+
+mod exif;
+#[cfg(feature = "images")]
+mod forced;
+#[cfg(feature = "images")]
+mod gif;
+#[cfg(feature = "svg")]
+mod svg;
+#[cfg(feature = "images")]
+mod webp;
+
+#[doc(hidden)]
+pub use exif::orientation as exif_orientation;
+/// SVGs drawn in a process of their own (see `svg::process`).
+#[cfg(all(feature = "svg", target_os = "linux"))]
+pub use svg::process::{
+    ARG as SVG_PROCESS_ARG, child as svg_child, running as svg_children,
+    set_program as set_svg_program,
+};
+#[cfg(all(feature = "svg", target_os = "linux"))]
+#[doc(hidden)]
+pub use svg::process::{
+    EAT as SVG_TEST_EAT, SPIN as SVG_TEST_SPIN, set_cpu_limit as set_svg_cpu_limit,
+    set_test as set_svg_test,
+};
 
 /// Memory for decoded images (and fetched bytes), at most. Images painted in the
 /// current frame are never evicted, so a window full of images may hold more.
@@ -34,12 +60,14 @@ pub const MAX_SIDE: u32 = 16_384;
 /// Largest side of an image decoded, at most: a JPEG's own limit. A PNG may claim 2³¹ − 1, which
 /// even within [`MAX_PIXELS`] (64,000,000 × 1) makes rows of hundreds of MB.
 pub const MAX_SOURCE_SIDE: u32 = 65_535;
-/// Bytes of a JPEG looked through for its size, at most (segments before the frame header are
-/// metadata: EXIF, color profiles, thumbnails).
+/// Bytes of an image looked through for its size and orientation, at most: a JPEG's segments
+/// before the frame header (metadata: EXIF, color profiles, thumbnails), a PNG's chunks before
+/// its data, a GIF's blocks before its first image, a WebP's chunks.
 const MAX_HEADER_SCAN: u64 = 4 << 20;
 /// What a JPEG's decoder keeps of its metadata segments (EXIF, XMP, ICC profile, IPTC), at most,
 /// as [`jpeg_metadata`] counts it: a JPEG with more has the segments cut out before it is
-/// decoded ([`shed_jpeg_metadata`]). None of it is used, and none of it is in the file's header.
+/// decoded ([`shed_jpeg_metadata`]). None of it is used but the EXIF orientation, which is put
+/// back.
 const MAX_JPEG_META: usize = 128 << 10;
 /// What decoding a JPEG holds for its metadata: the segments kept and, for extended XMP, the
 /// copy made of them put together.
@@ -63,15 +91,121 @@ pub struct Bitmap {
 pub enum Format {
     Png,
     Jpeg,
+    Gif,
+    Webp,
+    #[cfg(feature = "svg")]
+    Svg,
+}
+
+/// What decoding an SVG holds, as far as it is known: from its header (`parse` 0: a guess is
+/// charged), then as a job measured it (see `svg::render`), kept with the image's record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SvgCost {
+    /// Bytes of its XML (inflated, for an svgz).
+    xml: u32,
+    /// It is an svgz: its XML is inflated into a copy.
+    gz: bool,
+    /// What parsing it holds, as a job counted; 0 until one has.
+    parse: usize,
+    /// What drawing its largest path holds, whatever the box.
+    draw: usize,
+    /// The pixmaps rendering holds at once beside its canvas and result, in sixteenths of the
+    /// canvas (`svg::LAYER_UNITS`), their margins aside: those are for each of them
+    /// (`pixmaps`), by the box's sides.
+    layers: u32,
+    pixmaps: u32,
+    /// What decoding its largest embedded raster image holds besides its pixels.
+    raster: usize,
+}
+
+/// What a decode is allowed: the limits of [`Limits::normal`] keep every image within the
+/// budget of the cache ([`decode_cost`] says what one holds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Images with more pixels than this aren't decoded.
+    pub max_pixels: u64,
+    /// What decoding an SVG may hold all told, at most.
+    pub memory: usize,
+    /// A load the reader asked for past VOMD's limits ([`Limits::forced`]).
+    pub forced: bool,
+}
+
+impl Limits {
+    /// The limits of the images the cache holds.
+    pub const fn normal() -> Limits {
+        Limits {
+            max_pixels: MAX_PIXELS,
+            memory: CACHE_BYTES,
+            forced: false,
+        }
+    }
+
+    /// The limits of a load forced past the normal ones (a click on its placeholder): only
+    /// `memory` (see [`forced_ceiling`]), the sides a decoder reads, and an SVG's hard caps.
+    pub const fn forced(memory: usize) -> Limits {
+        Limits {
+            max_pixels: u64::MAX,
+            memory,
+            forced: true,
+        }
+    }
+}
+
+/// Why the image of `h` is over `limits` (VOMD's own), if it is: a raster's pixels, an SVG's
+/// bytes of XML.
+fn refusal(h: &Header, limits: &Limits) -> Option<Refusal> {
+    #[cfg(feature = "svg")]
+    if h.format == Format::Svg {
+        let xml = h.svg.xml as usize;
+        return (xml > svg::Caps::of(limits).xml).then_some(Refusal::Bytes(xml as u64));
+    }
+    let (w, h2) = h.shown();
+    (u64::from(h.w) * u64::from(h.h) > limits.max_pixels).then_some(Refusal::Pixels(w, h2))
+}
+
+/// Whether the image of `h` is drawn (an SVG), not decoded.
+fn is_svg(h: &Header) -> bool {
+    #[cfg(feature = "svg")]
+    return h.format == Format::Svg;
+    #[cfg(not(feature = "svg"))]
+    {
+        let _ = h;
+        false
+    }
+}
+
+/// [`refusal`] of the image `bytes` start with, within the normal limits; `None` also for what
+/// isn't an image.
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+pub(crate) fn refusal_of(bytes: &[u8]) -> Option<Refusal> {
+    refusal(&info_of(bytes)?, &Limits::normal())
+}
+
+/// A cancel flag never set: for a decode nothing stops.
+pub static NO_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Whether a decode was told to stop (checked once a row).
+fn cancelled(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
 }
 
 // ---- Headers ----------------------------------------------------------------------------
 
-/// The format and natural size of the image `r` starts with, read from the PNG `IHDR` chunk
-/// or the JPEG frame header (`SOFn`). `None` for anything else (GIF, WebP, SVG, ...), broken
-/// data, a zero size or a side over [`MAX_SOURCE_SIDE`].
-pub fn header(r: &mut impl Read) -> Option<(Format, u32, u32)> {
-    header_info(r).map(|h| (h.format, h.w, h.h))
+/// The format and natural size of the image `r` starts with, read from its header (a PNG's
+/// `IHDR` chunk, a JPEG's frame header, a GIF's screen, a WebP's first chunk, an SVG's root
+/// tag): the size it is shown at, turned by its EXIF orientation. `None` for anything else
+/// (AVIF, BMP, an SVG in a build without `svg`, ...), broken data, a zero size or a side over
+/// [`MAX_SOURCE_SIDE`].
+pub fn header(r: &mut (impl Read + Seek)) -> Option<(Format, u32, u32)> {
+    header_info(r).map(|h| {
+        let (w, h2) = h.shown();
+        (h.format, w, h2)
+    })
+}
+
+/// [`header`] of an image in memory.
+pub fn header_of(bytes: &[u8]) -> Option<(Format, u32, u32)> {
+    header(&mut Cursor::new(bytes))
 }
 
 /// What [`header`] reads, and what decoding the image will hold that its size alone doesn't say
@@ -90,7 +224,8 @@ struct Header {
     /// PNG: bytes a pixel has after the decoder's transformations (`normalize_to_color8`: 8 bits
     /// a channel, and an alpha channel if a `tRNS` chunk follows, which isn't known yet, so
     /// always one for an RGB or gray image); the whole frame of an interlaced PNG is this many
-    /// bytes a pixel. 0 for a JPEG.
+    /// bytes a pixel. WebP: the bytes a pixel of its output has (4 with alpha, else 3). 0 for
+    /// a JPEG or a GIF.
     out_channels: usize,
     /// JPEG: the bytes of coefficients its decoder holds for the whole image (every
     /// component's samples as `i16`, padded to whole MCUs): for a progressive JPEG, and for a
@@ -100,9 +235,40 @@ struct Header {
     coefficients: usize,
     /// JPEG: the bytes of what the decoder keeps per MCU row (see [`JPEG_ROW_BYTES`]).
     mcu_rows: usize,
+    /// GIF: the bytes of an interlaced first frame, which is read whole (a byte a pixel); 0 for
+    /// one read a row at a time. WebP: what its decoder works in besides its output (see
+    /// `webp::working`). 0 for the other formats.
+    held: usize,
+    /// The EXIF orientation, 1 to 8: 1 as stored, 2 mirrored, 3 turned half round, 4 upside
+    /// down; 5 to 8 swap the sides (the image is turned a quarter, mirrored or not). `w` and `h`
+    /// are the size as stored.
+    orientation: u8,
+    /// SVG: what decoding it holds, as far as it is known. Nothing for the other formats.
+    svg: SvgCost,
 }
 
-fn header_info(r: &mut impl Read) -> Option<Header> {
+impl Header {
+    /// The size the image is shown at: its stored size, its sides swapped for orientations 5–8.
+    fn shown(&self) -> (u32, u32) {
+        if self.transposed() {
+            (self.h, self.w)
+        } else {
+            (self.w, self.h)
+        }
+    }
+
+    /// Whether the orientation swaps the sides.
+    fn transposed(&self) -> bool {
+        self.orientation >= 5
+    }
+}
+
+/// [`header_info`] of an image in memory.
+fn info_of(bytes: &[u8]) -> Option<Header> {
+    header_info(&mut Cursor::new(bytes))
+}
+
+fn header_info(r: &mut (impl Read + Seek)) -> Option<Header> {
     let mut start = [0u8; 2];
     r.read_exact(&mut start).ok()?;
     match start {
@@ -119,7 +285,7 @@ fn header_info(r: &mut impl Read) -> Option<Header> {
             // Bit depth, color type, compression, filter and interlace method. A header cut
             // here isn't a PNG the decoder reads, but it has a size: it is costed as the worst.
             let mut rest = [16, 6, 0, 0, 1];
-            let _ = r.read_exact(&mut rest);
+            let whole = r.read_exact(&mut rest).is_ok();
             let (channels, out_channels) = match rest[1] {
                 0 => (1, 2),
                 2 => (3, 4),
@@ -137,6 +303,9 @@ fn header_info(r: &mut impl Read) -> Option<Header> {
                 out_channels,
                 coefficients: 0,
                 mcu_rows: 0,
+                held: 0,
+                orientation: if ok && whole { png_orientation(r) } else { 1 },
+                svg: SvgCost::default(),
             })
         }
         [0xFF, 0xD8] => jpeg_size(r).map(|j| Header {
@@ -148,8 +317,48 @@ fn header_info(r: &mut impl Read) -> Option<Header> {
             out_channels: 0,
             coefficients: j.coefficients,
             mcu_rows: j.mcu_rows,
+            held: 0,
+            orientation: j.orientation,
+            svg: SvgCost::default(),
         }),
+        #[cfg(feature = "images")]
+        [b'G', b'I'] => gif::header(r),
+        #[cfg(feature = "images")]
+        [b'R', b'I'] => webp::header(r),
+        #[cfg(feature = "svg")]
+        _ => svg::header(start, r),
+        #[cfg(not(feature = "svg"))]
         _ => None,
+    }
+}
+
+/// The orientation in a PNG's `eXIf` chunk, `r` just past the data of its `IHDR`: the chunks
+/// after it are walked by their headers, their data skipped, as far as the first `IDAT` and
+/// within [`MAX_HEADER_SCAN`] bytes. An `eXIf` after the image data isn't read, as the format
+/// says and browsers do. 1 if there is none.
+fn png_orientation(r: &mut (impl Read + Seek)) -> u8 {
+    // `IHDR`'s checksum.
+    let mut skip = 4;
+    let mut scanned = 0u64;
+    loop {
+        let mut head = [0u8; 8];
+        if r.seek_relative(skip).is_err() || r.read_exact(&mut head).is_err() {
+            return 1;
+        }
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+        scanned += 12 + u64::from(len);
+        if &head[4..] == b"IDAT" || scanned > MAX_HEADER_SCAN {
+            return 1;
+        }
+        if &head[4..] == b"eXIf" {
+            let mut tiff = [0u8; exif::HEAD];
+            let tiff = &mut tiff[..(len as usize).min(exif::HEAD)];
+            return match r.read_exact(tiff) {
+                Ok(()) => exif::orientation(tiff),
+                Err(_) => 1,
+            };
+        }
+        skip = i64::from(len) + 4;
     }
 }
 
@@ -159,6 +368,7 @@ struct JpegSize {
     h: u32,
     coefficients: usize,
     mcu_rows: usize,
+    orientation: u8,
 }
 
 /// A JPEG's segments read one after another from the start-of-image marker, within
@@ -196,7 +406,16 @@ impl<R: Read> JpegSegments<'_, R> {
             return Some((marker, 0));
         }
         let len = u16::from_be_bytes([self.byte()?, self.byte()?]);
-        (len >= 2).then_some((marker, u64::from(len - 2)))
+        (len >= 2).then(|| (marker, u64::from(len - 2)))
+    }
+
+    /// Read the first bytes of a payload into `buf`.
+    fn read(&mut self, buf: &mut [u8]) -> Option<()> {
+        self.scanned += buf.len() as u64;
+        if self.scanned > MAX_HEADER_SCAN {
+            return None;
+        }
+        self.r.read_exact(buf).ok()
     }
 
     /// Read past `n` bytes of a payload.
@@ -215,9 +434,11 @@ impl<R: Read> JpegSegments<'_, R> {
 /// The size in a JPEG's frame header, the segments after the start-of-image marker walked
 /// (and skipped) until it, and what its decoder holds that the size doesn't say (see
 /// [`Header`]), which takes the first scan's header too (a walk that doesn't get there is
-/// taken to find a scan with fewer components, the larger cost).
+/// taken to find a scan with fewer components, the larger cost). The orientation is the first
+/// EXIF `APP1`'s before the frame header (the start of it: [`exif::HEAD`]).
 fn jpeg_size(r: &mut impl Read) -> Option<JpegSize> {
     let mut seg = JpegSegments { r, scanned: 0 };
+    let mut orientation = None;
     let (w, h, progressive, sampling) = loop {
         let (marker, len) = seg.next()?;
         // The image ended, or its data began, before any frame header.
@@ -253,6 +474,19 @@ fn jpeg_size(r: &mut impl Read) -> Option<JpegSize> {
             let _ = seg.skip(rest);
             break (w, h, progressive, sampling);
         }
+        if marker == 0xE1 && orientation.is_none() && len >= 6 {
+            let mut tiff = [0u8; exif::HEAD];
+            seg.read(&mut tiff[..6])?;
+            let mut read = 6;
+            if tiff.starts_with(b"Exif\0\0") {
+                read = (len as usize).min(exif::HEAD);
+                seg.read(&mut tiff[6..read])?;
+                orientation = Some(exif::orientation(&tiff[..read]));
+            }
+            // The length's two bytes are counted by `skip`.
+            seg.skip(len - read as u64)?;
+            continue;
+        }
         seg.skip(len)?;
     };
     // On to the first scan: its header starts with the number of components in it.
@@ -267,7 +501,9 @@ fn jpeg_size(r: &mut impl Read) -> Option<JpegSize> {
             }
         }
     };
-    Some(jpeg_info(w, h, progressive, &sampling, first_scan))
+    let mut size = jpeg_info(w, h, progressive, &sampling, first_scan);
+    size.orientation = orientation.unwrap_or(1);
+    Some(size)
 }
 
 /// [`JpegSize`] of a frame of `w` × `h` with components sampled `sampling` (H, V), whose first
@@ -304,6 +540,7 @@ fn jpeg_info(
         h,
         coefficients,
         mcu_rows,
+        orientation: 1,
     }
 }
 
@@ -385,12 +622,30 @@ fn open_regular(path: &Path) -> Option<std::fs::File> {
     (meta.is_file() && meta.len() <= MAX_FILE).then_some(file)
 }
 
-/// The natural size of a local PNG or JPEG, from its header (`None`: missing, unreadable, not
-/// PNG or JPEG, or too large to decode: see [`MAX_PIXELS`] and [`MAX_SOURCE_SIDE`]).
+/// The natural size of a local image, from its header (`None`: missing, unreadable, not a
+/// format [`decode`] reads, or too large to decode: see [`MAX_PIXELS`] and [`MAX_SOURCE_SIDE`]).
 pub fn probe_file(path: &Path) -> Option<(u32, u32)> {
-    let file = open_regular(path)?;
-    let (_, w, h) = header(&mut std::io::BufReader::with_capacity(4096, file))?;
-    (u64::from(w) * u64::from(h) <= MAX_PIXELS).then_some((w, h))
+    match probe_size(path) {
+        ImageSize::Pixels(w, h) => Some((w, h)),
+        _ => None,
+    }
+}
+
+/// The size layout gives the local image at `path`: its natural size, why it's over VOMD's
+/// limits, or its alt text (missing, unreadable, not a format [`decode`] reads).
+fn probe_size(path: &Path) -> ImageSize {
+    let Some(h) = open_regular(path)
+        .and_then(|f| header_info(&mut std::io::BufReader::with_capacity(4096, f)))
+    else {
+        return ImageSize::Alt;
+    };
+    match refusal(&h, &Limits::normal()) {
+        Some(why) => ImageSize::Refused(why),
+        None => {
+            let (w, h) = h.shown();
+            ImageSize::Pixels(w, h)
+        }
+    }
 }
 
 /// The size layout gives a local image: its natural size, or its alt text.
@@ -398,10 +653,7 @@ fn probe(img: &ImageRef, base: Option<&Path>) -> ImageSize {
     if img.remote {
         return ImageSize::Alt;
     }
-    match local_path(&img.src, base).and_then(|p| probe_file(&p)) {
-        Some((w, h)) => ImageSize::Pixels(w, h),
-        None => ImageSize::Alt,
-    }
+    local_path(&img.src, base).map_or(ImageSize::Alt, |p| probe_size(&p))
 }
 
 /// A file's bytes, read whole, if the file is at most `limit` bytes (what a decode of it was
@@ -430,7 +682,8 @@ fn read_file(path: &Path, limit: usize) -> Option<Vec<u8>> {
 /// `cost = result + resample + source`
 ///
 /// * `result = 4·w·h`: `resample_rows` makes its `Vec` of 4-byte pixels with exactly that
-///   capacity.
+///   capacity. For an EXIF orientation that swaps the sides (5–8) it is resampled to `h × w`,
+///   and [`orient`] copies it into another `4·w·h` as it turns it.
 /// * `resample = `[`resample_cost`]` = spans(sw, w) + spans(sh, h) + 32·w`: both axes' [`Spans`]
 ///   are two flat buffers made with exactly the capacity [`spans_cost`] charges (see
 ///   [`spans_weights`] for why the weights fit it), and `reduced` and `acc` are `w × 4` `f32`
@@ -451,18 +704,53 @@ fn read_file(path: &Path, limit: usize) -> Option<Vec<u8>> {
 ///   of the row, the two rows and the destination of upsampling, the scratch of its width: at
 ///   most [`JPEG_ROW_BYTES`] for each pixel of a padded row and row of the MCU's height) and
 ///   [`JPEG_META_COST`] (the segments it copies, bounded by [`shed_jpeg_metadata`]).
+/// * `source` for a GIF: [`GIF_FIXED`], the first frame's indexed row and the screen's RGBA
+///   row (`5·sw`: the frame is no wider than the screen), and [`Header::held`] (an interlaced
+///   frame, read whole). The decoder is given no metadata to keep (`gif.rs`).
+/// * `source` for a WebP: its output, `out_channels·sw·sh` (RGB, or RGBA with alpha, decoded
+///   whole), [`Header::held`] (what the decoder works in, by kind of image: `webp::working`)
+///   and [`WEBP_FIXED`].
 ///
 /// Every term is checked against what the decoders allocate, counted, in `tests/image_memory.rs`
 /// (every combination of color type, depth, interlacing, sampling, scans and shape tried there
 /// is under its charge) and by its random mixes.
 fn decode_cost(header: &Header, w: u32, h: u32) -> usize {
+    #[cfg(feature = "svg")]
+    if header.format == Format::Svg {
+        return svg::cost(&header.svg, w, h);
+    }
+    let result = w as usize * h as usize * 4;
+    // Resampled as stored; turned, for 5–8, into a copy beside it.
+    let (resample, turned) = if header.transposed() {
+        (resample_cost(header.w, header.h, h, w), result)
+    } else {
+        (resample_cost(header.w, header.h, w, h), 0)
+    };
+    header_cost(header)
+        .saturating_add(resample)
+        .saturating_add(result)
+        .saturating_add(turned)
+}
+
+/// The `source` term of [`decode_cost`]: what the decoder holds, whatever the box.
+fn header_cost(header: &Header) -> usize {
     let pixels = header.w as usize * header.h as usize;
-    let source = match header.format {
+    match header.format {
         Format::Jpeg => pixels
             .saturating_mul(3)
             .saturating_add(header.coefficients)
             .saturating_add(header.mcu_rows)
             .saturating_add(JPEG_META_COST),
+        Format::Gif => GIF_FIXED
+            .saturating_add(5 * header.w as usize)
+            .saturating_add(header.held),
+        Format::Webp => pixels
+            .saturating_mul(header.out_channels)
+            .saturating_add(header.held)
+            .saturating_add(WEBP_FIXED),
+        // What it holds whatever the box: [`svg::cost`] with a box of no pixels.
+        #[cfg(feature = "svg")]
+        Format::Svg => svg::cost(&header.svg, 0, 0),
         Format::Png => {
             let frame = if header.interlaced {
                 pixels.saturating_mul(header.out_channels)
@@ -474,11 +762,36 @@ fn decode_cost(header: &Header, w: u32, h: u32) -> usize {
                 .saturating_add(PNG_ROW_FACTOR.saturating_mul(header.row))
                 .saturating_add(PNG_WIDTH_FACTOR.saturating_mul(header.w as usize))
         }
-    };
-    source
-        .saturating_add(resample_cost(header.w, header.h, w, h))
-        .saturating_add(w as usize * h as usize * 4)
+    }
 }
+
+/// What decoding the image `bytes` holds whatever the box ([`header_cost`]); 0 if it isn't one.
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+pub(crate) fn source_cost(bytes: &[u8]) -> usize {
+    info_of(bytes).map_or(0, |h| header_cost(&h))
+}
+
+/// What decoding the image `bytes` holds for each pixel of its box besides its result twice
+/// (which [`unfetched_cost`] counts), and for each pixel of its sides: an SVG's layers and their
+/// margins (see [`svg::cost`]); nothing for a raster image, or if it isn't one.
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+pub(crate) fn box_costs(bytes: &[u8]) -> (u32, u32) {
+    #[cfg(feature = "svg")]
+    if let Some(h) = info_of(bytes).filter(|h| h.format == Format::Svg) {
+        return svg::box_costs(&h.svg);
+    }
+    let _ = bytes;
+    (0, 0)
+}
+
+/// What a GIF's decoder holds however small the image: its LZW tables and buffers, the read
+/// buffer of 8 KB, the palettes, and its own structures.
+const GIF_FIXED: usize = 64 << 10;
+
+/// What a WebP's decoder holds however small the image: its tables, the lossless decoder's
+/// color cache and the code it may build past `webp::huffman_limit` (the limit's own bytes are
+/// in `Header::held`), and the map of the file's chunks.
+const WEBP_FIXED: usize = 256 << 10;
 
 /// What a PNG's decoder holds however small the image is, at most: its inflate state (a few
 /// tables of 16 KB in all), its own structures, and the stream buffer's `Vec` growing to twice
@@ -531,7 +844,7 @@ fn file_info(path: &Path) -> Option<FileInfo> {
 /// What decoding an image already in memory to `w` × `h` holds, its bytes not included.
 #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
 fn bytes_cost(bytes: &[u8], w: u32, h: u32) -> Option<usize> {
-    Some(decode_cost(&header_info(&mut &bytes[..])?, w, h))
+    Some(decode_cost(&info_of(bytes)?, w, h))
 }
 
 /// What decoding `bytes` to `w` × `h` (see [`clamp_box`]) holds at most besides the bytes and
@@ -543,6 +856,56 @@ pub fn decode_reservation(bytes: &[u8], w: u32, h: u32) -> Option<usize> {
     Some(bytes_cost(bytes, w, h)?.saturating_sub(w as usize * h as usize * 4))
 }
 
+/// [`decode`] as a load past the limits does, holding no more than `room` bytes in all (the
+/// result's too), for tests that count what it allocates.
+#[cfg(feature = "images")]
+#[doc(hidden)]
+pub fn decode_forced(bytes: &[u8], w: u32, h: u32, room: usize) -> Option<Bitmap> {
+    decode_with(bytes, w, h, &Limits::forced(room), &NO_CANCEL)
+}
+
+/// An SVG's job as the worker runs it, for tests that count what it allocates: charged what its
+/// record says ([`SvgJob::reservation`]), and run ([`SvgJob::run`]), which may find it needs more
+/// and record that, as the main thread does for a job that says so.
+#[cfg(feature = "svg")]
+#[doc(hidden)]
+pub struct SvgJob(Header, svg::Fonts);
+
+#[cfg(feature = "svg")]
+impl SvgJob {
+    /// The job of `bytes`, if it is an SVG.
+    pub fn of(bytes: &[u8]) -> Option<SvgJob> {
+        info_of(bytes)
+            .filter(|h| h.format == Format::Svg)
+            .map(|h| SvgJob(h, svg::Fonts::default()))
+    }
+
+    /// Its text set in `fonts`' faces (it is drawn without text otherwise).
+    pub fn with_fonts(mut self, fonts: &crate::fonts::Fonts) -> SvgJob {
+        self.1.set(Some(Arc::new(fonts.svg_sources())));
+        self
+    }
+
+    /// What its job to `w` × `h` is charged besides its result (as [`decode_reservation`]).
+    pub fn reservation(&self, w: u32, h: u32) -> usize {
+        decode_cost(&self.0, w, h).saturating_sub(w as usize * h as usize * 4)
+    }
+
+    /// Run its job to `w` × `h` within what it is charged: `Some` of the result, or `None` if it
+    /// needed more, which it is charged from now on.
+    pub fn run(&mut self, bytes: &[u8], w: u32, h: u32) -> Option<Option<Bitmap>> {
+        let charge = decode_cost(&self.0, w, h);
+        match svg::render(bytes, &self.0.svg, (w, h), charge, &NO_CANCEL, &mut self.1) {
+            svg::Rendered::Pixels(b, _) => Some(Some(b)),
+            svg::Rendered::Need(need) => {
+                self.0.svg = need;
+                None
+            }
+            _ => Some(None),
+        }
+    }
+}
+
 // ---- Decoding ---------------------------------------------------------------------------
 
 /// The size [`decode`] makes an image of box size `w` × `h`: each side at least 1 and at most
@@ -552,17 +915,94 @@ pub fn clamp_box(w: u32, h: u32) -> (u32, u32) {
     (w.clamp(1, MAX_SIDE), h.clamp(1, MAX_SIDE))
 }
 
-/// Decode a PNG or JPEG and resample it to `w` × `h` (see [`clamp_box`]). `None` for anything
-/// else, broken data, or more than [`MAX_PIXELS`].
+/// Decode a PNG, JPEG, GIF or WebP and resample it to `w` × `h` (see [`clamp_box`]), upright,
+/// or draw an SVG at that size. `None` for anything else, broken data, or more than
+/// [`MAX_PIXELS`] (an SVG: more than the cache can hold, or too slow to draw).
 #[cfg(feature = "images")]
 pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
-    let (format, sw, sh) = header(&mut &bytes[..])?;
-    if u64::from(sw) * u64::from(sh) > MAX_PIXELS {
-        return None;
+    decode_with(bytes, w, h, &Limits::normal(), &NO_CANCEL)
+}
+
+/// [`decode`] within `limits`, given up (`None`) once `cancel` is set.
+#[cfg(feature = "images")]
+pub fn decode_with(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Option<Bitmap> {
+    #[cfg(feature = "svg")]
+    let fonts = &mut svg::Fonts::default();
+    #[cfg(not(feature = "svg"))]
+    let fonts = &mut ();
+    decode_why(bytes, w, h, Sampling::Area, limits, cancel, fonts).ok()
+}
+
+/// How a decode reduces an image to its box: by averaging the source area under each target
+/// pixel (the resampler's own), or, for an SVG's `image-rendering` of `optimizeSpeed`,
+/// `crisp-edges` or `pixelated`, by taking the one under the target pixel's center, as resvg's
+/// nearest-neighbor drawing does (pixels averaged away can't be picked afterwards).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "svg"), allow(dead_code))]
+pub(crate) enum Sampling {
+    Area,
+    Nearest,
+}
+
+/// What SVG text is set in, for [`decode_why`].
+#[cfg(feature = "svg")]
+type SvgText = svg::Fonts;
+#[cfg(not(feature = "svg"))]
+type SvgText = ();
+
+/// [`decode_with`], an SVG's text set in `fonts`, and why it made nothing: `Some` refusal for
+/// `limits` (a click loads it anyway), `None` for broken data or a decode cancelled.
+#[cfg(feature = "images")]
+fn decode_why(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    sampling: Sampling,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    fonts: &mut SvgText,
+) -> Result<Bitmap, Option<Refusal>> {
+    let header = info_of(bytes).ok_or(None)?;
+    #[cfg(feature = "svg")]
+    if header.format == Format::Svg {
+        let (w, h) = clamp_box(w, h);
+        return match svg::draw(
+            bytes,
+            &header.svg,
+            (w, h),
+            limits.memory,
+            limits,
+            cancel,
+            &AtomicBool::new(false),
+            fonts,
+        ) {
+            svg::Rendered::Pixels(b, _) => Ok(b),
+            svg::Rendered::Need(need) => Err(Some(Refusal::Memory(svg::cost(&need, w, h) as u64))),
+            svg::Rendered::Refused(why) => Err(svg_refusal(why)),
+            svg::Rendered::Cancelled => Err(None),
+        };
     }
+    let _ = fonts;
+    if let Some(why) = refusal(&header, limits) {
+        return Err(Some(why));
+    }
+    let (sw, sh) = (header.w, header.h);
+    // The box is the image as shown: it is resampled as stored, and turned after.
     let (w, h) = clamp_box(w, h);
-    match format {
-        Format::Png => decode_png(bytes, w, h, true),
+    let (w, h) = if header.transposed() { (h, w) } else { (w, h) };
+    let bitmap = match header.format {
+        Format::Png => decode_png(bytes, w, h, true, sampling, cancel),
+        Format::Gif => gif::decode(bytes, w, h, sampling, cancel),
+        Format::Webp => webp::decode(bytes, &header, w, h, sampling, limits, cancel)?,
+        // Drawn above, at the box's size.
+        #[cfg(feature = "svg")]
+        Format::Svg => None,
         Format::Jpeg => {
             use zune_jpeg::zune_core::{
                 bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions,
@@ -574,7 +1014,7 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
             let bytes = if jpeg_metadata(bytes) > MAX_JPEG_META {
                 let mut copy = bytes.to_vec();
                 if !shed_jpeg_metadata(&mut copy) {
-                    return None;
+                    return Err(None);
                 }
                 shed = copy;
                 &shed[..]
@@ -589,13 +1029,13 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
                 .set_max_width(sw as usize)
                 .set_max_height(sh as usize);
             let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-            d.decode_headers().ok()?;
+            d.decode_headers().map_err(|_| None)?;
             // Neither side is over the limit, so the product is the size only if both are it.
             // (`info` would copy all the metadata, to read what this says.)
-            if d.output_buffer_size()? != sw as usize * sh as usize * 3 {
-                return None;
+            if d.output_buffer_size() != Some(sw as usize * sh as usize * 3) {
+                return Err(None);
             }
-            let data = d.decode().ok()?;
+            let data = d.decode().map_err(|_| None)?;
             let frame = Frame {
                 data: &data,
                 width: sw,
@@ -603,9 +1043,64 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Bitmap> {
                 stride: sw as usize * 3,
                 channels: 3,
             };
-            resample(frame, w, h)
+            resample(frame, w, h, sampling, cancel)
         }
     }
+    .ok_or(None)?;
+    orient(bitmap, header.orientation, cancel).ok_or(None)
+}
+
+/// The refusal of an SVG's job for the placeholder: broken data is none.
+#[cfg(feature = "svg")]
+fn svg_refusal(why: svg::Refusal) -> Option<Refusal> {
+    match why {
+        svg::Refusal::Broken => None,
+        svg::Refusal::Complex => Some(Refusal::Complex),
+        svg::Refusal::Slow => Some(Refusal::Slow),
+        // (How much it needs isn't known.)
+        svg::Refusal::Memory => Some(Refusal::Memory(0)),
+    }
+}
+
+/// `b`, resampled as its image is stored, turned the way its EXIF orientation says (see
+/// [`Header::orientation`]): flipped in place, or for 5–8, whose sides swap, copied (which
+/// [`decode_cost`] counts). Resampling first is the same as turning first: the resampler's
+/// box filter treats both axes alike.
+fn orient(mut b: Bitmap, orientation: u8, cancel: &AtomicBool) -> Option<Bitmap> {
+    let (w, h) = (b.width as usize, b.height as usize);
+    match orientation {
+        2 => b.data.chunks_exact_mut(w).for_each(<[u32]>::reverse),
+        3 => b.data.reverse(),
+        4 => {
+            let (top, bottom) = b.data.split_at_mut(w * (h / 2));
+            for (a, z) in top.chunks_exact_mut(w).zip(bottom.rchunks_exact_mut(w)) {
+                a.swap_with_slice(z);
+            }
+        }
+        5..=8 => {
+            // Shown, the image is `h` wide and `w` high: its row `y` is column `y` of `b` (5, 6)
+            // or `w − 1 − y` (7, 8), read from the top (5, 8) or from the bottom (6, 7).
+            let down = matches!(orientation, 5 | 8);
+            let mut data = Vec::with_capacity(w * h);
+            for y in 0..w {
+                if cancelled(cancel) {
+                    return None;
+                }
+                let sx = if orientation <= 6 { y } else { w - 1 - y };
+                data.extend((0..h).map(|x| {
+                    let sy = if down { x } else { h - 1 - x };
+                    b.data[sy * w + sx]
+                }));
+            }
+            return Some(Bitmap {
+                width: h as u32,
+                height: w as u32,
+                data,
+            });
+        }
+        _ => {}
+    }
+    Some(b)
 }
 
 /// The segments of a JPEG as its decoder (zune-jpeg 0.5) finds them: [`JpegWalk::next`] gives
@@ -713,15 +1208,18 @@ const JPEG_META_ENTRY: usize = 256;
 
 /// Cut every `APP1`, `APP2` and `APP13` segment out of a JPEG in place (`FF D8 ...`: the
 /// metadata its decoder keeps and nothing here uses; `APP0` and `APP14` stay, the decoder reads
-/// the color transform from `APP14`), if there is more than [`MAX_JPEG_META`] of it, the segments
-/// as [`JpegWalk`] finds them. `false` if what is left is still over the limit (cutting put
-/// together bytes the decoder reads as a segment, which the walk of the bytes as they were
-/// didn't find): the file is refused.
+/// the color transform from `APP14`; the EXIF orientation is put back, in an `APP1` of its own,
+/// [`exif::app1`]), if there is more than [`MAX_JPEG_META`] of it, the segments as [`JpegWalk`]
+/// finds them. `false` if what is left is still over the limit (cutting put together bytes the
+/// decoder reads as a segment, which the walk of the bytes as they were didn't find): the file
+/// is refused.
 #[cfg(feature = "images")]
 pub(crate) fn shed_jpeg_metadata(buf: &mut Vec<u8>) -> bool {
     if jpeg_metadata(buf) <= MAX_JPEG_META {
         return true;
     }
+    // The orientation goes, with the rest of the EXIF data: it is put back on its own.
+    let orientation = info_of(buf).map_or(1, |h| h.orientation);
     // `buf[..kept]` is what stays; `buf[from..]` hasn't been looked at, or is to stay once it is
     // (the walk reads on from the end of the last segment, which is not moved: no list of
     // segments is kept, 450,000 of them being 7 MB).
@@ -735,6 +1233,10 @@ pub(crate) fn shed_jpeg_metadata(buf: &mut Vec<u8>) -> bool {
     let len = buf.len();
     buf.copy_within(from..len, kept);
     buf.truncate(kept + len - from);
+    if orientation != 1 {
+        // After the start-of-image marker, where `header` finds it before the frame header.
+        buf.splice(2..2, exif::app1(orientation));
+    }
     buf.shrink_to_fit();
     jpeg_metadata(buf) <= MAX_JPEG_META
 }
@@ -743,8 +1245,15 @@ pub(crate) fn shed_jpeg_metadata(buf: &mut Vec<u8>) -> bool {
 /// (`rows`; `false` reads the whole frame, as an interlaced one must be): its full-size pixels
 /// can be hundreds of MB, and the memory the allocator then keeps would sit beside a full cache.
 #[cfg(feature = "images")]
-fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
-    let sw = header(&mut &bytes[..])?.1;
+fn decode_png(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    rows: bool,
+    sampling: Sampling,
+    cancel: &AtomicBool,
+) -> Option<Bitmap> {
+    let sw = info_of(bytes)?.w;
     // What the decoder may allocate for itself, besides the buffers [`decode_cost`] counts by the
     // stored row: the output row (at most 4 bytes a pixel of the source's width) and the palette
     // and `tRNS` (the chunks it is given besides the pixels, see `PngChunks`: 768 and 256
@@ -766,7 +1275,14 @@ fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
     };
     if rows && !reader.info().interlaced {
         let mut frame = PngRows { reader, next: 0 };
-        return resample_rows(&mut frame, (width, height), channels, w, h);
+        return resample_rows(
+            &mut frame,
+            (width, height),
+            channels,
+            (w, h),
+            sampling,
+            cancel,
+        );
     }
     let mut buf = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
@@ -779,7 +1295,7 @@ fn decode_png(bytes: &[u8], w: u32, h: u32, rows: bool) -> Option<Bitmap> {
         stride: info.line_size,
         channels,
     };
-    resample(frame, w, h)
+    resample(frame, w, h, sampling, cancel)
 }
 
 /// A PNG's bytes with the chunks nothing here uses left out: only the critical ones (`IHDR`,
@@ -917,10 +1433,16 @@ impl Rows for PngRows<'_> {
 }
 
 /// [`resample_rows`] for pixels in memory.
-fn resample(mut frame: Frame, w: u32, h: u32) -> Option<Bitmap> {
+fn resample(
+    mut frame: Frame,
+    w: u32,
+    h: u32,
+    sampling: Sampling,
+    cancel: &AtomicBool,
+) -> Option<Bitmap> {
     let size = (frame.width, frame.height);
     let channels = frame.channels;
-    resample_rows(&mut frame, size, channels, w, h)
+    resample_rows(&mut frame, size, channels, (w, h), sampling, cancel)
 }
 
 /// For each target pixel along one axis, the source pixels under it and their weights, in two
@@ -949,6 +1471,22 @@ impl Spans {
         }
         spans.push((src, weights.len() as u32));
         debug_assert!(weights.len() <= spans_weights(src, dst));
+        Spans { spans, weights }
+    }
+
+    /// [`Spans::new`] for [`Sampling::Nearest`]: the one source pixel under the center of each
+    /// target pixel, weight one (in the room of the same tables: it is never more than a
+    /// weight a target pixel).
+    fn nearest(src: u32, dst: u32) -> Spans {
+        let mut spans = Vec::with_capacity(dst as usize + 1);
+        let mut weights = Vec::with_capacity(spans_weights(src, dst));
+        for t in 0..dst {
+            // ⌊(t + ½) · src / dst⌋, exactly.
+            let at = ((2 * u64::from(t) + 1) * u64::from(src) / (2 * u64::from(dst))) as u32;
+            spans.push((at.min(src - 1), weights.len() as u32));
+            weights.push(1.0);
+        }
+        spans.push((src, weights.len() as u32));
         Spans { spans, weights }
     }
 
@@ -991,16 +1529,21 @@ fn resample_cost(sw: u32, sh: u32, w: u32, h: u32) -> usize {
 /// is taken once, in order, and reduced to the target width at once, then summed into the target
 /// row under it (the one row of the next target row it shares is kept): the extra memory is two
 /// rows of the target width however wide the source is, and the span tables ([`resample_cost`]).
-/// `None` if the source ends early or its end is bad ([`Rows::finish`]).
+/// `None` if the source ends early or its end is bad ([`Rows::finish`]), or `cancel` is set.
 fn resample_rows(
     rows: &mut impl Rows,
     (sw, sh): (u32, u32),
     channels: usize,
-    w: u32,
-    h: u32,
+    (w, h): (u32, u32),
+    sampling: Sampling,
+    cancel: &AtomicBool,
 ) -> Option<Bitmap> {
     let sw_px = sw as usize;
-    let (xs, ys) = (Spans::new(sw, w), Spans::new(sh, h));
+    let spans = match sampling {
+        Sampling::Area => Spans::new,
+        Sampling::Nearest => Spans::nearest,
+    };
+    let (xs, ys) = (spans(sw, w), spans(sh, h));
     // The last source row, reduced to the target width: (its index, premultiplied sums).
     let mut reduced = (usize::MAX, vec![0f32; w as usize * 4]);
     let mut acc = vec![0f32; w as usize * 4];
@@ -1011,6 +1554,9 @@ fn resample_rows(
         for (k, &weight) in wy.iter().enumerate() {
             let y = y0 + k;
             if reduced.0 != y {
+                if cancelled(cancel) {
+                    return None;
+                }
                 let row = rows.row(y)?.get(..sw_px * channels)?;
                 reduce_row(row, channels, &xs, &mut reduced.1);
                 reduced.0 = y;
@@ -1917,8 +2463,24 @@ pub(crate) enum Done {
         doc_gen: u64,
         key: Key,
         bitmap: Option<Bitmap>,
+        /// An SVG's job was charged less than it needs, and decoded nothing: what it needs, for
+        /// the image's record, and the image is asked for again ([`Images::remeasure`]).
+        need: Option<SvgCost>,
+        /// No pixels for VOMD's limits (not for broken data): the placeholder says why.
+        refused: Option<Refusal>,
+        /// An SVG drawn without some of its embedded images, for VOMD's limits.
+        skipped: bool,
+        /// The job was told to stop and made nothing: its image is given up already.
+        cancelled: bool,
         /// The worker that made it, which waits until the result is taken ([`Worker::taken`]).
         worker: Shared,
+    },
+    /// A load past the limits ([`forced`]) of `origin` at `size` is done.
+    #[cfg(feature = "images")]
+    Forced {
+        doc_gen: u64,
+        origin: forced::Origin,
+        result: Result<forced::Loaded, Refusal>,
     },
     /// A remote image was fetched: its bytes and natural size, or why not.
     #[cfg(feature = "remote-images")]
@@ -1934,6 +2496,11 @@ pub(crate) type Shared = Arc<(Mutex<Queue>, Condvar)>;
 #[derive(Default)]
 pub(crate) struct Queue {
     jobs: Vec<Job>,
+    /// The faces SVG text is set in ([`Images::set_svg_fonts`]).
+    #[cfg(feature = "svg")]
+    fonts: Option<Arc<crate::fonts::SvgFonts>>,
+    /// When the worker started the job in `busy`, while it runs.
+    since: Option<std::time::Instant>,
     /// The job being decoded, and then its result until the main thread takes it
     /// ([`Worker::taken`]): (key, size, cost). The worker starts no other meanwhile, so what is
     /// held beside the cache is one job's cost (result included) from its start until its result
@@ -1945,57 +2512,98 @@ pub(crate) struct Queue {
 /// What a worker holds besides its jobs: its queue and condition variable, the thread's own
 /// bookkeeping (its stack is not the allocator's).
 const WORKER_FIXED: usize = 512;
+/// The decode worker's stack.
+const WORKER_STACK: usize = 8 << 20;
+/// How long an SVG may take to draw before it's given up ([`Images::expire`]): its estimated
+/// work is about a tenth of it, at most.
+#[cfg_attr(not(feature = "svg"), allow(dead_code))]
+const SVG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// One thread decoding the most wanted image first; the queue is replaced as the viewport
 /// moves, so images scrolled past are never decoded.
 struct Worker {
     shared: Shared,
+    /// Set, the job it runs stops (an SVG's drawing, as soon as it can: [`Images::expire`]).
+    #[cfg_attr(not(feature = "svg"), allow(dead_code))]
+    cancel: Arc<AtomicBool>,
+    /// The SVG it is drawing is drawn in VOMD's own process, though SVGs are drawn apart (a child
+    /// couldn't be started): it can't be killed ([`Images::let_go`]).
+    #[cfg_attr(not(feature = "svg"), allow(dead_code))]
+    inline: Arc<AtomicBool>,
 }
 
 impl Worker {
     fn spawn(tx: Sender<Done>, wake: Wake) -> Worker {
         let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let theirs = shared.clone();
-        std::thread::spawn(move || {
-            let (lock, cv) = &*theirs;
-            loop {
-                let job = {
-                    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    // The last result still waits to be taken: its memory isn't free yet.
-                    while (q.jobs.is_empty() || q.busy.is_some()) && !q.quit {
-                        q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
-                    }
-                    if q.quit {
-                        return;
-                    }
-                    let job = q.jobs.remove(0);
-                    q.busy = Some((job.key.clone(), job.w, job.h, job.cost));
-                    job
-                };
-                let bitmap = decode_job(&job);
-                // The job's hold on a body (an `Arc` clone) ends before the result is sent: once
-                // the main thread has the result the body's slot may be evicted, and its charge
-                // with it ([`Slot::pinned`]).
-                let Job {
-                    doc_gen,
-                    key,
-                    source,
-                    ..
-                } = job;
-                drop(source);
-                let done = Done::Decoded {
-                    doc_gen,
-                    key,
-                    bitmap,
-                    worker: theirs.clone(),
-                };
-                if tx.send(done).is_err() {
+        let state = WorkerState::default();
+        let cancel = state.cancel.clone();
+        let inline = state.inline.clone();
+        // An SVG's tree is walked by recursion, a call or two a level, 256 levels at most
+        // (`svg::MAX_DEPTH`): the stack is said, not left to the platform. (Not the allocator's.)
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(move || Worker::work(&theirs, &tx, &wake, state))
+            .expect("the decode worker");
+        Worker {
+            shared,
+            cancel,
+            inline,
+        }
+    }
+
+    /// The worker's thread: the jobs of `theirs`, one at a time.
+    fn work(theirs: &Shared, tx: &Sender<Done>, wake: &Wake, mut state: WorkerState) {
+        let (lock, cv) = &**theirs;
+        loop {
+            let job = {
+                let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                // The last result still waits to be taken: its memory isn't free yet.
+                while (q.jobs.is_empty() || q.busy.is_some()) && !q.quit {
+                    q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+                if q.quit {
                     return;
                 }
-                wake();
+                let job = q.jobs.remove(0);
+                q.busy = Some((job.key.clone(), job.w, job.h, job.cost));
+                q.since = Some(std::time::Instant::now());
+                #[cfg(feature = "svg")]
+                state.fonts.set(q.fonts.clone());
+                job
+            };
+            let mut made = decode_job(&job, &mut state);
+            made.cancelled = made.bitmap.is_none()
+                && made.need.is_none()
+                && made.refused.is_none()
+                && cancelled(&state.cancel);
+            // Done: no deadline for it while its result waits to be taken.
+            lock.lock().unwrap_or_else(|e| e.into_inner()).since = None;
+            // The job's hold on a body (an `Arc` clone) ends before the result is sent: once
+            // the main thread has the result the body's slot may be evicted, and its charge
+            // with it ([`Slot::pinned`]).
+            let Job {
+                doc_gen,
+                key,
+                source,
+                ..
+            } = job;
+            drop(source);
+            let done = Done::Decoded {
+                doc_gen,
+                key,
+                bitmap: made.bitmap,
+                need: made.need,
+                refused: made.refused,
+                skipped: made.skipped,
+                cancelled: made.cancelled,
+                worker: theirs.clone(),
+            };
+            if tx.send(done).is_err() {
+                return;
             }
-        });
-        Worker { shared }
+            wake();
+        }
     }
 
     /// Replace the queue (most wanted first), skipping the job being decoded. Returns what that
@@ -2017,7 +2625,9 @@ impl Worker {
     /// worker, which may be another one ([`Images::set_wake`]).
     fn taken(shared: &Shared) {
         let (lock, cv) = &**shared;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).busy = None;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.busy = None;
+        q.since = None;
         cv.notify_one();
     }
 
@@ -2035,9 +2645,15 @@ impl Worker {
         let (lock, _) = &**shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
         let paths: usize = q.jobs.iter().map(|j| path_cost(&j.source)).sum();
+        // The font database its SVGs' text is set in, made or not.
+        #[cfg(feature = "svg")]
+        let fonts = q.fonts.as_ref().map_or(0, |f| svg_fonts_cost(f));
+        #[cfg(not(feature = "svg"))]
+        let fonts = 0;
         WORKER_FIXED
             .saturating_add(vec_bytes(&q.jobs))
             .saturating_add(paths)
+            .saturating_add(fonts)
     }
 
     /// Whether nothing is queued, being decoded, or decoded and not taken.
@@ -2050,6 +2666,13 @@ impl Worker {
         let (lock, _) = &**shared;
         let q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.jobs.is_empty() && q.busy.is_none()
+    }
+
+    /// The faces SVG text is set in from the next job on.
+    #[cfg(feature = "svg")]
+    fn set_fonts(&self, fonts: Option<Arc<crate::fonts::SvgFonts>>) {
+        let (lock, _) = &*self.shared;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).fonts = fonts;
     }
 
     /// What the largest job of this worker holds, queued, being decoded, or decoded and not taken.
@@ -2074,6 +2697,11 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // An SVG drawn apart is stopped (its process killed): nothing waits for its result.
+        #[cfg(feature = "svg")]
+        if svg::apart() {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
         let (lock, cv) = &*self.shared;
         let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
         q.quit = true;
@@ -2083,35 +2711,135 @@ impl Drop for Worker {
     }
 }
 
+/// What the worker keeps between jobs: the flag that stops the job it runs ([`Worker::cancel`]),
+/// and the font database of SVG text.
+#[derive(Default)]
+struct WorkerState {
+    cancel: Arc<AtomicBool>,
+    /// [`Worker::inline`].
+    inline: Arc<AtomicBool>,
+    #[cfg(feature = "svg")]
+    fonts: svg::Fonts,
+}
+
+/// What the faces SVG text is set in cost to keep: the list of them, and the font database the
+/// worker makes of them.
+#[cfg(feature = "svg")]
+fn svg_fonts_cost(f: &crate::fonts::SvgFonts) -> usize {
+    let paths: usize = (f.origins.iter())
+        .map(|o| match o {
+            crate::fonts::FontOrigin::File(p) => p.as_os_str().len(),
+            crate::fonts::FontOrigin::Embedded(_) => 0,
+        })
+        .sum();
+    vec_bytes(&f.sources)
+        .saturating_add(vec_bytes(&f.origins))
+        .saturating_add(paths)
+        .saturating_add(f.sources.len().saturating_mul(svg::FONTDB_COST))
+}
+
+/// What a job made: its pixels, or none if it failed (for VOMD's limits, `refused` says why);
+/// for an SVG charged less than it needs, no pixels and what it needs.
+#[derive(Default)]
+struct Made {
+    bitmap: Option<Bitmap>,
+    need: Option<SvgCost>,
+    refused: Option<Refusal>,
+    skipped: bool,
+    /// The job was told to stop ([`Images::expire`]) and made nothing: the image was given up
+    /// already, and has its own reason, not this result's.
+    cancelled: bool,
+}
+
 #[cfg(feature = "images")]
-fn decode_job(job: &Job) -> Option<Bitmap> {
+fn decode_job(job: &Job, state: &mut WorkerState) -> Made {
     match &job.source {
         Source::File(path) => {
             // What the job is charged for is what the file was when its header was read: a file
             // that is bigger now, or has another header, is refused (it shows its alt text)
             // instead of decoded with memory nothing counted.
             let held = job.cost.saturating_sub(job.w as usize * job.h as usize * 4);
-            let mut bytes = read_file(path, held)?;
-            if bytes
-                .len()
-                .saturating_add(bytes_cost(&bytes, job.w, job.h)?)
-                > job.cost
-            {
-                return None;
+            let Some(mut bytes) = read_file(path, held) else {
+                return Made::default();
+            };
+            let Some(cost) = bytes_cost(&bytes, job.w, job.h) else {
+                return Made::default();
+            };
+            if bytes.len().saturating_add(cost) > job.cost {
+                return Made::default();
             }
+            let room = job.cost - bytes.len();
             // The bytes are ours: a JPEG's metadata is cut out of them where they are.
             if !shed_jpeg_metadata(&mut bytes) {
-                return None;
+                return Made::default();
             }
-            decode(&bytes, job.w, job.h)
+            decode_in(&bytes, job, room, state)
         }
-        Source::Bytes(bytes) => decode(bytes, job.w, job.h),
+        Source::Bytes(bytes) => decode_in(bytes, job, job.cost, state),
+    }
+}
+
+/// [`decode`] for `job`, holding at most `room` (its cost, less a file's bytes).
+#[cfg(feature = "images")]
+fn decode_in(bytes: &[u8], job: &Job, room: usize, state: &mut WorkerState) -> Made {
+    #[cfg(feature = "svg")]
+    if let Some(header) = info_of(bytes).filter(|h| h.format == Format::Svg) {
+        let rendered = svg::draw(
+            bytes,
+            &header.svg,
+            (job.w, job.h),
+            room,
+            &Limits::normal(),
+            &state.cancel,
+            &state.inline,
+            &mut state.fonts,
+        );
+        return match rendered {
+            svg::Rendered::Pixels(b, skipped) => Made {
+                bitmap: Some(b),
+                skipped,
+                ..Made::default()
+            },
+            svg::Rendered::Need(need) => Made {
+                need: Some(need),
+                ..Made::default()
+            },
+            svg::Rendered::Refused(why) => Made {
+                refused: svg_refusal(why),
+                ..Made::default()
+            },
+            svg::Rendered::Cancelled => Made::default(),
+        };
+    }
+    let _ = room;
+    let limits = Limits::normal();
+    #[cfg(feature = "svg")]
+    let fonts = &mut svg::Fonts::default();
+    #[cfg(not(feature = "svg"))]
+    let fonts = &mut ();
+    match decode_why(
+        bytes,
+        job.w,
+        job.h,
+        Sampling::Area,
+        &limits,
+        &state.cancel,
+        fonts,
+    ) {
+        Ok(b) => Made {
+            bitmap: Some(b),
+            ..Made::default()
+        },
+        Err(refused) => Made {
+            refused,
+            ..Made::default()
+        },
     }
 }
 
 #[cfg(not(feature = "images"))]
-fn decode_job(_: &Job) -> Option<Bitmap> {
-    None
+fn decode_job(_: &Job, _: &mut WorkerState) -> Made {
+    Made::default()
 }
 
 // ---- A document's images ----------------------------------------------------------------
@@ -2122,7 +2850,7 @@ fn decode_job(_: &Job) -> Option<Bitmap> {
 /// costs here is the size of this enum and nothing that grows with its path.
 #[derive(Clone, Debug)]
 enum Src {
-    /// Nothing loadable (not found, failed to decode, not PNG or JPEG, a `data:` URL, ...).
+    /// Nothing loadable (not found, failed to decode, not an image, a `data:` URL, ...).
     None,
     /// A local file: its `src`, which [`local_path`] resolves against the document's directory.
     File(Arc<str>),
@@ -2254,8 +2982,31 @@ pub struct Images {
     #[cfg(feature = "remote-images")]
     held_due: bool,
     /// Images whose decode can't fit beside what the document's images cost to keep (see
-    /// [`Images::request`]): they show their alt text from the next poll.
-    refused: Vec<Key>,
+    /// [`Images::request`]), or that took too long: they show their alt text, and why, from the
+    /// next poll.
+    refused: Vec<(Key, Refusal)>,
+    /// SVGs drawn without some of their embedded images, for VOMD's limits: a click draws them
+    /// with ([`Images::force`]).
+    partial: Vec<Key>,
+    /// An image was chosen to load past the limits since the last poll: it is laid out anew.
+    repaint: bool,
+    /// The loads past the limits the reader asked for ([`forced`]).
+    #[cfg(feature = "images")]
+    forced: forced::Forced,
+    /// The images of the document that were chosen to load past the limits, and where from.
+    #[cfg(feature = "images")]
+    forced_ids: Vec<(u32, forced::Origin)>,
+    /// The faces SVG text is set in, for the workers ([`Images::set_svg_fonts`]).
+    #[cfg(feature = "svg")]
+    svg_fonts: Option<Arc<crate::fonts::SvgFonts>>,
+    /// A worker let go because its SVG took too long ([`Images::expire`]), drawn in VOMD's own
+    /// process: while it is still drawing, no other SVG is (raster images are). One drawn apart
+    /// is killed, and nothing waits for it.
+    #[cfg(feature = "svg")]
+    stuck: Option<Shared>,
+    /// [`SVG_DEADLINE`] (the tests' is shorter).
+    #[cfg(feature = "svg")]
+    svg_deadline: std::time::Duration,
     #[cfg(feature = "remote-images")]
     pub(crate) remote: crate::remote::Remote,
 }
@@ -2277,19 +3028,27 @@ fn body_cost(key: &Key, source: &Source) -> usize {
     }
 }
 
-/// What decoding a remote image of `sw` × `sh` to `w` × `h` is taken to hold before its body is
-/// there to say (see [`decode_cost`]): its largest frame (8 bytes a pixel covers an interlaced
-/// 16-bit PNG, 4 after it is made 8-bit, and a progressive JPEG, 6), the resampler's tables, the
-/// result and what a decoder holds however small the image: no less than what it holds when the
-/// body is there, so that deciding whether an image is wanted doesn't change with whether its
-/// body is cached.
+/// What decoding a remote image of `sw` × `sh` to `w` × `h` is taken to hold when its body has
+/// gone (see [`decode_cost`]): what its decoder holds whatever the box (`source`, as recorded
+/// when it was fetched: [`source_cost`]), the resampler's tables (for either orientation,
+/// `sw` × `sh` being the size shown) and the result twice (an EXIF orientation may turn it into
+/// a copy), and `per_px` more a pixel of the box and `per_side` a pixel of its sides (an SVG's
+/// layers: [`box_costs`]): no less than
+/// what it holds when the body is there, so that deciding whether an image is wanted doesn't
+/// change with whether its body is cached.
 #[cfg(feature = "remote-images")]
-fn unfetched_cost(sw: u32, sh: u32, w: u32, h: u32) -> usize {
-    (sw as usize * sh as usize)
-        .saturating_mul(8)
-        .saturating_add(resample_cost(sw, sh, w, h))
-        .saturating_add(w as usize * h as usize * 4)
-        .saturating_add(PNG_FIXED.max(JPEG_META_COST))
+fn unfetched_cost(
+    source: usize,
+    (per_px, per_side): (u32, u32),
+    (sw, sh): (u32, u32),
+    w: u32,
+    h: u32,
+) -> usize {
+    let pixels = w as usize * h as usize;
+    source
+        .saturating_add(resample_cost(sw, sh, w, h).max(resample_cost(sh, sw, h, w)))
+        .saturating_add(pixels.saturating_mul(per_px as usize + 8))
+        .saturating_add((w as usize + h as usize).saturating_mul(per_side as usize))
 }
 
 /// What the copy of a local file's path a job carries holds (see [`Worker::bookkeeping_of`]).
@@ -2462,6 +3221,18 @@ impl Default for Images {
             #[cfg(feature = "remote-images")]
             held_due: false,
             refused: Vec::new(),
+            partial: Vec::new(),
+            repaint: false,
+            #[cfg(feature = "images")]
+            forced: forced::Forced::default(),
+            #[cfg(feature = "images")]
+            forced_ids: Vec::new(),
+            #[cfg(feature = "svg")]
+            svg_fonts: None,
+            #[cfg(feature = "svg")]
+            stuck: None,
+            #[cfg(feature = "svg")]
+            svg_deadline: SVG_DEADLINE,
             #[cfg(feature = "remote-images")]
             remote: crate::remote::Remote::default(),
         }
@@ -2488,6 +3259,150 @@ impl Images {
         #[cfg(feature = "remote-images")]
         self.remote.set_wake(wake.clone());
         self.wake = wake;
+    }
+
+    /// When the SVG the worker is drawing has taken too long ([`SVG_DEADLINE`]): it's given up
+    /// then ([`Images::expire`]). `None` if it isn't drawing one: no timer.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        #[cfg(feature = "svg")]
+        if let Some(w) = &self.worker {
+            let (key, since) = {
+                let q = w.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+                (q.busy.as_ref()?.0.clone(), q.since?)
+            };
+            if self.is_svg(&key) {
+                return Some(since + self.svg_deadline);
+            }
+        }
+        None
+    }
+
+    /// Give up the SVG the worker is drawing if it has taken too long (the estimate of its work
+    /// missed): its drawing is told to stop (its process killed, if SVGs are drawn apart), its
+    /// image shows its alt text from the next poll, and the worker is let go (what it holds stays
+    /// counted till it is done, which the flag makes soon); a new one decodes the rest. Returns true if it did (the window polls).
+    pub fn expire(&mut self, now: std::time::Instant) -> bool {
+        #[cfg(feature = "svg")]
+        if self.deadline().is_some_and(|d| now >= d) {
+            return self.let_go(true);
+        }
+        let _ = now;
+        false
+    }
+
+    /// Let the worker go: its job is told to stop (an SVG drawn apart, its process killed), and
+    /// a new worker decodes the rest; what it holds stays counted till it is done. `slow`: the
+    /// image it draws took too long, and is refused for that. An SVG drawn in VOMD's own process
+    /// (SVGs are not drawn apart, or a child couldn't be started for it) may not stop at once (its
+    /// parse can't be): the other SVGs wait for it (`stuck`).
+    #[cfg(feature = "svg")]
+    fn let_go(&mut self, slow: bool) -> bool {
+        let Some(w) = self.worker.take() else {
+            return false;
+        };
+        w.cancel.store(true, Ordering::Relaxed);
+        let key = w
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .busy
+            .clone();
+        if let Some((key, ..)) = key
+            && slow
+            && !self.refused.iter().any(|r| r.0 == key)
+        {
+            self.refused.push((key, Refusal::Slow));
+        }
+        self.retired_cost();
+        self.retired.push(w.shared.clone());
+        if !svg::apart() || w.inline.load(Ordering::SeqCst) {
+            self.stuck = Some(w.shared.clone());
+        }
+        // (Dropping it stops what is queued, not what runs.)
+        drop(w);
+        true
+    }
+
+    /// The SVG the worker is drawing, and the size, if it is drawing one.
+    #[cfg(feature = "svg")]
+    fn drawing_svg(&self) -> Option<(Key, u32, u32)> {
+        let (key, w, h) = {
+            let q = self.worker.as_ref()?.shared.0.lock();
+            let q = q.unwrap_or_else(|e| e.into_inner());
+            q.since?;
+            let (key, w, h, _) = q.busy.as_ref()?;
+            (key.clone(), *w, *h)
+        };
+        self.is_svg(&key).then_some((key, w, h))
+    }
+
+    /// Give an SVG `deadline` to draw instead of [`SVG_DEADLINE`], for tests.
+    #[cfg(feature = "svg")]
+    #[doc(hidden)]
+    pub fn set_svg_deadline(&mut self, deadline: std::time::Duration) {
+        self.svg_deadline = deadline;
+    }
+
+    /// Whether the image of `key` is an SVG, as far as is known: a local one's header, a remote
+    /// one's body.
+    #[cfg(feature = "svg")]
+    fn is_svg(&self, key: &Key) -> bool {
+        match key {
+            Key::Local(id) => self
+                .costs
+                .get(id)
+                .is_some_and(|c| c.is_some_and(|c| c.header.format == Format::Svg)),
+            #[cfg(feature = "remote-images")]
+            Key::Remote(url) => self
+                .cache
+                .peek_bytes(url)
+                .and_then(|b| info_of(b))
+                .is_some_and(|h| h.format == Format::Svg),
+            #[cfg(not(feature = "remote-images"))]
+            Key::Remote(_) => false,
+        }
+    }
+
+    /// A worker let go for an SVG ([`Images::expire`]) is still drawing it, in VOMD's own process.
+    #[cfg(feature = "svg")]
+    #[doc(hidden)]
+    pub fn svg_stuck(&mut self) -> bool {
+        if self.stuck.as_ref().is_some_and(Worker::idle_of) {
+            self.stuck = None;
+        }
+        self.stuck.is_some()
+    }
+
+    /// The faces SVG text is set in (`Fonts::svg_sources`), from the next job on: given again
+    /// whenever the fonts change. (Images drawn already keep their text as it was.)
+    #[cfg(feature = "svg")]
+    pub fn set_svg_fonts(&mut self, fonts: crate::fonts::SvgFonts) {
+        let changed = self
+            .svg_fonts
+            .as_ref()
+            .is_some_and(|old| !same_fonts(old, &fonts));
+        let fonts = Some(Arc::new(fonts));
+        if let Some(w) = &self.worker {
+            w.set_fonts(fonts.clone());
+        }
+        self.forced.fonts = fonts.clone();
+        self.svg_fonts = fonts;
+        // The SVGs drawn are drawn again, their text in the new faces, when they are next asked
+        // for.
+        if changed {
+            let mut svgs: Vec<Key> = Vec::new();
+            for s in &self.cache.slots {
+                if s.pixels().is_some() && self.is_svg(&s.key) && !svgs.contains(&s.key) {
+                    svgs.push(s.key.clone());
+                }
+            }
+            if !svgs.is_empty() {
+                self.cache
+                    .retain(|s| s.pixels().is_none() || !svgs.contains(&s.key));
+            }
+            self.forced.forget_pixels();
+        }
     }
 
     /// How many times the wake has been called (by the threads, or by [`Images::request`]): a
@@ -2527,6 +3442,11 @@ impl Images {
         // Results for the old document are dropped from here on, and what is queued for it is not
         // run: the worker only finishes what it has begun.
         self.doc_gen += 1;
+        // An SVG drawn apart for the old document is stopped (its process killed).
+        #[cfg(feature = "svg")]
+        if svg::apart() && self.drawing_svg().is_some() {
+            self.let_go(false);
+        }
         if let Some(w) = &self.worker {
             w.set(Vec::new());
         }
@@ -2537,7 +3457,26 @@ impl Images {
         // made beside it (a decoded bitmap of the old document is dropped, a remote one is kept).
         self.drain_results();
         self.refused = Vec::new();
+        self.partial = Vec::new();
         self.unbuilt = false;
+        // A load past the limits for the old document stops; the images chosen are loaded again
+        // when they are in view.
+        #[cfg(feature = "images")]
+        {
+            self.forced.abandon();
+            self.forced.stale();
+            self.forced_ids = Vec::new();
+            if !self.forced.is_unused() {
+                let base = self.base.clone();
+                for (i, img) in doc.images.iter().enumerate() {
+                    if let Some(origin) = forced_origin(img, base.as_deref())
+                        && self.forced.is_chosen(&origin)
+                    {
+                        self.forced_ids.push((i as u32 + 1, origin));
+                    }
+                }
+            }
+        }
         // What the old document had painted is not painted any more: room is made from it first.
         self.cache.frame += 1;
         self.cache.floor = 0;
@@ -2654,13 +3593,20 @@ impl Images {
         }
         if cfg!(feature = "images") {
             let base = self.base.clone();
+            // What loads past the limits, or failed to, is sized by that.
+            #[cfg(feature = "images")]
+            let forced = self.forced_sizes(doc);
+            #[cfg(not(feature = "images"))]
+            let forced: Vec<(Arc<str>, ImageSize)> = Vec::new();
             layout.set_image_probe(
                 doc,
                 Some(Box::new(move |img: &ImageRef| {
-                    if loaded {
-                        probe(img, base.as_deref())
-                    } else {
+                    if !loaded {
                         ImageSize::Alt
+                    } else if let Some((_, size)) = forced.iter().find(|f| f.0 == img.src) {
+                        *size
+                    } else {
+                        probe(img, base.as_deref())
                     }
                 })),
             );
@@ -2895,19 +3841,30 @@ impl Images {
                     .map_or(result, |info| info.cost(w, h))
             }
             #[cfg(feature = "remote-images")]
-            Src::Remote(url) if self.remote.on => self
-                .cache
-                .peek_bytes(&url)
-                .and_then(|b| bytes_cost(b, w, h))
-                .unwrap_or_else(|| match self.remote.size(&url) {
-                    // Fetched before, and the body is gone: what its decode may hold is not
-                    // what it holds when the body is back (the whole frame, 12 MB for a JPEG
-                    // of 2 MP), and an image near the viewport was wanted without it, fetched,
-                    // found too big, and let go (its body is nobody's, and evicted), and
-                    // wanted again without it: fetched, found too big...
-                    Some(Some((sw, sh))) => unfetched_cost(sw, sh, w, h),
-                    _ => result,
-                }),
+            Src::Remote(url) if self.remote.on => {
+                // Fetched before, and the body is gone: what its decode may hold is not what it
+                // holds when the body is back (the whole frame, 12 MB for a JPEG of 2 MP), and
+                // an image near the viewport was wanted without it, fetched, found too big, and
+                // let go (its body is nobody's, and evicted), and wanted again without it:
+                // fetched, found too big...
+                let unfetched = || match self.remote.size(&url) {
+                    Some(Some((sw, sh))) => {
+                        let source = self.remote.source_cost(&url).unwrap_or(0);
+                        let box_costs = self.remote.box_costs(&url);
+                        Some(unfetched_cost(source, box_costs, (sw, sh), w, h))
+                    }
+                    _ => None,
+                };
+                match self.cache.peek_bytes(&url).and_then(|b| info_of(b)) {
+                    // What a job of an SVG measured is in its record, not in its bytes.
+                    #[cfg(feature = "svg")]
+                    Some(header) if header.format == Format::Svg => {
+                        decode_cost(&header, w, h).max(unfetched().unwrap_or(0))
+                    }
+                    Some(header) => decode_cost(&header, w, h),
+                    None => unfetched().unwrap_or(result),
+                }
+            }
             _ => result,
         }
     }
@@ -2941,6 +3898,40 @@ impl Images {
         if !cfg!(feature = "images") {
             return;
         }
+        // The images chosen to load past the limits go to their own thread, outside the budget:
+        // what the rest are asked for is as if they weren't there.
+        #[cfg(feature = "images")]
+        if !self.forced_ids.is_empty() {
+            let mut wants = Vec::new();
+            let (mut normal, mut shown) = (Vec::with_capacity(boxes.len()), 0);
+            for (n, &(id, w, h)) in boxes.iter().enumerate() {
+                let Some((_, origin)) = self.forced_ids.iter().find(|f| f.0 == id) else {
+                    normal.push((id, w, h));
+                    shown += usize::from(n < on_screen);
+                    continue;
+                };
+                // A remote image whose size isn't known yet is fetched for it first.
+                let size = match origin {
+                    forced::Origin::Url(u) if self.forced.natural(u).is_none() => None,
+                    _ => Some(clamp_box(w, h)),
+                };
+                if !wants.iter().any(|(o, _)| o == origin) {
+                    wants.push((origin.clone(), size));
+                }
+            }
+            #[cfg(feature = "remote-images")]
+            {
+                self.forced.fetch = Some(self.remote.forced_fetch.clone());
+            }
+            self.forced
+                .request(wants, self.doc_gen, &self.tx, &self.wake);
+            return self.request_normal(&normal, shown);
+        }
+        self.request_normal(boxes, on_screen);
+    }
+
+    /// [`Images::request`] for the images that aren't chosen to load past the limits.
+    fn request_normal(&mut self, boxes: &[(u32, u32, u32)], on_screen: usize) {
         if self.unbuilt {
             // A frame is a change of state that can make the tables buildable (what the old
             // document painted may be evicted from it on, and nothing else wakes the window for
@@ -2957,6 +3948,21 @@ impl Images {
         // made room for before any of it is made: as many of the boxes, most wanted first, as the
         // budget has room for beside what can't be evicted (the rest are asked for by a later
         // request, when a decode's result is taken or a frame has passed).
+        // An SVG drawn apart at a size its box no longer has is stopped (its process killed): it
+        // is asked for at the new one.
+        #[cfg(feature = "svg")]
+        if svg::apart()
+            && let Some((key, w, h)) = self.drawing_svg()
+        {
+            let sizes = || {
+                (boxes.iter())
+                    .filter(|b| self.key(b.0).as_ref() == Some(&key))
+                    .map(|b| clamp_box(b.1, b.2))
+            };
+            if sizes().next().is_some() && sizes().all(|s| s != (w, h)) {
+                self.let_go(false);
+            }
+        }
         self.refresh_reserve();
         #[cfg(feature = "remote-images")]
         {
@@ -3126,6 +4132,11 @@ impl Images {
             if heavy_chosen {
                 continue;
             }
+            // An SVG waits while one given up is still being drawn.
+            #[cfg(feature = "svg")]
+            if self.svg_stuck() && self.is_svg(&key) {
+                continue;
+            }
             #[cfg(feature = "remote-images")]
             let mut fresh_body = false;
             #[cfg(not(feature = "remote-images"))]
@@ -3176,8 +4187,17 @@ impl Images {
                 .saturating_add(body_cost(&key, &source))
                 .saturating_add(path_cost(&source));
             if own <= self.cache.cap && !self.fits_bookkeeping(own) {
-                if !self.refused.contains(&key) {
-                    self.refused.push(key);
+                if !self.refused.iter().any(|r| r.0 == key) {
+                    self.refused.push((key, Refusal::Memory(own as u64)));
+                }
+                continue;
+            }
+            // An SVG whose drawing needs more than the budget by itself is not drawn (a raster
+            // image's is bounded by its pixels, and runs alone, below): a click draws it anyway.
+            #[cfg(feature = "svg")]
+            if cost > self.cache.cap && self.is_svg(&key) {
+                if !self.refused.iter().any(|r| r.0 == key) {
+                    self.refused.push((key, Refusal::Memory(own as u64)));
                 }
                 continue;
             }
@@ -3275,7 +4295,10 @@ impl Images {
         self.cache.fetching = fetching;
         self.make_room("request: decodes and fetchers", 0);
         if !jobs.is_empty() && self.worker.is_none() {
-            self.worker = Some(Worker::spawn(self.tx.clone(), self.wake.clone()));
+            let worker = Worker::spawn(self.tx.clone(), self.wake.clone());
+            #[cfg(feature = "svg")]
+            worker.set_fonts(self.svg_fonts.clone());
+            self.worker = Some(worker);
         }
         if let Some(w) = &self.worker {
             // The worker may have started a job of the queue this replaces after the reserve was
@@ -3629,7 +4652,7 @@ impl Images {
         }
         self.refresh_reserve();
         self.charge_bookkeeping();
-        let mut any = self.show_refused(doc, layout);
+        let mut any = self.show_refused(doc, layout) | std::mem::take(&mut self.repaint);
         #[cfg(feature = "remote-images")]
         let paused = self.remote.paused();
         while let Ok(done) = self.rx.try_recv() {
@@ -3688,12 +4711,28 @@ impl Images {
                 doc_gen,
                 key,
                 bitmap,
+                need,
+                refused,
+                skipped,
+                cancelled,
                 worker,
             } => {
                 // The result is in the cache (or dropped) before the worker is let go on,
                 // so what it holds is never uncounted: see `Queue::busy`.
                 self.cache.expect = self.cache.expect.saturating_sub(1);
+                // Given up for taking too long: it is refused for that, which is not undone by
+                // the result of the drawing that stopped (it would show only alt text, and not
+                // that a click loads it).
+                if cancelled {
+                    Worker::taken(&worker);
+                    return;
+                }
                 if matches!(key, Key::Local(_)) && doc_gen != self.doc_gen {
+                    Worker::taken(&worker);
+                    return;
+                }
+                if let Some(need) = need {
+                    self.remeasure(&key, need);
                     Worker::taken(&worker);
                     return;
                 }
@@ -3702,6 +4741,10 @@ impl Images {
                         #[cfg(feature = "remote-images")]
                         if let Key::Remote(url) = &key {
                             self.cache.release_bytes(url);
+                        }
+                        // (At most one entry an image of the document, cleared with it.)
+                        if skipped && !self.partial.contains(&key) {
+                            self.partial.push(key.clone());
                         }
                         self.decodes += 1;
                         self.charge_bookkeeping();
@@ -3720,22 +4763,31 @@ impl Images {
                             self.cache.protect(&key_kept, w, h);
                         }
                     }
-                    // It could not be decoded: the data is bad. The image shows its alt text.
+                    // It could not be decoded: the data is bad, or over VOMD's limits. The image
+                    // shows its alt text.
                     None => self.failed(
                         key,
+                        refused,
                         page.as_mut().map(|(doc, layout)| (*doc, &mut **layout)),
                     ),
                 }
                 Worker::taken(&worker);
             }
+            #[cfg(feature = "images")]
+            Done::Forced {
+                doc_gen,
+                origin,
+                result,
+            } => self.take_forced(doc_gen, origin, result, page),
             #[cfg(feature = "remote-images")]
             Done::Fetched { url, result } => self.arrived(url, result, page.is_some()),
         }
     }
 
     /// The image for `key` can't be shown: it shows its alt text from now on (a local one, from
-    /// the layout's next look; a remote one while the document is open: its body is of no use).
-    fn failed(&mut self, key: Key, page: Option<(&Doc, &mut Layout)>) {
+    /// the layout's next look; a remote one while the document is open: its body is of no use),
+    /// and why, if that is VOMD's limits (`why`).
+    fn failed(&mut self, key: Key, why: Option<Refusal>, page: Option<(&Doc, &mut Layout)>) {
         match key {
             Key::Local(id) => {
                 if let Some(s) = id
@@ -3745,13 +4797,14 @@ impl Images {
                     *s = Src::None;
                 }
                 if let Some((doc, layout)) = page {
-                    layout.set_image(doc, id, ImageSize::Alt);
+                    let size = why.map_or(ImageSize::Alt, ImageSize::Refused);
+                    layout.set_image(doc, id, size);
                 }
             }
             #[cfg(feature = "remote-images")]
             Key::Remote(url) => {
                 let own = self.urls.contains(&url);
-                self.remote.failed(&url, own);
+                self.remote.failed(&url, own, why);
                 // The body that didn't decode is of no use: with it gone, the image is fetched
                 // again when a document with it is opened again (the failure is kept while this
                 // one is open).
@@ -3767,16 +4820,37 @@ impl Images {
         }
     }
 
+    /// A job of the SVG for `key` was charged less than it needs (`need`): its record says so
+    /// from now on (in place: nothing grows), and the next request asks for it with that charge,
+    /// or refuses it if that can't fit. The charge only grows, so this happens a few times at
+    /// most for an image.
+    fn remeasure(&mut self, key: &Key, need: SvgCost) {
+        match key {
+            Key::Local(id) => {
+                if let Some(Some(info)) = self.costs.get_mut(id) {
+                    info.header.svg = need;
+                }
+            }
+            #[cfg(all(feature = "remote-images", feature = "svg"))]
+            Key::Remote(url) => {
+                self.remote
+                    .remeasure(url, svg::cost(&need, 0, 0), svg::box_costs(&need));
+            }
+            #[cfg(not(all(feature = "remote-images", feature = "svg")))]
+            Key::Remote(_) => {}
+        }
+    }
+
     /// Images whose decode can't run in the budget ([`Images::refused`]) show their alt text.
     /// Returns true if there were any (the window needs a repaint).
     fn show_refused(&mut self, doc: &Doc, layout: &mut Layout) -> bool {
         if self.refused.is_empty() {
             return false;
         }
-        for key in std::mem::take(&mut self.refused) {
+        for (key, why) in std::mem::take(&mut self.refused) {
             // (A remote one is laid out by the one `sync_remote` that follows, for all.)
             let page = matches!(key, Key::Local(_)).then_some((doc, &mut *layout));
-            self.failed(key, page);
+            self.failed(key, Some(why), page);
         }
         #[cfg(feature = "remote-images")]
         self.sync_remote(doc, layout);
@@ -3859,9 +4933,16 @@ impl Images {
     /// shows its alt text (as it does when it fails to decode).
     #[cfg(feature = "remote-images")]
     fn refuse_fetched(&mut self, url: Arc<str>, result: crate::remote::Fetched) {
+        let need = match &result {
+            Ok((bytes, ..)) => self
+                .decode_estimate(&url, bytes)
+                .saturating_add(bytes.len()),
+            Err(_) => 0,
+        };
         self.take_fetched(url.clone(), result, false);
         let own = self.urls.contains(&url);
-        self.remote.failed(&url, own);
+        self.remote
+            .failed(&url, own, Some(Refusal::Memory(need as u64)));
     }
 
     /// Forget what is kept per URL that the current document doesn't have and nothing holds:
@@ -3936,12 +5017,15 @@ impl Images {
     /// (the box is known when it is asked for, and the reserve is made then).
     #[cfg(feature = "remote-images")]
     fn decode_estimate(&self, url: &Arc<str>, bytes: &Bytes) -> usize {
-        let Some(header) = header_info(&mut &bytes[..]) else {
+        let Some(header) = info_of(bytes) else {
             return 0;
         };
         let (w, h) = match self.in_view.iter().find(|(u, ..)| u == url) {
             Some(&(_, w, h)) => (w, h),
-            None => clamp_box(header.w, header.h),
+            None => {
+                let (w, h) = header.shown();
+                clamp_box(w, h)
+            }
         };
         decode_cost(&header, w, h)
     }
@@ -4393,7 +5477,15 @@ impl Images {
                 n = n.saturating_add(self.remote_images.saturating_mul(REQUEST_PER_REMOTE));
             }
         }
-        n = n.saturating_add(vec_bytes(&self.refused));
+        n = n
+            .saturating_add(vec_bytes(&self.refused))
+            .saturating_add(vec_bytes(&self.partial));
+        #[cfg(feature = "images")]
+        {
+            n = n
+                .saturating_add(self.forced.bookkeeping())
+                .saturating_add(vec_bytes(&self.forced_ids));
+        }
         n
     }
 
@@ -4559,9 +5651,167 @@ impl Images {
     pub(crate) fn sync_remote(&mut self, doc: &Doc, layout: &mut Layout) {
         for (i, src) in self.srcs.iter().enumerate() {
             if let Src::Remote(url) = src {
-                layout.set_image(doc, i as u32 + 1, self.remote.layout_size(url));
+                let id = i as u32 + 1;
+                let size = match self.forced_ids.iter().find(|f| f.0 == id) {
+                    Some((_, origin)) if self.remote.on => self.forced_size(origin),
+                    _ => match self.forced.failure(&forced::Origin::Url(url.clone())) {
+                        Some(why) if self.remote.on => ImageSize::Refused(why),
+                        _ => self.remote.layout_size(url),
+                    },
+                };
+                layout.set_image(doc, id, size);
             }
         }
+    }
+
+    /// Whether image `id` is an SVG drawn without some of its embedded images for VOMD's limits:
+    /// a click draws it with them ([`Images::force`]).
+    pub fn partial(&self, id: u32) -> bool {
+        #[cfg(feature = "images")]
+        if self.forced_ids.iter().any(|f| f.0 == id) {
+            return false;
+        }
+        self.key(id).is_some_and(|k| self.partial.contains(&k))
+    }
+
+    /// The reader clicked image `id`'s placeholder (or an SVG drawn without its embedded images):
+    /// load it past VOMD's limits, on a thread of its own ([`forced`]), from its next request on,
+    /// and lay it out at its natural size (a box while it loads). Returns true if it will be.
+    pub fn force(&mut self, id: u32, doc: &Doc, layout: &mut Layout) -> bool {
+        #[cfg(feature = "images")]
+        {
+            let Some(img) = id.checked_sub(1).and_then(|i| doc.images.get(i as usize)) else {
+                return false;
+            };
+            if img.remote && !self.remote_on() {
+                return false;
+            }
+            let Some(origin) = forced_origin(img, self.base.as_deref()) else {
+                return false;
+            };
+            self.forced.choose(origin.clone());
+            // Every image of the document from that file or URL.
+            for (i, other) in doc.images.iter().enumerate() {
+                let other_id = i as u32 + 1;
+                if other.src == img.src && !self.forced_ids.iter().any(|f| f.0 == other_id) {
+                    self.forced_ids.push((other_id, origin.clone()));
+                }
+            }
+            let size = self.forced_size(&origin);
+            for (i, other) in doc.images.iter().enumerate() {
+                if other.src == img.src {
+                    layout.set_image(doc, i as u32 + 1, size);
+                }
+            }
+            self.repaint = true;
+            (self.wake)();
+            true
+        }
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = (id, doc, layout);
+            false
+        }
+    }
+
+    /// The size layout gives an image chosen to load past the limits: its natural size (a 4:3
+    /// box for a remote one until it is fetched), or why its load failed.
+    #[cfg(feature = "images")]
+    fn forced_size(&self, origin: &forced::Origin) -> ImageSize {
+        if let Some(why) = self.forced.failure(origin) {
+            return ImageSize::Refused(why);
+        }
+        match origin {
+            forced::Origin::File(path) => open_regular(path)
+                .and_then(|f| header_info(&mut std::io::BufReader::with_capacity(4096, f)))
+                .map_or(ImageSize::Refused(Refusal::Failed), |h| {
+                    let (w, h) = h.shown();
+                    ImageSize::Pixels(w, h)
+                }),
+            forced::Origin::Url(url) => self
+                .forced
+                .natural(url)
+                .map_or(ImageSize::Loading, |(w, h)| ImageSize::Pixels(w, h)),
+        }
+    }
+
+    /// The sizes of `doc`'s local images that are chosen to load past the limits, or whose load
+    /// failed, by `src`: what the layout's probe gives them.
+    #[cfg(feature = "images")]
+    fn forced_sizes(&self, doc: &Doc) -> Vec<(Arc<str>, ImageSize)> {
+        let mut sizes = Vec::new();
+        if self.forced.is_unused() {
+            return sizes;
+        }
+        for img in doc.images.iter().filter(|img| !img.remote) {
+            if sizes.iter().any(|(s, _)| *s == img.src) {
+                continue;
+            }
+            let Some(origin) = forced_origin(img, self.base.as_deref()) else {
+                continue;
+            };
+            if self.forced.is_chosen(&origin) || self.forced.failure(&origin).is_some() {
+                sizes.push((img.src.clone(), self.forced_size(&origin)));
+            }
+        }
+        sizes
+    }
+
+    /// A load past the limits is done: its pixels are kept (and its image laid out at its
+    /// natural size), or the image shows why it failed, and isn't chosen any more.
+    #[cfg(feature = "images")]
+    fn take_forced(
+        &mut self,
+        doc_gen: u64,
+        origin: forced::Origin,
+        result: Result<forced::Loaded, Refusal>,
+        page: Option<(&Doc, &mut Layout)>,
+    ) {
+        let size = match result {
+            Ok(loaded) => {
+                let (w, h) = loaded.natural;
+                self.forced.loaded(origin.clone(), loaded, self.cache.frame);
+                ImageSize::Pixels(w, h)
+            }
+            Err(why) => {
+                self.forced.failed(origin.clone(), why);
+                ImageSize::Refused(why)
+            }
+        };
+        if doc_gen != self.doc_gen {
+            return;
+        }
+        if let Some((doc, layout)) = page {
+            for (id, _) in self.forced_ids.iter().filter(|f| f.1 == origin) {
+                layout.set_image(doc, *id, size);
+            }
+        }
+        if matches!(size, ImageSize::Refused(_)) {
+            self.forced_ids.retain(|f| f.1 != origin);
+        }
+    }
+
+    /// Whether a load past the limits runs or waits (the tests).
+    #[cfg(feature = "images")]
+    #[doc(hidden)]
+    pub fn forcing(&self) -> bool {
+        self.forced.busy()
+    }
+
+    /// The most a load past the limits may need (`None`: what [`forced::ceiling`] says), and the
+    /// bytes their pixels and bodies may hold beyond those painted (the tests).
+    #[cfg(feature = "images")]
+    #[doc(hidden)]
+    pub fn set_forced_limits(&mut self, ceiling: Option<usize>, kept: usize) {
+        self.forced.ceiling = ceiling;
+        self.forced.cap = kept;
+    }
+
+    /// How many loads past the limits were started (the tests).
+    #[cfg(feature = "images")]
+    #[doc(hidden)]
+    pub fn forced_loads(&self) -> usize {
+        self.forced.loads
     }
 
     /// Whether the remote image `id` is blocked (remote images are off but could be turned on):
@@ -4635,8 +5885,40 @@ impl Images {
     }
 }
 
+/// Where `img` comes from, for a load past the limits: its file, or its URL.
+#[cfg(feature = "images")]
+fn forced_origin(img: &ImageRef, base: Option<&Path>) -> Option<forced::Origin> {
+    if img.remote {
+        Some(forced::Origin::Url(img.src.clone()))
+    } else {
+        local_path(&img.src, base).map(forced::Origin::File)
+    }
+}
+
+/// Whether two sets of faces for SVG text are the same faces.
+#[cfg(feature = "svg")]
+fn same_fonts(a: &crate::fonts::SvgFonts, b: &crate::fonts::SvgFonts) -> bool {
+    let faces = |f: &crate::fonts::SvgFonts| {
+        f.sources
+            .iter()
+            .map(|(d, i)| (Arc::as_ptr(d).cast::<u8>(), *i))
+            .collect::<Vec<_>>()
+    };
+    (a.sans, a.mono) == (b.sans, b.mono) && faces(a) == faces(b)
+}
+
 impl crate::render::Pixels for Images {
     fn pixels(&mut self, id: u32, w: u32, h: u32) -> Option<&Bitmap> {
+        // Loaded past the limits: those pixels, at whatever size they were last (a zoom shows
+        // them until the new ones come), else what the cache has (an SVG drawn without its
+        // embedded images, until it is drawn with them).
+        #[cfg(feature = "images")]
+        if let Some((_, origin)) = self.forced_ids.iter().find(|f| f.0 == id) {
+            let frame = self.cache.frame;
+            if self.forced.pixels(origin, frame).is_some() {
+                return self.forced.pixels(origin, frame);
+            }
+        }
         let key = self.key(id)?;
         let (w, h) = clamp_box(w, h);
         self.cache.pixels(&key, w, h)

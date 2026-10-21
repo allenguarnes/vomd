@@ -114,6 +114,48 @@ pub enum Slot {
     MonoBold,
 }
 
+/// A font file's bytes, shared (embedded, or mapped).
+#[cfg(feature = "svg")]
+pub type FontData = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+/// The faces an SVG's text may be set in ([`Fonts::svg_sources`]): the files' bytes, shared, and
+/// the index of each face in its file; body text's regular face is `sans`, code's `mono`. Where
+/// each file comes from is in `origins`, beside it, for the process that draws SVGs to load the
+/// same faces (`image::svg`).
+#[cfg(feature = "svg")]
+pub struct SvgFonts {
+    pub sources: Vec<(FontData, u32)>,
+    pub origins: Vec<FontOrigin>,
+    pub sans: usize,
+    pub mono: usize,
+}
+
+/// Where a face's file of [`SvgFonts`] comes from: embedded in the binary (its place among the
+/// embedded faces), or a file on disk.
+#[cfg(feature = "svg")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FontOrigin {
+    Embedded(usize),
+    File(PathBuf),
+}
+
+/// The bytes of the file `origin` says, mapped (a file) or the binary's own (an embedded face).
+#[cfg(feature = "svg")]
+pub fn font_data(origin: &FontOrigin) -> Option<FontData> {
+    match origin {
+        #[cfg(feature = "embed-fonts")]
+        FontOrigin::Embedded(i) => EMBEDDED.get(*i).map(|e| Arc::new(e.1) as FontData),
+        #[cfg(not(feature = "embed-fonts"))]
+        FontOrigin::Embedded(_) => None,
+        FontOrigin::File(path) => {
+            let file = std::fs::File::open(path).ok()?;
+            // SAFETY: as `Fonts::load`'s: the file is treated as read-only.
+            let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+            Some(Arc::new(map))
+        }
+    }
+}
+
 pub struct Fonts {
     faces: Vec<Face>,
     slots: [FaceId; 6],
@@ -320,6 +362,55 @@ impl Fonts {
                 let face = self.face(id);
                 face.covers_sequence(base, marks) && loose.iter().all(|&m| face.glyph(m) != 0)
             })
+    }
+
+    /// The faces an SVG's text is set in (`image::svg`): these, and no other (no file is read
+    /// for them, and none is copied).
+    #[cfg(feature = "svg")]
+    pub fn svg_sources(&self) -> SvgFonts {
+        let mut ids: Vec<FaceId> = Vec::new();
+        for &id in self.slots.iter().chain(&self.fallbacks) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let place = |slot: Slot| {
+            let id = self.slots[slot as usize];
+            ids.iter().position(|&i| i == id).unwrap_or(0)
+        };
+        // (Without embedded faces, every face is a file's.)
+        #[cfg(feature = "embed-fonts")]
+        let embedded = |s: &[u8]| EMBEDDED.iter().position(|e| e.1.as_ptr() == s.as_ptr());
+        #[cfg(not(feature = "embed-fonts"))]
+        let embedded = |_: &[u8]| None;
+        SvgFonts {
+            sans: place(Slot::Regular),
+            mono: place(Slot::Mono),
+            origins: ids
+                .iter()
+                .map(|&id| {
+                    let face = self.face(id);
+                    match (&face.data, &face.source) {
+                        (_, Some((path, _))) => FontOrigin::File(path.clone()),
+                        (Data::Static(s), None) => {
+                            FontOrigin::Embedded(embedded(s).unwrap_or(usize::MAX))
+                        }
+                        (Data::Mapped(_), None) => FontOrigin::Embedded(usize::MAX),
+                    }
+                })
+                .collect(),
+            sources: ids
+                .iter()
+                .map(|&id| {
+                    let face = self.face(id);
+                    let data: FontData = match &face.data {
+                        Data::Static(s) => Arc::new(*s),
+                        Data::Mapped(m) => m.clone(),
+                    };
+                    (data, face.source.as_ref().map_or(0, |s| s.1))
+                })
+                .collect(),
+        }
     }
 
     pub fn has_source(&self, path: &Path, index: u32) -> bool {

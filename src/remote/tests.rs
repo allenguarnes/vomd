@@ -141,6 +141,12 @@ fn serve(s: TcpStream, port: u16) {
             body.resize(png.len() + (4 << 20), 0);
             respond(s, "200 OK", &len(body.len()), &body);
         }
+        // A PNG with 13 MiB after it: over what the fetchers take, not a forced fetch.
+        "/huge.png" => {
+            let mut body = png.clone();
+            body.resize(png.len() + (13 << 20), 0);
+            respond(s, "200 OK", &len(body.len()), &body);
+        }
         // `wide.jpg` with 390 KB of EXIF between its frame header and its scan.
         "/meta.jpg" => {
             let body = jpeg_with_exif();
@@ -260,7 +266,7 @@ fn fetching_follows_the_rules() {
     assert_eq!(fetch(&url("/to-file"), ROOMY), Err(Error::Failed));
     assert_eq!(fetch(&url("/to-ftp"), ROOMY), Err(Error::Failed));
     // The size cap, declared or not.
-    assert_eq!(fetch(&url("/big-declared"), ROOMY), Err(Error::Failed));
+    assert_eq!(fetch(&url("/big-declared"), ROOMY), Err(Error::TooLarge));
     // (Recent curl cuts an undeclared size off itself; the pipe is cut too, see below.)
     let streamed = fetch(&url("/big-stream"), ROOMY);
     assert!(
@@ -418,8 +424,10 @@ fn what_fetching_found_decides_the_layout() {
     let bytes: Bytes = Arc::new(png());
     assert!(r.fetched(&url, Ok((bytes, 2, 1))).is_some());
     assert_eq!(r.layout_size(&url), ImageSize::Pixels(2, 1));
-    r.failed(&url, true);
+    r.failed(&url, true, None);
     assert_eq!(r.layout_size(&url), ImageSize::Alt);
+    r.failed(&url, true, Some(Refusal::Complex));
+    assert_eq!(r.layout_size(&url), ImageSize::Refused(Refusal::Complex));
     let other: Arc<str> = "https://x.y/b.png".into();
     assert!(r.fetched(&other, Err(Error::NoCurl)).is_none());
     assert!(r.no_curl);
@@ -984,4 +992,112 @@ fn results_waiting_for_the_main_thread_are_bounded_in_number() {
         assert!(taken.insert(url), "once");
     }
     assert!(!r.busy());
+}
+
+/// A fetched body is sniffed for every format decoded, and its size is the one it is shown at
+/// (an EXIF orientation applied).
+#[test]
+fn bodies_of_every_format_are_taken_by_their_bytes() {
+    let fixture = |name: &str| {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/images")
+                .join(name),
+        )
+        .unwrap()
+    };
+    for (name, size) in [
+        ("anim.gif", (6, 4)),
+        ("zero-screen.gif", (3, 2)),
+        ("exif-6.jpg", (16, 24)),
+        ("exif-3.png", (24, 16)),
+        ("lossy.webp", (6, 4)),
+        ("anim.webp", (6, 4)),
+        ("exif-5.webp", (4, 6)),
+    ] {
+        let (_, w, h) = image_of(fixture(name)).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!((w, h), size, "{name}");
+    }
+    for junk in [&b"GIF89a"[..], b"BM\0\0", b"<html><svg/>"] {
+        assert_eq!(image_of(junk.to_vec()), Err(Error::NotAnImage));
+    }
+    // An SVG is an image in a build that draws them, and its size isn't held to the pixels a
+    // raster image may have.
+    let svg = b"<svg width='20000' height='9000'/>".to_vec();
+    if cfg!(feature = "svg") {
+        assert_eq!(image_of(svg).map(|(_, w, h)| (w, h)), Ok((16_384, 7373)));
+        assert!(image_of(fixture("badge.svgz")).is_ok());
+    } else {
+        assert_eq!(image_of(svg), Err(Error::NotAnImage));
+    }
+}
+
+/// A body over what the fetchers take is over VOMD's limits (its placeholder is clickable); the
+/// fetch a click makes takes up to 256 MiB.
+#[test]
+fn a_forced_fetch_takes_a_bigger_body() {
+    if !have_curl() {
+        return;
+    }
+    let port = server();
+    let url = format!("http://127.0.0.1:{port}/huge.png");
+    let big = Limits {
+        secs: 120,
+        ..LIMITS
+    };
+    assert_eq!(
+        fetch_with("curl", &url, big, &|_| true).map(|b| b.len()),
+        Err(Error::TooLarge)
+    );
+    assert_eq!(Error::TooLarge.refusal(), Some(Refusal::Bytes(0)));
+    let forced = Limits {
+        secs: 120,
+        ..FORCED_LIMITS
+    };
+    let body = fetch_with("curl", &url, forced, &|_| true).unwrap();
+    assert!(body.len() > 13 << 20);
+    assert_eq!(FORCED_LIMITS.bytes, 256 << 20);
+}
+
+/// A fetch for a load past the limits ends when its load is cancelled (the reader left the page),
+/// though no byte comes: its `curl` is killed, and the loads queued behind it don't wait for the
+/// 120 seconds it may take.
+#[cfg(unix)]
+#[test]
+fn a_cancelled_forced_fetch_ends() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("vomd-remote-cancel-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("curl");
+    std::fs::write(&fake, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut ended = None;
+    // (A script just written may be busy to exec, `ETXTBSY`: that fails at once, and is tried
+    // again; a fetch that ran is one that took the time it was cancelled after.)
+    for _ in 0..50 {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let theirs = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            theirs.store(true, Ordering::Relaxed);
+        });
+        let start = std::time::Instant::now();
+        let got = fetch_cancellable(
+            fake.to_str().unwrap(),
+            "https://x.y/a.png",
+            FORCED_LIMITS,
+            &|_| true,
+            Some(&cancel),
+        );
+        let took = start.elapsed();
+        setter.join().unwrap();
+        if took >= Duration::from_millis(250) {
+            ended = Some((got, took));
+            break;
+        }
+    }
+    let (got, took) = ended.expect("never ran");
+    assert_eq!(got, Err(Error::Failed));
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

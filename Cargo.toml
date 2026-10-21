@@ -9,7 +9,7 @@ publish = false
 
 [workspace]
 members = ["xtask"]
-exclude = ["fuzz"] # its own workspace (cargo-fuzz, nightly)
+exclude = ["fuzz", "vendor"] # fuzz: its own workspace (cargo-fuzz, nightly); vendor: patched crates
 
 [dependencies]
 pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }
@@ -26,6 +26,14 @@ unicode-linebreak = "0.1"
 unicode-bidi = "0.3"
 png = { version = "0.18", optional = true }
 zune-jpeg = { version = "0.5", optional = true }
+gif = { version = "0.14", default-features = false, features = ["std"], optional = true }
+image-webp = { version = "0.2", optional = true }
+# Exactly: the SVG memory and work charges (src/image/svg.rs) are measured against it, and it is
+# patched (vendor/resvg).
+resvg = { version = "=0.46.0", default-features = false, features = ["text"], optional = true }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"], optional = true } # svgz; usvg's
+# What usvg reads a style sheet with: the sheets' matching work is counted before usvg runs it.
+simplecss = { version = "0.2", default-features = false, optional = true }
 
 # The clipboard's display-server halves: the versions and features winit and softbuffer already
 # resolve to, so no new package is built.
@@ -46,7 +54,7 @@ name = "find_bench"
 required-features = ["find"]
 
 [features]
-default = ["images", "remote-images", "embed-fonts", "clipboard", "toc", "find"]
+default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find"]
 # Text selection and copy, and paste into the find bar. The X11 and Wayland clipboards use crates
 # that winit already brings in; the minimal build leaves all of it out.
 clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayland-protocols"]
@@ -54,7 +62,9 @@ clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayl
 toc = []
 # Find in page (Ctrl+F). No crates, and little code: the minimal build leaves it out.
 find = []
-images = ["dep:png", "dep:zune-jpeg"]
+images = ["dep:png", "dep:zune-jpeg", "dep:gif", "dep:image-webp"]
+# SVG and svgz images, with resvg (vendored, see [patch.crates-io]).
+svg = ["images", "dep:resvg", "dep:flate2", "dep:simplecss"]
 remote-images = ["images"] # no extra crates: uses system curl
 embed-fonts = []
 
@@ -68,9 +78,17 @@ debug = false
 incremental = false
 
 
+# Crates carried in the repository with a patch of VOMD's: each directory's VOMD-PATCH.md says what
+# changed. fuzz/Cargo.toml repeats this.
+[patch.crates-io]
+image-webp = { path = "vendor/image-webp" } # 0.2.4, its lossless decoder's Huffman codes bounded
+resvg = { path = "vendor/resvg" } # 0.46.0, raster images drawn by a hook, and a cancel flag
+simplecss = { path = "vendor/simplecss" } # 0.2.2, an error's position made in constant time
+
 [dev-dependencies]
 insta = "1"
 png = "0.18" # golden images (tests/golden.rs); already a dependency with `images`
+image-webp = "0.2" # lossless WebPs for the image memory tests; already a dependency with `images`
 
 # Tests decode and account for thousands of images: build them optimized, keeping debug
 # assertions and overflow checks (the image tests' room probe needs debug_assertions).

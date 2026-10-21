@@ -3,7 +3,7 @@
 # VOMD: View-Only Markdown
 
 A tiny, fast Markdown viewer for the Linux desktop. Double-click a `.md` file and it appears,
-rendered the way GitHub shows it, in well under a tenth of a second. It is one 3.9 MB binary
+rendered the way GitHub shows it, in well under a tenth of a second. It is one 5.5 MB binary
 with its fonts built in. It doesn't use a web engine or a GUI toolkit, and it never touches
 the network unless you ask it to.
 
@@ -13,7 +13,13 @@ the network unless you ask it to.
   scaling follows the system scale factor.
 - **Links**: `#anchors` scroll, relative `.md` links open in the same window (Back returns),
   and web links open in your browser.
-- **Images**: local PNG and JPEG, decoded lazily. Remote images load only after you press `I`.
+- **Images**: PNG, JPEG, GIF, WebP and SVG, local or remote, decoded lazily and drawn at the
+  screen's resolution (SVGs stay sharp at any zoom); photos are turned upright by their EXIF
+  orientation, and `<img width height>` is honored. Remote images load only after you press `I`.
+  An image too large or complex for VOMD's limits shows its alt text with *click to load*;
+  clicking loads it anyway (Ctrl+click when the image is a link). Loading it can use a lot of
+  memory and time (an SVG stops after 3 seconds, but a clicked one runs until it is done or has
+  used 120 seconds of CPU), and it's abandoned if you leave the page.
 - **Selecting and copying text**: drag, double-click a word, triple-click a block, or press
   `Ctrl+A`; `Ctrl+C` copies it as plain text, and what you select is also pasted by a middle
   click (X11 and Wayland). A code block shows a copy button, as on GitHub, when the pointer is
@@ -42,7 +48,7 @@ makepkg -si
 
 `vomd-bin` installs the release binary, which is small and runs on any x86-64 CPU. To build from
 source instead, use `packaging/aur/vomd`. It follows your `makepkg.conf`, so with CachyOS's
-`RUSTFLAGS` (`-C opt-level=3 -C target-cpu=native`) the binary is larger (about 5.2 MB) and
+`RUSTFLAGS` (`-C opt-level=3 -C target-cpu=native`) the binary is larger (about 7.4 MB) and
 faster, and runs only on the CPU it was built on.
 
 **Debian, Ubuntu:** from v1.1.0, each [release](https://github.com/allenguarnes/vomd/releases)
@@ -97,13 +103,16 @@ sudo apt install libwayland-client0 libxkbcommon0 \
 ```sh
 # Builds target/release/vomd:
 cargo build --release
+# Without SVG (SVGs show their alt text):
+cargo build --release --no-default-features --features images,remote-images,embed-fonts,clipboard,toc,find
 # The smallest build, with no images and system fonts only:
 cargo build --release --no-default-features
 ```
 
-The Cargo features are `images` (PNG/JPEG), `remote-images` (via the system `curl`),
-`embed-fonts`, `clipboard` (selecting and copying text), `toc` (the contents panel) and `find`
-(find in page). All six are on by default.
+The Cargo features are `images` (PNG, JPEG, GIF, WebP), `svg` (SVG and svgz, with `images`),
+`remote-images` (via the system `curl`), `embed-fonts`, `clipboard` (selecting and copying
+text), `toc` (the contents panel) and `find` (find in page). All seven are on by default. The
+build without SVG is 4.1 MB, and the smallest one 3.0 MB.
 
 ## Usage
 
@@ -140,6 +149,7 @@ Each window is its own process, so opening another file starts another window.
 | Drag | Select text (a drag that starts on a link selects, and doesn't follow it) |
 | Double-click, triple-click | Select a word, a paragraph (or a heading, code block, table row) |
 | `Shift` + click | Extend the selection |
+| Click an image's placeholder marked *click to load* | Load it beyond VOMD's limits (`Ctrl` + click when the image is a link) |
 | Click the copy button of a code block | Copy the block's code (the button shows at the block's upper right while the pointer is over it) |
 | `Ctrl+A` | Select everything |
 | `Ctrl+C`, `Ctrl+Insert` | Copy the selection |
@@ -248,7 +258,10 @@ placeholders until you press `I` (or click the toolbar's image button) for that 
 They are then fetched with the system `curl`, at most 4 at a time, limited to 12 MiB and
 15 seconds each, and kept in memory only. `remote_images = always` loads them for every
 document without asking, which lets any document you open contact the servers its images are
-on. `never` removes the option.
+on. `never` removes the option. An SVG never loads anything: references to other files or URLs
+inside it are ignored, even when you click to load it. Each SVG is drawn in a separate,
+short-lived `vomd` process, which reads only the SVG and VOMD's fonts, so a slow or broken one
+can be stopped: after 3 seconds, or after 120 seconds of CPU when you clicked to load it.
 
 ## Limitations
 
@@ -263,8 +276,13 @@ on. `never` removes the option.
   Wayland).
 - Drag-and-drop works on X11 only, because winit doesn't support it on Wayland; there, open
   files with Ctrl+O or the toolbar's folder button.
-- SVG, GIF and WebP images show as placeholders. EXIF orientation isn't applied. Math and
-  Mermaid show as text and code.
+- Math and Mermaid show as text and code.
+- Animated GIFs and WebPs show their first frame.
+- SVGs: text uses VOMD's fonts (Inter and JetBrains Mono, or your `font_sans`/`font_mono`), so
+  it can look different from a browser's. Images embedded in an SVG are drawn; references to
+  other files or URLs are never followed. There is no animation or scripting.
+- AVIF, HEIC, BMP, TIFF and ICO images show their alt text.
+- `<img>` sizes in `em`, `vw` and other units than px and % are ignored.
 
 ## Development
 
@@ -272,8 +290,13 @@ on. `never` removes the option.
 checks. `cargo xtask budgets` measures every performance budget against a release build (it
 needs a display). `cargo xtask images` runs the image memory tests, each in its own process and
 as many at once as there are CPUs (`-j N`, `--runs K` to repeat), much faster than
-`cargo test` on a machine with several cores. `just fuzz <doc|layout|settings> [seconds]` fuzzes
-on the stable toolchain.
+`cargo test` on a machine with several cores. `just fuzz <doc|image|layout|settings|svg>
+[seconds]` fuzzes on the stable toolchain.
+`vendor/` holds three crates VOMD patches, used through `[patch.crates-io]`: resvg 0.46 (its
+raster images go to VOMD's decoders, and drawing can be cancelled), image-webp 0.2.4 (a
+memory limit on a lossless image's Huffman codes) and simplecss 0.2.2 (an error's position made
+in constant time, as a style sheet of many rules took the square of its length). Each one's
+`VOMD-PATCH.md` lists the changes and how to upgrade.
 `scripts/aur-check.sh` builds and checks both AUR packages offline. `scripts/clipboard-check.sh`
 selects, copies and pastes against Xvfb and a headless sway in containers, with the real `xclip`,
 `xsel` and `wl-paste` (it needs docker); the copy button is clicked on X11 only, because a

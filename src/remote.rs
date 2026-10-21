@@ -7,7 +7,7 @@
 //! (`--globoff`: `x[1-1000000].png` is one URL), only http(s) allowed, also for redirects, with
 //! caps on redirects, time and size. The size cap is enforced again while reading the pipe, and
 //! the time cap by a watchdog that kills a `curl` still running well after it. The bytes are
-//! sniffed: only PNG and JPEG are kept.
+//! sniffed: only images of a format this build decodes are kept.
 //!
 //! Bodies are read into memory, so what is held is bounded: a fetcher takes credit for every
 //! 256 KB it reads (before its buffer grows by that much), and for as long as the body is its
@@ -40,12 +40,13 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::image::{self, Bytes, Done, Wake};
-use crate::layout::ImageSize;
+use crate::layout::{ImageSize, Refusal};
 use crate::settings::RemoteImages;
 
 /// Fetchers running at once, at most.
@@ -104,6 +105,28 @@ pub const LIMITS: Limits = Limits {
     redirects: 5,
 };
 
+/// What a fetch for a load past VOMD's limits (a click on the placeholder) may cost: a body of
+/// up to 256 MiB, and the time to bring it.
+pub const FORCED_LIMITS: Limits = Limits {
+    bytes: 256 << 20,
+    secs: 120,
+    redirects: 5,
+};
+
+/// What fetches a remote image for a load past VOMD's limits: its body, or why not
+/// (`Refusal::Ceiling` past [`FORCED_LIMITS`], `Refusal::Failed` for anything else). The fetch
+/// is ended (its `curl` killed) once the flag is set.
+pub(crate) type ForcedFetch =
+    Arc<dyn Fn(&str, &Arc<AtomicBool>) -> Result<Vec<u8>, Refusal> + Send + Sync>;
+
+/// [`ForcedFetch`] with `curl`.
+fn forced_fetch(url: &str, cancel: &Arc<AtomicBool>) -> Result<Vec<u8>, Refusal> {
+    fetch_cancellable("curl", url, FORCED_LIMITS, &|_| true, Some(cancel)).map_err(|e| match e {
+        Error::TooLarge => Refusal::Ceiling(FORCED_LIMITS.bytes),
+        _ => Refusal::Failed,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// There's no `curl` to run.
@@ -117,8 +140,22 @@ pub enum Error {
     /// Given up to let an older fetch have the credit it needs: nothing was found out about the
     /// URL, it is fetched again.
     Yielded,
-    /// Not a PNG or JPEG (or too many pixels to decode).
+    /// Not a format this build decodes.
     NotAnImage,
+    /// An image over VOMD's limits (too many pixels, an SVG too big).
+    OverLimits(Refusal),
+}
+
+impl Error {
+    /// Why the image is over VOMD's limits, if that is why it failed: its placeholder says so,
+    /// and a click loads it anyway.
+    fn refusal(self) -> Option<Refusal> {
+        match self {
+            Error::TooLarge => Some(Refusal::Bytes(0)),
+            Error::OverLimits(why) => Some(why),
+            _ => None,
+        }
+    }
 }
 
 /// Whether `url` may be handed to `curl`: `http://` or `https://` (any case), no longer than
@@ -142,6 +179,20 @@ pub fn fetch(url: &str, limits: Limits) -> Result<Vec<u8>, Error> {
 /// is as it was read: its buffer is as big as the credit taken, for the caller to [`cut_to_size`]
 /// once it has done what changes the size of it.
 fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<Vec<u8>, Error> {
+    fetch_cancellable(program, url, limits, grant, None)
+}
+
+/// How often the watchdog of a fetch that can be cancelled looks at its flag.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// [`fetch_with`] that ends (the `curl` killed, the fetch failed) soon after `cancel` is set.
+fn fetch_cancellable(
+    program: &str,
+    url: &str,
+    limits: Limits,
+    grant: Grant,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<Vec<u8>, Error> {
     if !fetchable(url) {
         return Err(Error::Refused);
     }
@@ -181,9 +232,20 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
     let (done, finished) = channel::<()>();
     let dog = child.clone();
     let wall = Duration::from_secs(u64::from(limits.secs)) + GRACE;
+    let cancel = cancel.cloned();
     std::thread::spawn(move || {
-        if finished.recv_timeout(wall) == Err(RecvTimeoutError::Timeout) {
-            let _ = dog.lock().unwrap_or_else(|e| e.into_inner()).kill();
+        let start = std::time::Instant::now();
+        // (Without a flag, one wait for the whole time: nothing wakes while it runs.)
+        let step = if cancel.is_some() { CANCEL_POLL } else { wall };
+        loop {
+            if finished.recv_timeout(step) != Err(RecvTimeoutError::Timeout) {
+                return;
+            }
+            let stopped = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+            if stopped || start.elapsed() >= wall {
+                let _ = dog.lock().unwrap_or_else(|e| e.into_inner()).kill();
+                return;
+            }
         }
     });
     // The buffer is as big as the credit taken, no more: it grows by `STEP` at a time instead
@@ -242,16 +304,19 @@ fn fetch_with(program: &str, url: &str, limits: Limits, grant: Grant) -> Result<
     }
     // The pipe is closed: it is on its way out (waiting without the lock held, so the watchdog
     // can still kill it).
-    let ok = loop {
+    let status = loop {
         match child.lock().unwrap_or_else(|e| e.into_inner()).try_wait() {
-            Ok(Some(status)) => break status.success(),
+            Ok(Some(status)) => break Some(status),
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(_) => break false,
+            Err(_) => break None,
         }
     };
     drop(done);
-    if !ok {
-        return Err(Error::Failed);
+    match status {
+        Some(s) if s.success() => {}
+        // `CURLE_FILESIZE_EXCEEDED`: the size the server declared is over the cap.
+        Some(s) if s.code() == Some(63) => return Err(Error::TooLarge),
+        _ => return Err(Error::Failed),
     }
     Ok(bytes)
 }
@@ -280,7 +345,7 @@ pub(crate) type Fetched = Result<(Bytes, u32, u32), Error>;
 /// What a fetcher thread runs for a URL (tests put their own in place of [`fetch_image`]).
 pub(crate) type Fetcher = Arc<dyn Fn(&str, Grant) -> Fetched + Send + Sync>;
 
-/// Fetch a remote image: its bytes and natural size, if it's a PNG or JPEG.
+/// Fetch a remote image: its bytes and natural size, if it's of a format this build decodes.
 fn fetch_image(url: &str, grant: Grant) -> Fetched {
     let bytes = fetch_with("curl", url, LIMITS, grant)?;
     image_of(bytes)
@@ -296,11 +361,12 @@ fn image_of(mut bytes: Vec<u8>) -> Fetched {
         return Err(Error::NotAnImage);
     }
     let bytes = cut_to_size(bytes);
-    match image::header(&mut &bytes[..]) {
-        Some((_, w, h)) if u64::from(w) * u64::from(h) <= image::MAX_PIXELS => {
-            Ok((Arc::new(bytes), w, h))
-        }
-        _ => Err(Error::NotAnImage),
+    if let Some(why) = image::refusal_of(&bytes) {
+        return Err(Error::OverLimits(why));
+    }
+    match image::header_of(&bytes) {
+        Some((_, w, h)) => Ok((Arc::new(bytes), w, h)),
+        None => Err(Error::NotAnImage),
     }
 }
 
@@ -685,6 +751,26 @@ impl Drop for Pool {
     }
 }
 
+/// What fetching found of an image: its natural size, and what decoding it holds: `kib`, rounded
+/// up to a KiB, whatever the box (`image::source_cost`), and for each pixel of the box besides
+/// its result twice, and of its sides (`image::box_costs`: an SVG's layers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Record {
+    pub w: u32,
+    pub h: u32,
+    pub kib: u32,
+    pub per_px: u32,
+    pub per_side: u32,
+}
+
+/// What fetching found of a URL ([`Remote::sizes`]).
+type Found = Result<Record, Option<Refusal>>;
+
+/// `bytes` in KiB, rounded up.
+fn kib(bytes: usize) -> u32 {
+    u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX)
+}
+
 /// Remote images for the window: the policy, whether they're on for this document, and what
 /// fetching found this session, by URL.
 pub struct Remote {
@@ -693,13 +779,16 @@ pub struct Remote {
     pub on: bool,
     /// `curl` couldn't be run: nothing is fetched, the toolbar says why.
     pub no_curl: bool,
-    /// Each URL fetched: its natural size, or `None` if it failed or isn't PNG or JPEG. Kept for
-    /// the current document's URLs and those with a body or pixels cached (`Images::attach`).
-    sizes: HashMap<Arc<str>, Option<(u32, u32)>>,
+    /// Each URL fetched: its natural size and what decoding it holds ([`Record`]), or `Err` if
+    /// it failed or isn't an image this build decodes (with why, if that is VOMD's limits). Kept
+    /// for the current document's URLs and those with a body or pixels cached (`Images::attach`).
+    sizes: HashMap<Arc<str>, Found>,
     /// What the strings of `sizes` hold ([`image::str_bytes`] of each), kept as it changes.
     sizes_str: usize,
     pool: Option<Pool>,
     fetcher: Fetcher,
+    /// What fetches for loads past the limits ([`ForcedFetch`]), outside the pool.
+    pub(crate) forced_fetch: ForcedFetch,
     /// A fetcher was ever started.
     started: bool,
     /// The fetchers are held off ([`Remote::pause`]), the pool that is started later too.
@@ -716,6 +805,7 @@ impl Default for Remote {
             sizes_str: 0,
             pool: None,
             fetcher: Arc::new(fetch_image),
+            forced_fetch: Arc::new(forced_fetch),
             started: false,
             paused: false,
         }
@@ -725,19 +815,53 @@ impl Default for Remote {
 impl Remote {
     /// What fetching found for `url`: `None` not fetched, `Some(None)` failed.
     pub fn size(&self, url: &str) -> Option<Option<(u32, u32)>> {
-        self.sizes.get(url).copied()
+        self.sizes.get(url).map(|s| s.ok().map(|r| (r.w, r.h)))
     }
 
-    /// How many URLs were fetched, and how many failed or aren't PNG or JPEG.
+    /// Why the image at `url` is over VOMD's limits, if it was fetched and is.
+    pub(crate) fn refusal(&self, url: &str) -> Option<Refusal> {
+        *self.sizes.get(url)?.as_ref().err()?
+    }
+
+    /// What decoding the image fetched for `url` holds whatever the box (see [`Remote::sizes`]),
+    /// rounded up to a KiB, if it was fetched and is an image.
+    pub(crate) fn source_cost(&self, url: &str) -> Option<usize> {
+        let r = self.sizes.get(url)?.ok()?;
+        Some((r.kib as usize).saturating_mul(1024))
+    }
+
+    /// What decoding the image fetched for `url` holds for each pixel of its box besides its
+    /// result twice, and for each pixel of its sides (see [`Record`]).
+    pub(crate) fn box_costs(&self, url: &str) -> (u32, u32) {
+        self.sizes
+            .get(url)
+            .and_then(|r| r.ok())
+            .map_or((0, 0), |r| (r.per_px, r.per_side))
+    }
+
+    /// A job of the SVG fetched for `url` found it holds more than its record said: what it
+    /// holds whatever the box (`source`), and for each pixel of it and of its sides, which only
+    /// grow.
+    #[cfg(feature = "svg")]
+    pub(crate) fn remeasure(&mut self, url: &str, source: usize, (per_px, per_side): (u32, u32)) {
+        if let Some(Ok(r)) = self.sizes.get_mut(url) {
+            r.kib = r.kib.max(kib(source));
+            r.per_px = r.per_px.max(per_px);
+            r.per_side = r.per_side.max(per_side);
+        }
+    }
+
+    /// How many URLs were fetched, and how many failed or aren't images.
     pub fn counts(&self) -> (usize, usize) {
-        let fetched = self.sizes.values().filter(|s| s.is_some()).count();
+        let fetched = self.sizes.values().filter(|s| s.is_ok()).count();
         (fetched, self.sizes.len() - fetched)
     }
 
     /// The size layout gives a remote image now.
     pub fn layout_size(&self, url: &str) -> ImageSize {
         match (self.on, self.size(url)) {
-            (false, _) | (true, Some(None)) => ImageSize::Alt,
+            (true, Some(None)) => self.refusal(url).map_or(ImageSize::Alt, ImageSize::Refused),
+            (false, _) => ImageSize::Alt,
             (true, Some(Some((w, h)))) => ImageSize::Pixels(w, h),
             (true, None) if self.no_curl => ImageSize::Alt,
             (true, None) => ImageSize::Loading,
@@ -768,7 +892,15 @@ impl Remote {
     ) -> Option<Bytes> {
         match result {
             Ok((bytes, w, h)) => {
-                self.record(url, Some((w, h)), own);
+                let (per_px, per_side) = image::box_costs(&bytes);
+                let record = Record {
+                    w,
+                    h,
+                    kib: kib(image::source_cost(&bytes)),
+                    per_px,
+                    per_side,
+                };
+                self.record(url, Ok(record), own);
                 Some(bytes)
             }
             Err(Error::NoCurl) => {
@@ -778,8 +910,8 @@ impl Remote {
             }
             // Nothing was found out: asked for again, as an image not fetched yet.
             Err(Error::Yielded) => None,
-            Err(_) => {
-                self.record(url, None, own);
+            Err(e) => {
+                self.record(url, Err(e.refusal()), own);
                 None
             }
         }
@@ -788,7 +920,7 @@ impl Remote {
     /// What fetching found for `url`. The table never grows here: a record already there is
     /// replaced, and a new one (`insert`: the document's URL) goes in the room made for the
     /// document's URLs ([`Remote::fit_sizes`]), which is there by what the document's numbers say.
-    fn record(&mut self, url: &Arc<str>, size: Option<(u32, u32)>, insert: bool) {
+    fn record(&mut self, url: &Arc<str>, size: Found, insert: bool) {
         if let Some(found) = self.sizes.get_mut(url) {
             *found = size;
         } else if insert {
@@ -812,8 +944,8 @@ impl Remote {
         mut keep: impl FnMut(&Arc<str>, Option<(u32, u32)>) -> bool,
     ) {
         let mut freed = 0;
-        self.sizes.retain(|u, &mut size| {
-            let k = keep(u, size);
+        self.sizes.retain(|u, size| {
+            let k = keep(u, size.as_ref().ok().map(|r| (r.w, r.h)));
             if !k {
                 freed += image::str_bytes(u);
             }
@@ -851,7 +983,7 @@ impl Remote {
     pub(crate) fn sizes_bytes_for(&self, extra: usize) -> usize {
         image::table_bytes(
             self.sizes.len().saturating_add(extra),
-            size_of::<(Arc<str>, Option<(u32, u32)>)>(),
+            size_of::<(Arc<str>, Found)>(),
         )
     }
 
@@ -862,18 +994,18 @@ impl Remote {
         image::fit_map(&mut self.sizes, extra);
     }
 
-    /// The URLs that failed or aren't PNG or JPEG (what [`Remote::size`] calls `Some(None)`).
+    /// The URLs that failed or aren't images (what [`Remote::size`] calls `Some(None)`).
     pub(crate) fn failed_urls(&self) -> impl Iterator<Item = &Arc<str>> {
         self.sizes
             .iter()
-            .filter(|(_, s)| s.is_none())
+            .filter(|(_, s)| s.is_err())
             .map(|(u, _)| u)
     }
 
-    /// The image at `url` didn't decode: it shows its alt text from now on. (`own`: the URL is the
-    /// document's, see [`Remote::record`].)
-    pub(crate) fn failed(&mut self, url: &Arc<str>, own: bool) {
-        self.record(url, None, own);
+    /// The image at `url` didn't decode: it shows its alt text from now on, and why, if that is
+    /// VOMD's limits (`why`). (`own`: the URL is the document's, see [`Remote::record`].)
+    pub(crate) fn failed(&mut self, url: &Arc<str>, own: bool, why: Option<Refusal>) {
+        self.record(url, Err(why), own);
     }
 
     /// Fetch `urls`, most wanted first (duplicates are fetched once), replacing what the
@@ -947,10 +1079,7 @@ impl Remote {
     /// buffer and its strings. The entries of the pool's list and the results in its channel
     /// are in [`FETCH_RESERVE`].
     pub(crate) fn bookkeeping_bytes(&self) -> usize {
-        let sizes = image::table_bytes(
-            self.sizes.capacity(),
-            size_of::<(Arc<str>, Option<(u32, u32)>)>(),
-        );
+        let sizes = image::table_bytes(self.sizes.capacity(), size_of::<(Arc<str>, Found)>());
         sizes
             .saturating_add(self.sizes_str)
             .saturating_add(self.pool.as_ref().map_or(0, Pool::bookkeeping))
@@ -979,6 +1108,8 @@ impl Remote {
     /// more URLs than `curl` can be run for.
     #[doc(hidden)]
     pub fn set_test_body(&mut self, body: TestBody) {
+        let forced = body.clone();
+        self.forced_fetch = Arc::new(move |url, _| forced(url).ok_or(Refusal::Failed));
         self.fetcher = Arc::new(move |url, grant| {
             let bytes = body(url).ok_or(Error::Failed)?;
             let mut granted = 0;

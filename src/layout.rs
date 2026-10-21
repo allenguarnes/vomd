@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::doc::{self, Alert, Block, BlockKind, Doc, ImageRef, Marker, Span, style};
+use crate::doc::{self, Alert, Block, BlockKind, Doc, ImageRef, Marker, Span, Want, style};
 use crate::fonts::Fonts;
 use crate::image::MAX_SIDE;
 use crate::text::{
@@ -67,12 +67,70 @@ const MAX_BOX_PIXELS: f32 = 16.0e6;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageSize {
     /// Its alt text in an outlined placeholder: nothing to show (a remote image while remote
-    /// images are off, a missing file, not PNG or JPEG).
+    /// images are off, a missing file, not a format this build decodes).
     Alt,
+    /// Its alt text, and why VOMD's limits keep it from being shown, in the placeholder: one
+    /// that is [`Refusal::forceable`] says that a click loads it anyway.
+    Refused(Refusal),
     /// Being fetched, size unknown: a 4:3 box.
     Loading,
     /// Its natural size in pixels: a box that many logical pixels, no wider than the line.
     Pixels(u32, u32),
+}
+
+/// Why an image isn't shown, VOMD's limits: what its placeholder says after its alt text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// More pixels than VOMD decodes: its size.
+    Pixels(u32, u32),
+    /// A file or body bigger than VOMD reads: its bytes (0: a fetch that was cut off).
+    Bytes(u64),
+    /// Decoding it needs more memory than the image budget: about how much (0: not known).
+    Memory(u64),
+    /// An SVG with more elements, depth, entities, `<use>` or embedded images than VOMD draws.
+    Complex,
+    /// An SVG that would take too long to draw at this size, or did.
+    Slow,
+    /// Loading it anyway needs more memory than a forced load may take: about how much.
+    Ceiling(u64),
+    /// Loading it anyway failed.
+    Failed,
+}
+
+impl Refusal {
+    /// A click loads it anyway (beyond the limits): not once that was tried.
+    pub fn forceable(self) -> bool {
+        !matches!(self, Refusal::Ceiling(_) | Refusal::Failed)
+    }
+
+    /// What the placeholder says after the alt text; `link`: the image is a link, which a
+    /// plain click follows.
+    pub fn suffix(self, link: bool) -> String {
+        let why = match self {
+            Refusal::Pixels(w, h) => format!("too large ({w}×{h})"),
+            Refusal::Bytes(0) | Refusal::Memory(0) => "too large".to_owned(),
+            Refusal::Bytes(n) => format!("too large ({})", mb(n)),
+            Refusal::Memory(n) => format!("too large (needs {})", mb(n)),
+            Refusal::Complex => "too complex".to_owned(),
+            Refusal::Slow => "too slow to draw".to_owned(),
+            Refusal::Ceiling(n) => return format!(" · too large to load (needs {})", mb(n)),
+            Refusal::Failed => return " · couldn't load".to_owned(),
+        };
+        let click = if link { "Ctrl+click" } else { "click" };
+        format!(" · {why} · {click} to load")
+    }
+}
+
+/// `n` bytes as people read them: `4.8 MB`, `88 MB`, `3.2 GB`.
+fn mb(n: u64) -> String {
+    let mb = n as f64 / f64::from(1 << 20);
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{:.1} MB", mb.max(0.1))
+    }
 }
 
 /// Finds a local image's size when its block is first measured (see `image.rs`).
@@ -1840,15 +1898,38 @@ struct Boxes<'a> {
 }
 
 impl Boxes<'_> {
-    /// The box image `id` is shown in, whole physical pixels; `None` for its alt text.
-    fn size(&self, id: u32) -> Option<(f32, f32)> {
+    /// The box image `id` is shown in, whole physical pixels; `None` for its alt text. `want` is
+    /// the size its `<img>` asks for: a side given is that (a percentage of the line's width),
+    /// one not follows the image's aspect, and both are kept as given (a raster is stretched, an
+    /// SVG fits inside); then, like the natural size, it is no wider than the line.
+    fn size(&self, id: u32, want: [Want; 2]) -> Option<(f32, f32)> {
+        let side = |w: Want| match w {
+            Want::Auto => None,
+            Want::Px(v) => Some(v as f32 / 100.0 * self.scale),
+            Want::Pct(v) => Some(v as f32 / 10_000.0 * self.max_w),
+        };
+        let (ww, wh) = (side(want[0]), side(want[1]));
         let (w, h) = match (*self.sizes.get(id.checked_sub(1)? as usize)?)? {
-            ImageSize::Alt => return None,
-            ImageSize::Loading => {
-                let w = (LOADING_EM * self.em).min(self.max_w);
-                (w, w * 0.75)
+            ImageSize::Alt | ImageSize::Refused(_) => return None,
+            // Its size unknown, a box of what is given: final if both sides are (no reflow
+            // when it comes), 4:3 otherwise.
+            ImageSize::Loading => match (ww, wh) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w * 0.75),
+                _ => {
+                    let w = (LOADING_EM * self.em).min(self.max_w);
+                    (w, w * 0.75)
+                }
+            },
+            ImageSize::Pixels(w, h) => {
+                let (w, h) = (w as f32 * self.scale, h as f32 * self.scale);
+                match (ww, wh) {
+                    (Some(ww), Some(wh)) => (ww, wh),
+                    (Some(ww), None) => (ww, ww * h / w),
+                    (None, Some(wh)) => (wh * w / h, wh),
+                    (None, None) => (w, h),
+                }
             }
-            ImageSize::Pixels(w, h) => (w as f32 * self.scale, h as f32 * self.scale),
         };
         // No side beyond what `image::decode` makes, whatever the pixel count; a side that
         // shrinks to less than a pixel stays one, and the other is what's left of the budget.
@@ -1867,17 +1948,16 @@ impl Boxes<'_> {
 
 fn fill_para(para: &mut Para, doc: &Doc, spans: &[Span], body: TextStyle, boxes: &Boxes) {
     para.clear();
-    for span in spans {
+    for (i, span) in spans.iter().enumerate() {
         let style = span_style(span, body);
+        let img = doc.images.get((span.image as usize).wrapping_sub(1));
+        let want = img.map_or([Want::Auto; 2], |img| img.want);
         if span.image != 0
-            && let Some((w, h)) = boxes.size(span.image)
+            && let Some((w, h)) = boxes.size(span.image, want)
         {
             // An alt text split over two spans (a long block cut in chunks) is one box, in the
             // chunk its text starts in; the rest of it shows nothing.
-            let first = doc
-                .images
-                .get(span.image as usize - 1)
-                .is_none_or(|img| img.start == span.start);
+            let first = img.is_none_or(|img| img.start == span.start);
             if first {
                 let b = InlineBox {
                     width: w,
@@ -1895,6 +1975,20 @@ fn fill_para(para: &mut Para, doc: &Doc, spans: &[Span], body: TextStyle, boxes:
             continue;
         }
         para.push_text(doc.span_text(span), span.start, style);
+        // The last of a refused image's alt text: why, in the placeholder. (Not the document's
+        // text: not selected, copied or found.)
+        if span.image != 0
+            && let Some(Some(ImageSize::Refused(why))) =
+                boxes.sizes.get(span.image as usize - 1).copied()
+            && spans.get(i + 1).is_none_or(|s| s.image != span.image)
+        {
+            let muted = TextStyle {
+                role: Role::Muted,
+                ..style
+            };
+            let at = span.end.saturating_sub(1).max(span.start);
+            para.push_synthetic(&why.suffix(span.link != 0), at, muted);
+        }
     }
     if para.styles.is_empty() {
         para.styles.push(body);

@@ -13,6 +13,10 @@ use vomd::doc::Doc;
 use vomd::image::{CACHE_BYTES, Images, decode};
 use vomd::layout::{Layout as PageLayout, Params};
 
+#[path = "../src/image/webp/many_groups.rs"]
+mod many_groups;
+use many_groups::many_groups;
+
 struct Counting;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -642,6 +646,58 @@ fn zlib_zeros(n: usize) -> Vec<u8> {
     // The Adler-32 of zeros: 1 in the low half, the count in the high.
     let mut out = b.out;
     out.extend(((((n as u64 % 65_521) as u32) << 16) | 1).to_be_bytes());
+    out
+}
+
+/// A GIF of a `sw` × `sh` screen whose first frame (left, top, width and height) is all index
+/// 0, interlaced or not, after `meta` bytes of XMP (which its decoder is never given). Its LZW
+/// codes stand for ever longer runs of zeros, the table cleared before the codes grow past 9
+/// bits, so a frame of millions of pixels is some KB.
+fn zero_gif(sw: u16, sh: u16, frame: [u16; 4], interlaced: bool, meta: usize) -> Vec<u8> {
+    let mut out = b"GIF89a".to_vec();
+    out.extend(sw.to_le_bytes());
+    out.extend(sh.to_le_bytes());
+    out.extend([0xF7, 0, 0]);
+    out.extend([0; 768]);
+    if meta > 0 {
+        out.extend(b"\x21\xFF\x0BXMP DataXMP");
+        for chunk in vec![b'x'; meta].chunks(255) {
+            out.push(chunk.len() as u8);
+            out.extend(chunk);
+        }
+        out.push(0);
+    }
+    out.push(0x2C);
+    for v in frame {
+        out.extend(v.to_le_bytes());
+    }
+    out.push(if interlaced { 0x40 } else { 0 });
+    out.push(8);
+    let mut b = Bits {
+        out: Vec::new(),
+        acc: 0,
+        n: 0,
+    };
+    let mut left = usize::from(frame[2]) * usize::from(frame[3]);
+    while left > 0 {
+        b.put(256, 9, false);
+        // A literal, then each code the one before and a zero more (made as it is read).
+        let mut run = 1;
+        while run <= left && run < 240 {
+            b.put(if run == 1 { 0 } else { 256 + run as u32 }, 9, false);
+            left -= run;
+            run += 1;
+        }
+    }
+    b.put(257, 9, false);
+    if b.n > 0 {
+        b.put(0, 8 - b.n, false);
+    }
+    for chunk in b.out.chunks(255) {
+        out.push(chunk.len() as u8);
+        out.extend(chunk);
+    }
+    out.extend([0, 0x3B]);
     out
 }
 
@@ -1280,7 +1336,352 @@ fn the_reservation_covers_what_decoding_allocates() {
             }
         }
     }
+    // GIFs: rows, interlaced, a frame smaller than the screen, metadata before it.
+    let gifs: &[(u16, u16, [u16; 4], bool, usize)] = &[
+        (1, 1, [0, 0, 1, 1], false, 0),
+        (100, 50, [0, 0, 100, 50], true, 0),
+        (12_000, 8, [0, 0, 12_000, 8], false, 0),
+        (8, 12_000, [0, 0, 8, 12_000], true, 0),
+        (2000, 1500, [0, 0, 2000, 1500], true, 0),
+        (2000, 1500, [0, 0, 2000, 1500], false, 0),
+        (3000, 2000, [700, 100, 1000, 1500], true, 0),
+        (300, 200, [0, 0, 300, 200], false, 1 << 20),
+    ];
+    for &(sw, sh, frame, interlaced, meta) in gifs {
+        let bytes = zero_gif(sw, sh, frame, interlaced, meta);
+        let (w, h) = (u32::from(sw), u32::from(sh));
+        assert!(decode(&bytes, 2, 2).is_some(), "{sw}×{sh} {frame:?}");
+        for target in [(1, 1), (300, 100), (w.min(16_384), h.min(16_384))] {
+            let what = format!("GIF {sw}×{sh} {frame:?} interlaced {interlaced} to {target:?}");
+            check(what, &bytes, target);
+        }
+    }
+    // WebPs: lossy, with alpha, animated, lossless (made here, with and without alpha).
+    let mut webps: Vec<(String, Vec<u8>)> = [
+        "lossy.webp",
+        "lossy-alpha.webp",
+        "lossless-alpha.webp",
+        "anim.webp",
+        "exif-5.webp",
+        "big-lossy.webp",
+        "big-lossy-alpha.webp",
+        "big-anim.webp",
+        "big-lossless.webp",
+        "big-lossless-alpha.webp",
+    ]
+    .iter()
+    .map(|n| (n.to_string(), fixture(n)))
+    .collect();
+    for (w, h, alpha) in [
+        (1, 1, false),
+        (2000, 1500, false),
+        (2000, 1500, true),
+        (16_383, 4, true),
+    ] {
+        let channels = if alpha { 4 } else { 3 };
+        let pixels: Vec<u8> = (0..w * h * channels)
+            .map(|i| (i * 7 + i / 4093) as u8)
+            .collect();
+        let mut out = Vec::new();
+        let color = if alpha {
+            image_webp::ColorType::Rgba8
+        } else {
+            image_webp::ColorType::Rgb8
+        };
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&pixels, w as u32, h as u32, color)
+            .unwrap();
+        webps.push((format!("lossless {w}×{h} alpha {alpha}"), out));
+    }
+    // A lossy frame with a MB of data its decoder copies, and doesn't need.
+    let mut padded = fixture("big-lossy.webp");
+    padded.extend(vec![0; 1 << 20]);
+    let vp8 = u32::from_le_bytes(padded[16..20].try_into().unwrap()) + (1 << 20);
+    padded[16..20].copy_from_slice(&vp8.to_le_bytes());
+    let riff = padded.len() as u32 - 8;
+    padded[4..8].copy_from_slice(&riff.to_le_bytes());
+    webps.push(("lossy with a MB more data".into(), padded));
+    // Lossless, with 800 KB of Huffman codes.
+    webps.push((
+        "lossless with 40 groups of codes".into(),
+        many_groups(40, 4),
+    ));
+    for (what, bytes) in &webps {
+        let (_, w, h) = vomd::image::header_of(bytes).expect(what);
+        assert!(decode(bytes, 2, 2).is_some(), "{what}");
+        for target in [(1, 1), (300, 100), (w.min(16_384), h.min(16_384))] {
+            check(format!("WebP {what} to {target:?}"), bytes, target);
+        }
+    }
+    // Lossless, with 20 MB of Huffman codes in a file of 59 KB: refused at the limit of the
+    // patched decoder (see src/image/webp/tests.rs), within the reservation.
+    let codes = many_groups(1024, 4);
+    assert!(decode(&codes, 2, 2).is_none());
+    check(
+        "WebP lossless with 1,024 groups of codes".into(),
+        &codes,
+        (4, 4),
+    );
+    // Turned by their EXIF orientation: resampled with the sides swapped, and copied.
+    let png = zero_png(3000, 20, 6, 8, false, 32_768);
+    let jpeg = jpeg_variant(&wide, 0xC0, 3000, 16, &[0x22, 0x11, 0x11], 3);
+    for (name, bytes) in [("PNG", &png), ("JPEG", &jpeg)] {
+        for o in [2, 3, 5, 6, 8] {
+            let turned = with_orientation(bytes, o);
+            let (w, h) = if o >= 5 { (20, 3000) } else { (3000, 20) };
+            for target in [(1, 1), (w, h), (w / 2, h / 3), (h, w)] {
+                check(format!("{name} turned {o} to {target:?}"), &turned, target);
+            }
+        }
+    }
     println!("{count} decodes within their reservation; the least room: {least:?}");
+}
+
+/// A load past the limits holds no more than the room it is given, whatever the room: a lossless
+/// WebP's codes (2,200 groups of them, 44 MB from a file of 130 KB) take what is left of it
+/// beside the rest of the decode, and not all of it.
+#[test]
+fn a_forced_webp_stays_in_its_room() {
+    let _serial = serial();
+    let bytes = many_groups(2200, 2048);
+    let (w, h) = (256, 256);
+    let cost = vomd::image::decode_reservation(&bytes, w, h).unwrap() + 4 * (w * h) as usize;
+    // Room for the rest of the decode and some of the codes.
+    for extra in [0, 10 << 20, 20 << 20, 60 << 20] {
+        let room = cost + extra;
+        let start = mark();
+        let bitmap = vomd::image::decode_forced(&bytes, w, h, room);
+        let peak = peak_over(start);
+        assert!(
+            peak <= room,
+            "{peak} bytes allocated in a room of {room} (extra {extra}: {})",
+            bitmap.is_some()
+        );
+        // The codes fit when the room does (their 44 MB, and what is beside them).
+        assert_eq!(bitmap.is_some(), extra >= 60 << 20, "extra {extra}");
+    }
+}
+
+/// A WebP file of `chunks` (tag and data).
+fn webp_of(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let mut body = b"WEBP".to_vec();
+    for (tag, data) in chunks {
+        body.extend(*tag);
+        body.extend((data.len() as u32).to_le_bytes());
+        body.extend(data);
+        body.extend(vec![0; data.len() & 1]);
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(body);
+    out
+}
+
+/// A lossy frame's own size is the one its file says before it allocates anything from it: a
+/// 16383 × 16383 frame (384 MB of planes) in a file that costs a canvas of 1 × 1, a still or the
+/// first frame of an animation, with an `ALPH` chunk or not, takes no more than the reservation.
+#[test]
+fn a_lossy_frame_of_another_size_than_its_header_allocates_nothing_for_it() {
+    let _serial = serial();
+    let vp8 = |w: u16, h: u16| {
+        let mut data = fixture("lossy.webp")[20..].to_vec();
+        data[6..8].copy_from_slice(&w.to_le_bytes());
+        data[8..10].copy_from_slice(&h.to_le_bytes());
+        data
+    };
+    let canvas = |flags: u8, w: u32, h: u32| {
+        [
+            &[flags, 0, 0, 0][..],
+            &(w - 1).to_le_bytes()[..3],
+            &(h - 1).to_le_bytes()[..3],
+        ]
+        .concat()
+    };
+    let anim = vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0];
+    let frame = |rest: &[u8]| [&[0u8; 6][..], &[0; 6], &[0; 4], rest].concat();
+    let chunk =
+        |tag: &[u8; 4], data: &[u8]| [&tag[..], &(data.len() as u32).to_le_bytes(), data].concat();
+    let big = vp8(16_383, 16_383);
+    let alph = vec![0x00, 0xFF];
+    let files = [
+        (
+            "still",
+            webp_of(&[(b"VP8X", canvas(0, 1, 1)), (b"VP8 ", big.clone())]),
+        ),
+        (
+            "still with alpha",
+            webp_of(&[
+                (b"VP8X", canvas(0x10, 1, 1)),
+                (b"ALPH", alph.clone()),
+                (b"VP8 ", big.clone()),
+            ]),
+        ),
+        (
+            "first frame",
+            webp_of(&[
+                (b"VP8X", canvas(0x02, 1, 1)),
+                (b"ANIM", anim.clone()),
+                (b"ANMF", frame(&chunk(b"VP8 ", &big))),
+            ]),
+        ),
+    ];
+    for (what, bytes) in &files {
+        let reserved = vomd::image::decode_reservation(bytes, 1, 1).expect(what) + 4;
+        let start = mark();
+        let bitmap = decode(bytes, 1, 1);
+        let used = peak_over(start);
+        assert!(bitmap.is_none(), "{what}");
+        assert!(
+            used <= reserved,
+            "{what}: a file of {} bytes, {reserved} reserved, {used} allocated",
+            bytes.len()
+        );
+    }
+    // With the size the file says, the same frame is decoded.
+    let (w, h) = (6, 4);
+    let ok = webp_of(&[(b"VP8X", canvas(0, w, h)), (b"VP8 ", vp8(6, 4))]);
+    assert!(decode(&ok, w, h).is_some());
+}
+
+/// The key frame of a lossy 1 × `h` image: `control` bytes of first partition (of which
+/// `claimed` is what the frame's tag says), and `rest` after them.
+fn vp8_frame(h: u16, claimed: u32, control: &[u8], rest: &[u8]) -> Vec<u8> {
+    let tag = claimed << 5 | 0x10;
+    let mut data = tag.to_le_bytes()[..3].to_vec();
+    data.extend([0x9D, 0x01, 0x2A, 1, 0]);
+    data.extend(h.to_le_bytes());
+    data.extend(control);
+    data.extend(rest);
+    data
+}
+
+/// A partition's length is a number in the file (24 bits for the entropy partitions, 19 for the
+/// first), not something that is there: a frame with the size it says, whose partitions claim 16
+/// MiB (or 512 KiB) the file doesn't hold, takes no more than the reservation, as a still, as the
+/// first frame of an animation, with an `ALPH` chunk or not.
+#[test]
+fn a_lossy_frame_claiming_more_partition_than_the_file_holds_allocates_nothing_for_it() {
+    let _serial = serial();
+    let canvas = |flags: u8| [&[flags, 0, 0, 0][..], &[0; 3], &[0; 3]].concat();
+    let anim = vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0];
+    let frame = |rest: &[u8]| [&[0u8; 6][..], &[0; 6], &[0; 4], rest].concat();
+    let chunk =
+        |tag: &[u8; 4], data: &[u8]| [&tag[..], &(data.len() as u32).to_le_bytes(), data].concat();
+    let alph = chunk(b"ALPH", &[0x00, 0xFF]);
+    // Two entropy partitions, the first one 0xFFFFFF long; the first partition 0x7FFFF long.
+    let frames = [
+        (
+            "entropy",
+            vp8_frame(1, 4, &[0, 1, 0, 0], &[0xFF, 0xFF, 0xFF]),
+        ),
+        ("first", vp8_frame(1, 0x7FFFF, &[0, 1, 0, 0], &[0; 4])),
+    ];
+    for (claim, vp8) in &frames {
+        let files = [
+            (
+                "still",
+                webp_of(&[(b"VP8X", canvas(0)), (b"VP8 ", vp8.clone())]),
+            ),
+            (
+                "still with alpha",
+                webp_of(&[
+                    (b"VP8X", canvas(0x10)),
+                    (b"ALPH", vec![0x00, 0xFF]),
+                    (b"VP8 ", vp8.clone()),
+                ]),
+            ),
+            ("bare still", webp_of(&[(b"VP8 ", vp8.clone())])),
+            (
+                "first frame",
+                webp_of(&[
+                    (b"VP8X", canvas(0x02)),
+                    (b"ANIM", anim.clone()),
+                    (b"ANMF", frame(&chunk(b"VP8 ", vp8))),
+                ]),
+            ),
+            (
+                "first frame with alpha",
+                webp_of(&[
+                    (b"VP8X", canvas(0x12)),
+                    (b"ANIM", anim.clone()),
+                    (b"ANMF", frame(&[&alph[..], &chunk(b"VP8 ", vp8)].concat())),
+                ]),
+            ),
+        ];
+        for (what, bytes) in &files {
+            let what = format!("{what}, {claim} partition");
+            let reserved = vomd::image::decode_reservation(bytes, 1, 1).expect(&what) + 4;
+            let start = mark();
+            let bitmap = decode(bytes, 1, 1);
+            let used = peak_over(start);
+            assert!(bitmap.is_none(), "{what}");
+            assert!(
+                used <= reserved,
+                "{what}: a file of {} bytes, {reserved} reserved, {used} allocated",
+                bytes.len()
+            );
+        }
+    }
+}
+
+/// Partitions read as their bytes come (see the test above) are the same bytes: a lossy frame of
+/// two macroblock rows, whose first partition (found by trying: it makes the decoder read
+/// several entropy partitions, the first one's length coming next) decodes whatever the length of
+/// the partition that follows it (3 bytes, a partial word; 10,001, past the first steps of the
+/// read).
+#[test]
+fn a_lossy_frame_in_several_partitions_is_read_whole() {
+    let _serial = serial();
+    let control = [
+        87, 74, 65, 227, 142, 0, 0, 241, 152, 208, 82, 161, 108, 244, 27, 66, 0, 0, 0, 88, 125, 0,
+        0, 140, 184, 0, 48, 106, 20, 243, 130, 0, 0, 8, 0, 45, 42, 0, 223, 0,
+    ];
+    let decoded = |second: usize| {
+        let vp8 = vp8_frame(
+            17,
+            control.len() as u32,
+            &control,
+            &[
+                &(second as u32).to_le_bytes()[..3],
+                &vec![0; second],
+                &[0; 9],
+            ]
+            .concat(),
+        );
+        let bytes = webp_of(&[(b"VP8 ", vp8)]);
+        decode(&bytes, 1, 17).map(|b| b.data)
+    };
+    let short = decoded(5);
+    assert!(short.is_some());
+    assert_eq!(decoded(10_001), short);
+    // Fewer bytes than the length says are an error, not a short partition.
+    let vp8 = vp8_frame(
+        17,
+        control.len() as u32,
+        &control,
+        &[0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
+    );
+    assert!(decode(&webp_of(&[(b"VP8 ", vp8)]), 1, 17).is_none());
+}
+
+/// `bytes`, a JPEG or a PNG, with an EXIF orientation of `o`.
+fn with_orientation(bytes: &[u8], o: u8) -> Vec<u8> {
+    let mut tiff = b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0".to_vec();
+    tiff.extend([o, 0, 0, 0, 0, 0, 0]);
+    let mut out;
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend(&tiff);
+        out = bytes[..2].to_vec();
+        out.extend(segment(0xE1, &exif));
+        out.extend(&bytes[2..]);
+    } else {
+        out = bytes[..33].to_vec();
+        png_chunk(&mut out, b"eXIf", &tiff);
+        out.extend(&bytes[33..]);
+    }
+    assert!(vomd::image::header_of(&out).is_some());
+    out
 }
 
 /// A valid 795 × 10,000 gray PNG: shown at its natural size its bitmap is 31.8 MB, which a
@@ -3097,7 +3498,8 @@ mod mix {
 
     /// The bytes of an image of a random kind and shape, smaller until it [`fits`] (or isn't an
     /// image at all), and its natural size. Extreme sides, interlaced and 16-bit PNGs, baseline,
-    /// progressive and multi-scan JPEGs of every sampling, a JPEG with metadata, a PNG cut short.
+    /// progressive and multi-scan JPEGs of every sampling, a JPEG with metadata, a PNG cut short,
+    /// GIFs read by rows and interlaced, a JPEG turned by its EXIF orientation, lossless WebPs.
     fn random_image(rng: &mut Rng, profile: u64) -> (Vec<u8>, u32, u32) {
         let (mut w, mut h) = match (profile, rng.below(8)) {
             // Big pictures, so a page of them fills the cache.
@@ -3112,7 +3514,7 @@ mod mix {
             (_, 6) => (65_535, 1),
             _ => (rng.range(1, 64), rng.range(1, 64)),
         };
-        let kind = rng.below(12);
+        let kind = rng.below(15);
         let color_depth = [(0, 8), (2, 8), (4, 8), (6, 8), (6, 16), (0, 16), (2, 16)];
         let (color, depth) = color_depth[rng.below(7) as usize];
         let interlaced = kind == 5;
@@ -3151,13 +3553,33 @@ mod mix {
                     let total = rng.range(100_000, 3_000_000) as usize;
                     return (jpeg_with(xmp(total)), 600, 200);
                 }
-                _ => {
+                11 => {
                     // Not an image.
                     let n = rng.range(10, 5_000) as usize;
                     return ((0..n).map(|_| rng.next() as u8).collect(), 0, 0);
                 }
+                12 => {
+                    (w, h) = (w.min(65_535), h.min(65_535));
+                    let side = [0, 0, w as u16, h as u16];
+                    zero_gif(w as u16, h as u16, side, depth == 16, 0)
+                }
+                13 => {
+                    let jpeg = jpeg_variant(&wide, 0xC0, w as u16, h as u16, comps, comps.len());
+                    with_orientation(&jpeg, 6)
+                }
+                _ => {
+                    (w, h) = (w.min(16_383), h.min(16_383));
+                    let pixels = vec![0; w as usize * h as usize * 4];
+                    let mut out = Vec::new();
+                    image_webp::WebPEncoder::new(&mut out)
+                        .encode(&pixels, w, h, image_webp::ColorType::Rgba8)
+                        .unwrap();
+                    out
+                }
             };
             if fits(&bytes) || (w <= 1 && h <= 1) {
+                // The turned JPEG is shown with its sides swapped.
+                let (w, h) = if kind == 13 { (h, w) } else { (w, h) };
                 return (bytes, w, h);
             }
             // Smaller on its longer side.
@@ -4369,4 +4791,253 @@ mod mix {
                 .join(", ")
         );
     }
+}
+
+/// SVGs made for the counting of what their jobs hold: name and bytes.
+#[cfg(feature = "svg")]
+fn svg_mix() -> Vec<(String, Vec<u8>)> {
+    let svg = |body: &str, size: &str| {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" {size}>{body}</svg>"
+        )
+        .into_bytes()
+    };
+    let mut out: Vec<(String, Vec<u8>)> = [
+        "badge.svg",
+        "badge-arial.svg",
+        "badge.svgz",
+        "logo-viewbox.svg",
+        "nested-logo.svg",
+        "external.svg",
+        "units.svg",
+    ]
+    .iter()
+    .map(|n| (n.to_string(), fixture(n)))
+    .collect();
+    let size = "width=\"64\" height=\"64\" viewBox=\"0 0 64 64\"";
+    for n in [100, 2_000, 12_000, 45_000] {
+        let body = "<g transform=\"translate(1 1)\"><rect width=\"1\" height=\"1\" style=\"fill:#e00\"/></g>"
+            .repeat(n);
+        out.push((format!("{n} groups of a rect"), svg(&body, size)));
+    }
+    for n in [1_000, 30_000] {
+        let body = (0..n)
+            .map(|i| format!("<rect x=\"{}\" y=\"{}\" width=\"3\" height=\"2\" fill=\"#0a0\" stroke=\"#000\" stroke-width=\"0.5\" opacity=\"0.9\" rx=\"1\"/>", i % 60, i / 60 % 60))
+            .collect::<String>();
+        out.push((format!("{n} rects of many attributes"), svg(&body, size)));
+    }
+    for (len, per_path) in [
+        (10 << 10, 1_000),
+        (1 << 20, 1_000),
+        (1 << 20, usize::MAX),
+        (3 << 20, 2_000),
+    ] {
+        let (mut paths, mut d) = (String::new(), String::new());
+        for i in 0.. {
+            if paths.len() + d.len() >= len {
+                break;
+            }
+            d += &format!("M{} {}h1v1h-1z", i % 1000 * 2, i / 1000 * 2);
+            if i % per_path == per_path - 1 {
+                paths += &format!("<path d=\"{d}\" stroke=\"#000\"/>");
+                d.clear();
+            }
+        }
+        paths += &format!("<path d=\"{d}\"/>");
+        out.push((
+            format!("{len} bytes of path data, {per_path} shapes a path"),
+            svg(
+                &paths,
+                "width=\"64\" height=\"64\" viewBox=\"0 0 2000 2000\"",
+            ),
+        ));
+    }
+    let css = format!(
+        "<style>rect {{ fill: #e00; stroke: #000; stroke-width: 2; opacity: .5 }} .a {{ fill: blue }}</style>{}",
+        "<rect class=\"a\" width=\"9\" height=\"9\"/>".repeat(5_000)
+    );
+    out.push(("a style sheet".into(), svg(&css, size)));
+    let nested = format!(
+        "{}<rect width=\"64\" height=\"64\" fill=\"#e00\"/>{}",
+        "<g opacity=\"0.9\">".repeat(12),
+        "</g>".repeat(12)
+    );
+    out.push(("12 groups of opacity".into(), svg(&nested, size)));
+    let effects = "<defs><mask id=\"m\"><rect width=\"64\" height=\"32\" fill=\"#fff\"/></mask>\
+        <clipPath id=\"c\"><circle cx=\"32\" cy=\"32\" r=\"20\"/></clipPath>\
+        <filter id=\"f\"><feGaussianBlur stdDeviation=\"2\"/><feOffset dx=\"2\"/><feMorphology radius=\"1\"/></filter>\
+        <pattern id=\"p\" width=\"8\" height=\"8\" patternUnits=\"userSpaceOnUse\"><rect width=\"4\" height=\"4\" fill=\"#00e\"/></pattern></defs>\
+        <g mask=\"url(#m)\"><g clip-path=\"url(#c)\"><g filter=\"url(#f)\"><rect width=\"64\" height=\"64\" fill=\"url(#p)\"/></g></g></g>";
+    out.push((
+        "a mask, clip, filter and pattern".into(),
+        svg(effects, size),
+    ));
+    // A marker of 4 shapes at each of 150 vertices, and a clip path of a long path.
+    let marker = "<defs><marker id=\"m\" markerWidth=\"2\" markerHeight=\"2\"><circle cx=\"1\" cy=\"1\" r=\"1\"/><rect width=\"1\" height=\"1\"/><path d=\"M0 0 L1 1\" stroke=\"#000\"/><circle r=\"0.5\"/></marker></defs>";
+    let zigzag: String = (0..150)
+        .map(|i| format!(" L{} {}", i % 60, (i * 7) % 60))
+        .collect();
+    out.push((
+        "a marker at each vertex".into(),
+        svg(
+            &format!("{marker}<path d=\"M0 0{zigzag}\" fill=\"none\" stroke=\"#000\" marker-mid=\"url(#m)\"/>"),
+            size,
+        ),
+    ));
+    let long: String = (0..1_500)
+        .map(|i| format!(" L{} {}", i % 64, (i * 7) % 64))
+        .collect();
+    out.push((
+        "a clip path of 1,500 segments".into(),
+        svg(
+            &format!("<clipPath id=\"c\"><path d=\"M0 0{long}\"/></clipPath><rect width=\"64\" height=\"64\" fill=\"#e00\" clip-path=\"url(#c)\"/>"),
+            size,
+        ),
+    ));
+    let text = "<text x=\"1\" y=\"10\">Some text, in no font at all.</text>".repeat(2_000);
+    out.push(("text".into(), svg(&text, size)));
+    let uses = format!(
+        "<defs><g id=\"g\">{}</g></defs>{}",
+        "<rect width=\"1\" height=\"1\"/>".repeat(10),
+        "<use xlink:href=\"#g\"/>".repeat(1_500)
+    );
+    out.push(("uses".into(), svg(&uses, size)));
+    // Raster images: a fixture of each kind and orientation, and a big PNG drawn small and
+    // large, turned, and many times.
+    out.push(("raster-inside.svg".into(), fixture("raster-inside.svg")));
+    let big = base64(&zero_png(1000, 800, 6, 8, false, 32_768));
+    let image = |at: &str| format!("<image {at} href=\"data:image/png;base64,{big}\"/>");
+    for (what, body) in [
+        ("a big PNG", image("width=\"64\" height=\"64\"")),
+        (
+            "a big PNG turned",
+            image("width=\"64\" height=\"32\" transform=\"rotate(30 32 32)\""),
+        ),
+        (
+            "a big PNG drawn huge",
+            image("x=\"-500\" y=\"-500\" width=\"2000\" height=\"1600\""),
+        ),
+        (
+            "a big PNG 20 times",
+            image("width=\"8\" height=\"8\"").repeat(20),
+        ),
+    ] {
+        out.push((what.into(), svg(&body, size)));
+    }
+    // Drawn by nearest neighbor, they are decoded whole (and a wide one's resampler holds rows
+    // of its own width, not of the canvas's), except those turned by EXIF 5–8, which are reduced
+    // to the box.
+    let nearest = |mime: &str, data: &[u8], at: &str| {
+        format!(
+            "<image width=\"64\" height=\"64\" {at} style=\"image-rendering:pixelated\" href=\"data:{mime};base64,{}\"/>",
+            base64(data)
+        )
+    };
+    let whole = [
+        (
+            "a big PNG, whole",
+            nearest("image/png", &zero_png(1024, 1024, 0, 8, false, 32_768), ""),
+        ),
+        (
+            "a wide GIF, whole",
+            nearest(
+                "image/gif",
+                &zero_gif(16_384, 1, [0, 0, 16_384, 1], false, 0),
+                "preserveAspectRatio=\"none\"",
+            ),
+        ),
+        (
+            "a turned JPEG, pixel-sharp",
+            nearest("image/jpeg", &fixture("exif-6.jpg"), ""),
+        ),
+        (
+            "a turned WebP, pixel-sharp",
+            nearest("image/webp", &fixture("exif-5.webp"), ""),
+        ),
+    ];
+    for (what, body) in whole {
+        out.push((what.into(), svg(&body, size)));
+    }
+    let jpeg = base64(&fixture("exif-6.jpg"));
+    out.push((
+        "a turned JPEG under a mask".into(),
+        svg(
+            &format!("<defs><mask id=\"m\"><rect width=\"64\" height=\"20\" fill=\"#fff\"/></mask></defs><g mask=\"url(#m)\"><image width=\"64\" height=\"64\" href=\"data:image/jpeg;base64,{jpeg}\"/></g>"),
+            size,
+        ),
+    ));
+    out
+}
+
+/// `data` in base64, for `data:` URLs.
+#[cfg(feature = "svg")]
+fn base64(data: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = c
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= c.len() {
+                ABC[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_jobs_hold_what_they_are_charged() {
+    let _serial = serial();
+    let mut least = (usize::MAX, String::new());
+    let fonts = vomd::fonts::Fonts::new().unwrap();
+    let mix = svg_mix();
+    // The ones with text, again with fonts to set it in.
+    let with_text: Vec<_> = mix
+        .iter()
+        .filter(|(what, _)| what.starts_with("badge") || what == "text")
+        .map(|(what, bytes)| (format!("{what} with fonts"), bytes.clone()))
+        .collect();
+    for (what, bytes) in mix.into_iter().chain(with_text) {
+        let Some(job) = vomd::image::SvgJob::of(&bytes) else {
+            panic!("{what}: not an SVG");
+        };
+        let mut job = if what.ends_with("with fonts") {
+            job.with_fonts(&fonts)
+        } else {
+            job
+        };
+        for (w, h) in [(1, 1), (64, 64), (700, 500)] {
+            // A job charged too little measures what it needs, and the next is charged that.
+            for attempt in 0.. {
+                assert!(attempt < 4, "{what}: still not charged enough");
+                let reserved = job.reservation(w, h);
+                let start = mark();
+                let result = job.run(&bytes, w, h);
+                let over = peak_over(start);
+                let done = result.is_some();
+                drop(result);
+                let used = over.saturating_sub(4 * w as usize * h as usize);
+                assert!(
+                    used <= reserved,
+                    "{what} to {w}×{h}: {used} bytes allocated, {reserved} reserved"
+                );
+                if reserved - used < least.0 {
+                    least = (
+                        reserved - used,
+                        format!("{what} {w}×{h}: {used} of {reserved}"),
+                    );
+                }
+                if done {
+                    break;
+                }
+            }
+        }
+    }
+    println!("SVG jobs within their reservation; the least room: {least:?}");
 }

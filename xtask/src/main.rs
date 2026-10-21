@@ -13,7 +13,7 @@ use std::{env, fs};
 mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
-const SIZE_BUDGET: [u64; 2] = [4_000_000, 3_000_000];
+const SIZE_BUDGET: [u64; 2] = [5_550_000, 3_000_000];
 const COLD_BUDGET_MS: f64 = 100.0;
 const WARM_BUDGET_MS: f64 = 50.0;
 /// Idle RSS, 50 KB document, 1080p window.
@@ -402,14 +402,15 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Peak RSS scrolling through 50 local PNGs of 2000 × 1500 (`examples/image_rss.rs`: the images
-/// are written first, by a process of their own, and removed after).
-fn local_image_rss(examples: &Path) -> Option<u64> {
+/// Peak RSS scrolling through 50 local PNGs of 2000 × 1500, or (`generate` `--generate-svg`)
+/// 50 SVG diagrams of 200 KB (`examples/image_rss.rs`: the images are written first, by a
+/// process of their own, and removed after).
+fn local_image_rss(examples: &Path, generate: &str) -> Option<u64> {
     let dir = scratch("images");
     let config = scratch("images-config");
     let bin = examples.join("image_rss");
     let made = Command::new(&bin)
-        .arg("--generate")
+        .arg(generate)
         .arg(dir.join("img"))
         .env("XDG_CONFIG_HOME", &config)
         .stdout(Stdio::null())
@@ -628,7 +629,14 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
                     true,
                 ),
             };
-            row("image RSS, 50 local PNGs", local_image_rss(&examples));
+            row(
+                "image RSS, 50 local PNGs",
+                local_image_rss(&examples, "--generate"),
+            );
+            row(
+                "image RSS, 50 local SVGs of 200 KB",
+                local_image_rss(&examples, "--generate-svg"),
+            );
             // Every way the memory budget is to hold: far from the viewport, in view, fast or
             // slow to be polled, and for bodies that shrink once their metadata is cut out.
             for (metric, n, mode, poll) in [

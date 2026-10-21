@@ -3,6 +3,34 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- GIF images (the first frame of an animation).
+- WebP images: lossy, lossless and with alpha (the first frame of an animation).
+- SVG and svgz images, with their text (set in VOMD's fonts) and the images embedded in them,
+  drawn at the screen's resolution so they stay sharp at any zoom. An SVG never reads another
+  file or fetches anything. Each one is drawn in a separate, short-lived `vomd` process, so one
+  that is slow or broken is stopped (after 3 seconds, or as soon as it isn't wanted) and never
+  holds up the window or the other images; one you click to load has no 3 seconds, and runs
+  until it is done, you leave the page, or it has used 120 seconds of CPU. The `svg` Cargo
+  feature (on by default) builds them in; without it an SVG shows its alt text.
+- `<img width height>`: a size in pixels or a percentage of the line's width, one side keeping
+  the image's shape; Markdown images keep their own size.
+- Click to load an image over VOMD's limits (too many pixels, an SVG too big, too complex or too
+  slow to draw, a decode that needs more than the image budget): its placeholder says why and
+  "click to load" (`Ctrl+click` in a link, where a click follows the link). It loads on a thread
+  of its own, outside the budget, within half the memory available (1 GiB at most). It stops
+  when the document goes (and starts again if the image is on the page you reload or come back
+  to), and starts again at the new size when the image's size changes. The choice is kept until
+  the window closes.
+
+### Changed
+- JPEG, PNG and WebP photos are turned upright by their EXIF orientation.
+- The default binary is 5.5 MB, up from 3.9 MB (the build without SVG is 4.1 MB).
+- A remote image whose server says it is over 12 MiB is refused as too large (click to load
+  takes up to 256 MiB), not as a failed fetch.
+
 ## [1.4.0] - 2026-10-21
 
 ### Added
@@ -166,6 +194,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.4.0...HEAD
 [1.4.0]: https://github.com/allenguarnes/vomd/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/allenguarnes/vomd/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/allenguarnes/vomd/compare/v1.1.0...v1.2.0

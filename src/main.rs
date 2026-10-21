@@ -621,12 +621,12 @@ impl App {
         } else {
             view.hover_end()
         };
-        // The hand is for what a click acts on: a link, a code block's copy button, a row of the
-        // contents panel.
+        // The hand is for what a click acts on: a link, a code block's copy button, an image to
+        // load past the limits, a row of the contents panel.
         #[cfg(feature = "clipboard")]
-        let hand = view.hovered().is_some() || view.over_copy();
+        let hand = view.hovered().is_some() || view.over_copy() || view.over_force();
         #[cfg(not(feature = "clipboard"))]
-        let hand = view.hovered().is_some();
+        let hand = view.hovered().is_some() || view.over_force();
         #[cfg(feature = "toc")]
         let hand = hand || view.over_toc();
         let update = view::hover_change(self.pointer, hand, changed);
@@ -1057,6 +1057,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mods = m.state();
                 #[cfg(any(feature = "clipboard", feature = "find"))]
                 view.set_shift(self.mods.shift_key());
+                view.set_ctrl(self.mods.control_key());
                 if !(self.mods.control_key() || self.mods.super_key()) {
                     view.zoom_wheel_end();
                 }
@@ -1256,8 +1257,16 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    // Started by VOMD to draw an SVG (`image::svg_child`): that, and nothing else.
+    #[cfg(all(feature = "svg", target_os = "linux"))]
+    if let Some(code) = vomd::image::svg_child() {
+        std::process::exit(code);
+    }
     let start = Instant::now();
     platform::tune_allocator();
+    // SVGs are drawn by this same binary, in processes that can be killed.
+    #[cfg(all(feature = "svg", target_os = "linux"))]
+    vomd::image::set_svg_program("/proc/self/exe".into());
     platform::attach_console();
     let (input, no_settings) = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Cli::Help) => {

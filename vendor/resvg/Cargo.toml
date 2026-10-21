@@ -1,0 +1,33 @@
+# resvg 0.46.0 from crates.io (git b8e58f5a), with VOMD's patch: see VOMD-PATCH.md. The
+# library's sources and licenses only: no binary, examples, tests or dev-dependencies, and no
+# `raster-images` (its decoders are replaced by a hook).
+[package]
+name = "resvg"
+version = "0.46.0"
+edition = "2024"
+rust-version = "1.87.0"
+license = "Apache-2.0 OR MIT"
+description = "An SVG rendering library."
+repository = "https://github.com/linebender/resvg"
+keywords = ["svg", "render", "raster"]
+
+[dependencies]
+log = "0.4"
+rgb = "0.8"
+svgtypes = "0.16.1"
+tiny-skia = "0.11.4"
+usvg = { version = "0.46.0", default-features = false }
+
+[features]
+default = ["text", "system-fonts", "memmap-fonts"]
+# Enables SVG Text support.
+text = ["usvg/text"]
+# Enables system fonts loading (only for `text`).
+system-fonts = ["usvg/system-fonts"]
+# Enables font files memmaping for faster loading (only for `text`).
+memmap-fonts = ["usvg/memmap-fonts"]
+
+# Upstream's warnings with the newer rgb in VOMD's lock file; not VOMD's code to change.
+[lints.rust]
+deprecated = "allow"
+unstable_name_collisions = "allow"

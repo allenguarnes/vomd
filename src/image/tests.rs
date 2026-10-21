@@ -37,16 +37,16 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn headers_give_format_and_size() {
     let png = png_bytes(7, 3, |_, _| [0, 0, 0, 255]);
-    assert_eq!(header(&mut &png[..]), Some((Format::Png, 7, 3)));
+    assert_eq!(header_of(&png), Some((Format::Png, 7, 3)));
     let jpeg = fixture("gradient.jpg");
-    assert_eq!(header(&mut &jpeg[..]), Some((Format::Jpeg, 32, 64)));
+    assert_eq!(header_of(&jpeg), Some((Format::Jpeg, 32, 64)));
     // Progressive (SOF2) and grayscale JPEGs.
     assert_eq!(
-        header(&mut &fixture("progressive.jpg")[..]),
+        header_of(&fixture("progressive.jpg")[..]),
         Some((Format::Jpeg, 48, 24))
     );
     assert_eq!(
-        header(&mut &fixture("gray.jpg")[..]),
+        header_of(&fixture("gray.jpg")[..]),
         Some((Format::Jpeg, 16, 16))
     );
     // Others aren't images to us.
@@ -56,13 +56,13 @@ fn headers_give_format_and_size() {
         b"RIFF\0\0\0\0WEBPVP8 ",
         b"",
     ] {
-        assert_eq!(header(&mut &other[..]), None);
+        assert_eq!(header_of(other), None);
     }
     // Cut short, or a zero size.
-    assert_eq!(header(&mut &png[..20]), None);
+    assert_eq!(header_of(&png[..20]), None);
     let mut zero = png.clone();
     zero[16..20].copy_from_slice(&0u32.to_be_bytes());
-    assert_eq!(header(&mut &zero[..]), None);
+    assert_eq!(header_of(&zero), None);
 }
 
 /// A JPEG's frame header can come after big metadata segments; they're skipped, not decoded.
@@ -79,10 +79,10 @@ fn jpeg_size_after_metadata_segments() {
     // component.
     j.extend([0xFF, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0x2C, 0x01, 0x90]);
     j.extend([0x01, 0x01, 0x11, 0x00]);
-    assert_eq!(header(&mut &j[..]), Some((Format::Jpeg, 400, 300)));
+    assert_eq!(header_of(&j), Some((Format::Jpeg, 400, 300)));
     // DHT (C4) isn't a frame header; the scan starting first means there's none.
     let j = [0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x02, 0xFF, 0xDA, 0x00, 0x02];
-    assert_eq!(header(&mut &j[..]), None);
+    assert_eq!(header_of(&j), None);
 }
 
 /// A JPEG that says 16×16 to a reader taking `FF 01` for a marker without a segment, and
@@ -124,11 +124,11 @@ fn zune_size(bytes: &[u8]) -> Option<(u32, u32)> {
 fn the_jpeg_header_agrees_with_the_decoder() {
     for name in ["gradient.jpg", "progressive.jpg", "gray.jpg", "wide.jpg"] {
         let j = fixture(name);
-        let (_, w, h) = header(&mut &j[..]).unwrap();
+        let (_, w, h) = header_of(&j).unwrap();
         assert_eq!(zune_size(&j), Some((w, h)), "{name}");
     }
     let j = crafted_jpeg();
-    assert_eq!(header(&mut &j[..]), Some((Format::Jpeg, 60_000, 60_000)));
+    assert_eq!(header_of(&j), Some((Format::Jpeg, 60_000, 60_000)));
     assert_eq!(zune_size(&j), Some((60_000, 60_000)));
     // 3.6 gigapixels: never decoded (this used to try to allocate 10.8 GB).
     assert_eq!(decode(&j, 10, 10), None);
@@ -280,8 +280,8 @@ fn a_png_read_by_rows_decodes_like_its_whole_frame() {
     for (sw, sh) in [(1, 1), (7, 5), (64, 3), (3, 64), (101, 97)] {
         let png = png_bytes(sw, sh, noise);
         for (w, h) in [(1, 1), (2, 3), (sw, sh), (sw / 2 + 1, sh * 2), (200, 150)] {
-            let rows = decode_png(&png, w, h, true).unwrap();
-            let frame = decode_png(&png, w, h, false).unwrap();
+            let rows = decode_png(&png, w, h, true, Sampling::Area, &NO_CANCEL).unwrap();
+            let frame = decode_png(&png, w, h, false, Sampling::Area, &NO_CANCEL).unwrap();
             assert_eq!(rows, frame, "{sw}×{sh} to {w}×{h}");
         }
     }
@@ -352,22 +352,33 @@ fn a_png_read_by_rows_decodes_like_its_whole_frame() {
             ),
         ),
     ] {
-        let rows = decode_png(&png, 3, 2, true).unwrap_or_else(|| panic!("{name}"));
-        assert_eq!(Some(rows), decode_png(&png, 3, 2, false), "{name}");
+        let rows = decode_png(&png, 3, 2, true, Sampling::Area, &NO_CANCEL)
+            .unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(
+            Some(rows),
+            decode_png(&png, 3, 2, false, Sampling::Area, &NO_CANCEL),
+            "{name}"
+        );
     }
     // An interlaced PNG is read whole (its rows arrive pass by pass) and comes out the same as
     // the same pixels not interlaced.
     let plain = fixture("alpha.png");
     let adam7 = fixture("interlaced.png");
-    assert_eq!(header(&mut &adam7[..]), Some((Format::Png, 320, 160)));
+    assert_eq!(header_of(&adam7), Some((Format::Png, 320, 160)));
     for (w, h) in [(160, 80), (320, 160), (500, 333), (7, 5)] {
         assert_eq!(decode(&plain, w, h), decode(&adam7, w, h), "{w}×{h}");
     }
     // Data that ends early doesn't decode, whichever way it's read.
     let png = png_bytes(40, 40, noise);
     let cut = &png[..png.len() - png.len() / 3];
-    assert_eq!(decode_png(cut, 10, 10, true), None);
-    assert_eq!(decode_png(cut, 10, 10, false), None);
+    assert_eq!(
+        decode_png(cut, 10, 10, true, Sampling::Area, &NO_CANCEL),
+        None
+    );
+    assert_eq!(
+        decode_png(cut, 10, 10, false, Sampling::Area, &NO_CANCEL),
+        None
+    );
 }
 
 /// The image resampled by averaging the source area under each target pixel a column at a time
@@ -455,6 +466,8 @@ fn rows_reduced_first_resample_like_columns_first() {
                 },
                 w,
                 h,
+                Sampling::Area,
+                &NO_CANCEL,
             )
             .unwrap();
             let old = resampled_columns_first(&frame, w, h);
@@ -494,11 +507,11 @@ fn a_very_wide_png_is_refused_or_decoded_in_rows() {
         (8_000_000, 8),
     ] {
         let png = ihdr(w, h);
-        assert_eq!(header(&mut &png[..]), None, "{w}×{h}");
+        assert_eq!(header_of(&png), None, "{w}×{h}");
         assert_eq!(decode(&png, 100, 100), None, "{w}×{h}");
     }
     assert_eq!(
-        header(&mut &ihdr(65_535, 976)[..]),
+        header_of(&ihdr(65_535, 976)[..]),
         Some((Format::Png, 65_535, 976))
     );
     // The widest, shrunk and enlarged, with a row a time held.
@@ -542,7 +555,11 @@ fn a_png_with_a_bad_final_checksum_is_refused() {
     ];
     for (what, bad) in cases {
         for rows in [true, false] {
-            assert_eq!(decode_png(&bad, 9, 7, rows), None, "{what} (rows: {rows})");
+            assert_eq!(
+                decode_png(&bad, 9, 7, rows, Sampling::Area, &NO_CANCEL),
+                None,
+                "{what} (rows: {rows})"
+            );
         }
         assert_eq!(decode(&bad, 4, 3), None, "{what}");
     }
@@ -550,7 +567,10 @@ fn a_png_with_a_bad_final_checksum_is_refused() {
     let mut trailing = good.clone();
     trailing.extend(b"trailing bytes");
     for rows in [true, false] {
-        assert!(decode_png(&trailing, 9, 7, rows).is_some(), "rows: {rows}");
+        assert!(
+            decode_png(&trailing, 9, 7, rows, Sampling::Area, &NO_CANCEL).is_some(),
+            "rows: {rows}"
+        );
     }
 }
 
@@ -562,7 +582,7 @@ fn an_interlaced_png_is_checked_to_its_iend() {
     let good = fixture("interlaced.png");
     assert_eq!(good[28], 1, "Adam7");
     assert_eq!(&good[good.len() - 8..good.len() - 4], b"IEND");
-    let (w, h, _) = header(&mut &good[..]).map(|(f, w, h)| (w, h, f)).unwrap();
+    let (w, h, _) = header_of(&good).map(|(f, w, h)| (w, h, f)).unwrap();
     assert!(decode(&good, w, h).is_some());
     let flip = |at: usize| {
         let mut bad = good.clone();
@@ -580,7 +600,11 @@ fn an_interlaced_png_is_checked_to_its_iend() {
     ];
     for (what, bad) in cases {
         assert_eq!(decode(&bad, w, h), None, "{what}");
-        assert_eq!(decode_png(&bad, w, h, true), None, "{what}");
+        assert_eq!(
+            decode_png(&bad, w, h, true, Sampling::Area, &NO_CANCEL),
+            None,
+            "{what}"
+        );
     }
     let mut trailing = good.clone();
     trailing.extend(b"trailing bytes");
@@ -649,8 +673,8 @@ fn png_metadata_is_not_given_to_the_decoder() {
     assert!(decode(&with, 3, 2).is_some());
     for rows in [true, false] {
         assert_eq!(
-            decode_png(&with, 2, 2, rows),
-            decode_png(&plain, 2, 2, rows),
+            decode_png(&with, 2, 2, rows, Sampling::Area, &NO_CANCEL),
+            decode_png(&plain, 2, 2, rows, Sampling::Area, &NO_CANCEL),
             "rows {rows}"
         );
     }
@@ -736,6 +760,240 @@ fn every_fixture_decodes() {
         }),
     ] {
         assert_eq!(decode(&bad, 10, 10), None, "{name}");
+    }
+}
+
+/// Every input of a past fuzz finding (fuzz/seeds/image/) goes through what the target does
+/// without a panic: a JPEG segment whose length is under 2 overflowed as it was read.
+#[test]
+fn every_image_fuzz_seed_is_read_without_a_panic() {
+    let dir = format!("{}/fuzz/seeds/image", env!("CARGO_MANIFEST_DIR"));
+    let mut seeds = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let data = std::fs::read(entry.unwrap().path()).unwrap();
+        assert!((1..=8).contains(&exif::orientation(&data)));
+        if let Some((_, w, h)) = header_of(&data) {
+            for (bw, bh) in [(1, 1), (7, 5), (w.min(64), h.min(64))] {
+                if let Some(b) = decode(&data, bw, bh) {
+                    assert_eq!((b.width, b.height), (bw, bh));
+                }
+            }
+        }
+        seeds += 1;
+    }
+    assert!(seeds >= 1);
+}
+
+/// The colors of `exif-N.jpg` and `exif-3.png` (3 × 2 cells of 8 pixels, red, green, blue over
+/// white, black, yellow, as stored) shown upright, a row at a time: what a browser shows.
+const UPRIGHT: [(u8, &str); 8] = [
+    (1, "RGB WKY"),
+    (2, "BGR YKW"),
+    (3, "YKW BGR"),
+    (4, "WKY RGB"),
+    (5, "RW GK BY"),
+    (6, "WR KG YB"),
+    (7, "YB KG WR"),
+    (8, "BY GK RW"),
+];
+
+/// The letters of `b`'s pixels (one a cell), in rows, by the color each is nearest.
+fn cells(b: &Bitmap) -> String {
+    let rows: Vec<String> = b
+        .data
+        .chunks(b.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|&p| {
+                    let c = |s: u32| (p >> s) & 0xff > 128;
+                    match (c(16), c(8), c(0)) {
+                        (true, false, false) => 'R',
+                        (false, true, false) => 'G',
+                        (false, false, true) => 'B',
+                        (true, true, true) => 'W',
+                        (false, false, false) => 'K',
+                        (true, true, false) => 'Y',
+                        _ => '?',
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    rows.join(" ")
+}
+
+/// Every EXIF orientation is applied: the size a JPEG or PNG is laid out at is the upright
+/// one, and so are its pixels, at the size of its cells and at its own.
+#[test]
+fn exif_orientation_turns_the_image_upright() {
+    for (o, want) in UPRIGHT {
+        let bytes = fixture(&format!("exif-{o}.jpg"));
+        let (w, h) = if o >= 5 { (16, 24) } else { (24, 16) };
+        assert_eq!(header_of(&bytes), Some((Format::Jpeg, w, h)), "{o}");
+        assert_eq!(info_of(&bytes).unwrap().orientation, o, "{o}");
+        let b = decode(&bytes, w / 8, h / 8).unwrap();
+        assert_eq!((b.width, b.height), (w / 8, h / 8), "{o}");
+        assert_eq!(cells(&b), want, "orientation {o}");
+        // At full size, each cell's middle pixel.
+        let full = decode(&bytes, w, h).unwrap();
+        assert_eq!((full.width, full.height), (w, h), "{o}");
+        let middles = Bitmap {
+            width: w / 8,
+            height: h / 8,
+            data: (0..h / 8)
+                .flat_map(|y| (0..w / 8).map(move |x| (x, y)))
+                .map(|(x, y)| full.data[((y * 8 + 4) * w + x * 8 + 4) as usize])
+                .collect(),
+        };
+        assert_eq!(cells(&middles), want, "orientation {o}, full size");
+    }
+    // A PNG's `eXIf` before its data is applied, exactly; one after it isn't.
+    let png = fixture("exif-3.png");
+    assert_eq!(header_of(&png), Some((Format::Png, 24, 16)));
+    assert_eq!(cells(&decode(&png, 3, 2).unwrap()), "YKW BGR");
+    let late = fixture("exif-late.png");
+    assert_eq!(info_of(&late).unwrap().orientation, 1);
+    assert_eq!(header_of(&late), Some((Format::Png, 24, 16)));
+    assert_eq!(cells(&decode(&late, 3, 2).unwrap()), "RGB WKY");
+    // A file's probe gives the upright size too.
+    assert_eq!(
+        probe_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/exif-6.jpg")),
+        Some((16, 24))
+    );
+}
+
+/// An `eXIf` is found past other chunks, and not past the scan's limit or the image data.
+#[test]
+fn a_pngs_exif_is_looked_for_up_to_its_data() {
+    let plain = png_bytes(3, 2, |_, _| [0, 0, 0, 255]);
+    let exif = fixture("exif-3.png");
+    let at = exif.windows(4).position(|w| w == b"eXIf").unwrap() - 4;
+    let chunk = &exif[at..at + 12 + usize::from(exif[at + 3])];
+    let ihdr_end = 33;
+    let put = |before: &[u8], text: usize| {
+        let mut b = plain[..ihdr_end].to_vec();
+        if text > 0 {
+            b.extend(png_chunk(b"tEXt", &vec![b'a'; text]));
+        }
+        b.extend(before);
+        b.extend(&plain[ihdr_end..]);
+        b
+    };
+    for text in [0, 1, 100_000] {
+        let b = put(chunk, text);
+        assert_eq!(
+            info_of(&b).unwrap().orientation,
+            3,
+            "after {text} bytes of text"
+        );
+        assert_eq!(header_of(&b), Some((Format::Png, 3, 2)));
+        assert!(decode(&b, 3, 2).is_some());
+    }
+    // Past the limit of the scan, it isn't read.
+    let b = put(chunk, MAX_HEADER_SCAN as usize);
+    assert_eq!(info_of(&b).unwrap().orientation, 1);
+    // An `eXIf` cut short, or one claiming more than the file has, is as stored.
+    let mut cut = put(chunk, 0);
+    cut.truncate(ihdr_end + 20);
+    assert_eq!(info_of(&cut).unwrap().orientation, 1);
+    let mut long = chunk.to_vec();
+    long[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(info_of(&put(&long, 0)).unwrap().orientation, 1);
+}
+
+/// A chunk of type `ty` holding `data`, its checksum not checked by the header.
+fn png_chunk(ty: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = (data.len() as u32).to_be_bytes().to_vec();
+    out.extend(ty);
+    out.extend(data);
+    out.extend([0; 4]);
+    out
+}
+
+/// Cutting a JPEG's metadata out keeps its orientation: an `APP1` of its own is put back, which
+/// the next look at the header (the decode's, or a fetched body's) finds.
+#[test]
+fn shedding_metadata_keeps_the_orientation() {
+    let plain = fixture("exif-6.jpg");
+    let want = decode(&plain, 2, 3).unwrap();
+    // A big EXIF block (a thumbnail, say) first, then others.
+    let mut big_exif = b"Exif\0\0".to_vec();
+    big_exif.extend(&plain[12..38]);
+    big_exif.resize(65_000, 0xAB);
+    for exif_first in [false, true] {
+        let mut b = plain.clone();
+        if exif_first {
+            b.splice(2..38, segment(0xE1, &big_exif));
+        }
+        let with = with_segments(
+            &b,
+            0,
+            &[
+                segment(0xE1, &[b'X'; 65_000]),
+                segment(0xE2, &[b'I'; 40_000]),
+                segment(0xE2, &[b'I'; 40_000]),
+            ],
+        );
+        assert!(jpeg_metadata(&with) > MAX_JPEG_META);
+        assert_eq!(header_of(&with), Some((Format::Jpeg, 16, 24)));
+        let mut cut = with.clone();
+        assert!(shed_jpeg_metadata(&mut cut));
+        assert!(cut.len() < plain.len() + 64, "{} bytes left", cut.len());
+        assert_eq!(
+            header_of(&cut),
+            Some((Format::Jpeg, 16, 24)),
+            "{exif_first}"
+        );
+        assert_eq!(decode(&cut, 2, 3).as_ref(), Some(&want), "{exif_first}");
+        assert_eq!(decode(&with, 2, 3).as_ref(), Some(&want), "{exif_first}");
+    }
+    // As stored: nothing is put back.
+    let upright = fixture("exif-1.jpg");
+    let mut cut = with_segments(&upright, 0, &vec![segment(0xE1, &[b'X'; 65_000]); 3]);
+    assert!(shed_jpeg_metadata(&mut cut));
+    assert!(!cut.windows(4).any(|w| w == b"Exif"));
+}
+
+/// A turned image's decode is charged its copy: resampled to the box with its sides swapped,
+/// and copied into the box.
+#[test]
+fn a_turned_image_is_charged_its_copy() {
+    let upright = info_of(&fixture("exif-1.jpg")).unwrap();
+    let turned = info_of(&fixture("exif-6.jpg")).unwrap();
+    let flipped = info_of(&fixture("exif-3.jpg")).unwrap();
+    assert_eq!(decode_cost(&flipped, 24, 16), decode_cost(&upright, 24, 16));
+    let (w, h) = (200, 300);
+    let stored = Header {
+        orientation: 1,
+        ..turned
+    };
+    assert_eq!(
+        decode_cost(&turned, w, h),
+        decode_cost(&stored, h, w) + 4 * (w * h) as usize
+    );
+    // The cost of a fetched image when its body has gone covers it, either way round.
+    #[cfg(feature = "remote-images")]
+    for (sw, sh) in [(16, 24), (24, 16), (1, 5000), (5000, 1)] {
+        for (w, h) in [(1, 1), (16, 24), (300, 7), (7, 300)] {
+            for header in [
+                Header {
+                    w: sh,
+                    h: sw,
+                    ..turned
+                },
+                Header {
+                    w: sw,
+                    h: sh,
+                    ..upright
+                },
+            ] {
+                let (sw, sh) = header.shown();
+                let source = header_cost(&header);
+                assert!(
+                    unfetched_cost(source, (0, 0), (sw, sh), w, h) >= decode_cost(&header, w, h)
+                );
+            }
+        }
     }
 }
 
@@ -1906,7 +2164,7 @@ fn blocked_images_are_not_offered_without_curl() {
 /// scans of the rest): both count in what a decode costs.
 #[test]
 fn progressive_jpegs_count_their_coefficients() {
-    let info = |b: &[u8]| header_info(&mut &b[..]).unwrap();
+    let info = |b: &[u8]| info_of(b).unwrap();
     assert_eq!(info(&fixture("gradient.jpg")).coefficients, 0, "baseline");
     // 48 × 24, every component sampled 1 × 1: three planes of 48 × 24 i16.
     let p = info(&fixture("progressive.jpg"));
@@ -2392,6 +2650,8 @@ fn a_decoded_result_evicts_a_body_let_in_earlier_in_the_poll() {
         q.jobs.push(job(Key::Remote("https://x.y/q.png".into())));
     }
     images.worker = Some(Worker {
+        cancel: Arc::default(),
+        inline: Arc::default(),
         shared: shared.clone(),
     });
     images.cache.expect = 1;
@@ -2423,6 +2683,10 @@ fn a_decoded_result_evicts_a_body_let_in_earlier_in_the_poll() {
             doc_gen: images.doc_gen,
             key: Key::Remote(p.clone()),
             bitmap: Some(bitmap),
+            need: None,
+            refused: None,
+            skipped: false,
+            cancelled: false,
             worker: shared.clone(),
         })
         .unwrap();
@@ -2565,16 +2829,29 @@ fn a_file_that_changed_since_it_was_sized_is_refused() {
         cost,
     };
     let cost = file_info(&path).unwrap().cost(40, 30);
-    assert!(decode_job(&job(cost)).is_some());
+    assert!(
+        decode_job(&job(cost), &mut WorkerState::default())
+            .bitmap
+            .is_some()
+    );
     std::fs::write(
         &path,
         png_bytes(400, 300, |x, y| [(x * y) as u8, y as u8, 3, 255]),
     )
     .unwrap();
-    assert!(decode_job(&job(cost)).is_none(), "bigger than it was");
+    assert!(
+        decode_job(&job(cost), &mut WorkerState::default())
+            .bitmap
+            .is_none(),
+        "bigger than it was"
+    );
     // Charged for what it is now, it decodes.
     let cost = file_info(&path).unwrap().cost(40, 30);
-    assert!(decode_job(&job(cost)).is_some());
+    assert!(
+        decode_job(&job(cost), &mut WorkerState::default())
+            .bitmap
+            .is_some()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3440,7 +3717,7 @@ fn an_image_that_failed_is_not_decoded_again_for_the_body_still_held() {
         Key::Remote(url.clone()),
         Data::Bytes(Arc::new(png[..png.len() / 2].to_vec())),
     );
-    images.remote.failed(&url, true);
+    images.remote.failed(&url, true, None);
     let boxes = [(1, 40, 30), (2, 20, 15)];
     images.begin_frame();
     images.request(&boxes, 2);
@@ -3756,4 +4033,678 @@ fn the_view_advances_past_the_images_that_have_loaded() {
     );
     // With remote images off none of them is to be loaded: none is wanted.
     assert_eq!(view(VIEW_MAX + 404, 0, false), (VIEW_MAX + 404, 0, 0));
+}
+
+/// An SVG whose first job finds it needs more than it was charged is asked for again with what
+/// it needs, and drawn; one that needs more than the cache is refused (its placeholder says so),
+/// and drawn once it is clicked, outside the budget.
+#[cfg(feature = "svg")]
+#[test]
+fn an_svg_charged_too_little_is_asked_for_again() {
+    use crate::render::Pixels;
+    let dir = scratch("svg-again");
+    let svg = |groups: usize| {
+        let body =
+            "<g transform=\"translate(1 1)\"><rect width=\"1\" height=\"1\" fill=\"#e00\"/></g>"
+                .repeat(groups);
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"30\">{body}</svg>")
+    };
+    std::fs::write(dir.join("a.svg"), svg(8_000)).unwrap();
+    std::fs::write(dir.join("b.svg"), svg(40_000)).unwrap();
+    let doc = Doc::parse("![a](a.svg) ![b](b.svg)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
+    assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(40, 30)));
+    let t = Instant::now();
+    let mut requests = 0;
+    while images.pixels(1, 40, 30).is_none()
+        || !matches!(layout.image_size(2), Some(ImageSize::Refused(_)))
+    {
+        assert!(t.elapsed() < Duration::from_secs(60), "timed out");
+        images.request(&[(1, 40, 30), (2, 40, 30)], 2);
+        requests += 1;
+        std::thread::sleep(Duration::from_millis(5));
+        images.poll(&doc, &mut layout);
+    }
+    assert_eq!(images.pixels(1, 40, 30).unwrap().data[40 + 1], 0xFFEE_0000);
+    for id in [1, 2] {
+        assert!(images.costs[&id].unwrap().header.svg.parse > 0, "measured");
+    }
+    let need = images.costs[&2].unwrap().cost(40, 30);
+    assert!(need > CACHE_BYTES);
+    let Some(ImageSize::Refused(Refusal::Memory(n))) = layout.image_size(2) else {
+        panic!("{:?}", layout.image_size(2));
+    };
+    assert!(n as usize >= need, "{n} < {need}");
+    assert_eq!(images.stats().decodes, 1);
+    // Not asked for over and over: a job or two each, one more when measured.
+    assert!(requests < 200, "{requests}");
+    // Clicked, it is drawn on the forced thread, and nothing of it is in the cache.
+    assert!(images.force(2, &doc, &mut layout));
+    assert_eq!(layout.image_size(2), Some(ImageSize::Pixels(40, 30)));
+    while images.pixels(2, 40, 30).is_none() {
+        assert!(t.elapsed() < Duration::from_secs(60), "timed out");
+        images.request(&[(1, 40, 30), (2, 40, 30)], 2);
+        std::thread::sleep(Duration::from_millis(5));
+        images.poll(&doc, &mut layout);
+    }
+    assert_eq!(images.pixels(2, 40, 30).unwrap().data[40 + 1], 0xFFEE_0000);
+    assert!(
+        !images.cache.has(&Key::Local(2), 40, 30),
+        "not in the cache"
+    );
+    assert_eq!(images.forced_loads(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An SVG that draws a big raster image whole (nearest neighbor) is loaded at one box size and
+/// at another, a zoom in or out: what the image holds doesn't grow with the box, so neither is
+/// refused for it.
+#[cfg(feature = "svg")]
+#[test]
+fn an_svg_with_a_whole_raster_loads_at_another_box_size() {
+    use crate::render::Pixels;
+    let dir = scratch("svg-zoom");
+    let mut png = Vec::new();
+    let mut enc = png::Encoder::new(&mut png, 1024, 1024);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .unwrap()
+        .write_image_data(&vec![7; 1024 * 1024])
+        .unwrap();
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\"><image width=\"100\" height=\"100\" style=\"image-rendering:pixelated\" href=\"data:image/png;base64,{}\"/></svg>",
+        crate::image::svg::tests::base64(&png)
+    );
+    std::fs::write(dir.join("a.svg"), svg).unwrap();
+    for (first, then) in [(100, 200), (200, 100)] {
+        let (doc, mut layout, mut images) = forced_page(&dir, "![a](a.svg)");
+        for side in [first, then] {
+            let boxes = [(1, side, side)];
+            pump(&doc, &mut layout, &mut images, &boxes, |i, l| {
+                assert!(
+                    !matches!(l.image_size(1), Some(ImageSize::Refused(_))),
+                    "refused at {side}: {:?}",
+                    l.image_size(1)
+                );
+                i.pixels(1, side, side).is_some_and(|b| b.width == side)
+            });
+            assert_eq!(images.pixels(1, side, side).unwrap().data[0], 0xFF07_0707);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An SVG that takes too long to draw is given up at its deadline: told to stop, shown as its
+/// alt text with a click to load, and its worker let go; the raster images after it are decoded by a new one, and
+/// another SVG waits until the one given up is done. With nothing drawing, there's no deadline.
+#[cfg(feature = "svg")]
+#[test]
+fn an_svg_that_takes_too_long_is_given_up() {
+    use crate::render::Pixels;
+    let dir = scratch("svg-slow");
+    // Random lines filled: about a tenth of a second, and well within the estimate's cap.
+    let mut seed = 1u32;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        (seed >> 8) % 4000
+    };
+    let mut d = String::from("M0 0");
+    for _ in 0..8_000 {
+        d += &format!(" L{} {}", rnd(), rnd());
+    }
+    let slow = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"512\" height=\"512\" viewBox=\"0 0 4000 4000\"><path d=\"{d}\"/></svg>"
+    );
+    std::fs::write(dir.join("slow.svg"), &slow).unwrap();
+    std::fs::write(dir.join("logo.svg"), fixture("logo-viewbox.svg")).unwrap();
+    std::fs::write(
+        dir.join("a.png"),
+        png_bytes(30, 20, |_, _| [0, 0, 255, 255]),
+    )
+    .unwrap();
+    let doc = Doc::parse("![slow](slow.svg) ![a](a.png) ![logo](logo.svg)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images {
+        svg_deadline: Duration::from_millis(1),
+        ..Images::default()
+    };
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
+    assert_eq!(images.deadline(), None);
+    let boxes = [(1, 512, 512), (2, 30, 20), (3, 48, 32)];
+    // The worker takes the SVG first (measured, and asked for again: then it's slow).
+    let t = Instant::now();
+    loop {
+        assert!(t.elapsed() < Duration::from_secs(10), "never given up");
+        images.request(&boxes, 3);
+        std::thread::sleep(Duration::from_millis(2));
+        if images.expire(Instant::now()) {
+            break;
+        }
+        images.poll(&doc, &mut layout);
+    }
+    assert!(images.worker.is_none() && images.svg_stuck());
+    images.poll(&doc, &mut layout);
+    assert_eq!(
+        layout.image_size(1),
+        Some(ImageSize::Refused(Refusal::Slow))
+    );
+    // The PNG is decoded by a new worker; the other SVG waits for the one given up.
+    while images.pixels(2, 30, 20).is_none() || images.svg_stuck() {
+        assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+        images.request(&boxes[1..], 2);
+        if images.svg_stuck() {
+            assert!(images.pixels(3, 48, 32).is_none());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    // What the stuck drawing made when it stopped doesn't take its refusal away: the placeholder
+    // still says a click loads it.
+    images.poll(&doc, &mut layout);
+    assert_eq!(
+        layout.image_size(1),
+        Some(ImageSize::Refused(Refusal::Slow))
+    );
+    images.svg_deadline = SVG_DEADLINE;
+    while images.pixels(3, 48, 32).is_none() {
+        assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+        images.request(&boxes[1..], 2);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    assert_eq!(images.deadline(), None);
+    assert!(!images.expire(Instant::now() + Duration::from_secs(60)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Loads past the limits (a click on the placeholder) ---------------------------------------
+
+/// A black 1-bit gray PNG of `w` × `h`: a few KB however many pixels.
+fn big_png(w: u32, h: u32) -> Vec<u8> {
+    filled_png(w, h, 0)
+}
+
+/// [`big_png`] filled with the bytes `fill` (0 black, 255 white).
+fn filled_png(w: u32, h: u32, fill: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, w, h);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::One);
+    let data = vec![fill; w.div_ceil(8) as usize * h as usize];
+    enc.write_header().unwrap().write_image_data(&data).unwrap();
+    out
+}
+
+/// A document of `md` in `dir`, attached and laid out.
+fn forced_page(dir: &Path, md: &str) -> (Doc, Layout, Images) {
+    let doc = Doc::parse(md);
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.to_path_buf()));
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 2000.0);
+    (doc, layout, images)
+}
+
+/// Stand in for the event loop: ask for `boxes` and poll until `done`, at most 20 s.
+fn pump(
+    doc: &Doc,
+    layout: &mut Layout,
+    images: &mut Images,
+    boxes: &[(u32, u32, u32)],
+    mut done: impl FnMut(&mut Images, &Layout) -> bool,
+) {
+    let t = Instant::now();
+    while !done(images, layout) {
+        assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+        images.begin_frame();
+        images.request(boxes, boxes.len());
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(doc, layout);
+    }
+}
+
+/// An image over VOMD's limits shows why, and a click loads it on the forced thread, outside
+/// the cache: at each box size, the old pixels shown until the new ones come; the choice is kept
+/// over a reload. What isn't over the limits (missing, broken) is plain alt text.
+#[test]
+fn a_clicked_image_loads_past_the_limits() {
+    use crate::render::Pixels;
+    let dir = scratch("forced");
+    std::fs::write(dir.join("big.png"), big_png(9000, 8000)).unwrap();
+    std::fs::write(dir.join("ok.png"), png_bytes(4, 3, |_, _| [9, 9, 9, 255])).unwrap();
+    std::fs::write(dir.join("broken.png"), b"\x89PNG\r\n\x1a\nnot really").unwrap();
+    let md = "![big](big.png) ![ok](ok.png) ![missing](none.png) ![broken](broken.png)";
+    let (doc, mut layout, mut images) = forced_page(&dir, md);
+    let refused = ImageSize::Refused(Refusal::Pixels(9000, 8000));
+    assert_eq!(layout.image_size(1), Some(refused));
+    assert_eq!(layout.image_size(2), Some(ImageSize::Pixels(4, 3)));
+    assert_eq!(layout.image_size(3), Some(ImageSize::Alt));
+    assert_eq!(layout.image_size(4), Some(ImageSize::Alt));
+    // Nothing is clicked: nothing past the limits.
+    assert!(
+        images.force(3, &doc, &mut layout),
+        "the API doesn't judge: the view does"
+    );
+    images.request(&[(2, 4, 3)], 1);
+    pump(&doc, &mut layout, &mut images, &[(2, 4, 3)], |i, _| {
+        i.pixels(2, 4, 3).is_some() && !i.forcing()
+    });
+    assert_eq!(
+        layout.image_size(3),
+        Some(ImageSize::Refused(Refusal::Failed))
+    );
+
+    assert!(images.force(1, &doc, &mut layout));
+    assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(9000, 8000)));
+    let loads = images.forced_loads();
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).is_some()
+    });
+    assert_eq!(images.forced_loads(), loads + 1);
+    let b = images.pixels(1, 90, 80).unwrap();
+    assert_eq!((b.width, b.height, b.data[0]), (90, 80, 0xFF00_0000));
+    assert!(!images.cache.has(&Key::Local(1), 90, 80), "not the cache's");
+    // Another size: the old pixels until the new ones come, and one load.
+    images.request(&[(1, 180, 160)], 1);
+    assert_eq!(images.pixels(1, 180, 160).unwrap().width, 90);
+    pump(&doc, &mut layout, &mut images, &[(1, 180, 160)], |i, _| {
+        i.pixels(1, 180, 160).unwrap().width == 180
+    });
+    assert_eq!(images.forced_loads(), loads + 2);
+    // Reloaded: still chosen, laid out at its size, never refused in between.
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 2000.0);
+    assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(9000, 8000)));
+    pump(&doc, &mut layout, &mut images, &[(1, 180, 160)], |i, _| {
+        !i.forcing() && i.pixels(1, 180, 160).is_some()
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A load past the limits runs beside the normal decodes (a PNG is decoded while it is held),
+/// and ends when its document goes or its box changes size (and it is loaded again at the new
+/// one); with nothing to load, the thread is gone.
+#[test]
+fn a_load_past_the_limits_is_abandoned() {
+    use crate::render::Pixels;
+    let dir = scratch("forced-abandon");
+    std::fs::write(dir.join("big.png"), big_png(9000, 8000)).unwrap();
+    std::fs::write(dir.join("ok.png"), png_bytes(4, 3, |_, _| [9, 9, 9, 255])).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![big](big.png) ![ok](ok.png)");
+    images.forced.hold.store(true, Ordering::Relaxed);
+    assert!(images.force(1, &doc, &mut layout));
+    let boxes = [(1, 90, 80), (2, 4, 3)];
+    pump(&doc, &mut layout, &mut images, &boxes, |i, _| {
+        i.pixels(2, 4, 3).is_some()
+    });
+    assert!(
+        images.forcing() && images.pixels(1, 90, 80).is_none(),
+        "held"
+    );
+    // Another size: the load held is cancelled, and the new one waits.
+    images.request(&[(1, 45, 40)], 1);
+    images.forced.hold.store(false, Ordering::Relaxed);
+    pump(&doc, &mut layout, &mut images, &[(1, 45, 40)], |i, _| {
+        i.pixels(1, 45, 40).is_some() && !i.forcing()
+    });
+    assert_eq!(
+        images.pixels(1, 45, 40).unwrap().width,
+        45,
+        "only the new size"
+    );
+    // Held again at another size, then another document: over within 200 ms.
+    images.forced.hold.store(true, Ordering::Relaxed);
+    images.request(&[(1, 90, 80)], 1);
+    assert!(images.forcing());
+    let other = Doc::parse("Nothing.");
+    images.attach(&other, &mut layout);
+    let t = Instant::now();
+    while images.forcing() {
+        assert!(t.elapsed() < Duration::from_secs(10), "still loading");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Idle: nothing wakes the window.
+    let wakes = images.wakes();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(images.wakes(), wakes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reload while a load past the limits runs (it is cancelled with the old document) loads the
+/// image again, though nothing asks for it a second time; and one loaded already is loaded
+/// again, as its file may have changed, the old pixels shown until the new ones come.
+#[test]
+fn a_reload_loads_a_clicked_image_again() {
+    use crate::render::Pixels;
+    let dir = scratch("forced-reload");
+    std::fs::write(dir.join("big.png"), big_png(9000, 8000)).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![big](big.png)");
+    images.forced.hold.store(true, Ordering::Relaxed);
+    assert!(images.force(1, &doc, &mut layout));
+    images.request(&[(1, 90, 80)], 1);
+    while !images.forced.running() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Reloaded while it runs: asked for once, and then the window only polls (as it would, woken).
+    images.attach(&doc, &mut layout);
+    images.request(&[(1, 90, 80)], 1);
+    images.forced.hold.store(false, Ordering::Relaxed);
+    let t = Instant::now();
+    while images.pixels(1, 90, 80).is_none() {
+        assert!(t.elapsed() < Duration::from_secs(20), "never loaded");
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    assert_eq!(images.pixels(1, 90, 80).unwrap().data[0], 0xFF00_0000);
+    // The file changed, and the page is reloaded: the old pixels until the new ones.
+    std::fs::write(dir.join("big.png"), filled_png(9000, 8000, 255)).unwrap();
+    images.attach(&doc, &mut layout);
+    assert_eq!(images.pixels(1, 90, 80).unwrap().data[0], 0xFF00_0000);
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).unwrap().data[0] == 0xFFFF_FFFF
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A load whose charge is over the ceiling isn't started: the placeholder says so, isn't
+/// clickable, and the image isn't tried again (a reload, a zoom) until its file changes.
+#[test]
+fn a_load_over_the_ceiling_says_so() {
+    let dir = scratch("forced-ceiling");
+    std::fs::write(dir.join("big.png"), big_png(9000, 8000)).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![big](big.png)");
+    images.set_forced_limits(Some(1 << 20), forced::KEPT_BYTES);
+    assert!(images.force(1, &doc, &mut layout));
+    pump(&doc, &mut layout, &mut images, &[(1, 900, 800)], |_, l| {
+        matches!(l.image_size(1), Some(ImageSize::Refused(_)))
+    });
+    let Some(ImageSize::Refused(why @ Refusal::Ceiling(n))) = layout.image_size(1) else {
+        panic!("{:?}", layout.image_size(1));
+    };
+    assert!(n > 1 << 20 && !why.forceable());
+    let loads = images.forced_loads();
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 2000.0);
+    assert_eq!(layout.image_size(1), Some(ImageSize::Refused(why)));
+    images.request(&[(1, 90, 80)], 1);
+    assert_eq!(images.forced_loads(), loads, "not tried again");
+    // Changed, it is over the normal limits again: clickable.
+    std::fs::write(dir.join("big.png"), big_png(9000, 8001)).unwrap();
+    images.attach(&doc, &mut layout);
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 2000.0);
+    assert_eq!(
+        layout.image_size(1),
+        Some(ImageSize::Refused(Refusal::Pixels(9000, 8001)))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pixels of loads past the limits are kept within their own cap, the least recently
+/// painted going first: one evicted is loaded again (once) when it is asked for, never refused.
+#[test]
+fn loads_past_the_limits_are_evicted_and_loaded_again() {
+    use crate::render::Pixels;
+    let dir = scratch("forced-evict");
+    std::fs::write(dir.join("a.png"), big_png(9000, 8000)).unwrap();
+    std::fs::write(dir.join("b.png"), big_png(8000, 9000)).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![a](a.png) ![b](b.png)");
+    images.set_forced_limits(None, 1 << 10);
+    assert!(images.force(1, &doc, &mut layout) && images.force(2, &doc, &mut layout));
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).is_some()
+    });
+    pump(&doc, &mut layout, &mut images, &[(2, 80, 90)], |i, _| {
+        i.pixels(2, 80, 90).is_some()
+    });
+    images.begin_frame();
+    assert!(images.pixels(1, 90, 80).is_none(), "evicted for the other");
+    let loads = images.forced_loads();
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).is_some()
+    });
+    assert_eq!(images.forced_loads(), loads + 1);
+    assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(9000, 8000)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A remote image over the limits shows why once remote images are on; a click fetches it again
+/// (with the forced fetch) for its size, and then draws it at its box.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_clicked_remote_image_is_fetched_and_drawn() {
+    use crate::render::Pixels;
+    let url = "https://x.y/big.png";
+    let doc = Doc::parse(&format!("![big]({url})"));
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    let body = big_png(9000, 8000);
+    images.set_test_body(Arc::new(move |_| Some(body.clone())));
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 2000.0);
+    assert!(!images.force(1, &doc, &mut layout), "remote images are off");
+    images.set_remote(true, &doc, &mut layout);
+    pump(&doc, &mut layout, &mut images, &[(1, 400, 300)], |_, l| {
+        matches!(l.image_size(1), Some(ImageSize::Refused(_)))
+    });
+    assert_eq!(
+        layout.image_size(1),
+        Some(ImageSize::Refused(Refusal::Pixels(9000, 8000)))
+    );
+    assert!(images.force(1, &doc, &mut layout));
+    assert_eq!(layout.image_size(1), Some(ImageSize::Loading));
+    pump(&doc, &mut layout, &mut images, &[(1, 400, 300)], |_, l| {
+        l.image_size(1) == Some(ImageSize::Pixels(9000, 8000))
+    });
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).is_some()
+    });
+    assert_eq!(images.forced_loads(), 2, "fetched, then drawn");
+}
+
+/// A body over what forced loads keep is let go once its image is drawn, but its size is not
+/// forgotten: the image stays at its size, with no fetch again and no flip back to loading.
+#[cfg(feature = "remote-images")]
+#[test]
+fn a_clicked_remote_image_over_the_kept_cap_is_fetched_once() {
+    use crate::render::Pixels;
+    let url = "https://x.y/big.png";
+    let doc = Doc::parse(&format!("![big]({url})"));
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_forced_limits(None, 1 << 10);
+    let body = big_png(9000, 8000);
+    images.set_test_body(Arc::new(move |_| Some(body.clone())));
+    images.attach(&doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 2000.0);
+    images.set_remote(true, &doc, &mut layout);
+    pump(&doc, &mut layout, &mut images, &[(1, 400, 300)], |_, l| {
+        matches!(l.image_size(1), Some(ImageSize::Refused(_)))
+    });
+    assert!(images.force(1, &doc, &mut layout));
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).is_some()
+    });
+    // Frames on: it stays drawn, and nothing is fetched or decoded again.
+    for _ in 0..100 {
+        images.begin_frame();
+        images.request(&[(1, 90, 80)], 1);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+        assert_eq!(layout.image_size(1), Some(ImageSize::Pixels(9000, 8000)));
+        assert!(images.pixels(1, 90, 80).is_some());
+    }
+    assert_eq!(images.forced_loads(), 2, "fetched, then drawn");
+}
+
+/// An SVG drawn without some of its embedded images says so (its note and click), and is drawn
+/// with them once clicked; SVGs drawn are drawn again when the faces of their text change.
+#[cfg(feature = "svg")]
+#[test]
+fn a_partial_svg_is_drawn_whole_when_clicked() {
+    use crate::render::Pixels;
+    let dir = scratch("forced-partial");
+    let png = png_bytes(1, 1, |_, _| [0, 0, 255, 255]);
+    let mut b64 = String::new();
+    {
+        const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for c in png.chunks(3) {
+            let n = c
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                b64.push(if i <= c.len() {
+                    ABC[(n >> (18 - 6 * i) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+    }
+    let rasters: String = (0..65)
+        .map(|i| {
+            format!(
+                "<image x=\"{i}\" width=\"1\" height=\"1\" href=\"data:image/png;base64,{b64}\"/>"
+            )
+        })
+        .collect();
+    let svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"65\" height=\"1\">{rasters}</svg>"
+    );
+    std::fs::write(dir.join("a.svg"), svg).unwrap();
+    std::fs::write(dir.join("logo.svg"), fixture("logo-viewbox.svg")).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![a](a.svg) ![logo](logo.svg)");
+    let (lw, lh) = match layout.image_size(2) {
+        Some(ImageSize::Pixels(w, h)) => (w, h),
+        other => panic!("{other:?}"),
+    };
+    let boxes = [(1, 65, 1), (2, lw, lh)];
+    pump(&doc, &mut layout, &mut images, &boxes, |i, _| {
+        i.pixels(1, 65, 1).is_some() && i.pixels(2, lw, lh).is_some()
+    });
+    assert!(images.partial(1) && !images.partial(2));
+    assert_eq!(
+        images.pixels(1, 65, 1).unwrap().data[64],
+        0,
+        "the 65th left out"
+    );
+    // New faces: the SVGs drawn are gone from the cache, and drawn again.
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    images.set_svg_fonts(fonts.svg_sources());
+    let empty = crate::fonts::SvgFonts {
+        sources: Vec::new(),
+        origins: Vec::new(),
+        sans: 0,
+        mono: 0,
+    };
+    images.set_svg_fonts(empty);
+    assert!(images.pixels(2, lw, lh).is_none(), "drawn again");
+    assert!(images.force(1, &doc, &mut layout));
+    assert!(!images.partial(1));
+    pump(&doc, &mut layout, &mut images, &boxes, |i, _| {
+        !i.forcing()
+            && i.pixels(1, 65, 1).is_some_and(|b| b.data[64] != 0)
+            && i.pixels(2, lw, lh).is_some()
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reduced by nearest neighbor, a decode keeps the source pixel under the center of each target
+/// pixel (as resvg's `Nearest` drawing does for `image-rendering: optimizeSpeed`, which can't
+/// pick them after they were averaged), for every format and way of reading: half the size of an
+/// image is its pixels at odd places, as stored; and halved by area it is their mean.
+#[test]
+fn nearest_sampling_keeps_the_pixels_under_the_centers() {
+    let stripes = png_bytes(8, 6, |x, y| {
+        let v = if x % 2 == 0 { 0 } else { 255 };
+        [v, y as u8 * 40, 255 - v, 255]
+    });
+    let mut files = vec![("png", stripes)];
+    for name in [
+        "lossy.webp",
+        "lossy-alpha.webp",
+        "lossless-alpha.webp",
+        "anim.gif",
+        "exif-1.jpg",
+    ] {
+        files.push((name, fixture(name)));
+    }
+    let go = |bytes: &[u8], w, h, sampling| {
+        #[cfg(feature = "svg")]
+        let fonts = &mut svg::Fonts::default();
+        #[cfg(not(feature = "svg"))]
+        let fonts = &mut ();
+        decode_why(bytes, w, h, sampling, &Limits::normal(), &NO_CANCEL, fonts).ok()
+    };
+    for (name, bytes) in &files {
+        let h = info_of(bytes).unwrap();
+        assert!(
+            h.w.is_multiple_of(2) && h.h.is_multiple_of(2) && h.orientation == 1,
+            "{name}"
+        );
+        let (w, h) = (h.w, h.h);
+        let full = go(bytes, w, h, Sampling::Area).expect(name);
+        let half = go(bytes, w / 2, h / 2, Sampling::Nearest).expect(name);
+        assert_eq!((half.width, half.height), (w / 2, h / 2), "{name}");
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
+                let at = |x: u32, y: u32| full.data[(y * w + x) as usize];
+                assert_eq!(
+                    half.data[(y * (w / 2) + x) as usize],
+                    at(2 * x + 1, 2 * y + 1),
+                    "{name} {x},{y}"
+                );
+            }
+        }
+    }
+    // The PNG the other ways: a whole frame (as an interlaced one is read), and by area.
+    let png = &files[0].1;
+    let whole = decode_png(png, 4, 3, false, Sampling::Nearest, &NO_CANCEL).unwrap();
+    let rows = decode_png(png, 4, 3, true, Sampling::Nearest, &NO_CANCEL).unwrap();
+    assert_eq!(whole, rows);
+    let mean = decode_png(png, 4, 3, true, Sampling::Area, &NO_CANCEL).unwrap();
+    assert_eq!(whole.data[0] >> 16 & 0xff, 255);
+    assert_eq!(mean.data[0] >> 16 & 0xff, 128);
+}
+
+/// Nearest-neighbor spans take no more room than the area ones (the tables are charged for
+/// that: [`spans_cost`]), pick the pixel under each target pixel's center, and copy pixels
+/// when the image is enlarged.
+#[test]
+fn nearest_spans_stay_within_their_bound() {
+    for src in (1..=40).chain([1000, 16_383]) {
+        for dst in (1..=40).chain([1000, 16_383]) {
+            let s = Spans::nearest(src, dst);
+            assert!(s.weights.len() <= spans_weights(src, dst), "{src} to {dst}");
+            assert_eq!(
+                s.weights.capacity(),
+                spans_weights(src, dst),
+                "{src} to {dst}"
+            );
+            assert_eq!(s.spans.capacity(), dst as usize + 1, "{src} to {dst}");
+            assert_eq!(s.len(), dst as usize);
+            for t in 0..s.len() {
+                let (first, w) = s.get(t);
+                assert_eq!(w, [1.0], "{src} to {dst}, pixel {t}");
+                let center = (2 * t + 1) * src as usize / (2 * dst as usize);
+                assert_eq!(first, center, "{src} to {dst}, pixel {t}");
+                assert!(first < src as usize);
+            }
+        }
+    }
 }

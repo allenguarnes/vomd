@@ -976,6 +976,37 @@ fn table_ids_are_not_capped_at_16_bits() {
     assert_eq!(doc.tables[table as usize].aligns.len(), 2);
 }
 
+/// `<img width height>`: pixels and percentages of a width are read, anything else is as if
+/// absent, and Markdown images have no size.
+#[test]
+fn img_sizes_are_parsed() {
+    let want = |tag: &str| Doc::parse(&format!("{tag}\n")).images[0].want;
+    let w = |v: &str| want(&format!("<img src=a.png width=\"{v}\">"))[0];
+    assert_eq!(w("128"), Want::Px(12_800));
+    assert_eq!(w("128px"), Want::Px(12_800));
+    assert_eq!(w(" 128PX "), Want::Px(12_800));
+    assert_eq!(w("128.5"), Want::Px(12_850));
+    assert_eq!(w("50%"), Want::Pct(5_000));
+    assert_eq!(w("4000"), Want::Px(400_000));
+    assert_eq!(w("99999"), Want::Px(MAX_SIDE * 100), "clamped");
+    for junk in [
+        "0", "-5", "", "auto", "abc", "12abc", "2em", "10vw", "NaN", "inf", ".", "0.001",
+    ] {
+        assert_eq!(w(junk), Want::Auto, "{junk:?}");
+    }
+    assert_eq!(w("1&#50;8"), Want::Px(12_800), "entity-decoded");
+    assert_eq!(
+        want("<img src=a.png width=64 height=40>"),
+        [Want::Px(6_400), Want::Px(4_000)]
+    );
+    assert_eq!(
+        want("<img src=a.png height=\"50%\">"),
+        [Want::Auto; 2],
+        "a percentage height is ignored"
+    );
+    assert_eq!(want("![a](a.png)"), [Want::Auto; 2]);
+}
+
 #[test]
 fn html_attributes_are_parsed_by_boundaries() {
     let src = |tag: &str| {

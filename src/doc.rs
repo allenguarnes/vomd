@@ -13,6 +13,8 @@ use pulldown_cmark::{
 };
 use unicase::UniCase;
 
+use crate::image::MAX_SIDE;
+
 mod autolink;
 mod pipeline;
 mod segment;
@@ -220,6 +222,50 @@ pub struct ImageRef {
     /// Where its alt text starts in [`Doc::text`]: a long block is cut into chunks, and the one
     /// that has this offset is the one that holds the image.
     pub start: u32,
+    /// The width and height an HTML `<img>` asks for (Markdown has no syntax for them).
+    pub want: [Want; 2],
+}
+
+/// A side of an image's box as an `<img>`'s `width` or `height` gives it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Want {
+    /// Not given, or not a value VOMD reads: the side follows the image's own size.
+    #[default]
+    Auto,
+    /// CSS (logical) pixels, in hundredths.
+    Px(u32),
+    /// A percentage of the width of the line the box is on, in hundredths: widths only.
+    Pct(u32),
+}
+
+impl Want {
+    /// The `width` (`height` false) or `height` attribute `value`, entity-decoded: `128`,
+    /// `128.5` and `128px` are pixels, `50%` a percentage of a width. Anything else (0,
+    /// negative, `auto`, `2em`, `12abc`, a percentage height) is as if it weren't there, and
+    /// a side over [`MAX_SIDE`] is that.
+    pub fn parse(value: &str, width: bool) -> Want {
+        let v = value.trim();
+        let digits = v
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(v.len());
+        let (num, unit) = v.split_at(digits);
+        let Some(n) = num
+            .parse::<f32>()
+            .ok()
+            .filter(|n| n.is_finite() && *n > 0.0)
+        else {
+            return Want::Auto;
+        };
+        // (Hundredths: a side of less than one is none.)
+        let n = (n * 100.0).round().min(MAX_SIDE as f32 * 100.0) as u32;
+        match unit {
+            _ if n == 0 => Want::Auto,
+            "" => Want::Px(n),
+            u if u.eq_ignore_ascii_case("px") => Want::Px(n),
+            "%" if width => Want::Pct(n),
+            _ => Want::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -894,7 +940,7 @@ impl Builder {
                 self.links.push(id);
             }
             Tag::Image { dest_url, .. } => {
-                let id = self.push_image(dest_url.into_string());
+                let id = self.push_image(dest_url.into_string(), [Want::Auto; 2]);
                 self.image = Some(ImageAlt {
                     id,
                     alt: String::new(),
@@ -1388,11 +1434,17 @@ impl Builder {
         }
     }
 
-    fn push_image(&mut self, src: String) -> u32 {
+    fn push_image(&mut self, src: String, want: [Want; 2]) -> u32 {
         let remote = has_http_scheme(&src);
         let start = self.doc.text.len() as u32;
         let src = src.into();
-        push_id(&mut self.doc.images, ImageRef { src, remote, start })
+        let img = ImageRef {
+            src,
+            remote,
+            start,
+            want,
+        };
+        push_id(&mut self.doc.images, img)
     }
 
     fn end_image(&mut self) {
@@ -1531,7 +1583,11 @@ impl Builder {
                 "img" => {
                     let src = attr(tag, "src").map_or_else(String::new, |s| decode_entities(&s));
                     let alt = attr(tag, "alt").map(|a| decode_entities(&a));
-                    let id = self.push_image(src);
+                    let want = |name, width| {
+                        attr(tag, name)
+                            .map_or(Want::Auto, |v| Want::parse(&decode_entities(&v), width))
+                    };
+                    let id = self.push_image(src, [want("width", true), want("height", false)]);
                     let alt = alt
                         .filter(|a| !a.trim().is_empty())
                         .unwrap_or("image".into());

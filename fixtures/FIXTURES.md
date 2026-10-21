@@ -14,3 +14,125 @@ Test documents for snapshots, goldens, and benchmarks.
 | `inline.md` | Inline HTML styles, autolinks, escapes, alerts (render goldens) |
 | `selection.md` | Text selection: inline code, an image, a list, code with a tab and a blank line, a table (render goldens) |
 | `images.md`, `images/` | Local PNG/JPEG (alpha, progressive, grayscale, linked, in a table), missing and unsupported images, blocked remote ones (P10) |
+| `formats.md` | GIF, WebP, SVG (with embedded images), EXIF orientation, `<img width>` and a placeholder over the limits, decoded for the render goldens (`formats*.png`) |
+| `img-size.md` | `<img width height>`: pixels, percentages, one side, both, too wide, values that are ignored, in a table, remote, and the same images as Markdown |
+
+## Images for the decoders (`images/`)
+
+Made with ImageMagick 7 (libwebp 1.6) and the Python below; each is a few hundred bytes, the
+`big-*.webp` ones a few KB.
+
+| File | What it is |
+|---|---|
+| `exif-1.jpg` … `exif-8.jpg` | 24 × 16, cells of 8 px: red, green, blue over white, black, yellow; EXIF orientation 1–8 |
+| `exif-3.png` | The same as a PNG, orientation 3 in an `eXIf` before `IDAT` |
+| `exif-late.png` | Orientation 6 in an `eXIf` after `IDAT` (ignored) |
+| `anim.gif` | 6 × 4, 3 frames; the first is red on the left, transparent on the right |
+| `offset.gif` | A 4 × 6 interlaced frame with its own palette at (3, 1) on a 10 × 8 screen |
+| `zero-screen.gif` | A 3 × 2 red frame on a 0 × 0 screen |
+| `lossy.webp`, `lossy-alpha.webp`, `lossless-alpha.webp` | 6 × 4 |
+| `anim.webp` | 6 × 4, 2 lossless frames, the first like `anim.gif`'s (alpha flag set by hand) |
+| `exif-5.webp` | `lossy.webp` in a `VP8X` with an `EXIF` chunk, orientation 5 |
+| `big-lossy.webp`, `big-lossy-alpha.webp`, `big-anim.webp` | 1024 × 768, flat, quality 5 (for `tests/image_memory.rs`) |
+| `big-lossless.webp`, `big-lossless-alpha.webp` | 2200 × 2048 and 1800 × 1200 (alpha), squares of random colors, lossless by libwebp's slowest setting: its transforms and groups of Huffman codes, a few KB (for `tests/image_memory.rs`) |
+| `badge.svg` | A shields-style badge, 90 × 20: its text in `Verdana,Geneva,DejaVu Sans,sans-serif`, with `textLength` |
+| `badge-arial.svg` | The same, its text in `Arial` alone (no generic family) |
+| `badge.svgz` | `badge.svg`, gzipped |
+| `logo-viewbox.svg` | A `viewBox` of 48 × 32 and no size: red and blue halves, a black line of one pixel along the top |
+| `percent.svg`, `units.svg`, `one-side.svg` | Sizes as a percentage of the `viewBox`, in mm and pt, and one side given |
+| `nested-logo.svg` | `logo-viewbox.svg` in a `data:image/svg+xml` URL |
+| `external.svg` | References to a file, a relative path, a URL and an `xml-stylesheet`: none is followed |
+| `raster-inside.svg` | A PNG (the cells of `exif-*`), the same at half opacity, `exif-6.jpg`, the PNG turned a quarter under a mask, and a `data:` URL that isn't an image |
+| `huge-header.png` | A PNG header of 20,000 × 20,000 and no data (over `MAX_PIXELS`: its placeholder says so, and a click fails to load it), made by the Python below |
+
+```sh
+for c in red lime blue white black yellow; do magick -size 8x8 xc:$c $c.png; done
+magick \( red.png lime.png blue.png +append \) \( white.png black.png yellow.png +append \) -append base.png
+magick base.png -sampling-factor 1x1 -quality 100 -strip plain.jpg
+magick base.png -strip -define png:exclude-chunks=all plain.png
+magick \( -size 6x4 xc:none -fill red -draw 'rectangle 0,0 2,3' \) \( -size 6x4 xc:blue \) \
+  \( -size 6x4 xc:lime \) -set delay 10 -loop 0 anim.gif
+magick -size 4x1 xc:red -size 4x1 xc:lime -size 4x1 xc:blue -size 4x1 xc:yellow \
+  -size 4x1 xc:white -size 4x1 xc:black -append -interlace GIF -page 10x8+3+1 offset.gif
+magick -size 3x2 xc:red +repage zero-screen.gif
+magick -size 6x4 xc:red -fill blue -draw 'rectangle 3,0 5,3' -quality 90 lossy.webp
+magick -size 6x4 xc:none -fill red -draw 'rectangle 0,0 2,3' -quality 90 lossy-alpha.webp
+magick -size 6x4 xc:none -fill red -draw 'rectangle 0,0 2,3' -define webp:lossless=true lossless-alpha.webp
+magick \( -size 6x4 xc:none -fill red -draw 'rectangle 0,0 2,3' \) \( -size 6x4 xc:blue \) \
+  -set delay 10 -loop 0 -define webp:lossless=true anim.webp
+magick -size 1024x768 xc:'#336699' -quality 5 big-lossy.webp
+magick -size 1024x768 xc:'#33669980' -quality 5 big-lossy-alpha.webp
+magick \( -size 1024x768 xc:'#33669980' \) \( -size 1024x768 xc:blue \) -set delay 10 -loop 0 \
+  -quality 5 big-anim.webp
+```
+
+```python
+# big-lossless.webp and big-lossless-alpha.webp (Pillow, libwebp 1.6)
+import random
+from PIL import Image, ImageDraw
+def squares(w, h, side, alpha, dst):
+    random.seed(5)
+    im = Image.new('RGBA' if alpha else 'RGB', (w, h)); d = ImageDraw.Draw(im)
+    for y in range(0, h, side):
+        for x in range(0, w, side):
+            c = tuple(random.randrange(256) for _ in range(3))
+            d.rectangle([x, y, x + side - 1, y + side - 1], fill=c + ((random.choice([255, 128, 0]),) if alpha else ()))
+    im.save(dst, 'WEBP', lossless=True, quality=100, method=6)
+squares(2200, 2048, 96, False, 'big-lossless.webp'); squares(1800, 1200, 64, True, 'big-lossless-alpha.webp')
+```
+
+```python
+import struct, zlib
+def tiff(o):  # little-endian, the first IFD at 8 holding the orientation alone
+    return b'II*\0' + struct.pack('<IHHHIHHI', 8, 1, 0x0112, 3, 1, o, 0, 0)
+def jpeg(src, dst, o):  # an APP1 right after the start of the image
+    b = open(src, 'rb').read(); body = b'Exif\0\0' + tiff(o)
+    open(dst, 'wb').write(b[:2] + b'\xff\xe1' + struct.pack('>H', len(body) + 2) + body + b[2:])
+def png(src, dst, o, late=False):  # after IHDR, or before IEND
+    b = open(src, 'rb').read(); d = tiff(o)
+    c = struct.pack('>I', len(d)) + b'eXIf' + d + struct.pack('>I', zlib.crc32(b'eXIf' + d))
+    at = len(b) - 12 if late else 33
+    open(dst, 'wb').write(b[:at] + c + b[at:])
+for o in range(1, 9): jpeg('plain.jpg', f'exif-{o}.jpg', o)
+png('plain.png', 'exif-3.png', 3); png('plain.png', 'exif-late.png', 6, late=True)
+# offset.gif: its global color table moved to the frame (a local one).
+b = bytearray(open('offset.gif', 'rb').read()); f = b[10]; n = 3 << ((f & 7) + 1)
+table = b[13:13 + n]; b[10] = f & 0x70; del b[13:13 + n]; i = 13
+while b[i] != 0x2C:  # past the extensions
+    j = i + 2
+    while b[j]: j += 1 + b[j]
+    i = j + 1
+b[i + 9] |= 0x80 | (f & 7); b[i + 10:i + 10] = table; open('offset.gif', 'wb').write(b)
+z = bytearray(open('zero-screen.gif', 'rb').read()); z[6:10] = bytes(4)
+open('zero-screen.gif', 'wb').write(z)
+a = bytearray(open('anim.webp', 'rb').read()); a[20] |= 0x10; open('anim.webp', 'wb').write(a)
+# exif-5.webp
+vp8 = open('lossy.webp', 'rb').read()[12:]; t = tiff(5)
+x = b'VP8X' + struct.pack('<I', 10) + bytes([8, 0, 0, 0]) + (5).to_bytes(3, 'little') + (3).to_bytes(3, 'little')
+body = b'WEBP' + x + vp8 + b'EXIF' + struct.pack('<I', len(t)) + t
+open('exif-5.webp', 'wb').write(b'RIFF' + struct.pack('<I', len(body)) + body)
+```
+
+The SVGs are written by hand, but for `badge.svgz` (`gzip -9 -n -c badge.svg`), `nested-logo.svg`
+and `raster-inside.svg`:
+
+```python
+import base64, struct, zlib
+b64 = lambda d: base64.b64encode(d).decode()
+open('nested-logo.svg', 'w').write('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="60" height="20"><rect width="60" height="20" fill="#555"/><image x="2" y="2" width="24" height="16" xlink:href="data:image/svg+xml;base64,' + b64(open('logo-viewbox.svg', 'rb').read()) + '"/></svg>\n')
+def chunk(t, d): return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
+cells = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255), (255, 255, 255, 255), (0, 0, 0, 255), (255, 255, 0, 255)]
+raw = b''.join(b'\0' + b''.join(bytes(cells[y // 8 * 3 + x // 8]) for x in range(24)) for y in range(16))
+p = b64(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 24, 16, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+j = b64(open('exif-6.jpg', 'rb').read())
+open('raster-inside.svg', 'w').write(f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="60" height="40">
+<defs><mask id="m"><rect x="30" y="20" width="30" height="10" fill="#fff"/></mask></defs>
+<image width="24" height="16" xlink:href="data:image/png;base64,{p}"/>
+<image x="30" width="24" height="16" opacity="0.5" xlink:href="data:image/png;base64,{p}"/>
+<image y="20" width="24" height="16" xlink:href="data:image/jpeg;base64,{j}"/>
+<g mask="url(#m)"><image width="24" height="16" transform="translate(54 20) rotate(90)" xlink:href="data:image/png;base64,{p}"/></g>
+<image x="26" y="0" width="4" height="4" xlink:href="data:text/plain;base64,{b64(b'not an image')}"/>
+</svg>
+''')
+open('huge-header.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 20000, 20000, 8, 6, 0, 0, 0)) + chunk(b'IEND', b''))
+```

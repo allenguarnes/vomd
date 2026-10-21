@@ -1,7 +1,7 @@
 use super::*;
 // Only the tests that need the embedded fonts use it.
 #[cfg(all(feature = "images", feature = "embed-fonts"))]
-use crate::layout::ImageSize;
+use crate::layout::{ImageSize, Refusal};
 use winit::keyboard::SmolStr;
 
 fn ch(s: &str) -> Key {
@@ -2169,7 +2169,7 @@ mod with_fonts {
     }
 
     /// Poll the image threads until `done` holds (fails after a while).
-    #[cfg(feature = "remote-images")]
+    #[cfg(feature = "images")]
     fn wait_images(v: &mut View, done: impl Fn(&View) -> bool) {
         let t = Instant::now();
         while !done(v) {
@@ -2213,6 +2213,147 @@ mod with_fonts {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(buf.iter().filter(|&&p| p == 0x119933).count(), 40 * 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image over VOMD's limits says why and "click to load" in its placeholder (not text of
+    /// the document: find doesn't find it), with the hand and a note under the pointer. A click
+    /// loads it, once however many clicks; a drag or a Shift+click doesn't. In a link, a click
+    /// follows the link and Ctrl+click loads it.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_click_loads_an_image_past_the_limits() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-force-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = |w: u32, h: u32| {
+            let mut out = Vec::new();
+            let mut enc = ::png::Encoder::new(&mut out, w, h);
+            enc.set_color(::png::ColorType::Grayscale);
+            enc.set_depth(::png::BitDepth::One);
+            let data = vec![0u8; w.div_ceil(8) as usize * h as usize];
+            enc.write_header().unwrap().write_image_data(&data).unwrap();
+            out
+        };
+        std::fs::write(dir.join("a.png"), big(9000, 8000)).unwrap();
+        std::fs::write(dir.join("b.png"), big(8000, 9000)).unwrap();
+        let mut v = view(
+            "![big a](a.png)\n\n[![big b](b.png)](https://e.x/)",
+            600,
+            400,
+        );
+        v.set_image_base(Some(dir.clone()));
+        let now = Instant::now();
+        frame(&mut v, now);
+        let refused = |w, h| Some(ImageSize::Refused(Refusal::Pixels(w, h)));
+        assert_eq!(v.layout().image_size(1), refused(9000, 8000));
+        assert_eq!(v.layout().image_size(2), refused(8000, 9000));
+        let at = |v: &View, id| {
+            (0..600)
+                .flat_map(|x| (0..200).map(move |y| (f64::from(x), f64::from(y))))
+                .find(|&(x, y)| v.image_at(x, y) == Some(id))
+                .expect("a placeholder on screen")
+        };
+        let (a, b) = (at(&v, 1), at(&v, 2));
+        // Under the pointer: the hand and the note; in a link, the link's.
+        v.hover(a.0, a.1);
+        assert_eq!(v.hover_note, Some(FORCE_NOTE));
+        assert!(v.over_force() && v.hovered().is_none());
+        v.hover(b.0, b.1);
+        assert!(!v.over_force() && v.hovered().is_some());
+        // Not the document's text.
+        #[cfg(feature = "find")]
+        {
+            v.set_find(true);
+            v.find_type("click to load");
+            assert_eq!(v.find_total(), 0);
+            v.set_find(false);
+        }
+        // A drag from it selects, and loads nothing; nor does a Shift+click.
+        v.press(a.0, a.1, now);
+        #[cfg(feature = "clipboard")]
+        {
+            v.select_to(a.0 + 200.0, a.1 + 60.0, now);
+            v.release_select();
+            assert_eq!(v.click(a.0 + 200.0, a.1 + 60.0), None);
+            assert_eq!(v.layout().image_size(1), refused(9000, 8000));
+            v.set_shift(true);
+            v.press(a.0, a.1, now + Duration::from_secs(1));
+            v.release_select();
+            assert_eq!(v.click(a.0, a.1), None);
+            assert_eq!(v.layout().image_size(1), refused(9000, 8000));
+            v.set_shift(false);
+        }
+        // In a link: a click follows it, Ctrl+click loads the image.
+        let later = now + Duration::from_secs(5);
+        v.press(b.0, b.1, later);
+        assert_eq!(v.click(b.0, b.1).as_deref(), Some("https://e.x/"));
+        assert_eq!(v.layout().image_size(2), refused(8000, 9000));
+        v.set_ctrl(true);
+        v.press(b.0, b.1, later + Duration::from_secs(1));
+        assert_eq!(v.click(b.0, b.1), None, "not followed");
+        v.set_ctrl(false);
+        assert_eq!(
+            v.layout().image_size(2),
+            Some(ImageSize::Pixels(8000, 9000))
+        );
+        // A double click loads it once.
+        let t = later + Duration::from_secs(5);
+        v.press(a.0, a.1, t);
+        assert_eq!(v.click(a.0, a.1), None);
+        v.ensure();
+        v.press(a.0, a.1, t + Duration::from_millis(50));
+        assert_eq!(v.click(a.0, a.1), None);
+        assert_eq!(
+            v.layout().image_size(1),
+            Some(ImageSize::Pixels(9000, 8000))
+        );
+        wait_images(&mut v, |v| {
+            v.images.forced_loads() >= 2 && !v.images.forcing()
+        });
+        assert_eq!(v.images.forced_loads(), 2, "one load each");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shift+click is the selection's whether or not there is one: with none yet, on a fresh
+    /// view, it loads no image either.
+    #[cfg(all(feature = "images", feature = "clipboard"))]
+    #[test]
+    fn shift_click_without_a_selection_loads_no_image() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-shift-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = Vec::new();
+        let mut enc = ::png::Encoder::new(&mut png, 9000, 8000);
+        enc.set_color(::png::ColorType::Grayscale);
+        enc.set_depth(::png::BitDepth::One);
+        let data = vec![0u8; 9000usize.div_ceil(8) * 8000];
+        enc.write_header().unwrap().write_image_data(&data).unwrap();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        let mut v = view("![big](a.png)", 600, 400);
+        v.set_image_base(Some(dir.clone()));
+        let now = Instant::now();
+        frame(&mut v, now);
+        let refused = Some(ImageSize::Refused(Refusal::Pixels(9000, 8000)));
+        assert_eq!(v.layout().image_size(1), refused);
+        let (x, y) = (0..600)
+            .flat_map(|x| (0..200).map(move |y| (f64::from(x), f64::from(y))))
+            .find(|&(x, y)| v.image_at(x, y) == Some(1))
+            .expect("a placeholder on screen");
+        v.set_shift(true);
+        v.press(x, y, now);
+        v.release_select();
+        assert_eq!(v.click(x, y), None);
+        assert_eq!(v.layout().image_size(1), refused);
+        v.set_shift(false);
+        // Without Shift the same click loads it.
+        v.press(x, y, now + Duration::from_secs(5));
+        assert_eq!(v.click(x, y), None);
+        assert_eq!(
+            v.layout().image_size(1),
+            Some(ImageSize::Pixels(9000, 8000))
+        );
+        wait_images(&mut v, |v| {
+            v.images.forced_loads() >= 1 && !v.images.forcing()
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2524,7 +2665,7 @@ mod with_fonts {
                 .find(|&(x, y)| v.image_at(x, y) == Some(1))
                 .expect("a placeholder on screen");
             assert!(v.hover(hit.0, hit.1));
-            assert!(v.hover_blocked);
+            assert_eq!(v.hover_note, Some(BLOCKED_NOTE));
             assert_eq!(v.hovered(), None, "not a link: no hand cursor");
             // `I`: they load (a box while fetching), and fail here, back to alt text.
             assert_eq!(v.apply(Action::ToggleRemote, now), Outcome::Redraw);
@@ -2543,7 +2684,7 @@ mod with_fonts {
                     && v.layout().image_size(2) == Some(ImageSize::Alt)
             });
             v.hover(hit.0, hit.1);
-            assert!(!v.hover_blocked, "on: not blocked");
+            assert_eq!(v.hover_note, None, "on: not blocked");
             // A reload keeps them on; another document turns them off.
             v.replace(Doc::parse(DOC), None);
             assert!(v.remote_on());
@@ -3157,10 +3298,10 @@ mod with_fonts {
                     .expect("a placeholder on screen");
                 assert!(hit.0 > 260.0, "the placeholder is on the page: {hit:?}");
                 assert!(v.hover_at(hit.0, hit.1, now));
-                assert!(v.hover_blocked);
+                assert_eq!(v.hover_note, Some(BLOCKED_NOTE));
                 // Under the panel the document is out of reach, hit or not.
                 assert!(v.hover_at(hit.0 - 260.0, hit.1, now));
-                assert!(!v.hover_blocked);
+                assert_eq!(v.hover_note, None);
             }
         }
     }

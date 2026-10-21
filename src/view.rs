@@ -19,7 +19,7 @@ use crate::cli::Input;
 use crate::doc::{Doc, Heading};
 use crate::fonts::Fonts;
 use crate::image::{Images, Wake as ImageWake};
-use crate::layout::{Anchor, BlockBox, Layout, Params};
+use crate::layout::{Anchor, BlockBox, ImageSize, Layout, Params};
 use crate::platform;
 use crate::render::{self, Clip, Frame, ScrollbarFade, Viewport};
 use crate::settings::RemoteImages;
@@ -65,6 +65,10 @@ const NOTICE: Duration = Duration::from_secs(6);
 pub const LARGE_FILE: usize = 10 << 20;
 /// What hovering a blocked remote image's placeholder says.
 pub const BLOCKED_NOTE: &str = "Remote image blocked · press I to load";
+/// What hovering the placeholder of an image over VOMD's limits says (a click loads it).
+pub const FORCE_NOTE: &str = "Over VOMD's image limits · click to load anyway";
+/// What hovering an SVG drawn without some of its embedded images says (a click draws them).
+pub const PARTIAL_NOTE: &str = "Some embedded images were skipped · click to load anyway";
 /// Passes [`View::bottom`] makes: measuring the last screen changes the total height.
 const BOTTOM_PASSES: usize = 4;
 
@@ -482,10 +486,19 @@ pub struct View {
     zoom_pixels: f64,
     /// The link under the pointer (1-based id into `Doc::links`): pointer cursor and URL preview.
     hover: Option<u32>,
-    /// The pointer is on a blocked remote image's placeholder (its note shows).
-    hover_blocked: bool,
+    /// What the image under the pointer says at the bottom: a blocked remote image's
+    /// placeholder ([`BLOCKED_NOTE`]), one a click loads past the limits ([`FORCE_NOTE`],
+    /// [`PARTIAL_NOTE`]).
+    hover_note: Option<&'static str>,
+    /// The pointer is on an image a click loads past the limits (outside a link): the hand.
+    hover_force: bool,
     /// The link the mouse button went down on; a click is a release on the same link.
     pressed: Option<u32>,
+    /// The image a click loads past the limits that the mouse button went down on (with Ctrl in a
+    /// link); a click is a release on it.
+    pressed_image: Option<u32>,
+    /// Ctrl is held down (a click on an image in a link loads it, and doesn't follow the link).
+    ctrl: bool,
     /// While a message replaces a reloaded document: the reading position of the last good
     /// one, for the next successful reload (a file that is briefly missing, as editors and
     /// branch switches make it, doesn't cost the position).
@@ -579,8 +592,11 @@ impl View {
             msg_missing: BTreeSet::new(),
             zoom_pixels: 0.0,
             hover: None,
-            hover_blocked: false,
+            hover_note: None,
+            hover_force: false,
             pressed: None,
+            pressed_image: None,
+            ctrl: false,
             kept: None,
             images: Images::default(),
             images_dirty: false,
@@ -599,6 +615,8 @@ impl View {
             find: find::Bar::default(),
         };
         view.images.set_base(base);
+        #[cfg(feature = "svg")]
+        view.images.set_svg_fonts(view.fonts.svg_sources());
         view.attach_images();
         view
     }
@@ -693,6 +711,8 @@ impl View {
     /// loaded (the defaults are used).
     pub fn set_family(&mut self, mono: bool, faces: Option<&[Option<(PathBuf, u32)>; 4]>) -> bool {
         let ok = self.fonts.set_family(mono, faces);
+        #[cfg(feature = "svg")]
+        self.images.set_svg_fonts(self.fonts.svg_sources());
         #[cfg(feature = "toc")]
         self.toc.forget_rows();
         self.layout.invalidate_all();
@@ -1085,6 +1105,7 @@ impl View {
     /// Returns true if the window needs a repaint: the toolbar or the scrollbar took the press, the
     /// selection changed, or the find bar's field lost the keyboard.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        self.pressed_image = None;
         #[cfg(feature = "clipboard")]
         self.cancel_copy();
         let ctx = self.toolbar_ctx();
@@ -1132,6 +1153,16 @@ impl View {
         #[cfg(not(feature = "find"))]
         let blurred = false;
         self.pressed = if taken { None } else { self.link_at(x, y) };
+        // An image a click loads past the limits: outside a link, or with Ctrl in one (whose
+        // link isn't followed then).
+        if !taken && let Some(id) = self.forceable_at(x, y) {
+            if self.pressed.is_none() {
+                self.pressed_image = Some(id);
+            } else if self.ctrl {
+                self.pressed = None;
+                self.pressed_image = Some(id);
+            }
+        }
         // Not the scrollbar's either: a press on text, which may start a selection.
         #[cfg(feature = "clipboard")]
         if taken {
@@ -1320,7 +1351,20 @@ impl View {
             && self
                 .image_at(x, y)
                 .is_some_and(|id| self.images.blocked(id));
-        let note = std::mem::replace(&mut self.hover_blocked, blocked) != blocked;
+        let force = if free { self.forceable_at(x, y) } else { None };
+        let hover_note = if blocked {
+            Some(BLOCKED_NOTE)
+        } else if let Some(id) = force {
+            Some(if self.images.partial(id) {
+                PARTIAL_NOTE
+            } else {
+                FORCE_NOTE
+            })
+        } else {
+            None
+        };
+        self.hover_force = force.is_some() && link.is_none();
+        let note = std::mem::replace(&mut self.hover_note, hover_note) != hover_note;
         #[cfg(feature = "clipboard")]
         let note = note | self.copy_pointer(Some((x, y)));
         (std::mem::replace(&mut self.hover, link) != link) | bar | note
@@ -1329,7 +1373,8 @@ impl View {
     /// The pointer left the window. Returns true if a link was hovered (or the toolbar needs a
     /// repaint).
     pub fn hover_end(&mut self) -> bool {
-        let note = std::mem::take(&mut self.hover_blocked);
+        let note = std::mem::take(&mut self.hover_note).is_some();
+        self.hover_force = false;
         let bar = self.set_over_bar(false, Instant::now());
         #[cfg(feature = "find")]
         let bar = bar | self.find_pointer(None, Instant::now());
@@ -1366,6 +1411,13 @@ impl View {
         #[cfg(feature = "toc")]
         if let Some(row) = self.toc.pressed.take() {
             self.click_toc(row, x, y);
+            return None;
+        }
+        if let Some(id) = self.pressed_image.take() {
+            self.ensure_content();
+            if self.forceable_at(x, y) == Some(id) {
+                self.images.force(id, &self.doc, &mut self.layout);
+            }
             return None;
         }
         let pressed = self.pressed.take()?;
@@ -1503,9 +1555,7 @@ impl View {
                 let total = self.layout.total_height();
                 render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
             }
-            let note = self
-                .hovered()
-                .or(self.hover_blocked.then_some(BLOCKED_NOTE));
+            let note = self.hovered().or(self.hover_note);
             if let Some(text) = note.map(str::to_owned) {
                 self.paint_preview(&mut frame, &text, theme);
             }
@@ -1786,6 +1836,7 @@ impl View {
             scroll,
             checked,
             tip,
+            self.images.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1817,7 +1868,14 @@ impl View {
         let scrolled = false;
         #[cfg(feature = "find")]
         let scrolled = scrolled | self.find_expire(now);
-        fade | pulse | toast | notice | scrolled | self.toolbar.expire(&self.toolbar_ctx(), now)
+        // An SVG that took too long shows its alt text.
+        let images = self.images.expire(now) && self.poll_images(now);
+        fade | pulse
+            | toast
+            | notice
+            | scrolled
+            | images
+            | self.toolbar.expire(&self.toolbar_ctx(), now)
     }
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its
@@ -1872,6 +1930,8 @@ impl View {
             added |= self.fonts.add_fallback(&f.path, f.index).is_some();
         }
         if added {
+            #[cfg(feature = "svg")]
+            self.images.set_svg_fonts(self.fonts.svg_sources());
             #[cfg(feature = "toc")]
             self.toc.forget_rows();
             self.layout.invalidate_missing(&self.doc);
@@ -2039,6 +2099,27 @@ impl View {
             .map(|s| s.image)
     }
 
+    /// The image at (`x`, `y`) that a click loads past VOMD's limits: a placeholder that says
+    /// so, or an SVG drawn without some of its embedded images.
+    fn forceable_at(&self, x: f64, y: f64) -> Option<u32> {
+        let id = self.image_at(x, y)?;
+        let refused = matches!(
+            self.layout.image_size(id),
+            Some(ImageSize::Refused(why)) if why.forceable()
+        );
+        (refused || self.images.partial(id)).then_some(id)
+    }
+
+    /// The pointer is on an image a click loads past VOMD's limits, outside a link: the hand.
+    pub fn over_force(&self) -> bool {
+        self.hover_force
+    }
+
+    /// Ctrl is held down: a click on an image in a link that says "Ctrl+click to load" loads it.
+    pub fn set_ctrl(&mut self, ctrl: bool) {
+        self.ctrl = ctrl;
+    }
+
     // ---- Documents ------------------------------------------------------------------------
 
     /// Show a different document (or a message), from the top.
@@ -2070,8 +2151,10 @@ impl View {
         }
         self.kept = None;
         self.hover = None;
-        self.hover_blocked = false;
+        self.hover_note = None;
+        self.hover_force = false;
         self.pressed = None;
+        self.pressed_image = None;
         // Remote images are off again for another document.
         self.images.forget_remote();
         self.attach_images();
@@ -2104,8 +2187,10 @@ impl View {
             .unwrap_or_else(|| (self.place(), self.anchor));
         // Link ids belong to the old document, and so do the offsets of a selection.
         self.hover = None;
-        self.hover_blocked = false;
+        self.hover_note = None;
+        self.hover_force = false;
         self.pressed = None;
+        self.pressed_image = None;
         #[cfg(feature = "clipboard")]
         {
             self.clear_selection();

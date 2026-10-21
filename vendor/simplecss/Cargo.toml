@@ -1,0 +1,20 @@
+# simplecss 0.2.2 from crates.io, with VOMD's patch: see VOMD-PATCH.md. The library's sources and
+# licenses only: no examples, tests or dev-dependencies.
+[package]
+name = "simplecss"
+version = "0.2.2"
+edition = "2021"
+rust-version = "1.65"
+license = "Apache-2.0 OR MIT"
+description = "A simple CSS 2 parser and selector."
+repository = "https://github.com/linebender/simplecss"
+keywords = ["css", "parser", "selector"]
+categories = ["parser-implementations"]
+
+[dependencies.log]
+version = "0.4.22"
+default-features = false
+
+[features]
+default = ["std"]
+std = ["log/std"]

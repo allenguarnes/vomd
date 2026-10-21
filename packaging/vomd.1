@@ -30,6 +30,13 @@ Each window is its own process.
 The document is reloaded when it changes on disk and the window gets focus, keeping the
 reading position.
 Remote images are not loaded until asked for (\fBI\fR).
+.PP
+Images may be PNG, JPEG, GIF, WebP or SVG (svgz too); an animation shows its first frame.
+An image too large or complex for the viewer's limits shows its alt text with
+.IR "click to load" :
+a click loads it anyway (\fBCtrl\fR+click when the image is a link).
+An SVG that takes more than 3 seconds to draw is given up, but one loaded by a click runs until
+it is done or has used 120 seconds of CPU.
 .SH OPTIONS
 .TP
 .B \-\-no\-settings
@@ -118,6 +125,9 @@ Dragging past the top or bottom of the window scrolls.
 .RB "Double-click, triple-click, " Shift "+click"
 Select a word, a block (a paragraph, heading, code block or table row), or extend the selection.
 .TP
+Click an image placeholder marked \fIclick to load\fR
+Load it beyond the limits; \fBCtrl\fR+click when it is a link.
+.TP
 Click the copy button of a code block
 Copy the block's code to the clipboard, as written (no language tag, no quote marks or list
 indent, no line break after the last line).
@@ -170,6 +180,12 @@ only after
 .B I
 is pressed for a document, or for every document with
 .BR "remote_images = always" .
+An SVG never loads anything: references to other files or URLs inside it are ignored, even
+when you click to load it.
+Each SVG is drawn in a separate, short-lived
+.B vomd
+process, which reads only the SVG and the viewer's fonts, so a slow or broken one can be
+stopped: after 3 seconds, or after 120 seconds of CPU when it was loaded by a click.
 .SH SEE ALSO
 .UR https://github.com/allenguarnes/vomd
 .UE

@@ -1917,7 +1917,7 @@ fn image_boxes_stay_within_what_can_be_decoded() {
                 em: 16.0 * scale,
                 max_w: 900.0 * scale,
             };
-            let (bw, bh) = boxes.size(1).unwrap();
+            let (bw, bh) = boxes.size(1, AUTO).unwrap();
             let what = format!("{w}×{h} at {scale}: {bw}×{bh}");
             assert!(bw >= 1.0 && bh >= 1.0, "{what}");
             assert!(bw <= side && bh <= side, "{what}");
@@ -1933,7 +1933,142 @@ fn image_boxes_stay_within_what_can_be_decoded() {
         em: 16.0,
         max_w: 900.0,
     };
-    assert_eq!(b.size(1), Some((1.0, side)));
+    assert_eq!(b.size(1, AUTO), Some((1.0, side)));
+}
+
+/// An image's box as no `<img>` size says.
+const AUTO: [Want; 2] = [Want::Auto; 2];
+
+/// An `<img>`'s `width` and `height` set its box in logical pixels (or a percentage of the
+/// line): one side keeps the image's aspect, both are kept as given, and the box is still no
+/// wider than the line; while it loads, both sides give the box it will have.
+#[test]
+fn img_sizes_set_the_box() {
+    let px = |v: f32| Want::Px((v * 100.0) as u32);
+    let pct = |v: f32| Want::Pct((v * 100.0) as u32);
+    for scale in [1.0, 2.0] {
+        let sizes = [
+            Some(ImageSize::Pixels(200, 100)),
+            Some(ImageSize::Loading),
+            Some(ImageSize::Alt),
+        ];
+        let b = Boxes {
+            sizes: &sizes,
+            scale,
+            em: 16.0 * scale,
+            max_w: 700.0 * scale,
+        };
+        let s = |w| w * scale;
+        let size = |id, want| b.size(id, want).unwrap();
+        assert_eq!(size(1, AUTO), (s(200.0), s(100.0)));
+        assert_eq!(size(1, [px(128.0), Want::Auto]), (s(128.0), s(64.0)));
+        assert_eq!(size(1, [Want::Auto, px(40.0)]), (s(80.0), s(40.0)));
+        assert_eq!(
+            size(1, [px(64.0), px(64.0)]),
+            (s(64.0), s(64.0)),
+            "stretched"
+        );
+        assert_eq!(size(1, [pct(50.0), Want::Auto]), (s(350.0), s(175.0)));
+        // Wider than the line: fitted to it, the aspect asked for kept.
+        assert_eq!(size(1, [px(4000.0), Want::Auto]), (s(700.0), s(350.0)));
+        assert_eq!(size(1, [px(1400.0), px(100.0)]), (s(700.0), s(50.0)));
+        // Loading: both sides are the final box, a width alone is 4:3, a height alone as without.
+        assert_eq!(size(2, [px(60.0), px(20.0)]), (s(60.0), s(20.0)));
+        assert_eq!(size(2, [px(160.0), Want::Auto]), (s(160.0), s(120.0)));
+        assert_eq!(size(2, [Want::Auto, px(20.0)]), size(2, AUTO));
+        // Alt text has no box, whatever is asked.
+        assert_eq!(b.size(3, [px(64.0), px(64.0)]), None);
+    }
+}
+
+/// `<img width>` in a document: Markdown images keep their size, and a percentage is of a
+/// table cell inside a table.
+#[test]
+fn img_widths_in_a_document() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(
+        "<img src=\"a.png\" width=\"50\">\n\n![a](a.png)\n\n\
+         | A | B |\n|---|---|\n| <img src=\"wide.png\" width=\"50%\"> | text |\n",
+    );
+    let mut l = Layout::new(&doc, params(600.0, 1.0));
+    l.set_image_probe(&doc, Some(test_probe()));
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    let b = boxes(&l, 0)[0].b;
+    assert_eq!((b.width, b.ascent), (50.0, 25.0));
+    let b = boxes(&l, 1)[0].b;
+    assert_eq!((b.width, b.ascent), (100.0, 50.0));
+    let row = (2..doc.blocks.len())
+        .find(|&i| !boxes(&l, i).is_empty())
+        .unwrap();
+    let b = boxes(&l, row)[0].b;
+    let (_, col_w) = l.column();
+    assert!(b.width < col_w / 2.0, "{} of {col_w}", b.width);
+}
+
+/// A refused image's placeholder says why after its alt text, inside its outline, muted, at the
+/// alt text's size (so it scales with zoom): "Ctrl+click" in a link.
+#[test]
+fn a_refused_image_says_why() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse("![alt](big.png)\n\n![alt](none.png)\n\n[![alt](big.png)](https://e.x/)");
+    let outline = |l: &Layout, b: usize| {
+        let c = l.geoms()[b].content.as_ref().unwrap();
+        let w = c
+            .rects
+            .iter()
+            .filter(|r| r.role == Role::Border)
+            .map(|r| r.x + r.w)
+            .fold(0.0, f32::max);
+        let muted = c
+            .glyphs
+            .iter()
+            .filter(|g| c.styles[g.style as usize].role == Role::Muted);
+        (w, muted.count())
+    };
+    for scale in [1.0, 2.0] {
+        let mut l = Layout::new(&doc, params(900.0, scale));
+        let probe: ImageProbe = Box::new(|img: &ImageRef| match &*img.src {
+            "big.png" => ImageSize::Refused(Refusal::Pixels(9000, 8000)),
+            _ => ImageSize::Alt,
+        });
+        l.set_image_probe(&doc, Some(probe));
+        l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+        let (refused, why) = outline(&l, 0);
+        let (alt, none) = outline(&l, 1);
+        let (linked, ctrl) = outline(&l, 2);
+        assert!(refused > alt * 4.0, "{refused} vs {alt}");
+        assert!(
+            why > none + 20,
+            "{why} {none}: the alt text's own, and the suffix"
+        );
+        assert!(ctrl > why && linked > refused, "Ctrl+click");
+    }
+    assert_eq!(
+        Refusal::Pixels(9000, 8000).suffix(false),
+        " · too large (9000×8000) · click to load"
+    );
+    assert_eq!(
+        Refusal::Memory(88 << 20).suffix(true),
+        " · too large (needs 88 MB) · Ctrl+click to load"
+    );
+    assert_eq!(
+        Refusal::Bytes(5 << 20).suffix(false),
+        " · too large (5.0 MB) · click to load"
+    );
+    assert_eq!(
+        Refusal::Complex.suffix(false),
+        " · too complex · click to load"
+    );
+    assert_eq!(
+        Refusal::Slow.suffix(false),
+        " · too slow to draw · click to load"
+    );
+    assert_eq!(
+        Refusal::Ceiling(3277 << 20).suffix(false),
+        " · too large to load (needs 3.2 GB)"
+    );
+    assert_eq!(Refusal::Failed.suffix(true), " · couldn't load");
+    assert!(!Refusal::Failed.forceable() && !Refusal::Ceiling(1).forceable());
 }
 
 /// A long alt text is cut into chunk blocks; the image is one box, in the chunk its text starts

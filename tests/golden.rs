@@ -163,6 +163,12 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// `formats.md` with its images decoded by the viewer's own code: SVG drawn at the box (sharp
+/// at 2×), the other formats, EXIF orientation, `<img width>`, and a placeholder over the
+/// limits.
+#[cfg(feature = "svg")]
+const FORMAT_CASES: &[(&str, f32)] = &[("formats", 1.0), ("formats-2x", 2.0)];
+
 /// What the pointer is doing at a code block's copy button.
 #[cfg(feature = "clipboard")]
 #[derive(Clone, Copy)]
@@ -375,6 +381,98 @@ fn render_case(case: &Case, fonts: &Fonts) -> Rendered {
         assert!(total > h as f32, "{}: the window must scroll", case.name);
         render::paint_scrollbar(&mut frame, vp, total, case.scale, case.theme);
     }
+    (w, h, px)
+}
+
+/// A [`FORMAT_CASES`] case painted: the whole of `formats.md` at `scale`, 760 logical pixels
+/// wide, its images decoded (and waited for) as the viewer decodes them.
+#[cfg(feature = "svg")]
+fn render_formats(scale: f32, fonts: &Fonts) -> Rendered {
+    use vomd::image::Images;
+    /// The boxes painting asks for.
+    struct Boxes(Vec<(u32, u32, u32)>);
+    impl Pixels for Boxes {
+        fn pixels(&mut self, id: u32, w: u32, h: u32) -> Option<&Bitmap> {
+            self.0.push((id, w, h));
+            None
+        }
+    }
+    let src = std::fs::read_to_string(root().join("fixtures/formats.md")).unwrap();
+    let doc = Doc::parse(&src);
+    let width = (760.0 * scale).round();
+    let mut layout = Layout::new(
+        &doc,
+        Params {
+            width,
+            scale,
+            ..Params::default()
+        },
+    );
+    let mut images = Images::default();
+    images.set_svg_fonts(fonts.svg_sources());
+    images.set_base(Some(root().join("fixtures")));
+    images.attach(&doc, &mut layout);
+    while !layout.idle(&doc, fonts, Instant::now() + Duration::from_secs(1)) {}
+    let h = (layout.total_height().ceil() as usize).clamp(1, MAX_H);
+    layout.ensure(&doc, fonts, Anchor::TOP, h as f32);
+    let w = width as usize;
+    let vp = Viewport {
+        area: Clip {
+            x0: 0,
+            y0: 0,
+            x1: w as i32,
+            y1: h as i32,
+        },
+        scroll: 0.0,
+    };
+    let mut px = vec![0; w * h];
+    let mut frame = Frame::new(&mut px, w, h, w);
+    let mut boxes = Boxes(Vec::new());
+    render::paint_images(
+        &mut frame,
+        vp,
+        &layout,
+        &mut boxes,
+        &LIGHT,
+        #[cfg(feature = "clipboard")]
+        None,
+    );
+    let t = Instant::now();
+    while !boxes
+        .0
+        .iter()
+        .all(|&(id, w, h)| images.pixels(id, w, h).is_some())
+    {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "formats: never decoded"
+        );
+        images.begin_frame();
+        images.request(&boxes.0, boxes.0.len());
+        std::thread::sleep(Duration::from_millis(5));
+        images.poll(&doc, &mut layout);
+    }
+    render::paint(
+        &mut frame,
+        vp,
+        &layout,
+        fonts,
+        &mut GlyphCache::default(),
+        &LIGHT,
+        #[cfg(feature = "clipboard")]
+        None,
+        #[cfg(feature = "find")]
+        None,
+    );
+    render::paint_images(
+        &mut frame,
+        vp,
+        &layout,
+        &mut images,
+        &LIGHT,
+        #[cfg(feature = "clipboard")]
+        None,
+    );
     (w, h, px)
 }
 
@@ -596,6 +694,12 @@ fn goldens() {
     );
     #[cfg(feature = "find")]
     let cases = cases.chain(FIND_CASES.iter().map(|case| (case.name, render_find(case))));
+    #[cfg(feature = "svg")]
+    let cases = cases.chain(
+        FORMAT_CASES
+            .iter()
+            .map(|&(name, scale)| (name, render_formats(scale, &fonts))),
+    );
     for (name, (w, h, px)) in cases {
         let rgb = to_rgb(&px);
         let golden: PathBuf = root().join("tests/golden").join(format!("{name}.png"));
