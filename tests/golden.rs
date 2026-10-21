@@ -20,6 +20,8 @@ use vomd::text::cache::GlyphCache;
 use vomd::theme::{DARK, LIGHT, Theme};
 #[cfg(any(feature = "clipboard", feature = "find"))]
 use vomd::view::{ThemeMode, View};
+#[cfg(feature = "find")]
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Tallest golden image; documents are cut off below this.
 const MAX_H: usize = 4000;
@@ -232,7 +234,8 @@ const BUTTON_CASES: &[ButtonCase] = &[
     },
 ];
 
-/// The find bar open on `selection.md`, with its toolbar: the second match of `query` current.
+/// The find bar open on `selection.md`, with its toolbar: the second match of `query` current,
+/// and the last `select` characters of the query selected in the field.
 #[cfg(feature = "find")]
 struct FindCase {
     name: &'static str,
@@ -241,6 +244,7 @@ struct FindCase {
     scale: f32,
     dark: bool,
     query: &'static str,
+    select: usize,
 }
 
 #[cfg(feature = "find")]
@@ -251,6 +255,7 @@ const FIND_CASES: &[FindCase] = &[
         scale: 1.0,
         dark: false,
         query: "in",
+        select: 0,
     },
     FindCase {
         name: "find-dark",
@@ -258,6 +263,7 @@ const FIND_CASES: &[FindCase] = &[
         scale: 1.0,
         dark: true,
         query: "in",
+        select: 0,
     },
     // HiDPI 2×: the bar, its field and the washes scale with the window.
     FindCase {
@@ -266,6 +272,16 @@ const FIND_CASES: &[FindCase] = &[
         scale: 2.0,
         dark: false,
         query: "line",
+        select: 0,
+    },
+    // What is selected in the field is washed, with the caret at its start.
+    FindCase {
+        name: "find-field",
+        width: 640.0,
+        scale: 1.0,
+        dark: false,
+        query: "line",
+        select: 2,
     },
 ];
 
@@ -457,6 +473,11 @@ fn render_find(case: &FindCase) -> Rendered {
         "{}: the query has matches to step through",
         case.name
     );
+    for _ in 0..case.select {
+        let shift = ModifiersState::SHIFT;
+        view.find_key(&Key::Named(NamedKey::ArrowLeft), None, shift, now);
+    }
+    assert_eq!(view.find_selected().chars().count(), case.select);
     while !view.idle(Instant::now() + Duration::from_secs(1)) {}
     view.ensure();
     let h = (view.layout().total_height().ceil() as u32 + view.top_inset()).clamp(1, MAX_H as u32);

@@ -834,7 +834,8 @@ macro_rules! template {
 # wide = false
 
 # Selecting text with the mouse (or Ctrl+A) offers it as the primary selection, which a middle
-# click pastes elsewhere: on or off. Ctrl+C copies to the clipboard either way.
+# click pastes elsewhere: on or off. Ctrl+C copies to the clipboard either way, and a middle click
+# on the find bar's field pastes what other programs offer either way.
 # primary_selection = ",
             $primary,
             "

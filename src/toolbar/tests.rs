@@ -175,7 +175,7 @@ fn clicks_map_to_the_shortcuts_actions() {
         (Item::Theme, Command::Action(Action::CycleTheme)),
         (Item::Reload, Command::Action(Action::Reload)),
         #[cfg(feature = "find")]
-        (Item::Find, Command::Action(Action::ToggleFind)),
+        (Item::Find, Command::Action(Action::Find)),
         (Item::Settings, Command::Settings),
     ] {
         let (x, y) = center(&s, item);
@@ -718,7 +718,7 @@ fn the_find_button_shows_whether_the_bar_is_open() {
     assert_eq!(Item::Find.label(&c), "Find (Ctrl+F)");
     assert_eq!(
         Item::Find.label(&Ctx { find: true, ..c }),
-        "Close find (Esc)"
+        "Close find (Ctrl+F)"
     );
     let s = slots(&c);
     let r = |i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;

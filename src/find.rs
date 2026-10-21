@@ -17,6 +17,30 @@ use crate::doc::{BlockKind, Doc, Span};
 
 /// The most characters a query holds.
 pub const MAX_QUERY: usize = 256;
+
+/// A character the text layout ends a line at: CR, LF, NEL, VT, FF and the line and paragraph
+/// separators. The query is one line, so none of them may get into it.
+pub fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\r' | '\n' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// What of a typed or committed text goes into the query: no line break and no other control
+/// character.
+pub fn typed_query(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !c.is_control() && !is_line_break(c))
+        .collect()
+}
+
+/// What of a pasted text goes into the query: its first line, tabs as spaces, with no other
+/// control character.
+pub fn pasted_query(text: &str) -> String {
+    let line = text.split(is_line_break).next().unwrap_or_default();
+    typed_query(&line.replace('\t', " "))
+}
 /// The most matches kept, in a window around the point searched for: half of them behind it,
 /// unless there are fewer than that ahead of it, or the other way round.
 pub const WINDOW: usize = 10_000;

@@ -6,15 +6,12 @@
 use std::time::{Duration, Instant};
 
 use super::View;
+use super::clicks::Clicks;
 use crate::copy::Content;
 use crate::select::{Pos, Selection};
 
 /// How far a press may move, in logical pixels (not scaled by zoom), and still be a click.
 const DRAG_THRESHOLD: f64 = 4.0;
-/// Presses within this time, and the drag threshold of one another, are a double or triple
-/// click. winit gives no click count, and neither X11 nor Wayland tells a client the desktop's
-/// interval; this is the Windows default, at or above the GTK and KDE ones.
-const MULTI_CLICK: Duration = Duration::from_millis(500);
 /// A pointer this near the edge of the document area, inside it, also scrolls (a maximized
 /// window's edges are the screen's, so the pointer can't go past them), in logical pixels.
 const EDGE_BAND: f64 = 2.0;
@@ -35,10 +32,9 @@ pub(super) struct Select {
     /// click, or by select all.
     sel: Option<Selection>,
     press: Option<Press>,
-    /// The press that started the last gesture, for counting clicks.
-    last: Option<Click>,
+    last: Clicks,
     /// Shift is held: a click extends the selection.
-    shift: bool,
+    pub(super) shift: bool,
 }
 
 /// A mouse button held down on the document.
@@ -57,40 +53,12 @@ struct Press {
     scroll: Option<Instant>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Click {
-    at: (f64, f64),
-    when: Instant,
-    count: u8,
-}
-
 impl Select {
     /// A press that starts nothing (the toolbar's, the scrollbar's): the gesture ends, and it
     /// isn't part of a double click.
     fn cancel(&mut self) {
         self.press = None;
-        self.last = None;
-    }
-
-    /// The count of this press: 1, 2 or 3 for a click, double click or triple click; a fourth
-    /// begins again.
-    fn count(&mut self, now: Instant, at: (f64, f64), slop: f64) -> u8 {
-        let n = match self.last {
-            Some(c)
-                if now.saturating_duration_since(c.when) <= MULTI_CLICK
-                    && (at.0 - c.at.0).hypot(at.1 - c.at.1) <= slop
-                    && c.count < 3 =>
-            {
-                c.count + 1
-            }
-            _ => 1,
-        };
-        self.last = Some(Click {
-            at,
-            when: now,
-            count: n,
-        });
-        n
+        self.last.reset();
     }
 }
 
@@ -110,11 +78,6 @@ impl View {
     /// A drag is making a selection.
     pub fn selecting(&self) -> bool {
         self.select.press.as_ref().is_some_and(|p| p.dragging)
-    }
-
-    /// Shift is held down (a click then extends the selection).
-    pub fn set_shift(&mut self, shift: bool) {
-        self.select.shift = shift;
     }
 
     /// Forget a press that something else took (the toolbar's, the scrollbar's).
@@ -149,9 +112,9 @@ impl View {
         Some(Pos::new(hit.block, hit.doc))
     }
 
-    /// Whether the pointer is over text, which shows the text cursor: not over the toolbar or
-    /// the scrollbar, and not over a link, whose cursor is the hand.
-    pub fn text_cursor(&self, x: f64, y: f64) -> bool {
+    /// The pointer is over the document's text, which shows the text cursor: not over the toolbar
+    /// or the scrollbar, and not over a link, whose cursor is the hand.
+    pub(super) fn over_text(&self, x: f64, y: f64) -> bool {
         if self.selecting() {
             return true;
         }
@@ -170,10 +133,10 @@ impl View {
     pub(super) fn press_text(&mut self, x: f64, y: f64, now: Instant) -> bool {
         self.select.press = None;
         if self.message.is_some() || self.doc.blocks.is_empty() || !self.in_area(x, y) {
-            self.select.last = None;
+            self.select.last.reset();
             return false;
         }
-        let count = self.select.count(now, (x, y), self.slop());
+        let count = self.select.last.count(now, (x, y), self.slop());
         let at = self.caret_at(x, y);
         let had = self.select.sel.is_some();
         let mut press = Press {

@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::doc::Doc;
+use crate::find::{self, MAX_QUERY};
 use crate::fonts::Fonts;
 use crate::theme::LIGHT;
 use crate::view::{Action, key_action};
@@ -83,27 +84,51 @@ fn open(v: &mut View) {
     v.apply(Action::Find, Instant::now());
 }
 
+const CTRL_F: &str = "\u{6}";
+
 #[test]
-fn ctrl_f_opens_and_focuses_the_bar() {
+fn ctrl_f_opens_and_closes_the_bar() {
     assert_eq!(key_action(&ch("f"), CTRL), Some(Action::Find));
     assert_eq!(key_action(&ch("F"), CTRL | SHIFT), Some(Action::Find));
     assert_eq!(key_action(&ch("f"), NONE), None);
     let mut v = view("# Title\n\nSome text.\n", 800, 600);
     assert!(!v.find_open());
     assert_eq!(v.top_inset(), 0);
-    assert_eq!(press(&mut v, ch("f"), Some("\u{6}"), CTRL), Outcome::Redraw);
-    assert!(v.find_open());
+    assert_eq!(press(&mut v, ch("f"), Some(CTRL_F), CTRL), Outcome::Redraw);
+    assert!(v.find_open() && v.find_focused());
     assert_eq!(v.top_inset(), 32);
-    // Again: still open, and the query shows selected so typing replaces it.
     typed(&mut v, "abc");
     assert_eq!(v.find_query(), "abc");
-    press(&mut v, ch("f"), Some("\u{6}"), CTRL);
-    assert!(v.find_open());
+    // Again: closed, with the field focused.
+    press(&mut v, ch("f"), Some(CTRL_F), CTRL);
+    assert!(!v.find_open() && !v.find_focused());
+    assert_eq!(v.top_inset(), 0);
+    // And once more: open, the query kept and shown selected, so typing replaces it.
+    press(&mut v, ch("f"), Some(CTRL_F), CTRL);
+    assert!(v.find_open() && v.find_focused());
+    assert_eq!(v.find_selected(), "abc");
     typed(&mut v, "x");
     assert_eq!(v.find_query(), "x");
-    // Typing goes on at its end afterwards.
+    // Typing goes on at the caret afterwards.
     typed(&mut v, "y");
     assert_eq!(v.find_query(), "xy");
+}
+
+#[test]
+fn ctrl_f_closes_the_bar_whoever_has_the_keyboard() {
+    let mut v = view("text\n", 800, 600);
+    open(&mut v);
+    // The document has it (a click on the text): Ctrl+F still closes the bar.
+    v.press(400.0, 300.0, Instant::now());
+    v.release(Instant::now());
+    assert!(v.find_open() && !v.find_focused());
+    press(&mut v, ch("F"), Some(CTRL_F), CTRL | SHIFT);
+    assert!(!v.find_open());
+    // The toolbar's button does the same, and either way the bar opens with the keyboard.
+    v.apply(Action::Find, Instant::now());
+    assert!(v.find_open() && v.find_focused());
+    v.apply(Action::Find, Instant::now());
+    assert!(!v.find_open());
 }
 
 #[test]
@@ -165,7 +190,7 @@ fn the_toolbar_button_toggles_the_bar() {
     assert!(v.press(x, y, now));
     assert!(v.release_toolbar(x, y));
     let command = v.take_command().expect("a click");
-    assert_eq!(command, toolbar::Command::Action(Action::ToggleFind));
+    assert_eq!(command, toolbar::Command::Action(Action::Find));
     let toolbar::Command::Action(action) = command else {
         panic!()
     };
@@ -216,15 +241,26 @@ fn shortcuts_with_ctrl_and_keys_that_are_no_text_still_reach_the_document() {
     assert_eq!(press(&mut v, ch("w"), Some("\u{17}"), CTRL), Outcome::Quit);
     assert_eq!(press(&mut v, ch("o"), Some("\u{f}"), CTRL), Outcome::Open);
     assert_eq!(v.find_query(), "p", "no control character was typed");
-    // Arrows and pages scroll; Home and End jump.
+    // Up, Down and the page keys scroll; Home, End and the sideways arrows are the field's.
     let top = v.scroll();
     press(&mut v, named(NamedKey::PageDown), None, NONE);
     assert!(v.scroll() > top);
+    let down = v.scroll();
     press(&mut v, named(NamedKey::ArrowDown), None, NONE);
-    press(&mut v, named(NamedKey::End), None, NONE);
-    assert!(v.scroll() > 0.0);
-    press(&mut v, named(NamedKey::Home), None, NONE);
-    assert_eq!(v.scroll(), 0.0);
+    assert!(v.scroll() > down);
+    press(&mut v, named(NamedKey::ArrowUp), None, NONE);
+    assert_eq!(v.scroll(), down);
+    press(&mut v, named(NamedKey::PageUp), None, NONE);
+    assert_eq!(v.scroll(), top);
+    for key in [
+        NamedKey::End,
+        NamedKey::Home,
+        NamedKey::ArrowLeft,
+        NamedKey::ArrowRight,
+    ] {
+        press(&mut v, named(key), None, NONE);
+        assert_eq!(v.scroll(), top, "{key:?} does not scroll");
+    }
     // The query is what it was.
     assert_eq!(v.find_query(), "p");
     // Space is text, not a page.
@@ -270,7 +306,7 @@ fn backspace_deletes_a_character_and_ctrl_backspace_a_word() {
     press(&mut v, named(NamedKey::Backspace), None, NONE);
     assert_eq!(v.find_query(), "añ");
     // A query shown selected goes whole.
-    press(&mut v, ch("f"), Some("\u{6}"), CTRL);
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
     press(&mut v, named(NamedKey::Backspace), None, NONE);
     assert_eq!(v.find_query(), "");
     // Without the bar, Backspace goes back.
@@ -298,8 +334,8 @@ fn the_query_is_at_most_256_characters_and_has_no_control_characters() {
     open(&mut v);
     v.find_type("a\tb\nc\u{7f}d");
     assert_eq!(v.find_query(), "abcd");
-    // An empty commit leaves the query as it is, selected-looking or not.
-    press(&mut v, ch("f"), Some("\u{6}"), CTRL);
+    // An empty commit leaves the query as it is, selected or not.
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
     v.find_type("");
     v.find_type("\t");
     assert_eq!(v.find_query(), "abcd");
@@ -659,13 +695,15 @@ fn a_short_selection_of_one_line_fills_the_query() {
     open(&mut v);
     assert_eq!(v.find_query(), "Hello world");
     assert_eq!(v.find_matches().len(), 1);
-    // The bar open already: Ctrl+F takes a new selection.
+    // Closed and opened again with a new selection: the query is that.
     let mut v = view("Hello world\n", 800, 600);
     open(&mut v);
     typed(&mut v, "zzz");
+    v.set_find(false);
     assert!(v.select_all());
-    press(&mut v, ch("f"), Some("\u{6}"), CTRL);
+    press(&mut v, ch("f"), Some(CTRL_F), CTRL);
     assert_eq!(v.find_query(), "Hello world");
+    assert_eq!(v.find_selected(), "Hello world", "shown selected");
     // A long line is not a query either.
     let long = "word ".repeat(80);
     let mut v = view(&long, 800, 600);
@@ -817,39 +855,6 @@ fn the_bar_is_painted_in_its_strip() {
 }
 
 #[test]
-fn a_long_query_is_cut_from_the_left_so_its_end_shows() {
-    let mut v = view("text\n", 400, 300);
-    open(&mut v);
-    v.find_type(&"abcdefghij".repeat(20));
-    v.find_type("END");
-    let s = v.hidpi as f32;
-    let style = TextStyle {
-        bold: false,
-        italic: false,
-        mono: false,
-        size: TEXT * s,
-        role: Role::Text,
-        deco: 0,
-        shift: 0.0,
-        link: 0,
-    };
-    let q = v.find_query().to_owned();
-    let (para, pl) = v.fit_tail(&q, style, 200.0);
-    assert!(pl.width <= 200.0, "{}", pl.width);
-    let shown: String = para.text.clone();
-    assert!(shown.starts_with('…') && shown.ends_with("END"), "{shown}");
-    assert!(shown.chars().count() > 5);
-    // A short one is whole.
-    let (para, _) = v.fit_tail("short", style, 200.0);
-    assert_eq!(para.text, "short");
-    // Painting a narrow window with a long query does not panic, and keeps to its strip.
-    for w in [60, 120, 400] {
-        v.resize(w, 300);
-        paint(&mut v, Instant::now());
-    }
-}
-
-#[test]
 fn the_buttons_step_and_close_and_the_field_keeps_the_focus() {
     let mut v = view("foo one\n\nfoo two\n\nfoo three\n", 800, 600);
     open(&mut v);
@@ -893,16 +898,57 @@ fn the_buttons_step_and_close_and_the_field_keeps_the_focus() {
 }
 
 #[test]
-fn a_click_on_the_document_keeps_the_bar_open_and_typing_still_goes_to_it() {
+fn a_click_on_the_document_keeps_the_bar_open_and_takes_the_keyboard_from_the_field() {
     let mut v = view("foo bar\n\n[link](https://example.com)\n", 800, 600);
     open(&mut v);
     typed(&mut v, "fo");
     let now = Instant::now();
     let _ = v.press(60.0, 80.0, now);
     v.release(now);
-    assert!(v.find_open());
+    assert!(v.find_open() && !v.find_focused());
     typed(&mut v, "o");
-    assert_eq!(v.find_query(), "foo");
+    assert_eq!(v.find_query(), "fo", "the keys are the document's");
+}
+
+#[test]
+fn a_click_on_the_document_that_blurs_the_field_asks_for_a_repaint() {
+    let mut v = view("foo bar\n\nsome more text here\n", 800, 600);
+    open(&mut v);
+    typed(&mut v, "fo");
+    let now = Instant::now();
+    assert!(v.press(60.0, 80.0, now), "the caret and the selection go");
+    v.release(now);
+    assert!(!v.find_focused());
+    // (With the clipboard, a press on text starts a selection, which is a change of its own.)
+    #[cfg(not(feature = "clipboard"))]
+    {
+        assert!(!v.press(60.0, 80.0, now), "nothing changes the second time");
+        v.release(now);
+        // Closed, the same click has nothing to blur.
+        v.set_find(false);
+        assert!(!v.press(60.0, 80.0, now));
+    }
+}
+
+#[test]
+fn ctrl_home_and_ctrl_end_are_not_the_fields_to_take() {
+    let mut v = field_view(600, "par");
+    press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+    for key in [NamedKey::Home, NamedKey::End] {
+        // They go on to the document, which has no use for them.
+        assert!(
+            v.find_key(&named(key), None, CTRL, Instant::now())
+                .is_none()
+        );
+        assert_eq!(caret(&v), 2, "{key:?} did not move the caret");
+        assert!(
+            v.find_key(&named(key), None, CTRL | SHIFT, Instant::now())
+                .is_none()
+        );
+        assert_eq!(v.find_selected(), "");
+    }
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    assert_eq!(caret(&v), 0, "Home is the field's");
 }
 
 #[test]
@@ -1251,13 +1297,13 @@ fn a_new_query_is_looked_for_from_the_reading_position_not_the_old_match() {
     open(&mut v);
     typed(&mut v, "zebra");
     assert_eq!(v.find_current_start(), Some((0, v.find_matches()[0].start)));
-    // The reader scrolls away, and asks for the bar again: the query shows selected.
+    // The reader scrolls away, and selects the query to type another.
     v.set_anchor(Anchor {
         block: 70,
         frac: 0.0,
     });
     v.ensure();
-    press(&mut v, ch("f"), Some("\u{6}"), CTRL);
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
     typed(&mut v, "yak");
     let m = v.find_matches()[v.find_current().unwrap()];
     assert!(m.block >= 69, "from block 70, not {}", m.block);
@@ -1595,4 +1641,1223 @@ fn a_match_in_a_block_with_no_cluster_is_revealed_at_the_top_of_the_block() {
         top >= v.scroll() && bottom <= v.scroll() + area,
         "{top} is not in view"
     );
+}
+
+// ---- The field ---------------------------------------------------------------------------------
+
+/// The window x of the caret place at byte offset `at` in the query, as the field is laid out now.
+fn place_x(v: &mut View, at: usize) -> f64 {
+    let (_, inner) = v.find_geometry();
+    let text = v.find_text();
+    f64::from(inner.x0 - v.find.scroll + text.x(at))
+}
+
+/// The window x halfway through the character at byte offset `at`, which is `len` bytes long.
+fn over_x(v: &mut View, at: usize, len: usize) -> f64 {
+    (place_x(v, at) + place_x(v, at + len)) / 2.0
+}
+
+/// A click on the field at window x `x`: the press and the release, as the shell sends them.
+/// True if what it selected is offered as the primary selection.
+fn click(v: &mut View, x: f64, at: Instant) -> bool {
+    v.press(x, 16.0, at);
+    let offer = v.release_find_drag();
+    v.release(at);
+    offer
+}
+
+/// A view with the bar open on a plain document, the query `query` typed, and the field laid out.
+fn field_view(width: u32, query: &str) -> View {
+    let mut v = view("some text to search\n\nmore text, and more\n", width, 300);
+    open(&mut v);
+    v.find_type(query);
+    paint(&mut v, Instant::now());
+    v
+}
+
+fn caret(v: &View) -> usize {
+    v.find_caret()
+}
+
+#[test]
+fn the_caret_moves_where_typing_and_the_arrows_say() {
+    let mut v = field_view(600, "alpha beta");
+    assert_eq!(caret(&v), 10);
+    press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+    press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+    typed(&mut v, "X");
+    assert_eq!(v.find_query(), "alpha beXta");
+    assert_eq!(caret(&v), 9);
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    assert_eq!(caret(&v), 0);
+    press(&mut v, named(NamedKey::ArrowRight), None, CTRL);
+    assert_eq!(caret(&v), 5, "Ctrl+Right is a word");
+    press(&mut v, named(NamedKey::ArrowRight), None, CTRL);
+    assert_eq!(caret(&v), 11);
+    press(&mut v, named(NamedKey::ArrowLeft), None, CTRL);
+    assert_eq!(caret(&v), 6);
+    press(&mut v, named(NamedKey::End), None, NONE);
+    assert_eq!(caret(&v), 11);
+    press(&mut v, named(NamedKey::Delete), None, NONE);
+    assert_eq!(v.find_query(), "alpha beXta", "nothing after the caret");
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    press(&mut v, named(NamedKey::Delete), None, NONE);
+    assert_eq!(v.find_query(), "lpha beXta");
+    press(&mut v, named(NamedKey::Delete), None, CTRL);
+    assert_eq!(v.find_query(), " beXta", "Ctrl+Delete is a word");
+    press(&mut v, named(NamedKey::ArrowRight), None, NONE);
+    press(&mut v, named(NamedKey::Backspace), None, CTRL);
+    assert_eq!(v.find_query(), "beXta", "and Ctrl+Backspace");
+}
+
+#[test]
+fn shift_selects_ctrl_a_selects_all_and_typing_replaces_the_selection() {
+    let mut v = field_view(600, "alpha beta");
+    assert_eq!(
+        press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT),
+        selected()
+    );
+    press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT);
+    assert_eq!(v.find_selected(), "ta");
+    press(&mut v, named(NamedKey::ArrowLeft), None, CTRL | SHIFT);
+    assert_eq!(v.find_selected(), "beta");
+    press(&mut v, named(NamedKey::Home), None, SHIFT);
+    assert_eq!(v.find_selected(), "alpha beta");
+    press(&mut v, named(NamedKey::ArrowRight), None, NONE);
+    assert_eq!(v.find_selected(), "");
+    assert_eq!(caret(&v), 10, "Right goes to the end of the selection");
+    assert_eq!(press(&mut v, ch("a"), Some("\u{1}"), CTRL), selected());
+    assert_eq!(v.find_selected(), "alpha beta");
+    typed(&mut v, "x");
+    assert_eq!(v.find_query(), "x");
+    // A selection in the middle, replaced, and deleted.
+    v.find_type("yz");
+    press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT);
+    typed(&mut v, "Q");
+    assert_eq!(v.find_query(), "xyQ");
+    press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT);
+    press(&mut v, named(NamedKey::Backspace), None, NONE);
+    assert_eq!(v.find_query(), "xy");
+    // The matches follow.
+    v.find_type("ext");
+    assert_eq!(v.find_matches().len(), 0);
+    press(&mut v, named(NamedKey::Backspace), None, CTRL);
+    press(&mut v, named(NamedKey::Backspace), None, CTRL);
+    typed(&mut v, "text");
+    assert_eq!(v.find_matches().len(), 2);
+}
+
+#[cfg(feature = "clipboard")]
+#[test]
+fn a_selection_made_with_the_keys_is_offered_as_primary_and_a_motion_is_not() {
+    let mut v = field_view(600, "alpha");
+    for (key, mods, selects) in [
+        (NamedKey::ArrowLeft, NONE, false),
+        (NamedKey::ArrowLeft, SHIFT, true),
+        (NamedKey::Home, SHIFT, true),
+        (NamedKey::End, NONE, false),
+    ] {
+        let outcome = press(&mut v, named(key), None, mods);
+        assert_eq!(outcome == selected(), selects, "{key:?} {mods:?}");
+    }
+    assert_eq!(selected(), Outcome::Selected);
+    press(&mut v, named(NamedKey::Home), None, SHIFT);
+    assert_eq!(
+        v.offered().and_then(|c| match c {
+            Content::Text(t) => Some(t.to_string()),
+            Content::Lazy { .. } => None,
+        }),
+        Some("alpha".to_owned()),
+        "while the field has the keyboard, what is offered is its selection"
+    );
+}
+
+#[test]
+fn the_caret_stays_between_characters_of_every_size() {
+    let mut v = field_view(600, "é日😀z");
+    for want in [9, 5, 2, 0] {
+        press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+        assert_eq!(caret(&v), want);
+    }
+    press(&mut v, named(NamedKey::Delete), None, NONE);
+    assert_eq!(v.find_query(), "日😀z");
+    press(&mut v, named(NamedKey::End), None, NONE);
+    press(&mut v, named(NamedKey::Backspace), None, NONE);
+    press(&mut v, named(NamedKey::Backspace), None, NONE);
+    assert_eq!(v.find_query(), "日");
+}
+
+#[test]
+fn the_caret_at_the_end_is_where_the_text_ends() {
+    for query in [
+        "AV", "To", "Ty.", "fi", "ffi", "r,", "mm", "日本", "e\u{301}",
+    ] {
+        let mut v = field_view(600, query);
+        let end = place_x(&mut v, query.len());
+        let (_, inner) = v.find_geometry();
+        let width = v.find_line(query, Role::Text).1;
+        assert!(
+            (end - f64::from(inner.x0 + width)).abs() < 0.01,
+            "{query:?}: the caret is at {end}, the text ends at {}",
+            inner.x0 + width
+        );
+    }
+}
+
+#[test]
+fn the_caret_advances_over_spaces_at_the_end_of_the_query() {
+    let mut v = field_view(600, "ab");
+    let a = place_x(&mut v, 2);
+    typed(&mut v, " ");
+    let b = place_x(&mut v, 3);
+    typed(&mut v, "  ");
+    let c = place_x(&mut v, 5);
+    assert!(a < b && b < c, "{a} {b} {c}");
+    assert!(place_x(&mut v, 0) < place_x(&mut v, 1));
+}
+
+#[test]
+fn the_text_scrolls_to_keep_the_caret_in_the_field() {
+    let mut v = field_view(300, "");
+    let (_, inner) = v.find_geometry();
+    v.find_type(&"abcdefghij".repeat(10));
+    assert!(v.find.scroll > 0.0, "the end of the query is what shows");
+    let at = |v: &mut View| place_x(v, v.find_caret());
+    let visible = |v: &mut View| {
+        let x = at(v) as f32;
+        x >= inner.x0 && x <= inner.x1
+    };
+    assert!(visible(&mut v));
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    assert_eq!(v.find.scroll, 0.0, "back to the start");
+    assert!(visible(&mut v));
+    // A caret moved to the right edge brings the text along, a step at a time.
+    let mut last = 0.0;
+    for _ in 0..60 {
+        press(&mut v, named(NamedKey::ArrowRight), None, NONE);
+        assert!(visible(&mut v), "caret {}", caret(&v));
+        assert!(v.find.scroll >= last, "the text only goes left");
+        last = v.find.scroll;
+    }
+    assert!(last > 0.0);
+    // And back to the left again.
+    for _ in 0..60 {
+        press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+        assert!(visible(&mut v));
+    }
+    // Deleting the end of a scrolled text does not leave a gap at its right.
+    press(&mut v, named(NamedKey::End), None, NONE);
+    let full = v.find.scroll;
+    for _ in 0..40 {
+        press(&mut v, named(NamedKey::Backspace), None, NONE);
+    }
+    assert!(v.find.scroll < full);
+    assert!(visible(&mut v));
+    // A window narrower than the field's room: it still paints.
+    for w in [60, 120, 400] {
+        v.resize(w, 300);
+        paint(&mut v, Instant::now());
+        assert!(v.find.scroll >= 0.0);
+    }
+}
+
+#[test]
+fn the_ime_window_follows_the_caret() {
+    let mut v = field_view(600, "abcdef");
+    let end = v.find_ime_area().0;
+    press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+    press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+    assert!(v.find_ime_area().0 < end);
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    let start = v.find_ime_area().0;
+    assert!(start < v.find_ime_area().0 + 1 && start < end);
+}
+
+// ---- Focus -------------------------------------------------------------------------------------
+
+#[test]
+fn a_blurred_field_leaves_letters_and_sideways_keys_to_the_document() {
+    let src = big(60, &[]);
+    let mut v = view(&src, 800, 500);
+    open(&mut v);
+    let (top, theme) = (v.scroll(), v.theme_mode());
+    // Focused: j and t are text.
+    typed(&mut v, "parjt");
+    assert_eq!(v.find_query(), "parjt");
+    assert_eq!((v.scroll(), v.theme_mode()), (top, theme));
+    for _ in 0..2 {
+        press(&mut v, named(NamedKey::Backspace), None, NONE);
+    }
+    let found = v.find_matches().len();
+    assert!(found > 0);
+    // A click on the document blurs the field: the bar stays, with its matches.
+    let now = Instant::now();
+    v.press(400.0, 300.0, now);
+    v.release(now);
+    assert!(v.find_open() && !v.find_focused());
+    assert_eq!(v.find_matches().len(), found, "the highlights stay");
+    press(&mut v, ch("j"), Some("j"), NONE);
+    assert!(v.scroll() > top, "j scrolls the document");
+    press(&mut v, ch("t"), Some("t"), NONE);
+    assert_ne!(v.theme_mode(), theme, "t is the theme key");
+    assert_eq!(v.find_query(), "par", "the query is as it was");
+    // Typed and committed text goes nowhere.
+    v.find_type("zzz");
+    assert_eq!(v.find_query(), "par");
+    // Left and Right do nothing there; Home and End are the document's.
+    for key in [NamedKey::ArrowLeft, NamedKey::ArrowRight] {
+        assert_eq!(press(&mut v, named(key), None, NONE), Outcome::Nothing);
+    }
+    assert_eq!(v.find_caret(), 3, "the caret did not move");
+    press(&mut v, named(NamedKey::End), None, NONE);
+    assert!(v.scroll() > top);
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    assert_eq!(v.scroll(), 0.0);
+    // Backspace is the document's too: Back.
+    assert_eq!(
+        press(&mut v, named(NamedKey::Backspace), None, NONE),
+        Outcome::Back
+    );
+}
+
+#[test]
+fn enter_goes_to_the_document_when_blurred_and_f3_and_ctrl_g_still_step() {
+    let mut v = view("foo one\n\nFoo two\n\nxx FOO three\n", 800, 600);
+    open(&mut v);
+    typed(&mut v, "foo");
+    let now = Instant::now();
+    v.press(400.0, 300.0, now);
+    v.release(now);
+    assert!(!v.find_focused());
+    assert_eq!(v.find_count(), "1 / 3");
+    assert_eq!(
+        press(&mut v, named(NamedKey::Enter), Some("\r"), NONE),
+        Outcome::Nothing,
+        "Enter is no key of the document's"
+    );
+    assert_eq!(v.find_count(), "1 / 3", "and does not step");
+    press(&mut v, named(NamedKey::F3), None, NONE);
+    assert_eq!(v.find_count(), "2 / 3");
+    press(&mut v, named(NamedKey::F3), None, SHIFT);
+    assert_eq!(v.find_count(), "1 / 3");
+    press(&mut v, ch("g"), Some("\u{7}"), CTRL);
+    assert_eq!(v.find_count(), "2 / 3");
+    press(&mut v, ch("G"), Some("\u{7}"), CTRL | SHIFT);
+    assert_eq!(v.find_count(), "1 / 3");
+    // Focused again by a click in the field, Enter steps.
+    click(&mut v, 30.0, now);
+    assert!(v.find_focused());
+    enter(&mut v, NONE);
+    assert_eq!(v.find_count(), "2 / 3");
+}
+
+#[test]
+fn a_click_in_the_field_a_reopening_and_the_button_give_the_field_the_keyboard() {
+    let mut v = view("text\n", 800, 600);
+    open(&mut v);
+    let now = Instant::now();
+    v.press(400.0, 300.0, now);
+    v.release(now);
+    assert!(!v.find_focused());
+    // The bar's margin, beside the field, doesn't.
+    v.press(3.0, 16.0, now);
+    v.release_find_drag();
+    v.release(now);
+    assert!(!v.find_focused(), "beside the field is not the field");
+    click(&mut v, 30.0, now);
+    assert!(v.find_focused());
+    // Close and open again, by key and by the toolbar's action.
+    v.press(400.0, 300.0, now);
+    assert!(!v.find_focused());
+    v.apply(Action::Find, now);
+    assert!(!v.find_open());
+    v.apply(Action::Find, now);
+    assert!(v.find_open() && v.find_focused());
+}
+
+#[test]
+fn a_selection_drag_on_the_document_blurs_the_field_and_the_scrollbar_does_not() {
+    let src = big(60, &[]);
+    let mut v = view(&src, 800, 500);
+    open(&mut v);
+    settle(&mut v);
+    let now = Instant::now();
+    // The scrollbar's track, at the window's right edge, is not a click on the text.
+    v.hover_at(796.0, 300.0, now);
+    v.press(796.0, 300.0, now);
+    v.release(now);
+    assert!(v.find_focused());
+    v.press(100.0, 200.0, now);
+    #[cfg(feature = "clipboard")]
+    v.select_to(300.0, 260.0, now);
+    assert!(!v.find_focused());
+    v.release(now);
+    #[cfg(feature = "clipboard")]
+    {
+        v.release_select();
+        // Ctrl+C copies the document's selection; Ctrl+A selects the document.
+        assert_eq!(
+            press(&mut v, ch("c"), Some("\u{3}"), CTRL),
+            Outcome::Copy,
+            "the document's selection"
+        );
+        assert!(matches!(v.offered(), Some(Content::Text(t)) if !t.is_empty()));
+        assert_eq!(
+            press(&mut v, ch("a"), Some("\u{1}"), CTRL),
+            Outcome::Selected
+        );
+        assert!(v.selection().is_some());
+    }
+}
+
+#[test]
+fn escape_closes_the_bar_before_other_things_whoever_has_the_keyboard() {
+    let mut v = view("text\n", 800, 600);
+    open(&mut v);
+    let now = Instant::now();
+    v.press(400.0, 300.0, now);
+    v.release(now);
+    assert!(!v.find_focused());
+    assert_eq!(
+        press(&mut v, named(NamedKey::Escape), None, NONE),
+        Outcome::Redraw
+    );
+    assert!(!v.find_open());
+}
+
+#[test]
+fn the_toolbar_button_names_the_shortcut_for_closing_too() {
+    let mut v = view("text\n", 800, 600);
+    v.set_toolbar(true);
+    assert_eq!(toolbar::Item::Find.label(&v.toolbar_ctx()), "Find (Ctrl+F)");
+    open(&mut v);
+    assert_eq!(
+        toolbar::Item::Find.label(&v.toolbar_ctx()),
+        "Close find (Ctrl+F)"
+    );
+}
+
+// ---- The mouse ---------------------------------------------------------------------------------
+
+#[test]
+fn a_click_puts_the_caret_between_the_characters_nearest_it() {
+    let mut v = field_view(600, "alpha beta");
+    let now = Instant::now();
+    for at in [0, 3, 6, 10] {
+        let x = place_x(&mut v, at);
+        click(
+            &mut v,
+            x,
+            now + Duration::from_secs(u64::try_from(at).unwrap()),
+        );
+        assert_eq!(caret(&v), at);
+        assert_eq!(v.find_selected(), "");
+    }
+    // Between two places goes to the nearer.
+    let (a, b) = (place_x(&mut v, 3), place_x(&mut v, 4));
+    click(&mut v, a + (b - a) * 0.3, now + Duration::from_secs(20));
+    assert_eq!(caret(&v), 3);
+    click(&mut v, a + (b - a) * 0.7, now + Duration::from_secs(30));
+    assert_eq!(caret(&v), 4);
+    // Past the end of the text, and before its start.
+    let (field, inner) = v.find_geometry();
+    click(
+        &mut v,
+        f64::from(inner.x1) - 1.0,
+        now + Duration::from_secs(40),
+    );
+    assert_eq!(caret(&v), 10);
+    click(
+        &mut v,
+        f64::from(field.x0) + 1.0,
+        now + Duration::from_secs(50),
+    );
+    assert_eq!(caret(&v), 0);
+    // Typing goes in at the caret.
+    typed(&mut v, "_");
+    assert_eq!(v.find_query(), "_alpha beta");
+}
+
+#[test]
+fn a_drag_selects_and_is_offered_as_primary() {
+    let mut v = field_view(600, "alpha beta gamma");
+    let now = Instant::now();
+    let (x0, x1) = (place_x(&mut v, 3), place_x(&mut v, 8));
+    v.press(x0, 16.0, now);
+    assert!(v.find_dragging());
+    assert!(v.find_drag_to(x1, now));
+    assert_eq!(v.find_selected(), "ha be");
+    let (x2, x3) = (place_x(&mut v, 1), place_x(&mut v, 14));
+    v.find_drag_to(x3, now);
+    assert_eq!(v.find_selected(), "ha beta gam");
+    v.find_drag_to(x2, now);
+    assert_eq!(v.find_selected(), "lp", "backwards from the press");
+    assert!(v.release_find_drag(), "a selection is worth offering");
+    assert!(!v.find_dragging());
+    assert!(!v.release_find_drag());
+    // A plain click selects nothing to offer.
+    assert!(!click(&mut v, x0, now + Duration::from_secs(5)));
+    // Shift extends a selection from the caret.
+    v.set_shift(true);
+    let x = place_x(&mut v, 9);
+    v.press(x, 16.0, now + Duration::from_secs(10));
+    v.release_find_drag();
+    v.set_shift(false);
+    assert_eq!(v.find_selected(), "ha bet");
+}
+
+#[test]
+fn double_click_selects_a_word_and_triple_click_everything() {
+    let mut v = field_view(600, "alpha beta gamma");
+    let now = Instant::now();
+    let x = over_x(&mut v, 7, 1);
+    v.press(x, 16.0, now);
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), "");
+    v.press(x, 16.0, now + Duration::from_millis(100));
+    assert!(v.release_find_drag());
+    assert_eq!(v.find_selected(), "beta");
+    v.press(x, 16.0, now + Duration::from_millis(200));
+    assert!(v.release_find_drag());
+    assert_eq!(v.find_selected(), "alpha beta gamma");
+    // A fourth begins again.
+    v.press(x, 16.0, now + Duration::from_millis(300));
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), "");
+    // Too late, or too far, is a click of its own.
+    v.press(x, 16.0, now + Duration::from_secs(5));
+    v.release_find_drag();
+    v.press(
+        x,
+        16.0,
+        now + Duration::from_secs(5) + Duration::from_millis(900),
+    );
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), "");
+    // A drag after a double click goes by words.
+    let (a, b) = (over_x(&mut v, 7, 1), over_x(&mut v, 12, 1));
+    let t = now + Duration::from_secs(20);
+    click(&mut v, a, t);
+    v.press(a, 16.0, t + Duration::from_millis(100));
+    v.find_drag_to(b, t + Duration::from_millis(100));
+    assert_eq!(v.find_selected(), "beta gamma");
+    let c = over_x(&mut v, 1, 1);
+    v.find_drag_to(c, t + Duration::from_millis(100));
+    assert_eq!(v.find_selected(), "alpha beta");
+    v.release_find_drag();
+    // A double click on white space selects it, one on the end of the text its last word.
+    let t = now + Duration::from_secs(40);
+    let x = over_x(&mut v, 5, 1);
+    click(&mut v, x, t);
+    click(&mut v, x, t + Duration::from_millis(100));
+    assert_eq!(v.find_selected(), " ");
+    let t = now + Duration::from_secs(60);
+    let end = f64::from(v.find_geometry().1.x1) - 1.0;
+    click(&mut v, end, t);
+    click(&mut v, end, t + Duration::from_millis(100));
+    assert_eq!(v.find_selected(), "gamma");
+}
+
+#[test]
+fn a_press_elsewhere_ends_a_double_click_on_the_field() {
+    let mut v = field_view(600, "alpha beta gamma");
+    let now = Instant::now();
+    let x = over_x(&mut v, 7, 1);
+    // A button of the bar between two clicks on the field.
+    click(&mut v, x, now);
+    let (_, button) = v.find_buttons()[0];
+    let (bx, by) = ((button.x0 + button.x1) / 2.0, (button.y0 + button.y1) / 2.0);
+    v.press(
+        f64::from(bx),
+        f64::from(by),
+        now + Duration::from_millis(100),
+    );
+    v.release(now + Duration::from_millis(150));
+    click(&mut v, x, now + Duration::from_millis(200));
+    assert_eq!(v.find_selected(), "", "a click, not a double click");
+    // The document between two clicks on the field.
+    let t = now + Duration::from_secs(5);
+    click(&mut v, x, t);
+    v.press(40.0, 150.0, t + Duration::from_millis(100));
+    v.release(t + Duration::from_millis(150));
+    assert!(!v.find_focused());
+    click(&mut v, x, t + Duration::from_millis(200));
+    assert_eq!(v.find_selected(), "", "a click, not a double click");
+    assert!(v.find_focused());
+}
+
+#[test]
+fn a_drag_past_the_end_of_the_field_scrolls_the_text_on_its_own() {
+    let mut v = field_view(300, "");
+    v.find_type(&"abcdefghij".repeat(10));
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    let (_, inner) = v.find_geometry();
+    let now = Instant::now();
+    v.press(f64::from(inner.x0) + 10.0, 16.0, now);
+    // Inside the field: no timer.
+    v.find_drag_to(f64::from(inner.x0) + 50.0, now);
+    assert_eq!(v.find_deadline(), None);
+    // Past its right end: the text scrolls a step when the time comes, and the selection grows.
+    let past = f64::from(inner.x1) + 40.0;
+    v.find_drag_to(past, now);
+    let due = v.find_deadline().expect("a step is due");
+    assert!(!v.find_expire(now), "not yet");
+    let mut t = due;
+    let mut last = (v.find.scroll, v.find_selected().len());
+    for _ in 0..10 {
+        assert!(v.find_expire(t));
+        assert!(v.find.scroll > last.0 && v.find_selected().len() > last.1);
+        last = (v.find.scroll, v.find_selected().len());
+        t = v.find_deadline().expect("it goes on") + Duration::ZERO;
+    }
+    // Back inside the field the timer is gone.
+    v.find_drag_to(f64::from(inner.x0 + inner.x1) / 2.0, t);
+    assert_eq!(v.find_deadline(), None);
+    // Past the left end it scrolls back.
+    v.find_drag_to(f64::from(inner.x0) - 30.0, t);
+    let before = v.find.scroll;
+    let t = v.find_deadline().unwrap();
+    assert!(v.find_expire(t));
+    assert!(v.find.scroll < before);
+    v.release_find_drag();
+    assert_eq!(v.find_deadline(), None);
+    // The scroll stops at the end of the text, and the timer with it.
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    v.press(f64::from(inner.x0) + 10.0, 16.0, t);
+    v.find_drag_to(past, t);
+    for _ in 0..2000 {
+        let Some(due) = v.find_deadline() else { break };
+        v.find_expire(due);
+    }
+    assert_eq!(v.find_deadline(), None, "the end of the text was reached");
+    assert_eq!(
+        v.find_caret(),
+        100,
+        "the selection went to the end of the query"
+    );
+}
+
+#[test]
+fn the_text_cursor_is_over_the_field() {
+    let mut v = field_view(600, "abc");
+    paint(&mut v, Instant::now());
+    let (field, _) = v.find_geometry();
+    let (x, y) = (f64::from(field.x0 + 20.0), 16.0);
+    assert!(v.text_cursor(x, y));
+    assert!(v.find_over_field(x, y));
+    // Not over the buttons, or the document, or when the bar is closed.
+    assert!(!v.text_cursor(590.0, 16.0));
+    assert!(!v.text_cursor(300.0, 100.0));
+    v.set_find(false);
+    assert!(!v.text_cursor(x, y));
+}
+
+// ---- Paste -------------------------------------------------------------------------------------
+
+#[test]
+fn a_paste_is_its_first_line_with_tabs_for_spaces_and_no_other_control_characters() {
+    assert_eq!(find::pasted_query("one line"), "one line");
+    assert_eq!(find::pasted_query("first\nsecond"), "first");
+    assert_eq!(find::pasted_query("first\r\nsecond"), "first");
+    assert_eq!(find::pasted_query("first\rsecond"), "first");
+    assert_eq!(find::pasted_query("trailing\n"), "trailing");
+    assert_eq!(find::pasted_query("\nafter a blank line"), "");
+    assert_eq!(find::pasted_query("a\tb\t\tc"), "a b  c");
+    assert_eq!(find::pasted_query("a\u{7}b\u{1b}[0mc\u{7f}d"), "ab[0mcd");
+    assert_eq!(
+        find::pasted_query("日本\u{200b}語 é😀"),
+        "日本\u{200b}語 é😀"
+    );
+    assert_eq!(find::pasted_query(""), "");
+}
+
+/// Every character the layout breaks a line at.
+const BREAKS: [char; 7] = [
+    '\r', '\n', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}',
+];
+
+/// The height of the query as the field lays it out.
+fn field_height(v: &mut View) -> f32 {
+    v.find_text().height
+}
+
+#[test]
+fn a_paste_with_any_line_separator_is_its_first_line_and_the_field_stays_one_line() {
+    let mut one = field_view(600, "first");
+    let height = field_height(&mut one);
+    for c in BREAKS {
+        assert_eq!(
+            find::pasted_query(&format!("first{c}second")),
+            "first",
+            "{c:?}"
+        );
+        assert_eq!(find::pasted_query(&format!("{c}first")), "", "{c:?}");
+        let mut v = field_view(600, "");
+        let ticket = v.find_ticket();
+        assert!(v.find_paste(ticket, &format!("first{c}second")), "{c:?}");
+        assert_eq!(v.find_query(), "first", "{c:?}");
+        assert_eq!(field_height(&mut v), height, "{c:?}: one line");
+    }
+    assert_eq!(find::pasted_query("first\r\nsecond"), "first");
+}
+
+#[test]
+fn typed_and_committed_text_with_a_line_separator_makes_no_second_line() {
+    let mut one = field_view(600, "ab");
+    let height = field_height(&mut one);
+    for c in BREAKS {
+        let mut v = field_view(600, "");
+        v.find_type(&format!("a{c}b"));
+        assert_eq!(v.find_query(), "ab", "{c:?}: an input method's commit");
+        assert_eq!(field_height(&mut v), height, "{c:?}");
+        let mut v = field_view(600, "");
+        let text = format!("a{c}");
+        press(&mut v, ch("a"), Some(&text), NONE);
+        assert_eq!(v.find_query(), "a", "{c:?}: a key's text");
+        assert_eq!(
+            field_height(&mut v),
+            field_height(&mut field_view(600, "a"))
+        );
+    }
+}
+
+#[cfg(feature = "clipboard")]
+#[test]
+fn a_document_selection_with_any_line_separator_is_no_query() {
+    // The parser turns a CR, LF and the like in a paragraph into a space; these it keeps.
+    for c in ['\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}'] {
+        let mut v = view(&format!("Hello{c}world\n"), 800, 600);
+        assert!(v.select_all());
+        open(&mut v);
+        assert_eq!(v.find_query(), "", "{c:?}");
+    }
+    assert!(find::is_line_break('\u{2028}') && find::is_line_break('\u{85}'));
+    assert!(!find::is_line_break('\t') && !find::is_line_break(' '));
+}
+
+#[test]
+fn a_paste_goes_in_at_the_caret_over_the_selection_and_up_to_256_characters() {
+    let mut v = field_view(600, "alpha beta");
+    let ticket = v.find_ticket();
+    assert!(v.find_paste(ticket, "XY\nignored"));
+    assert_eq!(
+        v.find_query(),
+        "alpha betaXY",
+        "at the caret, which was at the end"
+    );
+    press(&mut v, named(NamedKey::ArrowLeft), None, NONE);
+    assert!(v.find_paste(ticket, "\t-"));
+    assert_eq!(v.find_query(), "alpha betaX -Y");
+    // Over a selection.
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
+    assert!(v.find_paste(ticket, "XY"));
+    assert_eq!(
+        v.find_query(),
+        "XY",
+        "the query was selected, so it is replaced"
+    );
+    // Nothing to paste (an empty text, or only a line break) changes nothing, whatever is selected.
+    press(&mut v, named(NamedKey::Home), None, SHIFT);
+    assert!(!v.find_paste(ticket, ""));
+    assert!(!v.find_paste(ticket, "\nx"));
+    assert_eq!(v.find_query(), "XY");
+    // The cap holds, a selection making room.
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
+    v.find_paste(ticket, &"a".repeat(300));
+    assert_eq!(v.find_query().chars().count(), MAX_QUERY);
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    for _ in 0..4 {
+        press(&mut v, named(NamedKey::ArrowRight), None, SHIFT);
+    }
+    v.find_paste(ticket, &"b".repeat(10));
+    assert_eq!(v.find_query().chars().count(), MAX_QUERY);
+    assert_eq!(v.find_query().matches('b').count(), 4);
+    // The matches are found again.
+    v.find_paste(ticket, "x");
+    assert!(v.find_matches().is_empty());
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
+    v.find_paste(ticket, "text");
+    assert_eq!(v.find_matches().len(), 2);
+}
+
+#[test]
+fn a_paste_that_comes_after_the_bar_closed_or_the_field_was_left_inserts_nothing() {
+    let mut v = field_view(600, "abc");
+    let now = Instant::now();
+    // The bar is closed in between.
+    let ticket = v.find_ticket();
+    v.set_find(false);
+    assert!(!v.find_paste(ticket, "x"));
+    // Closed and open again in between: the same.
+    let ticket = {
+        v.set_find(true);
+        v.find_ticket()
+    };
+    v.set_find(false);
+    v.set_find(true);
+    assert!(!v.find_paste(ticket, "x"), "another opening");
+    assert_eq!(v.find_query(), "abc");
+    // The field is left in between (a click on the document).
+    let ticket = v.find_ticket();
+    v.press(400.0, 250.0, now);
+    v.release(now);
+    assert!(!v.find_paste(ticket, "x"));
+    assert!(
+        !v.find_paste(v.find_ticket(), "x"),
+        "and while it stays left"
+    );
+    assert_eq!(v.find_query(), "abc");
+    // The field has the keyboard again: a paste asked for now lands, and one asked for
+    // before the click still does not.
+    let end = place_x(&mut v, 3);
+    click(&mut v, end, now);
+    assert!(!v.find_paste(ticket, "x"));
+    let fresh = v.find_ticket();
+    assert!(v.find_paste(fresh, "x"));
+    assert_eq!(v.find_query(), "abcx");
+    // Typing in between does not matter.
+    let ticket = v.find_ticket();
+    typed(&mut v, "yz");
+    assert!(v.find_paste(ticket, "!"));
+    assert_eq!(v.find_query(), "abcxyz!");
+}
+
+#[cfg(feature = "clipboard")]
+#[test]
+fn copy_cut_and_paste_keys_are_the_fields_while_it_has_the_keyboard() {
+    use crate::clipboard::Which;
+    let text = |c: Option<Content>| match c {
+        Some(Content::Text(t)) => Some(t.to_string()),
+        _ => None,
+    };
+    let mut v = field_view(600, "alpha beta");
+    // Nothing selected: nothing to copy or cut.
+    press(&mut v, named(NamedKey::End), None, NONE);
+    assert_eq!(
+        press(&mut v, ch("c"), Some("\u{3}"), CTRL),
+        Outcome::Nothing
+    );
+    assert_eq!(
+        press(&mut v, ch("x"), Some("\u{18}"), CTRL),
+        Outcome::Nothing
+    );
+    assert_eq!(v.find_query(), "alpha beta");
+    // Copy: the selection is offered, the query stays.
+    press(&mut v, named(NamedKey::ArrowLeft), None, CTRL | SHIFT);
+    assert_eq!(press(&mut v, ch("c"), Some("\u{3}"), CTRL), Outcome::Copy);
+    assert_eq!(text(v.offered()), Some("beta".into()));
+    assert_eq!(v.find_query(), "alpha beta");
+    assert_eq!(
+        press(&mut v, named(NamedKey::Insert), None, CTRL),
+        Outcome::Copy
+    );
+    assert_eq!(
+        press(&mut v, ch("C"), Some("\u{3}"), CTRL | SHIFT),
+        Outcome::Copy
+    );
+    // Cut: the selection leaves the query, and waits to be offered.
+    assert_eq!(press(&mut v, ch("x"), Some("\u{18}"), CTRL), Outcome::Cut);
+    assert_eq!(v.find_query(), "alpha ");
+    assert_eq!(text(v.take_cut()), Some("beta".into()));
+    assert_eq!(text(v.take_cut()), None, "once");
+    // Paste: Ctrl+V and Shift+Insert ask for the clipboard, the shell reads it.
+    assert_eq!(
+        press(&mut v, ch("v"), Some("\u{16}"), CTRL),
+        Outcome::Paste(Which::Clipboard)
+    );
+    assert_eq!(
+        press(&mut v, named(NamedKey::Insert), None, SHIFT),
+        Outcome::Paste(Which::Clipboard)
+    );
+    // The matches follow a cut.
+    assert_eq!(v.find_matches().len(), 0);
+    // Not while the document has the keyboard: Ctrl+C is the document's copy, with its own
+    // selection (none: nothing), and Ctrl+V and Ctrl+X do nothing there.
+    let now = Instant::now();
+    v.press(400.0, 250.0, now);
+    v.release(now);
+    assert_eq!(
+        press(&mut v, ch("c"), Some("\u{3}"), CTRL),
+        Outcome::Nothing
+    );
+    assert_eq!(
+        press(&mut v, ch("v"), Some("\u{16}"), CTRL),
+        Outcome::Nothing
+    );
+    assert_eq!(
+        press(&mut v, ch("x"), Some("\u{18}"), CTRL),
+        Outcome::Nothing
+    );
+    assert_eq!(v.find_query(), "alpha ");
+}
+
+#[cfg(feature = "clipboard")]
+#[test]
+fn a_middle_click_on_the_field_puts_the_caret_there_and_asks_for_a_paste_of_primary() {
+    let mut v = field_view(600, "alpha beta");
+    let now = Instant::now();
+    let x = place_x(&mut v, 3);
+    let ticket = v.find_middle(x, 16.0).expect("on the field");
+    assert_eq!(caret(&v), 3);
+    assert_eq!(v.find_selected(), "");
+    assert!(v.find_paste(ticket, "XY"));
+    assert_eq!(v.find_query(), "alpXYha beta");
+    // Not on the buttons, the document, or a closed bar.
+    assert_eq!(v.find_middle(590.0, 16.0), None);
+    assert_eq!(v.find_middle(300.0, 100.0), None);
+    // It takes the keyboard back for the field.
+    v.press(400.0, 250.0, now);
+    v.release(now);
+    assert!(!v.find_focused());
+    let x = place_x(&mut v, 0);
+    assert!(v.find_middle(x, 16.0).is_some());
+    assert!(v.find_focused());
+    v.set_find(false);
+    assert_eq!(v.find_middle(x, 16.0), None);
+}
+
+// ---- Painting ----------------------------------------------------------------------------------
+
+#[test]
+fn the_selection_in_the_field_is_washed_and_the_caret_shows_only_when_focused() {
+    let theme = LIGHT;
+    let mut v = field_view(400, "alpha beta");
+    let now = Instant::now();
+    let count = |buf: &[u32], color| {
+        let (w, _) = (400usize, 0);
+        buf[..w * 32].iter().filter(|&&p| p == color).count()
+    };
+    // Focused with the whole query selected (as it opens after a Ctrl+A): the wash, the caret.
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
+    let buf = paint(&mut v, now);
+    let wash = count(&buf, theme.selection);
+    assert!(wash > 100, "{wash}");
+    assert!(count(&buf, theme.text) > 0);
+    // Nothing selected: no wash.
+    press(&mut v, named(NamedKey::End), None, NONE);
+    let buf = paint(&mut v, now);
+    assert_eq!(count(&buf, theme.selection), 0);
+    // A wider selection washes more.
+    press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT);
+    let one = count(&paint(&mut v, now), theme.selection);
+    press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT);
+    let two = count(&paint(&mut v, now), theme.selection);
+    assert!(one > 0 && two > one, "{one} {two}");
+    // Blurred: dimmer (a different color), and no caret.
+    let focused = paint(&mut v, now);
+    v.press(400.0 - 1.0, 250.0, now);
+    v.release(now);
+    assert!(!v.find_focused());
+    let blurred = paint(&mut v, now);
+    assert_eq!(
+        count(&blurred, theme.selection),
+        0,
+        "dimmer than the focused wash"
+    );
+    assert!(blurred[..400 * 32] != focused[..400 * 32]);
+    let dim = blurred[..400 * 32]
+        .iter()
+        .filter(|&&p| p != theme.code_bg && p != theme.bg && p != theme.border)
+        .count();
+    assert!(dim > 0);
+}
+
+// ---- Right to left text in the field -----------------------------------------------------------
+
+const HEBREW: &str = "שלום";
+const MIXED: &str = "abc שלום def";
+
+/// The columns of the field's rows that are washed as a selection (the first and the last, and
+/// how many in all).
+fn washed_columns(v: &mut View) -> Option<(i32, i32, usize)> {
+    let buf = paint(v, Instant::now());
+    let (field, _) = v.find.rects.unwrap();
+    let (x0, y0, x1, y1) = field.px();
+    let width = v.size().0 as usize;
+    let mut columns = Vec::new();
+    for x in x0..x1 {
+        let hit = (y0..y1).any(|y| buf[y as usize * width + x as usize] == LIGHT.selection);
+        if hit {
+            columns.push(x);
+        }
+    }
+    Some((*columns.first()?, *columns.last()?, columns.len()))
+}
+
+/// The window x range of the clusters that start in the bytes `lo..hi` of the query, as laid out.
+fn extent_of(v: &mut View, lo: u32, hi: u32) -> (f32, f32) {
+    let (_, inner) = v.find_geometry();
+    let text = v.find_text();
+    let near = text
+        .content
+        .hits
+        .iter()
+        .filter(|h| (lo..hi).contains(&h.doc))
+        .map(|h| (h.x0.min(h.x1), h.x0.max(h.x1)))
+        .fold((f32::MAX, f32::MIN), |a, h| (a.0.min(h.0), a.1.max(h.1)));
+    (
+        inner.x0 - v.find.scroll + near.0,
+        inner.x0 - v.find.scroll + near.1,
+    )
+}
+
+fn caret_shows(v: &mut View) -> bool {
+    paint(v, Instant::now());
+    let (_, inner) = v.find_geometry();
+    v.find.caret >= inner.x0 && v.find.caret + v.find_caret_width() <= inner.x1 + 0.5
+}
+
+#[test]
+fn the_selection_of_a_right_to_left_word_in_a_left_to_right_query_is_washed_where_its_glyphs_are() {
+    let mut v = field_view(600, "");
+    v.find_type(MIXED);
+    // `שלום`, in the middle of the query: its clusters, not the stretch between its ends.
+    let (lo, hi) = (
+        MIXED.find(HEBREW).unwrap(),
+        MIXED.find(HEBREW).unwrap() + HEBREW.len(),
+    );
+    v.find.field.select(lo, hi);
+    let (a, b) = extent_of(&mut v, lo as u32, hi as u32);
+    let (first, last, count) = washed_columns(&mut v).expect("the selection is washed");
+    assert!(
+        (first as f32 - a).abs() <= 2.0 && (last as f32 - b).abs() <= 2.0,
+        "washed {first}..{last}, the glyphs are at {a}..{b}"
+    );
+    assert!(
+        count as f32 >= (b - a) * 0.9,
+        "{count} columns for {a}..{b}"
+    );
+    // And nothing of the Latin letters around it.
+    let before = extent_of(&mut v, 0, 3);
+    let after = extent_of(&mut v, 13, 16);
+    assert!(first as f32 >= before.1 - 1.0, "{first} is over `abc`");
+    assert!(last as f32 <= after.0 + 1.0, "{last} is over `def`");
+}
+
+#[test]
+fn the_selection_of_a_right_to_left_query_is_washed_over_all_of_it_or_the_part_selected() {
+    let mut v = field_view(600, "");
+    v.find_type(HEBREW);
+    let all = extent_of(&mut v, 0, HEBREW.len() as u32);
+    v.find.field.select(0, HEBREW.len());
+    let (first, last, _) = washed_columns(&mut v).expect("washed");
+    assert!((first as f32 - all.0).abs() <= 2.0 && (last as f32 - all.1).abs() <= 2.0);
+    // The first two letters are the right-hand ones.
+    v.find.field.select(0, 4);
+    let part = extent_of(&mut v, 0, 4);
+    let (first, last, _) = washed_columns(&mut v).expect("washed");
+    assert!((first as f32 - part.0).abs() <= 2.0 && (last as f32 - part.1).abs() <= 2.0);
+    assert!(
+        part.0 > all.0 + 5.0 && (part.1 - all.1).abs() < 1.0,
+        "{part:?} in {all:?}"
+    );
+}
+
+#[test]
+fn the_caret_stays_in_the_field_in_right_to_left_and_mixed_queries() {
+    for query in [
+        HEBREW.to_owned(),
+        MIXED.to_owned(),
+        format!("{HEBREW} ").repeat(12),
+        format!("{MIXED} ").repeat(8),
+    ] {
+        let mut v = field_view(260, "");
+        v.find_type(&query);
+        assert!(caret_shows(&mut v), "{query}: after typing");
+        for (key, mods) in [
+            (NamedKey::Home, NONE),
+            (NamedKey::End, NONE),
+            (NamedKey::Home, SHIFT),
+            (NamedKey::ArrowRight, CTRL),
+            (NamedKey::ArrowLeft, NONE),
+            (NamedKey::End, SHIFT),
+            (NamedKey::ArrowLeft, CTRL),
+        ] {
+            press(&mut v, named(key), None, mods);
+            assert!(caret_shows(&mut v), "{query}: after {key:?} {mods:?}");
+        }
+        // The text can be scrolled no further than the end of what shows.
+        let (_, inner) = v.find_geometry();
+        let text = v.find_text();
+        assert!(
+            v.find.scroll
+                <= (text.width + v.find_caret_width() - (inner.x1 - inner.x0)).max(0.0) + 0.01
+        );
+    }
+}
+
+#[test]
+fn home_and_end_of_a_right_to_left_query_put_the_caret_at_the_edges_of_its_text() {
+    let mut v = field_view(600, "");
+    v.find_type(HEBREW);
+    let (_, inner) = v.find_geometry();
+    let text = v.find_text();
+    // The text starts at the field's left, and its width is that of its glyphs.
+    let hits = &text.content.hits;
+    let right = hits.iter().map(|h| h.x1).fold(0.0, f32::max);
+    assert!(
+        (text.width - right).abs() < 0.01 && text.width < 100.0,
+        "{}",
+        text.width
+    );
+    press(&mut v, named(NamedKey::Home), None, NONE);
+    paint(&mut v, Instant::now());
+    let home = v.find.caret;
+    press(&mut v, named(NamedKey::End), None, NONE);
+    paint(&mut v, Instant::now());
+    let end = v.find.caret;
+    // Home is the start of the text, which is at its right; End is the left end.
+    assert!(
+        home > end && (home - inner.x0 - text.width).abs() < 1.0,
+        "{home} {end}"
+    );
+    assert!((end - inner.x0).abs() < 1.5, "{end} against {}", inner.x0);
+}
+
+#[test]
+fn a_click_and_a_double_click_on_right_to_left_text_find_the_character_under_them() {
+    let mut v = field_view(600, "");
+    v.find_type(MIXED);
+    let now = Instant::now();
+    // The middle of `ו`, the third letter of the word.
+    let at = MIXED.find(HEBREW).unwrap() + 4;
+    let x = over_x(&mut v, at, 2);
+    v.press(x, 16.0, now);
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), "");
+    assert!([at, at + 2].contains(&caret(&v)), "caret at {}", caret(&v));
+    v.press(x, 16.0, now + Duration::from_millis(100));
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), HEBREW);
+}
+
+#[test]
+fn a_drag_across_right_to_left_text_selects_the_letters_between() {
+    let mut v = field_view(600, "");
+    v.find_type(HEBREW);
+    // From the second letter's leading edge (on its right) to the fourth's, going left.
+    let (a, b) = (place_x(&mut v, 2), place_x(&mut v, 6));
+    assert!(a > b);
+    let now = Instant::now();
+    v.press(a, 16.0, now);
+    v.find_drag_to(b, now);
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), "לו");
+    // And the other way, back past where it began.
+    v.press(b, 16.0, now + Duration::from_secs(10));
+    let start = place_x(&mut v, 0);
+    v.find_drag_to(start, now + Duration::from_secs(10));
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), "שלו");
+}
+
+#[test]
+fn a_press_on_the_toolbar_ends_a_double_click_on_the_field() {
+    let mut v = view("some text to search\n", 600, 300);
+    v.set_toolbar(true);
+    open(&mut v);
+    v.find_type("alpha beta gamma");
+    paint(&mut v, Instant::now());
+    let now = Instant::now();
+    let x = over_x(&mut v, 7, 1);
+    let y = f64::from(v.find_geometry().0.y0) + 4.0;
+    // A button of the toolbar (the find button itself: its press only arms it).
+    let slots = toolbar::slots(&v.toolbar_ctx());
+    let (_, rect) = *slots
+        .items
+        .iter()
+        .find(|(i, _)| *i == toolbar::Item::Find)
+        .expect("a find button");
+    let (bx, by) = (
+        f64::from(rect.x0 + rect.x1) / 2.0,
+        f64::from(rect.y0 + rect.y1) / 2.0,
+    );
+    v.press(x, y, now);
+    v.release_find_drag();
+    assert!(v.press(bx, by, now + Duration::from_millis(50)));
+    v.release_toolbar(bx, by);
+    v.take_command();
+    v.press(x, y, now + Duration::from_millis(100));
+    v.release_find_drag();
+    assert_eq!(
+        v.find_selected(),
+        "",
+        "a click of its own, not a double one"
+    );
+    // Without the toolbar's press between them, the same two make a double click.
+    v.press(x, y, now + Duration::from_secs(10));
+    v.release_find_drag();
+    v.press(
+        x,
+        y,
+        now + Duration::from_secs(10) + Duration::from_millis(100),
+    );
+    v.release_find_drag();
+    assert_eq!(v.find_selected(), "beta");
+}
+
+/// The stretches `v`'s field washes for its selection, from the text's own layout.
+fn washes(v: &mut View) -> Vec<(f32, f32)> {
+    let text = v.find_text();
+    let (lo, hi) = v.find.field.range();
+    let mut out = Vec::new();
+    text.selection(lo, hi, |x0, x1| out.push((x0, x1)));
+    out
+}
+
+#[test]
+fn a_selected_space_at_the_end_of_the_query_is_washed_and_not_the_letter_before() {
+    let mut v = field_view(600, "abc ");
+    press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT);
+    assert_eq!(v.find_selected(), " ");
+    let text = v.find_text();
+    let (a, b) = (text.x(3), text.x(4));
+    assert!(b > a, "the space has an extent: {a}..{b}");
+    let washed = washes(&mut v);
+    assert_eq!(washed.len(), 1, "{washed:?}");
+    assert!(
+        (washed[0].0 - a).abs() < 0.5 && (washed[0].1 - b).abs() < 0.5,
+        "washed {washed:?}, the space is at {a}..{b}"
+    );
+    // Selecting the last two characters washes the letter and the space together, to the end.
+    press(&mut v, named(NamedKey::ArrowLeft), None, SHIFT);
+    let washed = washes(&mut v);
+    assert_eq!(washed.len(), 1);
+    assert!((washed[0].0 - text.x(2)).abs() < 0.5 && (washed[0].1 - b).abs() < 0.5);
+}
+
+#[test]
+fn the_selection_of_a_query_of_spaces_is_washed() {
+    let mut v = field_view(600, "   ");
+    press(&mut v, ch("a"), Some("\u{1}"), CTRL);
+    assert_eq!(v.find_selected(), "   ");
+    let text = v.find_text();
+    let washed = washes(&mut v);
+    assert_eq!(washed.len(), 1, "{washed:?}");
+    assert!(
+        (washed[0].0 - text.x(0)).abs() < 0.5 && (washed[0].1 - text.x(3)).abs() < 0.5,
+        "{washed:?} against {}..{}",
+        text.x(0),
+        text.x(3)
+    );
+    assert!(washed[0].1 > washed[0].0);
+    paint(&mut v, Instant::now());
+}
+
+#[test]
+fn the_caret_and_clicks_past_spaces_at_the_end_of_the_query_are_after_them() {
+    let mut v = field_view(600, "ab  ");
+    paint(&mut v, Instant::now());
+    let (_, inner) = v.find_geometry();
+    let text = v.find_text();
+    assert!(text.x(4) > text.x(3) && text.x(3) > text.x(2));
+    assert!((v.find.caret - (inner.x0 - v.find.scroll + text.x(4))).abs() < 0.5);
+    // A click well past the end puts the caret at the end; one over the second space, in it.
+    let now = Instant::now();
+    click(&mut v, f64::from(inner.x1) - 4.0, now);
+    assert_eq!(caret(&v), 4);
+    let x = over_x(&mut v, 3, 1);
+    click(&mut v, x, now + Duration::from_secs(10));
+    assert!([3, 4].contains(&caret(&v)));
+    assert_eq!(v.find_text().over(text.x(3) + 1.0), 3, "over the space");
 }

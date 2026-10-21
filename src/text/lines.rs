@@ -469,12 +469,12 @@ mod tests {
             (100.0, 120.0, 120.0, 130.0)
         );
         assert_eq!((h[0].doc, h[1].doc), (50, 10));
-        #[cfg(feature = "clipboard")]
+        #[cfg(any(feature = "clipboard", feature = "find"))]
         assert!(h.iter().all(PHit::rtl));
     }
 
     /// The direction is only a bit of the style index: the index reads the same.
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "find"))]
     #[test]
     fn the_direction_bit_leaves_the_style_index_alone() {
         let (para, shaped) = spanning(0, [1, 1]);

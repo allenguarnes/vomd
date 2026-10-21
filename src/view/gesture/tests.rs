@@ -664,11 +664,11 @@ fn the_count_cycles_through_a_triple_click() {
     let t = Instant::now();
     let at = (10.0, 10.0);
     let counts: Vec<u8> = (0..5)
-        .map(|i| s.count(t + Duration::from_millis(100 * i), at, 4.0))
+        .map(|i| s.last.count(t + Duration::from_millis(100 * i), at, 4.0))
         .collect();
     assert_eq!(counts, [1, 2, 3, 1, 2]);
     s.cancel();
-    assert_eq!(s.count(t + Duration::from_millis(600), at, 4.0), 1);
+    assert_eq!(s.last.count(t + Duration::from_millis(600), at, 4.0), 1);
 }
 
 #[test]

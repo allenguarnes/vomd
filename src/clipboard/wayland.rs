@@ -8,13 +8,15 @@
 //! sends them the same events, with the same serials, as the window's. A thread blocked on our
 //! queue (dispatching it from winit's loop isn't an option: that loop runs no iteration when only
 //! another queue got events) answers the compositor, and each paste gets a thread that writes
-//! the text into its pipe, so nothing here blocks the window.
+//! the text into its pipe, so nothing here blocks the window. The offers of the current selections
+//! are kept, to read a paste: the thread asks the offer for text through a pipe of its own, and a
+//! worker reads the pipe, up to a limit and a time.
 
-use std::io::{self, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use wayland_backend::client::Backend;
@@ -22,7 +24,7 @@ use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
 use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
-use wayland_client::protocol::wl_data_offer::WlDataOffer;
+use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
 use wayland_client::protocol::wl_data_source::{self, WlDataSource};
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
@@ -35,13 +37,15 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_v1::{
         self as primary_device, ZwpPrimarySelectionDeviceV1 as PrimaryDevice,
     },
-    zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1 as PrimaryOffer,
+    zwp_primary_selection_offer_v1::{
+        self as primary_offer, ZwpPrimarySelectionOfferV1 as PrimaryOffer,
+    },
     zwp_primary_selection_source_v1::{
         self as primary_source, ZwpPrimarySelectionSourceV1 as PrimarySource,
     },
 };
 
-use super::{TEXT_TYPES, Which, latin1};
+use super::{READ_CAP, READ_WAIT, Reply, TEXT_TYPES, Which, decode, latin1};
 use crate::copy::Content;
 
 /// Pastes that are being written at once. A paste past this gets an empty answer: pastes are a
@@ -53,7 +57,15 @@ pub struct Owner {
     conn: Connection,
     display: WlDisplay,
     qh: QueueHandle<State>,
-    copies: Sender<(Which, Content)>,
+    copies: Sender<Request>,
+}
+
+/// What the main thread asks the thread to do once the compositor has answered a `sync`.
+enum Request {
+    /// Offer content as a selection.
+    Offer(Which, Content),
+    /// Read a selection for a paste.
+    Read(Which, Reply),
 }
 
 impl Owner {
@@ -88,6 +100,8 @@ impl Owner {
             serial: 0,
             offers: Vec::new(),
             primary_offers: Vec::new(),
+            selected: None,
+            primary_selected: None,
             slots: [Slot::default(), Slot::default()],
             requests,
             writers: Arc::new(AtomicUsize::new(0)),
@@ -117,7 +131,18 @@ impl Owner {
     /// a `sync`: by then it has dispatched every event sent before it, among them the key press
     /// or button release that caused this copy, so the serial it has is that of the copy.
     pub fn set(&self, which: Which, content: Content) {
-        let _ = self.copies.send((which, content));
+        self.request(Request::Offer(which, content));
+    }
+
+    /// Read the selection `which` for a paste, once the compositor has told the thread of the
+    /// selections as they are now. `reply` gets the text, or nothing if the thread has ended.
+    pub fn read(&self, which: Which, reply: Reply) {
+        self.request(Request::Read(which, reply));
+    }
+
+    fn request(&self, request: Request) {
+        // (A thread that has ended drops the request, and a dropped paste says there was nothing.)
+        let _ = self.copies.send(request);
         self.display.sync(&self.qh, ());
         let _ = self.conn.flush();
     }
@@ -159,16 +184,27 @@ struct State {
     /// let go of once the event that names it has come (see the `Dispatch` for the device).
     offers: Vec<WlDataOffer>,
     primary_offers: Vec<PrimaryOffer>,
+    /// The offers of the current selections, which a paste reads.
+    selected: Option<WlDataOffer>,
+    primary_selected: Option<PrimaryOffer>,
     /// CLIPBOARD and PRIMARY, by [`super::Which`] order.
     slots: [Slot; 2],
-    requests: Receiver<(Which, Content)>,
+    requests: Receiver<Request>,
     writers: Arc<AtomicUsize>,
 }
 
 impl State {
-    /// Take the selections the main thread has left content for.
+    /// Do what the main thread asked: take the selections it left content for, and begin the
+    /// pastes it wants read.
     fn take(&mut self) {
-        while let Ok((which, content)) = self.requests.try_recv() {
+        while let Ok(request) = self.requests.try_recv() {
+            let (which, content) = match request {
+                Request::Offer(which, content) => (which, content),
+                Request::Read(which, reply) => {
+                    self.read(which, reply);
+                    continue;
+                }
+            };
             match which {
                 Which::Clipboard => {
                     let source = self.manager.create_data_source(&self.qh, ());
@@ -193,6 +229,49 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Begin reading the selection `which`: from what we offer if it is ours, else from the offer
+    /// of the program that owns it, through a pipe a worker reads.
+    fn read(&self, which: Which, reply: Reply) {
+        let i = match which {
+            Which::Clipboard => 0,
+            Which::Primary => 1,
+        };
+        if let Some(content) = &self.slots[i].content {
+            reply.send(content.chunks().next());
+            return;
+        }
+        let (mimes, offer): (Vec<String>, &dyn Receive) = match which {
+            Which::Clipboard => match &self.selected {
+                Some(o) => (mimes_of(o.data::<Mimes>()), o),
+                None => return reply.send(None),
+            },
+            Which::Primary => match &self.primary_selected {
+                Some(o) => (mimes_of(o.data::<Mimes>()), o),
+                None => return reply.send(None),
+            },
+        };
+        let Some(mime) = TEXT_TYPES
+            .into_iter()
+            .find(|t| mimes.iter().any(|m| m == t))
+        else {
+            return reply.send(None);
+        };
+        let Ok((pipe, writer)) = io::pipe() else {
+            return reply.send(None);
+        };
+        offer.receive(mime, &writer);
+        // Our end of the writing must go, or the pipe never ends for the reader.
+        drop(writer);
+        let as_latin1 = mime == "STRING";
+        // If the worker can't start, the closure goes with the reply, which says there was nothing.
+        let _ = std::thread::Builder::new()
+            .name("vomd-read".into())
+            .spawn(move || {
+                let bytes = read_within(pipe, READ_CAP, READ_WAIT);
+                reply.send(bytes.map(|b| decode(&b, as_latin1)));
+            });
     }
 
     /// A program asked for the text of slot `i` as `mime`, into `fd`.
@@ -346,6 +425,68 @@ fn wait_writable(pipe: &std::fs::File, limit: Duration) {
     unsafe { poll(&mut fd, 1, ms) };
 }
 
+/// The types an offer says it has, as they come.
+#[derive(Default)]
+struct Mimes(Mutex<Vec<String>>);
+
+fn mimes_of(mimes: Option<&Mimes>) -> Vec<String> {
+    mimes.map_or_else(Vec::new, |m| {
+        m.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    })
+}
+
+/// An offer of either kind, which can be asked for text.
+trait Receive {
+    fn receive(&self, mime: &str, fd: &dyn AsFd);
+}
+
+impl Receive for WlDataOffer {
+    fn receive(&self, mime: &str, fd: &dyn AsFd) {
+        WlDataOffer::receive(self, mime.into(), fd.as_fd());
+    }
+}
+
+impl Receive for PrimaryOffer {
+    fn receive(&self, mime: &str, fd: &dyn AsFd) {
+        PrimaryOffer::receive(self, mime.into(), fd.as_fd());
+    }
+}
+
+const POLLIN: i16 = 1;
+
+/// Read the pipe up to `cap` bytes or its end: `None` if it doesn't end or fill within `limit`
+/// (a program that holds the pipe open and writes nothing, or too slowly, is given up on).
+fn read_within(mut pipe: io::PipeReader, cap: usize, limit: Duration) -> Option<Vec<u8>> {
+    let end = Instant::now() + limit;
+    let mut bytes = Vec::new();
+    let mut piece = [0u8; 8192];
+    while bytes.len() < cap {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let mut fd = PollFd {
+            fd: pipe.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        let ms = left.as_millis().clamp(1, 1000) as i32;
+        // SAFETY: one valid `pollfd`, as the count says.
+        if unsafe { poll(&mut fd, 1, ms) } <= 0 {
+            // An interrupt or the wait running out: look at the clock again.
+            continue;
+        }
+        let room = piece.len().min(cap - bytes.len());
+        match pipe.read(&mut piece[..room]) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&piece[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(bytes)
+}
+
 impl Dispatch<WlCallback, ()> for State {
     fn event(
         state: &mut Self,
@@ -467,27 +608,48 @@ impl Dispatch<WlDataDevice, ()> for State {
         // a destroyed object can't be named.
         match event {
             wl_data_device::Event::DataOffer { id } => state.offers.push(id),
-            wl_data_device::Event::Selection { .. }
-            | wl_data_device::Event::Leave
-            | wl_data_device::Event::Drop => state.offers.drain(..).for_each(|o| o.destroy()),
+            // The offer the selection event names is the current selection, which a paste reads,
+            // until the next one: the others are let go of.
+            wl_data_device::Event::Selection { id } => {
+                state.offers.retain(|o| {
+                    let keep = id.as_ref() == Some(o);
+                    if !keep {
+                        o.destroy();
+                    }
+                    keep
+                });
+                if let Some(old) = std::mem::replace(&mut state.selected, state.offers.pop()) {
+                    old.destroy();
+                }
+            }
+            wl_data_device::Event::Leave | wl_data_device::Event::Drop => {
+                state.offers.drain(..).for_each(|o| o.destroy());
+            }
             _ => {}
         }
     }
 
     event_created_child!(State, WlDataDevice, [
-        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, Mimes::default()),
     ]);
 }
 
-impl Dispatch<WlDataOffer, ()> for State {
+impl Dispatch<WlDataOffer, Mimes> for State {
     fn event(
         _: &mut Self,
         _: &WlDataOffer,
-        _: <WlDataOffer as wayland_client::Proxy>::Event,
-        _: &(),
+        event: wl_data_offer::Event,
+        mimes: &Mimes,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            mimes
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(mime_type);
+        }
     }
 }
 
@@ -534,27 +696,45 @@ impl Dispatch<PrimaryDevice, ()> for State {
     ) {
         match event {
             primary_device::Event::DataOffer { offer } => state.primary_offers.push(offer),
-            primary_device::Event::Selection { .. } => {
-                state.primary_offers.drain(..).for_each(|o| o.destroy());
+            primary_device::Event::Selection { id } => {
+                state.primary_offers.retain(|o| {
+                    let keep = id.as_ref() == Some(o);
+                    if !keep {
+                        o.destroy();
+                    }
+                    keep
+                });
+                let old =
+                    std::mem::replace(&mut state.primary_selected, state.primary_offers.pop());
+                if let Some(old) = old {
+                    old.destroy();
+                }
             }
             _ => {}
         }
     }
 
     event_created_child!(State, PrimaryDevice, [
-        primary_device::EVT_DATA_OFFER_OPCODE => (PrimaryOffer, ()),
+        primary_device::EVT_DATA_OFFER_OPCODE => (PrimaryOffer, Mimes::default()),
     ]);
 }
 
-impl Dispatch<PrimaryOffer, ()> for State {
+impl Dispatch<PrimaryOffer, Mimes> for State {
     fn event(
         _: &mut Self,
         _: &PrimaryOffer,
-        _: <PrimaryOffer as wayland_client::Proxy>::Event,
-        _: &(),
+        event: primary_offer::Event,
+        mimes: &Mimes,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let primary_offer::Event::Offer { mime_type } = event {
+            mimes
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(mime_type);
+        }
     }
 }
 

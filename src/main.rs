@@ -26,6 +26,8 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 use vomd::cli::{self, Cli, Input};
 #[cfg(feature = "clipboard")]
 use vomd::clipboard::{Clipboard, Which};
+#[cfg(feature = "clipboard")]
+use vomd::copy::Content;
 use vomd::doc::Doc;
 use vomd::fonts::Fonts;
 use vomd::nav::{self, BackStack, Target};
@@ -89,6 +91,10 @@ enum UserEvent {
     OpenFailed(String),
     /// Open's dialog closed: the file picked (`None`: nothing), or why there was no dialog.
     Chosen(Result<Option<std::path::PathBuf>, String>),
+    /// A paste into the find bar's field was read: the text (`None`: there was none), and the
+    /// ticket the paste was asked for with, which says whether the field is still the one.
+    #[cfg(all(feature = "clipboard", feature = "find"))]
+    Pasted(u32, Option<String>),
 }
 
 /// How long the first window waits for the portal's dark preference before painting with
@@ -239,7 +245,7 @@ struct App {
     /// The pointer cursor shows a hand (over a link).
     pointer: bool,
     /// The pointer cursor shows the text cursor (over text, or while selecting).
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "find"))]
     text_cursor: bool,
     /// Where copies go (made with the window, which has the display).
     #[cfg(feature = "clipboard")]
@@ -583,14 +589,15 @@ impl App {
         self.redraw();
     }
 
-    /// Take text from an input method while the find bar is open, and not otherwise (so the
-    /// window has no input method's cursor over the document), with its window by the query.
+    /// Take text from an input method while the find bar's field has the keyboard, and not
+    /// otherwise (so the window has no input method's cursor over the document), with its window
+    /// by the caret.
     #[cfg(feature = "find")]
     fn sync_ime(&mut self) {
         let (Some(view), Some(gfx)) = (self.view.as_ref(), self.gfx.as_ref()) else {
             return;
         };
-        let area = view.find_open().then(|| view.find_ime_area());
+        let area = view.find_focused().then(|| view.find_ime_area());
         if let Some((x, y, w, h)) = area
             && self.ime != area
         {
@@ -623,16 +630,16 @@ impl App {
         #[cfg(feature = "toc")]
         let hand = hand || view.over_toc();
         let update = view::hover_change(self.pointer, hand, changed);
-        #[cfg(feature = "clipboard")]
+        #[cfg(any(feature = "clipboard", feature = "find"))]
         let text = self.cursor_in && view.text_cursor(self.cursor.x, self.cursor.y);
-        #[cfg(feature = "clipboard")]
+        #[cfg(any(feature = "clipboard", feature = "find"))]
         let set_cursor = update.set_cursor || text != self.text_cursor;
-        #[cfg(not(feature = "clipboard"))]
+        #[cfg(not(any(feature = "clipboard", feature = "find")))]
         let set_cursor = update.set_cursor;
         if set_cursor {
-            #[cfg(feature = "clipboard")]
+            #[cfg(any(feature = "clipboard", feature = "find"))]
             let text_icon = text && !update.pointer;
-            #[cfg(not(feature = "clipboard"))]
+            #[cfg(not(any(feature = "clipboard", feature = "find")))]
             let text_icon = false;
             gfx.window.set_cursor(if update.pointer {
                 CursorIcon::Pointer
@@ -643,7 +650,7 @@ impl App {
             });
         }
         self.pointer = update.pointer;
-        #[cfg(feature = "clipboard")]
+        #[cfg(any(feature = "clipboard", feature = "find"))]
         {
             self.text_cursor = text;
         }
@@ -718,12 +725,31 @@ impl App {
         if which == Which::Primary && !self.primary {
             return;
         }
-        let content = self.view.as_ref().and_then(View::copy_content);
+        let content = self.view.as_ref().and_then(View::offered);
+        self.offer_content(which, content);
+    }
+
+    /// Offer `content`, if there is any, as the clipboard or the primary selection.
+    #[cfg(feature = "clipboard")]
+    fn offer_content(&mut self, which: Which, content: Option<Content>) {
         if let (Some(content), Some(clipboard)) = (content, self.clipboard.as_mut()) {
             // (Without a clipboard a copy by key does nothing, as it always has; the copy button
             // says why.)
             let _ = clipboard.set(which, content);
         }
+    }
+
+    /// Paste a selection into the find bar's field: read it off the main thread, and the text
+    /// comes back as [`UserEvent::Pasted`].
+    #[cfg(all(feature = "clipboard", feature = "find"))]
+    fn paste(&mut self, which: Which, ticket: u32) {
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        clipboard.read(which, move |text| {
+            let _ = proxy.send_event(UserEvent::Pasted(ticket, text));
+        });
     }
 
     /// A click on a code block's copy button: offer its code as the clipboard (never as PRIMARY,
@@ -760,6 +786,18 @@ impl App {
             }
             #[cfg(feature = "clipboard")]
             Outcome::Copy => self.offer(Which::Clipboard),
+            #[cfg(all(feature = "clipboard", feature = "find"))]
+            Outcome::Cut => {
+                let cut = self.view.as_mut().and_then(View::take_cut);
+                self.offer_content(Which::Clipboard, cut);
+                self.redraw();
+            }
+            #[cfg(all(feature = "clipboard", feature = "find"))]
+            Outcome::Paste(which) => {
+                if let Some(ticket) = self.view.as_ref().map(View::find_ticket) {
+                    self.paste(which, ticket);
+                }
+            }
             Outcome::Quit => event_loop.exit(),
         }
     }
@@ -934,6 +972,14 @@ impl ApplicationHandler<UserEvent> for App {
                     Err(why) => self.toast(format!("Can't open a file: {why}")),
                 }
             }
+            #[cfg(all(feature = "clipboard", feature = "find"))]
+            UserEvent::Pasted(ticket, text) => {
+                let pasted = text.as_deref().zip(self.view.as_mut());
+                if pasted.is_some_and(|(text, view)| view.find_paste(ticket, text)) {
+                    self.redraw();
+                }
+                self.sync_ime();
+            }
             UserEvent::SystemDark(dark) => {
                 self.portal = dark;
                 if let (Some(view), Some(gfx)) = (self.view.as_mut(), self.gfx.as_ref())
@@ -990,6 +1036,8 @@ impl ApplicationHandler<UserEvent> for App {
                     view.release_select();
                     view.cancel_copy();
                 }
+                #[cfg(feature = "find")]
+                view.release_find_drag();
                 self.save(|s| s.flush());
             }
             WindowEvent::Focused(true) => {
@@ -1007,7 +1055,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::DroppedFile(path) => self.go_to(Input::File(path)),
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
-                #[cfg(feature = "clipboard")]
+                #[cfg(any(feature = "clipboard", feature = "find"))]
                 view.set_shift(self.mods.shift_key());
                 if !(self.mods.control_key() || self.mods.super_key()) {
                     view.zoom_wheel_end();
@@ -1059,6 +1107,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let moved = view.drag_to(position.y, now);
                 #[cfg(feature = "clipboard")]
                 let moved = view.select_to(position.x, position.y, now) | moved;
+                #[cfg(feature = "find")]
+                let moved = view.find_drag_to(position.x, now) | moved;
                 if moved {
                     self.redraw();
                 }
@@ -1083,6 +1133,13 @@ impl ApplicationHandler<UserEvent> for App {
                             offer_primary = view.release_select();
                             code = view.release_copy(x, y);
                         }
+                        // A selection made in the find bar's field is offered too.
+                        #[cfg(all(feature = "clipboard", feature = "find"))]
+                        {
+                            offer_primary |= view.release_find_drag();
+                        }
+                        #[cfg(all(feature = "find", not(feature = "clipboard")))]
+                        view.release_find_drag();
                         (
                             view.release(now) | bar,
                             view.click(x, y),
@@ -1114,6 +1171,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // A click can close the contents panel (a row, or the document it covers).
                 self.record(now);
+            }
+            // A middle click on the find bar's field pastes the primary selection there.
+            #[cfg(all(feature = "clipboard", feature = "find"))]
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                if let Some(ticket) = view.find_middle(self.cursor.x, self.cursor.y) {
+                    self.redraw();
+                    self.paste(Which::Primary, ticket);
+                }
             }
             _ => {}
         }
@@ -1251,7 +1320,7 @@ fn main() {
         cursor: PhysicalPosition::new(0.0, 0.0),
         cursor_in: false,
         pointer: false,
-        #[cfg(feature = "clipboard")]
+        #[cfg(any(feature = "clipboard", feature = "find"))]
         text_cursor: false,
         #[cfg(feature = "clipboard")]
         clipboard: None,

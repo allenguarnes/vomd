@@ -113,6 +113,7 @@ fn a_selection_is_answered_with_the_targets_that_serve_text() {
         TEXT_PLAIN_UTF8: 11,
         TEXT_PLAIN: 12,
         VOMD_SELECTION: 13,
+        VOMD_PASTE: 14,
     };
     let list = targets(&a);
     for t in [
@@ -131,4 +132,98 @@ fn a_selection_is_answered_with_the_targets_that_serve_text() {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(unique.len(), list.len());
+}
+
+fn reading() -> Reading {
+    Reading {
+        reply: Some(Reply::new(|_| {})),
+        selection: 1,
+        time: 1000,
+        target: 2,
+        asked: 1,
+        deadline: Instant::now() + READ_WAIT,
+        incr: false,
+        ended: false,
+        draining: false,
+        data: Vec::new(),
+        latin1: false,
+    }
+}
+
+#[test]
+fn only_the_answer_to_this_request_is_taken_for_it() {
+    let r = reading();
+    assert!(r.answered_by(1, 2, 1000));
+    // A late answer to a paste that timed out had the time of that one.
+    assert!(!r.answered_by(1, 2, 400));
+    assert!(!r.answered_by(1, 3, 1000));
+    assert!(!r.answered_by(3, 2, 1000));
+}
+
+#[test]
+fn the_pieces_of_a_paste_are_joined_and_the_empty_one_ends_it() {
+    let mut r = reading();
+    assert!(!r.push(b"hello "));
+    assert!(!r.push("wörld".as_bytes()));
+    assert!(r.push(b""));
+    assert_eq!(decode(&r.data, false), "hello wörld");
+}
+
+#[test]
+fn a_paste_is_cut_at_the_cap_whatever_the_size_of_the_pieces() {
+    let mut r = reading();
+    let piece = vec![b'x'; CHUNK];
+    let mut taken = 0;
+    while !r.push(&piece) {
+        taken += 1;
+        assert!(taken < 100, "it never ends");
+    }
+    assert_eq!(r.data.len(), READ_CAP);
+    // One piece that is too big alone.
+    let mut r = reading();
+    assert!(r.push(&vec![b'y'; 3 * READ_CAP]));
+    assert_eq!(r.data.len(), READ_CAP);
+    // And anything after the cap adds nothing.
+    assert!(r.push(b"more"));
+    assert_eq!(r.data.len(), READ_CAP);
+}
+
+#[test]
+fn a_property_that_a_paste_gave_up_on_is_left_alone_until_it_has_been_quiet() {
+    let t0 = Instant::now();
+    let mut names = Pastes::new(10);
+    assert_eq!(names.take(t0), Some(10));
+    names.retire(10, t0);
+    assert!(names.is_retired(10));
+    // No name left to use but the room for more.
+    assert_eq!(names.take(t0), None);
+    assert!(names.room());
+    names.add(11);
+    assert_eq!(names.take(t0), Some(11));
+    // A late write to the retired one starts the quiet over.
+    let t1 = t0 + QUIET - Duration::from_secs(1);
+    names.retire(10, t1);
+    names.retire(11, t1);
+    assert_eq!(names.take(t0 + QUIET), None);
+    assert_eq!(names.take(t1 + QUIET), Some(10));
+    // Back in use, no longer retired.
+    assert!(!names.is_retired(10));
+}
+
+#[test]
+fn only_a_few_names_are_made_and_a_paste_finds_none_when_all_are_retired() {
+    let t0 = Instant::now();
+    let mut names = Pastes::new(1);
+    for atom in 2..=PASTE_NAMES as Atom {
+        assert!(names.room());
+        names.add(atom);
+    }
+    assert!(!names.room());
+    for atom in 1..=PASTE_NAMES as Atom {
+        assert_eq!(names.take(t0), Some(atom));
+        names.retire(atom, t0);
+    }
+    assert_eq!(names.take(t0 + Duration::from_secs(1)), None);
+    assert_eq!(names.next_name(), format!("VOMD_PASTE_{PASTE_NAMES}"));
+    assert!(names.has(2) && !names.has(99));
 }

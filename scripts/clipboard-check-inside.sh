@@ -25,7 +25,17 @@
 #   - (X11 only) the rarer requests: MULTIPLE, TIMESTAMP, and one from before VOMD owned the
 #     selection (refused), made by `examples/clip_probe.rs`; and at exit a clipboard manager
 #     (also the probe) is asked to save the clipboard, and does, while with none VOMD quits at
-#     once.
+#     once;
+#   - reading, which a paste into the find bar's field does: what another program (xclip,
+#     wl-copy) offers as CLIPBOARD and PRIMARY is read by VOMD's own code, in a window of the
+#     probe's (`clip_probe read`), whole, with the first 64 KiB of a long one (X11's INCR too),
+#     in Latin-1 when that is all that is offered (X11), with nothing printed for a selection
+#     that has no owner, offers no text, or is never answered (X11: after about 2 s), and with
+#     what the probe offers itself read back as it is; and in VOMD itself, with real keys:
+#     Ctrl+F, Ctrl+V (the clipboard, X11 and Wayland) or a middle click on the field (PRIMARY,
+#     X11 only, for the reason above), Ctrl+A and Ctrl+C to copy what was pasted out, a
+#     selection VOMD offers itself read back the same way, and the field's own Ctrl+X, Ctrl+A
+#     (PRIMARY) and Ctrl+V.
 set -euo pipefail
 [ "${VOMD_CLIPBOARD_CHECK:-}" = in-container ] || {
     echo "run scripts/clipboard-check.sh: this starts servers and sends input, and must stay in its container"
@@ -50,6 +60,14 @@ printf 'Paragraph one: café 日本 and some more words.\n\n- item one\n- item t
 printf 'Paragraph one: caf\351 ?? and some more words.\n\n- item one\n- item two\n\n> quoted line\n\na\tb\n1\t2' >small.latin1
 printf 'Paragraph one: café 日本 and some more words.' >first.expected
 printf 'Paragraph' >word.expected
+# What other programs offer for VOMD to read: UTF-8 text with a second line, Latin-1 text that is
+# `STRING` alone, and the text VOMD reads of a long one (64 KiB).
+printf 'café 日本 first line\nsecond line' >offer.txt
+printf 'café 日本 first line' >offer.first
+printf 'caf\351' >offer.latin1
+printf 'café' >offer.latin1.expected
+printf 'hello world' >hello.expected
+printf 'OTHER' >other.expected
 # A document that starts with code, for the copy button: the code has a tab, a blank line, an
 # indented line and a non-ASCII letter, and the text that selecting all of it gives.
 printf '%s\n' '```rust' 'fn f() {' $'\treturn 1;  // tab' '' '    deep   spaced é' '}' '```' '' 'After the code.' >code.md
@@ -59,6 +77,7 @@ printf 'fn f() {\n\treturn 1;  // tab\n\n    deep   spaced \351\n}' >code.latin1
 awk -v n=90000 'BEGIN { for (i = 1; i <= n; i++) { if (i > 1) printf "\n\n"; printf "Paragraph %d of the big document, with a little text in it.", i } }' >big.expected
 { cat big.expected; echo; } >big.md
 big_sha=$(sha256sum <big.expected | cut -d' ' -f1)
+head -c 65536 big.expected >big.cap
 echo "== a $(stat -c %s big.md) byte document, sha256 $big_sha"
 mkdir -p cfg-on cfg-off home run
 printf 'primary_selection = off\n' >cfg-off/settings.ini
@@ -155,10 +174,183 @@ x11_same() { # sel, file
 }
 x11_unset() { ! xclip -o -selection "$1" >got.txt 2>/dev/null && [ ! -s got.txt ]; }
 
+# What the probe's window reads from the selection `$1` with VOMD's code (`$2`: it offers that
+# first, itself): its output is the text, and it fails with nothing printed if there was none.
+x11_read() { DISPLAY=:99 timeout 30 "$probe" read "$@"; }
+
+# Where the find bar's field is in the window: the bar is below the toolbar (32 px), as high as it.
+field_x() { echo $((X + 60)); }
+field_y() { echo $((Y + 32 + 16)); }
+
+x11_reading() {
+    echo "-- reading"
+    local t0 t1
+    # No owner (nothing has been offered on this server yet): nothing, and without a wait.
+    t0=$(date +%s%N)
+    x11_read PRIMARY >got.txt 2>err.txt && fail "X11: read a PRIMARY that has no owner: $(cat got.txt)"
+    t1=$(date +%s%N)
+    [ ! -s got.txt ] || fail "X11: a selection with no owner gave '$(cat got.txt)'"
+    grep -qx nothing err.txt || fail "X11: no owner: $(cat err.txt)"
+    [ $(((t1 - t0) / 1000000)) -lt 1500 ] || fail "X11: a selection with no owner took $(((t1 - t0) / 1000000)) ms"
+    ok "X11: a selection with no owner reads as nothing, at once"
+    # Another program's UTF-8 text, CLIPBOARD and PRIMARY, whole (the first line is the field's doing).
+    xclip -i -selection clipboard <offer.txt
+    x11_read CLIPBOARD >got.txt || fail "X11: reading CLIPBOARD: $(cat err.txt)"
+    cmp -s got.txt offer.txt || fail "X11: CLIPBOARD read as: $(od -c got.txt | head -5)"
+    xclip -i -selection primary <offer.txt
+    x11_read PRIMARY >got.txt || fail "X11: reading PRIMARY"
+    cmp -s got.txt offer.txt || fail "X11: PRIMARY read as: $(od -c got.txt | head -5)"
+    ok "X11: VOMD's code reads CLIPBOARD and PRIMARY that xclip offers"
+    # A program that offers only STRING (Latin-1) is read through the fallback.
+    xclip -i -selection clipboard -t STRING <offer.latin1
+    x11_read CLIPBOARD >got.txt || fail "X11: reading a STRING-only clipboard"
+    cmp -s got.txt offer.latin1.expected || fail "X11: STRING read as: $(od -c got.txt | head -3)"
+    ok "X11: a clipboard that is Latin-1 STRING alone is read"
+    # A long one comes by INCR (xclip's 5 MB does): the first 64 KiB, and nothing waits for the rest.
+    xclip -i -selection clipboard <big.expected
+    t0=$(date +%s%N)
+    x11_read CLIPBOARD >got.txt || fail "X11: reading a 5 MB clipboard"
+    t1=$(date +%s%N)
+    cmp -s got.txt big.cap || fail "X11: the 5 MB clipboard read as $(stat -c %s got.txt) bytes"
+    [ $(((t1 - t0) / 1000000)) -lt 3000 ] || fail "X11: reading 5 MB took $(((t1 - t0) / 1000000)) ms"
+    ok "X11: a 5 MB clipboard is read up to 64 KiB"
+    # Two reads in a row from it: the first leaves the owner's transfer unfinished, and the second
+    # has none of its pieces (nor any of the first's) in its text.
+    # (A new xclip: the one that served the read before is still waiting for a window that is gone.)
+    xclip -i -selection clipboard <big.expected
+    DISPLAY=:99 timeout 30 "$probe" reread CLIPBOARD >got2.bin || fail "X11: reading a 5 MB clipboard twice"
+    head -c 65536 got2.bin | cmp -s - big.cap || fail "X11: the first of two 5 MB reads differs"
+    tail -c +65538 got2.bin | cmp -s - big.cap || fail "X11: the second of two 5 MB reads differs"
+    [ "$(stat -c %s got2.bin)" = 131073 ] || fail "X11: two 5 MB reads came to $(stat -c %s got2.bin) bytes"
+    ok "X11: a second read after a 5 MB one has nothing of its transfer in it"
+    # An owner that never answers is given up on after a moment, without a text.
+    "$probe" hold CLIPBOARD >hold.log &
+    local holder=$!
+    pids+=("$holder")
+    retry grep -qx ready hold.log || fail "X11: the probe didn't take the clipboard"
+    t0=$(date +%s%N)
+    x11_read CLIPBOARD >got.txt 2>err.txt && fail "X11: read from an owner that never answers: $(cat got.txt)"
+    t1=$(date +%s%N)
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    grep -qx nothing err.txt || fail "X11: a stuck owner: $(cat err.txt)"
+    [ $(((t1 - t0) / 1000000)) -ge 1500 ] || fail "X11: gave up on a stuck owner after $(((t1 - t0) / 1000000)) ms"
+    [ $(((t1 - t0) / 1000000)) -lt 6000 ] || fail "X11: waited $(((t1 - t0) / 1000000)) ms for a stuck owner"
+    ok "X11: an owner that never answers is given up on in about 2 s"
+    # An owner that is slow with the pieces of an INCR transfer (it writes the next a moment after
+    # the reader deleted the last one) is read whole: nothing may take a piece away in between.
+    "$probe" slow CLIPBOARD 'slow owner' 30 >slow.log &
+    holder=$!
+    pids+=("$holder")
+    retry grep -qx ready slow.log || fail "X11: the slow probe didn't take the clipboard"
+    x11_read CLIPBOARD >got.txt 2>err.txt || fail "X11: reading from a slow INCR owner: $(cat err.txt)"
+    [ "$(cat got.txt)" = 'slow owner' ] || fail "X11: a slow INCR owner read as '$(cat got.txt)'"
+    retry grep -qx ended slow.log || fail "X11: a slow INCR owner's transfer wasn't ended by the reader"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    ok "X11: an INCR owner that is slow with each piece is read whole"
+    # An owner that answers late, after the paste gave up on it: the answer goes to a property of
+    # the old paste, which VOMD keeps emptying so that the owner can end its transfer, and the
+    # next paste (right after the first gave up) has its own text, not a piece of the late one.
+    "$probe" stale CLIPBOARD 'fresh text' >stale.log &
+    holder=$!
+    pids+=("$holder")
+    retry grep -qx ready stale.log || fail "X11: the stale probe didn't take the clipboard"
+    DISPLAY=:99 timeout 30 "$probe" again CLIPBOARD >got2.bin 2>err.txt || fail "X11: reading from a late owner: $(cat err.txt)"
+    printf '\0fresh text' | cmp -s - got2.bin || fail "X11: two reads, the first given up on, came to: $(od -c got2.bin | head -3)"
+    retry grep -qx ended stale.log || fail "X11: a late answer was not taken from the property of the paste that gave up"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    ok "X11: a late answer to a paste that gave up neither reaches the next paste nor stalls its owner"
+    # A selection the reader offers itself is read back as it is.
+    x11_read CLIPBOARD 'own text é' >got.txt || fail "X11: reading its own selection"
+    [ "$(cat got.txt)" = 'own text é' ] || fail "X11: its own selection read as '$(cat got.txt)'"
+    ok "X11: a selection VOMD's code offers itself reads back from what it offers"
+
+    echo "-- pasting into the find bar"
+    # Ctrl+F, Ctrl+V, then Ctrl+A and Ctrl+C copy the query out: what was pasted, its first line.
+    xclip -i -selection clipboard <offer.txt
+    x11_vomd small.md cfg-on
+    x11_key ctrl+f
+    sleep 0.3
+    x11_key ctrl+v
+    sleep 0.5
+    x11_key ctrl+a ctrl+c
+    retry x11_same clipboard offer.first || fail "X11: Ctrl+V into the find bar: the query came out as '$(x11_paste clipboard | od -c | head -3)'"
+    ok "X11: Ctrl+V pastes the clipboard's first line into the find bar"
+    x11_end
+    # A middle click on the field pastes PRIMARY (the xclip's, then VOMD's own).
+    printf 'primary é\nsecond' | xclip -i -selection primary
+    printf 'primary é' >primary.first
+    x11_vomd small.md cfg-on
+    x11_key ctrl+f
+    sleep 0.3
+    DISPLAY=:99 xdotool mousemove "$(field_x)" "$(field_y)"
+    sleep 0.3
+    DISPLAY=:99 xdotool click 2
+    sleep 0.5
+    x11_key ctrl+a ctrl+c
+    retry x11_same clipboard primary.first || fail "X11: a middle click on the field: the query came out as '$(x11_paste clipboard | od -c | head -3)'"
+    ok "X11: a middle click on the field pastes PRIMARY"
+    x11_end
+    # A selection VOMD owns itself: select all (PRIMARY), then Ctrl+C (CLIPBOARD), and the bar
+    # takes it from VOMD's own thread.
+    x11_vomd small.md cfg-on
+    x11_key ctrl+a ctrl+c
+    retry x11_same clipboard small.expected || fail "X11: Ctrl+C didn't copy"
+    x11_key ctrl+f
+    sleep 0.3
+    x11_key ctrl+v
+    sleep 0.5
+    printf other | xclip -i -selection clipboard
+    retry test "$(x11_paste clipboard)" = other || fail "X11: another program couldn't take the clipboard"
+    x11_key ctrl+a ctrl+c
+    retry x11_same clipboard first.expected || fail "X11: pasting VOMD's own clipboard: '$(x11_paste clipboard | od -c | head -3)'"
+    ok "X11: the clipboard VOMD owns is pasted from what it offers"
+    x11_end
+    x11_vomd small.md cfg-on
+    x11_key ctrl+a
+    retry x11_same primary small.expected || fail "X11: Ctrl+A didn't offer the document as PRIMARY"
+    x11_key ctrl+f
+    sleep 0.3
+    DISPLAY=:99 xdotool mousemove "$(field_x)" "$(field_y)"
+    sleep 0.3
+    DISPLAY=:99 xdotool click 2
+    sleep 0.5
+    x11_key ctrl+a ctrl+c
+    retry x11_same clipboard first.expected || fail "X11: pasting VOMD's own PRIMARY: '$(x11_paste clipboard | od -c | head -3)'"
+    ok "X11: the PRIMARY VOMD owns is pasted from what it offers"
+    x11_end
+    # The field's own selection and cut: Ctrl+A in it offers it as PRIMARY, Ctrl+X takes it
+    # out and makes it the clipboard, and what is pasted next goes into the empty field.
+    x11_vomd small.md cfg-on
+    x11_key ctrl+f
+    sleep 0.3
+    DISPLAY=:99 xdotool type --delay 60 'hello world'
+    sleep 0.3
+    x11_key ctrl+a
+    retry x11_same primary hello.expected || fail "X11: Ctrl+A in the field didn't offer it as PRIMARY: '$(x11_paste primary)'"
+    x11_key ctrl+x
+    retry x11_same clipboard hello.expected || fail "X11: Ctrl+X didn't cut to the clipboard: '$(x11_paste clipboard)'"
+    printf OTHER | xclip -i -selection clipboard
+    retry test "$(x11_paste clipboard)" = OTHER || fail "X11: another program couldn't take the clipboard"
+    x11_key ctrl+v
+    sleep 0.5
+    x11_key ctrl+a ctrl+c
+    retry x11_same clipboard other.expected || fail "X11: Ctrl+X left text in the field: '$(x11_paste clipboard)'"
+    ok "X11: the field's selection is PRIMARY, Ctrl+X cuts it, Ctrl+V pastes into what is left"
+    x11_end
+    # The next checks start with no owner of either selection.
+    pkill -x xclip 2>/dev/null || true
+    retry x11_unset clipboard || fail "X11: the clipboard still has an owner"
+    retry x11_unset primary || fail "X11: PRIMARY still has an owner"
+}
+
 x11_suite() {
     echo "== X11"
     export DISPLAY=:99
     x11_server
+    x11_reading
 
     echo "-- short text"
     x11_vomd small.md cfg-on
@@ -421,10 +613,108 @@ wl_unset() { # options
     ! wl wl-paste -n "$@" >got.txt 2>/dev/null && [ ! -s got.txt ]
 }
 
+# What the probe's window reads from the selection `$1` with VOMD's code (`$2`: it offers that
+# first, itself): the text it prints, with nothing printed (and a failure) if there was none. A
+# headless sway has no keyboard, and a window is only told of the selections when it has one, so
+# a virtual keyboard is held (Shift down, for as long as the probe takes) while it runs.
+wl_read() {
+    wl wtype -M shift -s 20000 -m shift &
+    local keyboard=$! status=0
+    sleep 0.3
+    wl timeout 30 "$probe" read "$@" || status=$?
+    kill "$keyboard" 2>/dev/null || true
+    wait "$keyboard" 2>/dev/null || true
+    return "$status"
+}
+
+wayland_reading() {
+    echo "-- reading"
+    local keys
+    wl_read PRIMARY >got.txt 2>err.txt && fail "Wayland: read a PRIMARY that has no owner: $(cat got.txt)"
+    grep -qx nothing err.txt || fail "Wayland: no owner: $(cat err.txt)"
+    ok "Wayland: a selection with no owner reads as nothing"
+    wl wl-copy <offer.txt
+    wl_read CLIPBOARD >got.txt || fail "Wayland: reading CLIPBOARD: $(cat err.txt)"
+    cmp -s got.txt offer.txt || fail "Wayland: CLIPBOARD read as: $(od -c got.txt | head -5)"
+    wl wl-copy --primary <offer.txt
+    wl_read PRIMARY >got.txt || fail "Wayland: reading PRIMARY: $(cat err.txt)"
+    cmp -s got.txt offer.txt || fail "Wayland: PRIMARY read as: $(od -c got.txt | head -5)"
+    ok "Wayland: VOMD's code reads CLIPBOARD and PRIMARY that wl-copy offers"
+    # (wl-copy gives the bytes it is given for whatever text type it offers, so a Latin-1 `STRING`
+    # can't be had from it as it can from xclip; a unit test covers that type. This is a type with
+    # no charset, the last that is tried.)
+    wl wl-copy -t text/plain <offer.txt
+    wl_read CLIPBOARD >got.txt || fail "Wayland: reading a text/plain clipboard"
+    cmp -s got.txt offer.txt || fail "Wayland: text/plain read as: $(od -c got.txt | head -3)"
+    ok "Wayland: a clipboard that offers text/plain is read"
+    wl wl-copy <big.expected
+    wl_read CLIPBOARD >got.txt || fail "Wayland: reading a 5 MB clipboard"
+    cmp -s got.txt big.cap || fail "Wayland: the 5 MB clipboard read as $(stat -c %s got.txt) bytes"
+    wl wl-copy --primary <big.expected
+    wl_read PRIMARY >got.txt || fail "Wayland: reading a 5 MB PRIMARY"
+    cmp -s got.txt big.cap || fail "Wayland: the 5 MB PRIMARY read as $(stat -c %s got.txt) bytes"
+    ok "Wayland: a 5 MB clipboard and PRIMARY are read up to 64 KiB"
+    wl wl-copy -t image/png <small.md
+    wl_read CLIPBOARD >got.txt 2>err.txt && fail "Wayland: read an image offer as text: $(cat got.txt)"
+    grep -qx nothing err.txt || fail "Wayland: an offer with no text: $(cat err.txt)"
+    wl wl-copy --clear
+    wl_read CLIPBOARD >got.txt 2>err.txt && fail "Wayland: read a cleared clipboard: $(cat got.txt)"
+    ok "Wayland: an offer with no text, and a cleared clipboard, read as nothing"
+    wl_read CLIPBOARD 'own text é' >got.txt || fail "Wayland: reading its own selection: $(cat err.txt)"
+    [ "$(cat got.txt)" = 'own text é' ] || fail "Wayland: its own selection read as '$(cat got.txt)'"
+    wl_read PRIMARY 'own primary é' >got.txt || fail "Wayland: reading its own PRIMARY: $(cat err.txt)"
+    [ "$(cat got.txt)" = 'own primary é' ] || fail "Wayland: its own PRIMARY read as '$(cat got.txt)'"
+    ok "Wayland: a selection VOMD's code offers itself reads back from what it offers"
+
+    echo "-- pasting into the find bar"
+    # (Prime the virtual keyboard with a key that does nothing, then send the keys at once.)
+    keys=(-M ctrl f -m ctrl -M ctrl v -m ctrl -M ctrl a -m ctrl -M ctrl c -m ctrl)
+    wl wl-copy <offer.txt
+    wayland_vomd small.md cfg-on
+    for _ in 1 2; do wl_keys -k Shift_L; done
+    wl_keys "${keys[@]}"
+    retry wl_same offer.first || fail "Wayland: Ctrl+V into the find bar: the query came out as '$(wl_paste | od -c | head -3)'"
+    ok "Wayland: Ctrl+V pastes the clipboard's first line into the find bar"
+    wayland_end
+    # VOMD's own clipboard, which the bar takes from what VOMD offers.
+    wayland_vomd small.md cfg-on
+    for _ in 1 2; do wl_keys -k Shift_L; done
+    wl_keys -M ctrl a -m ctrl -M ctrl c -m ctrl
+    retry wl_same small.expected || fail "Wayland: Ctrl+C didn't copy"
+    wl_keys -M ctrl f -m ctrl -M ctrl v -m ctrl
+    sleep 0.5
+    printf other | wl wl-copy
+    retry test "$(wl_paste)" = other || fail "Wayland: another program couldn't take the clipboard"
+    wl_keys -M ctrl a -m ctrl -M ctrl c -m ctrl
+    retry wl_same first.expected || fail "Wayland: pasting VOMD's own clipboard: '$(wl_paste | od -c | head -3)'"
+    ok "Wayland: the clipboard VOMD owns is pasted from what it offers"
+    wayland_end
+    # The field's own selection (PRIMARY), cut and paste.
+    wayland_vomd small.md cfg-on
+    for _ in 1 2; do wl_keys -k Shift_L; done
+    wl_keys -M ctrl f -m ctrl
+    wl_keys hello world
+    wl_keys -M ctrl a -m ctrl
+    retry wl_same hello.expected --primary || fail "Wayland: Ctrl+A in the field didn't offer it as PRIMARY: '$(wl_paste --primary)'"
+    wl_keys -M ctrl x -m ctrl
+    retry wl_same hello.expected || fail "Wayland: Ctrl+X didn't cut to the clipboard: '$(wl_paste)'"
+    printf OTHER | wl wl-copy
+    retry test "$(wl_paste)" = OTHER || fail "Wayland: another program couldn't take the clipboard"
+    wl_keys -M ctrl v -m ctrl
+    sleep 0.5
+    wl_keys -M ctrl a -m ctrl -M ctrl c -m ctrl
+    retry wl_same other.expected || fail "Wayland: Ctrl+X left text in the field: '$(wl_paste)'"
+    ok "Wayland: the field's selection is PRIMARY, Ctrl+X cuts it, Ctrl+V pastes into what is left"
+    wayland_end
+    wl wl-copy --clear
+    wl wl-copy --clear --primary
+}
+
 wayland_suite() {
     echo "== Wayland (sway)"
     unset DISPLAY
     wayland_server
+    wayland_reading
 
     echo "-- short text"
     wayland_vomd small.md cfg-on

@@ -47,8 +47,8 @@ required-features = ["find"]
 
 [features]
 default = ["images", "remote-images", "embed-fonts", "clipboard", "toc", "find"]
-# Text selection and copy. The X11 and Wayland clipboards use crates that winit already brings
-# in; the minimal build leaves all of it out.
+# Text selection and copy, and paste into the find bar. The X11 and Wayland clipboards use crates
+# that winit already brings in; the minimal build leaves all of it out.
 clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayland-protocols"]
 # The table of contents panel (C). No crates, and little code: the minimal build leaves it out.
 toc = []

@@ -1,13 +1,21 @@
 //! The clipboard: what Ctrl+C copies (CLIPBOARD) and what selecting text offers (PRIMARY, on
-//! X11 and Wayland), served to the programs that paste it.
+//! X11 and Wayland), served to the programs that paste it, and what they have offered, read for
+//! the find bar's field.
 //!
 //! The window system's own libraries (winit's) don't expose what an owner of a selection must
 //! answer, so each backend has a connection of its own to the same display: an XCB connection on
 //! X11 (`x11.rs`), and a second event queue on winit's `wl_display` on Wayland (`wayland.rs`).
-//! A backend starts on the first copy (a window that never copies pays for nothing), and serves
-//! the selections from a thread of its own that sleeps until a program asks, so an idle window
-//! stays idle. What is served is a [`Content`], which makes its text as it is asked for.
-//! Windows and macOS have no backend yet: a copy there does nothing.
+//! A backend starts on the first copy or paste (a window that never uses the clipboard pays for
+//! nothing), and serves the selections from a thread of its own that sleeps until a program asks,
+//! so an idle window stays idle. What is served is a [`Content`], which makes its text as it is
+//! asked for. A paste is read by that thread too (or a worker of it), never by the window's: it
+//! asks the owner of the selection for text, takes at most [`READ_CAP`] bytes of it, gives up
+//! after [`READ_WAIT`], and hands the text to a callback (see [`Clipboard::read`]). Windows and
+//! macOS have no backend yet: a copy there does nothing, and a paste finds nothing.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use winit::raw_window_handle::RawDisplayHandle;
 
@@ -28,6 +36,12 @@ const TEXT_TYPES: [&str; 5] = [
     "STRING",
     "text/plain",
 ];
+
+/// The most bytes of a selection a paste reads. The find bar's field takes one short line, and a
+/// program may offer a whole book.
+pub const READ_CAP: usize = 64 * 1024;
+/// How long a paste waits for the owner of the selection to answer.
+pub const READ_WAIT: Duration = Duration::from_secs(2);
 
 /// The selections a copy goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +86,50 @@ impl<T> Backend<T> {
     }
 }
 
+/// Where the text of a paste goes when it is read: the callback of [`Clipboard::read`], called
+/// once, from whichever thread read it, with `None` if there was nothing to read. Dropped
+/// unanswered (the backend's thread ended) it says that too, so a read always ends.
+pub struct Reply(Option<Box<dyn FnOnce(Option<String>) + Send>>);
+
+impl Reply {
+    fn new(done: impl FnOnce(Option<String>) + Send + 'static) -> Reply {
+        Reply(Some(Box::new(done)))
+    }
+
+    /// The text read, if there was any (nothing at all is no text).
+    #[cfg_attr(
+        not(all(unix, not(any(target_os = "macos", target_os = "ios")))),
+        allow(dead_code)
+    )]
+    fn send(mut self, text: Option<String>) {
+        if let Some(done) = self.0.take() {
+            done(text.filter(|t| !t.is_empty()));
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            done(None);
+        }
+    }
+}
+
+/// The text of the bytes a selection gave: Latin-1 for `STRING`, else UTF-8, whose bad bytes (and
+/// a character cut off by [`READ_CAP`]) show as `\u{fffd}`.
+#[cfg_attr(
+    not(all(unix, not(any(target_os = "macos", target_os = "ios")))),
+    allow(dead_code)
+)]
+fn decode(bytes: &[u8], latin1: bool) -> String {
+    if latin1 {
+        bytes.iter().map(|&b| char::from(b)).collect()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 /// The clipboard of the window system the window is on.
 pub struct Clipboard {
     #[cfg_attr(
@@ -83,6 +141,8 @@ pub struct Clipboard {
     x11: Backend<x11::Owner>,
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     wayland: Backend<wayland::Owner>,
+    /// A read is under way: one at a time, as a person pastes.
+    reading: Arc<AtomicBool>,
 }
 
 impl Clipboard {
@@ -95,6 +155,7 @@ impl Clipboard {
             x11: Backend::Idle,
             #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
             wayland: Backend::Idle,
+            reading: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -123,6 +184,47 @@ impl Clipboard {
         {
             let _ = (which, content);
             Err("this system has no clipboard support".into())
+        }
+    }
+
+    /// Read the text of the selection `which`, for a paste, and call `done` with it, from another
+    /// thread, once it is read: `None` if there is no owner, no text, nothing to ask (a window
+    /// system with no clipboard here), or no answer in [`READ_WAIT`]. This never waits: a selection
+    /// that is ours is answered from what we offer, and another program's is asked for by the
+    /// backend's thread, which takes at most [`READ_CAP`] bytes of it. A read while another is
+    /// under way finds nothing. Only the first line of the text matters to the one pasting it, so
+    /// a long selection is cut where it is read.
+    pub fn read(&mut self, which: Which, done: impl FnOnce(Option<String>) + Send + 'static) {
+        let reading = self.reading.clone();
+        if reading.swap(true, Ordering::AcqRel) {
+            done(None);
+            return;
+        }
+        let reply = Reply::new(move |text| {
+            reading.store(false, Ordering::Release);
+            done(text);
+        });
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+        match self.display {
+            RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => {
+                match self.x11.get(x11::Owner::start) {
+                    Ok(x11) => x11.read(which, reply),
+                    Err(_) => reply.send(None),
+                }
+            }
+            RawDisplayHandle::Wayland(handle) => {
+                let display = handle.display.as_ptr();
+                match self.wayland.get(|| wayland::Owner::start(display)) {
+                    Ok(wayland) => wayland.read(which, reply),
+                    Err(_) => reply.send(None),
+                }
+            }
+            _ => reply.send(None),
+        }
+        #[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
+        {
+            let _ = which;
+            drop(reply);
         }
     }
 

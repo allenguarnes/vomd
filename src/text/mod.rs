@@ -232,17 +232,17 @@ pub struct PHit {
     pub x0: f32,
     pub x1: f32,
     pub doc: u32,
-    /// Index into the owner's style table; with `clipboard`, bit 31 says the cluster runs right
-    /// to left (see [`PHit::style_index`] and [`PHit::rtl`]).
+    /// Index into the owner's style table; with `clipboard` or `find`, bit 31 says the cluster
+    /// runs right to left (see [`PHit::style_index`] and [`PHit::rtl`]).
     pub style: u32,
 }
 
 /// The bit of [`PHit::style`] that marks a right-to-left cluster. Style tables never come near
 /// 2³¹ entries. Packed into the index so a hit stays 16 bytes: there is one per cluster of
 /// every block near the viewport.
-#[cfg(feature = "clipboard")]
+#[cfg(any(feature = "clipboard", feature = "find"))]
 const HIT_RTL: u32 = 1 << 31;
-#[cfg(not(feature = "clipboard"))]
+#[cfg(not(any(feature = "clipboard", feature = "find")))]
 const HIT_RTL: u32 = 0;
 
 impl PHit {
@@ -252,7 +252,7 @@ impl PHit {
     }
 
     /// The cluster runs right to left, so its leading edge is on the right.
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "find"))]
     pub fn rtl(&self) -> bool {
         self.style & HIT_RTL != 0
     }

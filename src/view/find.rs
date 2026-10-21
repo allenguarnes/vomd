@@ -5,7 +5,8 @@
 //! area starts below (see [`View::chrome_inset`]), so opening it keeps the reading position as the
 //! toolbar's showing does. It is chrome, whose sizes are logical pixels that scale with the display
 //! like the toolbar's, not with the document's zoom. There is one input, the query, which has the
-//! keyboard while the bar is open (see [`View::find_key`]), whatever is clicked.
+//! keyboard while the bar is open (see [`View::find_key`]), until a click on the document takes it
+//! away: the bar stays open, and the keys are the document's again.
 //!
 //! The matches come from the document's text (see [`crate::find`]) and are found again on every
 //! edit of the query, on a reload and for a new document. Stepping to a match scrolls it to a
@@ -13,17 +14,25 @@
 //! by its byte offset in the lines of its block, so a match in a block that has not been shaped
 //! yet is reached by shaping the block first.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+use self::field::{Field, Motion};
+use super::clicks::Clicks;
 use super::{Outcome, View};
-use crate::find::{self, Focus, Found, MAX_QUERY, Match};
-use crate::layout::{Anchor, BlockBox};
+#[cfg(feature = "clipboard")]
+use crate::clipboard::Which;
+#[cfg(feature = "clipboard")]
+use crate::copy::Content;
+use crate::find::{self, Focus, Found, Match};
+use crate::layout::{self, Anchor, BlockBox};
 use crate::render::{self, Clip, Frame};
-use crate::text::{Align, Para, TextStyle};
+use crate::text::{Align, PHit, Para, TextStyle};
 use crate::theme::{Role, Theme};
 use crate::toolbar::{self, Rect, icon};
+
+mod field;
 
 /// The bar's height, a button's size, the margin of the buttons at the window's edge, the gap
 /// between the field and the count and the buttons, and the text's size, in logical pixels.
@@ -37,6 +46,18 @@ const TEXT: f32 = 13.0;
 const MARGIN: f32 = 8.0;
 const FIELD_Y: f32 = 4.0;
 const FIELD_PAD: f32 = 8.0;
+/// How far a press may move, in logical pixels, and still be part of a double click.
+const CLICK_SLOP: f64 = 4.0;
+/// While a drag in the field is past its end, the text scrolls this many physical pixels per
+/// second for each pixel of the pointer's distance past it, within these limits, a step at about
+/// the frame rate (see the document's drag, which does the same).
+const SCROLL_PER_PX: f64 = 12.0;
+const SCROLL_MIN: f64 = 60.0;
+const SCROLL_MAX: f64 = 1500.0;
+const SCROLL_TICK: Duration = Duration::from_millis(16);
+const SCROLL_STEP_MAX: Duration = Duration::from_millis(100);
+/// How much of the selection's wash shows while the field doesn't have the keyboard, of 255.
+const DIM: u8 = 110;
 /// The most passes made to bring a match to its place: measuring the blocks on the way changes
 /// where it is.
 const PASSES: usize = 5;
@@ -49,7 +70,8 @@ enum Spot {
     Prev,
     Next,
     Close,
-    /// Anywhere else on the bar: the field, which keeps the focus it has.
+    /// Anywhere else on the bar: the field if it is on that, which takes the focus, and else
+    /// nothing, the field keeping the focus it has.
     Field,
 }
 
@@ -76,11 +98,27 @@ impl Spot {
 #[derive(Default)]
 pub(super) struct Bar {
     pub open: bool,
-    pub query: String,
-    /// The query shows selected, so the next character typed replaces it.
-    fresh: bool,
-    /// Where the caret was last painted, as a physical x.
+    field: Field,
+    /// The field has the keyboard: typing goes to it, and it shows a caret. A click on the
+    /// document takes the keyboard away without closing the bar.
+    focused: bool,
+    /// Counts the changes of the field's focus and of the bar's being open, so a paste that was
+    /// asked for before one of them is known (see [`View::find_ticket`]).
+    epoch: u32,
+    /// How far the text is scrolled to the left in the field, in physical pixels.
+    scroll: f32,
+    /// Where the caret was last put, as a physical x in the window.
     caret: f32,
+    /// The field and the room inside it, as last laid out.
+    rects: Option<(Rect, Rect)>,
+    /// The mouse button is held down on the field.
+    drag: Option<Drag>,
+    clicks: Clicks,
+    /// Shift is held: a click extends the selection.
+    shift: bool,
+    /// The text a cut took out, for the shell to offer as the clipboard.
+    #[cfg_attr(not(feature = "clipboard"), allow(dead_code))]
+    cut: Option<String>,
     pub found: Found,
     /// The current match, an index into `found.matches`.
     pub current: Option<usize>,
@@ -93,6 +131,112 @@ pub(super) struct Bar {
     tooltip: bool,
 }
 
+/// A press that began on the field, and what the pointer's movements do to the selection.
+struct Drag {
+    by: By,
+    /// Where the pointer is, as a physical x in the window.
+    at: f64,
+    /// The next step of scrolling, while the pointer is past an end of the field.
+    scroll: Option<Instant>,
+}
+
+/// What a drag in the field selects by.
+#[derive(Clone, Copy)]
+enum By {
+    Chars,
+    /// Words, from the span a double click selected.
+    Words(usize, usize),
+    /// A triple click selected everything: nothing to extend.
+    All,
+}
+
+/// The query laid out in one line, and the x of each place the caret can be at (a byte offset
+/// on a character boundary, with the x in the text's own coordinates). Where the text runs both
+/// ways, those are not in order of x.
+struct Text {
+    content: BlockBox,
+    /// The extent of each cluster of the query, from the measured line: it keeps the white space
+    /// at the end that the painted one leaves out, and leaves the zero width space out.
+    hits: Vec<PHit>,
+    /// The right edge of the text as it shows: the greatest x of any of its clusters (the text
+    /// starts at 0, whichever way it runs).
+    width: f32,
+    height: f32,
+    xs: Vec<(usize, f32)>,
+    /// The byte offsets the clusters start at, in the order of the query.
+    clusters: Vec<u32>,
+    /// The length of the query: where the last cluster ends.
+    len: usize,
+}
+
+impl Text {
+    /// The x of the caret at byte offset `at`.
+    fn x(&self, at: usize) -> f32 {
+        let i = self.xs.partition_point(|p| p.0 < at);
+        self.xs.get(i).map_or(self.width, |p| p.1)
+    }
+
+    /// The caret position nearest to `x`.
+    fn nearest(&self, x: f32) -> usize {
+        let dist = |p: &&(usize, f32)| (p.1 - x).abs();
+        let best = self.xs.iter().min_by(|a, b| dist(a).total_cmp(&dist(b)));
+        best.map_or(0, |p| p.0)
+    }
+
+    /// The offset of the character `x` is over: the nearest place if it is over none.
+    fn over(&self, x: f32) -> usize {
+        let hits = self.hits.iter();
+        let hit = hits.filter(|h| (h.x0.min(h.x1)..h.x0.max(h.x1)).contains(&x));
+        hit.map(|h| h.doc as usize)
+            .next()
+            .unwrap_or_else(|| self.nearest(x))
+    }
+
+    /// Call `rect(x0, x1)` for each stretch of text between the byte offsets `lo` and `hi`: the
+    /// clusters they touch, as many stretches as the text runs both ways make of them.
+    fn selection(&self, lo: usize, hi: usize, mut rect: impl FnMut(f32, f32)) {
+        let touched = |doc: u32| {
+            let i = self
+                .clusters
+                .partition_point(|&c| c <= doc)
+                .checked_sub(1)?;
+            let start = self.clusters[i] as usize;
+            let end = self.clusters.get(i + 1).map_or(self.len, |&c| c as usize);
+            (start < hi && end > lo).then_some(())
+        };
+        layout::runs(&self.hits, touched, |x0, x1, ()| rect(x0, x1));
+    }
+}
+
+/// The x of every place the caret can be at in `text`, from the clusters' extents: a place inside
+/// a cluster (a ligature of two characters) is a share of it.
+fn caret_xs(text: &str, hits: &[PHit]) -> Vec<(usize, f32)> {
+    let mut clusters: Vec<&PHit> = hits.iter().collect();
+    clusters.sort_by_key(|h| h.doc);
+    let places = text
+        .char_indices()
+        .map(|c| c.0)
+        .chain(std::iter::once(text.len()));
+    places
+        .map(|at| {
+            let i = clusters.partition_point(|h| h.doc as usize <= at);
+            let Some(&h) = i.checked_sub(1).and_then(|i| clusters.get(i)) else {
+                return (at, 0.0);
+            };
+            let start = h.doc as usize;
+            let end = clusters.get(i).map_or(text.len(), |n| n.doc as usize);
+            let size = text[start..end].chars().count().max(1) as f32;
+            let share = text[start..at].chars().count() as f32 / size;
+            let x = if h.rtl() {
+                h.x1 - (h.x1 - h.x0) * share
+            } else {
+                h.x0 + (h.x1 - h.x0) * share
+            };
+            (at, x)
+        })
+        .collect()
+}
+
 impl View {
     /// The bar is open.
     pub fn find_open(&self) -> bool {
@@ -101,7 +245,21 @@ impl View {
 
     /// The query, as typed.
     pub fn find_query(&self) -> &str {
-        &self.find.query
+        self.find.field.text()
+    }
+
+    /// The bar is open and its field has the keyboard.
+    pub fn find_focused(&self) -> bool {
+        self.find.open && self.find.focused
+    }
+
+    /// The selected part of the query, and the caret's byte offset in it.
+    pub fn find_selected(&self) -> &str {
+        self.find.field.selection()
+    }
+
+    pub fn find_caret(&self) -> usize {
+        self.find.field.caret()
     }
 
     /// The matches in reading order (none while the bar is closed): all of them, or a window of
@@ -129,7 +287,7 @@ impl View {
     pub fn find_count(&self) -> String {
         let f = &self.find.found;
         match self.find.current {
-            _ if self.find.query.is_empty() => String::new(),
+            _ if self.find.field.text().is_empty() => String::new(),
             Some(i) => format!("{} / {}", f.first + i + 1, f.total),
             None => "No matches".into(),
         }
@@ -188,9 +346,11 @@ impl View {
 
     // ---- Opening and closing ---------------------------------------------------------------
 
-    /// Show or hide the bar. Opening takes a short selection for the query and goes to the first
-    /// match from the reading position; closing clears the matches but keeps the query. The
-    /// document area gives up or reclaims the bar's height, keeping the reading position.
+    /// Show or hide the bar. Opening takes a short selection for the query, which shows selected
+    /// in the field, and goes to the first match from the reading position; closing clears the
+    /// matches but keeps the query. The document area gives up or reclaims the bar's height,
+    /// keeping the reading position. Ctrl+F and the toolbar's button open the bar when it is
+    /// closed and close it when it is open, whoever has the keyboard.
     pub fn set_find(&mut self, open: bool) {
         if std::mem::replace(&mut self.find.open, open) == open {
             return;
@@ -200,7 +360,13 @@ impl View {
         self.find.pressed = None;
         self.find.hover_since = None;
         self.find.tooltip = false;
-        self.find.fresh = true;
+        self.find.drag = None;
+        self.find.clicks.reset();
+        self.find.rects = None;
+        self.find.focused = open;
+        self.find.epoch = self.find.epoch.wrapping_add(1);
+        self.find.field.select_all();
+        self.find.scroll = 0.0;
         self.set_top_inset(self.chrome_inset());
         if open {
             // Opening takes the toolbar's menu away (the bar would sit under it); closing leaves
@@ -208,22 +374,10 @@ impl View {
             self.close_menu();
             self.find_take_selection();
             self.find_refresh(None, true);
+            self.find_fit();
         } else {
             self.find.found = Found::default();
             self.find.current = None;
-        }
-    }
-
-    /// Ctrl+F: open the bar, or when it is open put the focus back on the query, which shows
-    /// selected (and is the selected text, if there is a short selection).
-    pub(super) fn find_focus(&mut self) {
-        if !self.find.open {
-            self.set_find(true);
-            return;
-        }
-        self.find.fresh = true;
-        if self.find_take_selection() {
-            self.find_refresh(None, true);
         }
     }
 
@@ -234,19 +388,48 @@ impl View {
         was
     }
 
-    /// The selected text, if it is one line of at most [`MAX_QUERY`] characters, becomes the
-    /// query. Returns true if the query changed.
+    /// The field has the keyboard (a click on it).
+    fn find_focus(&mut self) {
+        if !std::mem::replace(&mut self.find.focused, true) {
+            self.find.epoch = self.find.epoch.wrapping_add(1);
+        }
+    }
+
+    /// A click on the document takes the keyboard from the field: the bar stays open, with its
+    /// matches, and the keys are the document's again. Returns true if the field had the keyboard.
+    pub(super) fn find_blur(&mut self) -> bool {
+        let had = self.find.open && std::mem::replace(&mut self.find.focused, false);
+        if had {
+            self.find.epoch = self.find.epoch.wrapping_add(1);
+            self.find.drag = None;
+            self.find.clicks.reset();
+        }
+        had
+    }
+
+    /// What a paste asked for now must still be true of when its text comes: the bar not closed
+    /// or the field not left since.
+    pub fn find_ticket(&self) -> u32 {
+        self.find.epoch
+    }
+
+    /// The selected text, if it is one line of at most [`find::MAX_QUERY`] characters, becomes the
+    /// query, selected. Returns true if the query changed.
     #[cfg(feature = "clipboard")]
     fn find_take_selection(&mut self) -> bool {
-        let Some(crate::copy::Content::Text(text)) = self.copy_content() else {
+        let Some(Content::Text(text)) = self.copy_content() else {
             return false;
         };
-        let text = text.trim_end_matches(['\r', '\n']);
-        if text.is_empty() || text.chars().count() > MAX_QUERY || text.contains(['\r', '\n']) {
+        let text = text.trim_end_matches(find::is_line_break);
+        if text.is_empty()
+            || text.chars().count() > find::MAX_QUERY
+            || text.contains(find::is_line_break)
+        {
             return false;
         }
-        self.find.fresh = true;
-        std::mem::replace(&mut self.find.query, text.to_owned()) != text
+        let changed = self.find.field.text() != text;
+        self.find.field.set(text);
+        changed
     }
 
     #[cfg(not(feature = "clipboard"))]
@@ -256,11 +439,17 @@ impl View {
 
     // ---- Typing ----------------------------------------------------------------------------
 
-    /// A key press while the bar is open goes to the query before it is a shortcut of the
-    /// document: text is typed (it is `text` of the key event, so layouts and dead keys work),
-    /// Backspace deletes, Enter and F3 step, Ctrl+Backspace deletes a word. Shortcuts with Ctrl
-    /// or Cmd and the keys that are no text (arrows, pages) go on to the document, which is what
-    /// `None` says; Escape does as well, for [`View::apply`] to close the bar first.
+    /// A key press while the bar is open: Enter (while the field has the keyboard), F3 and Ctrl+G
+    /// step through the matches, and Shift with them goes the other way. With the keyboard the
+    /// field takes the keys of a text field: text is typed (it is `text` of the key event, so
+    /// layouts and dead keys work), the arrows, Home and End move the caret and with Shift
+    /// select, Ctrl makes the arrows move by words and Backspace and Delete delete them, Ctrl+A
+    /// selects all, and with the clipboard Ctrl+C, Ctrl+X and Ctrl+V (or Ctrl+Insert, Shift+Insert)
+    /// copy, cut and paste. The keys that are no text or editing (Up, Down, the page keys) and
+    /// the other shortcuts with Ctrl or Cmd (Ctrl+Home and Ctrl+End too) go on to the document,
+    /// which is what `None` says; Escape does as well, for [`View::apply`] to close the bar first,
+    /// and so does Ctrl+F, which closes it. Without the keyboard the field takes only the steps,
+    /// and everything else is the document's.
     pub fn find_key(
         &mut self,
         key: &Key,
@@ -272,26 +461,29 @@ impl View {
             return None;
         }
         let command = mods.control_key() || mods.super_key();
-        let dir = if mods.shift_key() { -1 } else { 1 };
-        match key {
-            Key::Named(NamedKey::Enter | NamedKey::F3) => {
-                self.find_step(dir, now);
-                return Some(Outcome::Redraw);
-            }
-            Key::Character(c) if command && matches!(c.as_str(), "g" | "G") => {
-                self.find_step(dir, now);
-                return Some(Outcome::Redraw);
-            }
-            Key::Named(NamedKey::Backspace) if !mods.alt_key() => {
-                self.find_backspace(command);
-                return Some(Outcome::Redraw);
-            }
-            _ => {}
+        let (shift, alt) = (mods.shift_key(), mods.alt_key());
+        let steps = match key {
+            Key::Named(NamedKey::F3) => true,
+            Key::Named(NamedKey::Enter) => self.find.focused,
+            Key::Character(c) => command && matches!(c.as_str(), "g" | "G"),
+            _ => false,
+        };
+        if steps {
+            self.find_step(if shift { -1 } else { 1 }, now);
+            return Some(Outcome::Redraw);
         }
-        if command || mods.alt_key() {
+        if !self.find.focused {
             return None;
         }
-        let typed: String = text?.chars().filter(|c| !c.is_control()).collect();
+        let outcome = match key {
+            Key::Named(named) if !alt => self.find_named_key(*named, command, shift),
+            Key::Character(c) if command && !alt => self.find_command_key(c.as_str()),
+            _ => None,
+        };
+        if outcome.is_some() || command || alt {
+            return outcome;
+        }
+        let typed = find::typed_query(text?);
         if typed.is_empty() {
             return None;
         }
@@ -299,45 +491,142 @@ impl View {
         Some(Outcome::Redraw)
     }
 
-    /// Type `text` (a key's, or what an input method committed) into the query: it replaces a
-    /// query that shows selected, else goes at its end, up to [`MAX_QUERY`] characters.
-    pub fn find_type(&mut self, text: &str) {
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        if !self.find.open || text.is_empty() {
-            return;
-        }
-        let replaced = std::mem::take(&mut self.find.fresh);
-        if replaced {
-            self.find.query.clear();
-        }
-        let room = MAX_QUERY.saturating_sub(self.find.query.chars().count());
-        self.find.query.extend(text.chars().take(room));
-        self.find_edited(replaced);
+    /// A named key that is the field's: a motion, a deletion, or a copy, cut or paste key.
+    fn find_named_key(&mut self, key: NamedKey, command: bool, shift: bool) -> Option<Outcome> {
+        let word = |left, right, command| if command { left } else { right };
+        Some(match key {
+            NamedKey::ArrowLeft => {
+                self.find_go(word(Motion::WordLeft, Motion::Left, command), shift)
+            }
+            NamedKey::ArrowRight => {
+                self.find_go(word(Motion::WordRight, Motion::Right, command), shift)
+            }
+            NamedKey::Home if !command => self.find_go(Motion::Home, shift),
+            NamedKey::End if !command => self.find_go(Motion::End, shift),
+            NamedKey::Backspace => self.find_edit(|f| f.backspace(command)),
+            NamedKey::Delete => self.find_edit(|f| f.delete(command)),
+            #[cfg(feature = "clipboard")]
+            NamedKey::Insert if command => self.find_copy(),
+            #[cfg(feature = "clipboard")]
+            NamedKey::Insert if shift => Outcome::Paste(Which::Clipboard),
+            #[cfg(feature = "clipboard")]
+            NamedKey::Copy => self.find_copy(),
+            #[cfg(feature = "clipboard")]
+            NamedKey::Cut => self.find_cut(),
+            #[cfg(feature = "clipboard")]
+            NamedKey::Paste => Outcome::Paste(Which::Clipboard),
+            _ => return None,
+        })
     }
 
-    /// Delete the last character of the query, or its last word (and the white space after it)
-    /// for `word`; a query that shows selected goes whole.
-    fn find_backspace(&mut self, word: bool) {
-        let q = &mut self.find.query;
-        let replaced = std::mem::take(&mut self.find.fresh);
-        if replaced {
-            q.clear();
-        } else if word {
-            while q.ends_with(char::is_whitespace) {
-                q.pop();
+    /// A letter with Ctrl that is the field's: select all, and with the clipboard copy, cut and
+    /// paste.
+    fn find_command_key(&mut self, key: &str) -> Option<Outcome> {
+        Some(match key {
+            "a" | "A" => {
+                self.find.field.select_all();
+                self.find_fit();
+                selected()
             }
-            while q.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
-                q.pop();
-            }
-        } else {
-            q.pop();
+            #[cfg(feature = "clipboard")]
+            "c" | "C" => self.find_copy(),
+            #[cfg(feature = "clipboard")]
+            "x" | "X" => self.find_cut(),
+            #[cfg(feature = "clipboard")]
+            "v" | "V" => Outcome::Paste(Which::Clipboard),
+            _ => return None,
+        })
+    }
+
+    /// Move the caret, extending the selection with `extend`. What is selected is offered as the
+    /// primary selection.
+    fn find_go(&mut self, motion: Motion, extend: bool) -> Outcome {
+        self.find.field.go(motion, extend);
+        self.find_fit();
+        if extend { selected() } else { Outcome::Redraw }
+    }
+
+    /// Edit the query with `edit`, which says whether it changed the text; the matches are found
+    /// again if it did, and the caret is kept in view.
+    fn find_edit(&mut self, edit: impl FnOnce(&mut Field) -> bool) -> Outcome {
+        let whole = self.find.field.all_selected();
+        if edit(&mut self.find.field) {
+            self.find_edited(whole);
         }
-        self.find_edited(replaced);
+        self.find_fit();
+        Outcome::Redraw
+    }
+
+    /// Ctrl+C in the field: the selected text goes to the clipboard, if there is any.
+    #[cfg(feature = "clipboard")]
+    fn find_copy(&self) -> Outcome {
+        if self.find.field.has_selection() {
+            Outcome::Copy
+        } else {
+            Outcome::Nothing
+        }
+    }
+
+    /// Ctrl+X: the selected text is taken out of the query, and waits in [`View::take_cut`] to
+    /// be offered as the clipboard.
+    #[cfg(feature = "clipboard")]
+    fn find_cut(&mut self) -> Outcome {
+        let whole = self.find.field.all_selected();
+        let Some(text) = self.find.field.cut() else {
+            return Outcome::Nothing;
+        };
+        self.find.cut = Some(text);
+        self.find_edited(whole);
+        self.find_fit();
+        Outcome::Cut
+    }
+
+    /// The text of the last cut, for the clipboard.
+    #[cfg(feature = "clipboard")]
+    pub fn take_cut(&mut self) -> Option<Content> {
+        self.find.cut.take().map(|text| Content::Text(text.into()))
+    }
+
+    /// What a copy offers while the field has the keyboard: the text selected in it.
+    #[cfg(feature = "clipboard")]
+    pub(super) fn find_content(&self) -> Option<Content> {
+        let field = &self.find.field;
+        field
+            .has_selection()
+            .then(|| Content::Text(field.selection().into()))
+    }
+
+    /// Type `text` (a key's, or what an input method committed) into the query at the caret, over
+    /// what is selected, up to [`find::MAX_QUERY`] characters in all. It goes to the field only while
+    /// the field has the keyboard.
+    pub fn find_type(&mut self, text: &str) {
+        let text = find::typed_query(text);
+        if !self.find_focused() || text.is_empty() {
+            return;
+        }
+        self.find_edit(|f| f.insert(&text));
+    }
+
+    /// Text pasted from a selection (asked for with [`View::find_ticket`]) goes into the query
+    /// like typed text, but for what a paste may hold: the first line only, tabs as spaces, no
+    /// other control characters. Returns true if the bar needs a repaint. It is dropped if the bar
+    /// was closed or the field left since the ticket was taken.
+    pub fn find_paste(&mut self, ticket: u32, text: &str) -> bool {
+        if !self.find_focused() || ticket != self.find.epoch {
+            return false;
+        }
+        let text = find::pasted_query(text);
+        if text.is_empty() {
+            return false;
+        }
+        self.find_edit(|f| f.insert(&text));
+        true
     }
 
     /// The query changed: look again from where the current match was, so typing on keeps it, as
-    /// long as it is what the reader is looking at. A new query (`replaced`), or a current match
-    /// that has been scrolled out of view, is looked for from the reading position.
+    /// long as it is what the reader is looking at. A new query (`replaced`: the whole of the old
+    /// one was selected), or a current match that has been scrolled out of view, is looked for from
+    /// the reading position.
     fn find_edited(&mut self, replaced: bool) {
         let from = self
             .find_current_start()
@@ -390,7 +679,7 @@ impl View {
     /// `reveal` the view scrolls to it.
     pub(super) fn find_refresh(&mut self, from: Option<(u32, u32)>, reveal: bool) {
         let (block, off) = from.unwrap_or_else(|| self.find_reading_point());
-        let found = find::search_from(&self.doc, &self.find.query, Focus::At(block, off));
+        let found = find::search_from(&self.doc, self.find.field.text(), Focus::At(block, off));
         self.find.current = (found.total > 0).then(|| found.at - found.first);
         self.find.found = found;
         if reveal {
@@ -414,7 +703,7 @@ impl View {
         if (f.first..f.first + f.matches.len()).contains(&next) {
             self.find.current = Some(next - f.first);
         } else {
-            let found = find::search_from(&self.doc, &self.find.query, Focus::Index(next));
+            let found = find::search_from(&self.doc, self.find.field.text(), Focus::Index(next));
             self.find.current = Some(found.at - found.first);
             self.find.found = found;
         }
@@ -515,12 +804,167 @@ impl View {
     // ---- Mouse -----------------------------------------------------------------------------
 
     /// A press at (`x`, `y`): true if the bar takes it. A press on a button is the start of a
-    /// click, anywhere else on the bar it does nothing (the field keeps the focus).
-    pub(super) fn press_find(&mut self, x: f64, y: f64) -> bool {
+    /// click. A press on the field takes the keyboard for it and puts the caret there (Shift
+    /// extends the selection to it), a double click selects a word and a triple click everything,
+    /// and the pointer's movements with the button down select on. Anywhere else on the bar it
+    /// does nothing (the field keeps the keyboard it has).
+    pub(super) fn press_find(&mut self, x: f64, y: f64, now: Instant) -> bool {
         self.find.pressed = self.find_spot_at(x, y);
         self.find.tooltip = false;
         self.find.hover_since = None;
+        self.find.drag = None;
+        let mut on_field = false;
+        if self.find.pressed == Some(Spot::Field) {
+            let (field, _) = self.find_geometry();
+            on_field = field.contains(x, y);
+            if on_field {
+                self.find_press_field(x, now);
+            }
+        }
+        if !on_field {
+            self.find_clicks_end();
+        }
         self.find.pressed.is_some()
+    }
+
+    /// A press that was not the bar's: it ends a double click on the field.
+    pub(super) fn find_clicks_end(&mut self) {
+        self.find.clicks.reset();
+    }
+
+    fn find_press_field(&mut self, x: f64, now: Instant) {
+        self.find_focus();
+        let slop = CLICK_SLOP * self.hidpi;
+        let count = self.find.clicks.count(now, (x, 0.0), slop);
+        let text = self.find_text();
+        let tx = self.find_text_x(x);
+        let by = match count {
+            1 => {
+                self.find.field.place(text.nearest(tx), self.find.shift);
+                By::Chars
+            }
+            2 => {
+                let (lo, hi) = self.find.field.word_at(text.over(tx));
+                self.find.field.select(lo, hi);
+                By::Words(lo, hi)
+            }
+            _ => {
+                self.find.field.select_all();
+                By::All
+            }
+        };
+        self.find.drag = Some(Drag {
+            by,
+            at: x,
+            scroll: None,
+        });
+        self.find_fit();
+    }
+
+    /// The x in the text's own coordinates of window x `x`, which is clamped to the room the text
+    /// has in the field.
+    fn find_text_x(&self, x: f64) -> f32 {
+        let Some((_, inner)) = self.find.rects else {
+            return 0.0;
+        };
+        let x = (x as f32).clamp(inner.x0, inner.x1);
+        x - inner.x0 + self.find.scroll
+    }
+
+    /// A selection is being dragged in the field.
+    pub fn find_dragging(&self) -> bool {
+        self.find.drag.is_some()
+    }
+
+    /// The pointer moved to window x `x` with the button down on the field: the selection follows
+    /// it, and past an end of the field the text scrolls on its own (see `View::find_expire`).
+    /// Returns true if the bar needs a repaint.
+    pub fn find_drag_to(&mut self, x: f64, now: Instant) -> bool {
+        let Some(drag) = self.find.drag.as_mut() else {
+            return false;
+        };
+        drag.at = x;
+        let (_, inner) = self.find_geometry();
+        let outside = x < f64::from(inner.x0) || x > f64::from(inner.x1);
+        if let Some(drag) = self.find.drag.as_mut() {
+            drag.scroll = if outside {
+                drag.scroll.or(Some(now))
+            } else {
+                None
+            };
+        }
+        self.find_drag_select()
+    }
+
+    /// Put the end of the selection under the pointer again. Returns true if it moved.
+    fn find_drag_select(&mut self) -> bool {
+        let Some(&Drag { by, at, .. }) = self.find.drag.as_ref() else {
+            return false;
+        };
+        let before = (self.find.field.range(), self.find.field.caret());
+        let text = self.find_text();
+        let tx = self.find_text_x(at);
+        let field = &mut self.find.field;
+        match by {
+            By::Chars => field.place(text.nearest(tx), true),
+            By::Words(lo, hi) => {
+                let (from, to) = field.word_at(text.over(tx));
+                if from < lo {
+                    field.select(hi, from);
+                } else {
+                    field.select(lo, to);
+                }
+            }
+            By::All => {}
+        }
+        (field.range(), field.caret()) != before
+    }
+
+    /// The button came up after a press on the field. Returns true if what it selected is worth
+    /// offering as the primary selection.
+    pub fn release_find_drag(&mut self) -> bool {
+        self.find.drag.take().is_some() && self.find.field.has_selection()
+    }
+
+    /// Shift is held down (a click then extends the selection).
+    pub(super) fn find_shift(&mut self, shift: bool) {
+        self.find.shift = shift;
+    }
+
+    /// A middle click at window point (`x`, `y`): on the field it puts the caret there and takes
+    /// the keyboard for it, and the ticket for the paste of the primary selection that follows
+    /// is returned.
+    #[cfg(feature = "clipboard")]
+    pub fn find_middle(&mut self, x: f64, y: f64) -> Option<u32> {
+        if !self.find.open {
+            return None;
+        }
+        let (field, _) = self.find_geometry();
+        if !field.contains(x, y) || self.find_menu_covers(x, y) {
+            return None;
+        }
+        self.find_focus();
+        let text = self.find_text();
+        self.find
+            .field
+            .place(text.nearest(self.find_text_x(x)), false);
+        self.find_fit();
+        Some(self.find.epoch)
+    }
+
+    /// The point is on the field, where the pointer is a text cursor: not under the toolbar's
+    /// dropdown, which hangs over the bar. It goes by where the field was last laid out.
+    pub fn find_over_field(&self, x: f64, y: f64) -> bool {
+        self.find.open
+            && self
+                .find
+                .rects
+                .is_some_and(|(field, _)| field.contains(x, y))
+            && !self.find_menu_covers(x, y)
+    }
+
+    fn find_menu_covers(&self, x: f64, y: f64) -> bool {
+        self.toolbar.menu_covers(&self.toolbar_ctx(), x, y)
     }
 
     /// The button came up at (`x`, `y`) after a press on the bar: a click if it is on the same
@@ -572,22 +1016,72 @@ impl View {
     }
 
     /// When the tooltip of the hovered button is due.
-    pub(super) fn find_deadline(&self) -> Option<Instant> {
+    fn tooltip_deadline(&self) -> Option<Instant> {
         if self.find.tooltip {
             return None;
         }
         self.find.hover_since.map(|t| t + toolbar::TOOLTIP_DELAY)
     }
 
-    /// Show the tooltip if its time has come. Returns true if the window needs a repaint.
+    /// When the loop must wake for the bar: for a tooltip, or to scroll the text for a drag that
+    /// is past an end of the field.
+    pub(super) fn find_deadline(&self) -> Option<Instant> {
+        let scroll = self.find.drag.as_ref().and_then(|d| d.scroll);
+        let scroll = scroll.map(|t| t + SCROLL_TICK);
+        [self.tooltip_deadline(), scroll]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Show the tooltip if its time has come, and scroll a step if one is due. Returns true if
+    /// the window needs a repaint.
     pub(super) fn find_expire(&mut self, now: Instant) -> bool {
-        match self.find_deadline() {
-            Some(t) if now >= t => {
-                self.find.tooltip = true;
-                true
-            }
-            _ => false,
+        let tip = self.tooltip_deadline().is_some_and(|t| now >= t);
+        if tip {
+            self.find.tooltip = true;
         }
+        tip | self.find_autoscroll(now)
+    }
+
+    /// Scroll the text a step while a drag is past an end of the field, and put the end of the
+    /// selection under the pointer again.
+    fn find_autoscroll(&mut self, now: Instant) -> bool {
+        let Some(&Drag {
+            at,
+            scroll: Some(last),
+            ..
+        }) = self.find.drag.as_ref()
+        else {
+            return false;
+        };
+        if now < last + SCROLL_TICK {
+            return false;
+        }
+        let (_, inner) = self.find_geometry();
+        let past = if at < f64::from(inner.x0) {
+            at - f64::from(inner.x0)
+        } else {
+            (at - f64::from(inner.x1)).max(0.0)
+        };
+        let moved = if past == 0.0 {
+            false
+        } else {
+            let speed = (past.abs() * SCROLL_PER_PX)
+                .clamp(SCROLL_MIN * self.hidpi, SCROLL_MAX * self.hidpi)
+                * past.signum();
+            let secs = now.saturating_duration_since(last).min(SCROLL_STEP_MAX);
+            let before = self.find.scroll;
+            let text = self.find_text();
+            let to = f64::from(before) + speed * secs.as_secs_f64();
+            self.find.scroll = (to as f32).clamp(0.0, self.find_max_scroll(inner, &text));
+            self.find.scroll != before
+        };
+        // At the end of the text there is nothing to wait for until the pointer moves.
+        if let Some(drag) = self.find.drag.as_mut() {
+            drag.scroll = moved.then_some(now);
+        }
+        self.find_drag_select() | moved
     }
 
     /// A new text (a reload, another document): the query stays, and the matches are those of the
@@ -598,6 +1092,7 @@ impl View {
         self.find.pressed = None;
         self.find.hover_since = None;
         self.find.tooltip = false;
+        self.find.drag = None;
         if self.find.open {
             self.find_refresh(None, false);
         }
@@ -638,75 +1133,94 @@ impl View {
         (field, inner)
     }
 
-    /// The width the query may take: the caret needs room of its own at the text's end.
-    fn find_room(&self, inner: Rect) -> f32 {
-        let s = self.hidpi as f32;
-        (inner.x1 - inner.x0 - 2.0 * s).max(TEXT * s)
+    /// The field and the room inside it as painted, which depends on how wide the count is, and
+    /// is kept for the pointer's sake.
+    fn find_geometry(&mut self) -> (Rect, Rect) {
+        let count = self.find_count();
+        let width = (!count.is_empty()).then(|| self.find_line(&count, Role::Muted).1);
+        self.find_laid(width)
     }
 
-    fn find_query_style(&self) -> TextStyle {
-        TextStyle {
-            bold: false,
-            italic: false,
-            mono: false,
-            size: TEXT * self.hidpi as f32,
-            role: Role::Text,
-            deco: 0,
-            shift: 0.0,
-            link: 0,
+    /// The field and its room when the count is `width` wide, kept.
+    fn find_laid(&mut self, width: Option<f32>) -> (Rect, Rect) {
+        let rects = self.find_field(self.find_count_x(width));
+        self.find.rects = Some(rects);
+        rects
+    }
+
+    /// The query laid out in one line. The layout leaves white space at the end of a line out, so
+    /// where the caret can be is measured on the query with a zero width space after it, which
+    /// stays and neither kerns, joins nor takes part in bidi runs with what is before it.
+    fn find_text(&mut self) -> Text {
+        let query = self.find.field.text().to_owned();
+        let probe = format!("{query}\u{200B}");
+        let (measured, room, _) = self.find_line(&probe, Role::Text);
+        // The query as painted is as wide as the measured line, so that a line that runs right to
+        // left has the same right edge in both (what hangs at its end is left of it).
+        let (content, _, height) = self.find_line_in(&query, Role::Text, room);
+        let mut xs = caret_xs(&probe, &measured.hits);
+        xs.pop();
+        let width = measured
+            .hits
+            .iter()
+            .map(|h| h.x0.max(h.x1))
+            .fold(0.0, f32::max);
+        let hits: Vec<PHit> = (measured.hits.iter().copied())
+            .filter(|h| (h.doc as usize) < query.len())
+            .collect();
+        let mut clusters: Vec<u32> = hits.iter().map(|h| h.doc).collect();
+        clusters.sort_unstable();
+        clusters.dedup();
+        Text {
+            content,
+            hits,
+            len: query.len(),
+            width,
+            height,
+            xs,
+            clusters,
         }
     }
 
-    // ---- Painting --------------------------------------------------------------------------
+    /// How far the text may be scrolled: until its end, with room for the caret, is at the field's.
+    fn find_max_scroll(&self, inner: Rect, text: &Text) -> f32 {
+        (text.width + self.find_caret_width() - (inner.x1 - inner.x0)).max(0.0)
+    }
 
-    /// `raw` in one line no wider than `max_w`, cut from the left with a leading `…` when it is
-    /// wider (the end of a long query is where the caret is), at the longest tail that fits when
-    /// measured.
-    fn fit_tail(
-        &mut self,
-        raw: &str,
-        style: TextStyle,
-        max_w: f32,
-    ) -> (Para, crate::text::ParaLayout) {
-        let chars: Vec<(usize, char)> = raw.char_indices().collect();
-        let tail = |n: usize| -> String {
-            let from = chars
-                .get(chars.len().saturating_sub(n))
-                .map_or(raw.len(), |c| c.0);
-            if n < chars.len() {
-                format!("…{}", &raw[from..])
-            } else {
-                raw.to_owned()
-            }
-        };
-        let lay = |view: &mut View, text: &str| {
-            let mut para = Para::default();
-            para.push_text(text, 0, style);
-            let pl = view
-                .msg_ctx
-                .layout(&view.fonts, &para, 1.0e6, Align::Start, 1.4);
-            (para, pl)
-        };
-        let whole = lay(self, raw);
-        if whole.1.width <= max_w {
-            return whole;
+    fn find_caret_width(&self) -> f32 {
+        (self.hidpi as f32).round().max(1.0)
+    }
+
+    /// Scroll the text so the caret is in the field, and note where it is for an input method.
+    fn find_fit(&mut self) {
+        let (_, inner) = self.find_geometry();
+        let text = self.find_text();
+        self.find_fit_to(inner, &text);
+    }
+
+    fn find_fit_to(&mut self, inner: Rect, text: &Text) {
+        let (room, bar) = (inner.x1 - inner.x0, self.find_caret_width());
+        // The caret is a bar that starts at the place it is at.
+        let place = text.x(self.find.field.caret());
+        let mut scroll = self.find.scroll;
+        if place + bar - scroll > room {
+            scroll = place + bar - room;
         }
-        // The longest tail that fits (widths grow with it); none still shows `…`.
-        let (mut lo, mut hi) = (0, chars.len());
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if lay(self, &tail(mid)).1.width <= max_w {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
+        if place < scroll {
+            scroll = place;
         }
-        lay(self, &tail(lo))
+        self.find.scroll = scroll.clamp(0.0, self.find_max_scroll(inner, text));
+        self.find.caret = inner.x0 - self.find.scroll + place;
     }
 
     /// One line of the bar's text in `style`, laid out (the characters no face has are noted for
     /// the fallback scan).
     fn find_line(&mut self, text: &str, role: Role) -> (BlockBox, f32, f32) {
+        self.find_line_in(text, role, 0.0)
+    }
+
+    /// `find_line`, where a line that runs right to left has at least `room` to be laid out in.
+    fn find_line_in(&mut self, text: &str, role: Role, room: f32) -> (BlockBox, f32, f32) {
         let s = self.hidpi as f32;
         let style = TextStyle {
             bold: false,
@@ -720,9 +1234,17 @@ impl View {
         };
         let mut para = Para::default();
         para.push_text(text, 0, style);
-        let pl = self
+        let mut pl = self
             .msg_ctx
             .layout(&self.fonts, &para, 1.0e6, Align::Start, 1.4);
+        // A line that runs right to left is aligned to the right of all that room: laid out
+        // again, as wide as it is, it starts at the left like the rest.
+        if pl.hits.iter().any(PHit::rtl) {
+            let fit = (pl.width + 0.5).max(room + 0.5);
+            pl = self
+                .msg_ctx
+                .layout(&self.fonts, &para, fit, Align::Start, 1.4);
+        }
         self.msg_missing
             .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
         let (w, h) = (pl.width, pl.height);
@@ -792,8 +1314,9 @@ impl View {
             self.paint_text(frame, &content, x, bar.y0 + (BAR * s - h) / 2.0, theme);
             counted = Some(w);
         }
-        // The field: the query with the caret after it, or shown selected.
-        let (field, inner) = self.find_field(self.find_count_x(counted));
+        // The field: the query, scrolled to keep the caret in it, with what is selected washed
+        // and the caret a bar.
+        let (field, inner) = self.find_laid(counted);
         let r = (4.0 * s).round();
         frame.rounded_rect(field.px(), r, None, theme.bg, 255);
         frame.rounded_rect(field.px(), r, Some(line as f32), theme.border, 255);
@@ -804,36 +1327,35 @@ impl View {
             x1: fx1,
             y1: fy1,
         });
-        let room = self.find_room(inner);
-        if self.find.query.is_empty() {
+        let text = self.find_text();
+        self.find_fit_to(inner, &text);
+        let (x, y) = (
+            inner.x0 - self.find.scroll,
+            field.y0 + (field.y1 - field.y0 - text.height) / 2.0,
+        );
+        if self.find.field.text().is_empty() {
             let (content, _, h) = self.find_line("Find in page", Role::Muted);
             let y = field.y0 + (field.y1 - field.y0 - h) / 2.0;
             self.paint_text(frame, &content, inner.x0, y, theme);
         }
-        let query = self.find.query.clone();
-        let style = self.find_query_style();
-        let (para, pl) = self.fit_tail(&query, style, room);
-        self.msg_missing
-            .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
-        let (w, h) = (pl.width, pl.height);
-        let y = field.y0 + (field.y1 - field.y0 - h) / 2.0;
-        if !query.is_empty() {
-            let content = BlockBox::from_para(pl, &para.styles);
-            if self.find.fresh {
-                let pad = 2.0 * s;
+        if self.find.field.has_selection() {
+            let (lo, hi) = self.find.field.range();
+            let alpha = if self.find.focused { 255 } else { DIM };
+            let (top, bottom) = (y.round() as i32, (y + text.height).round() as i32);
+            text.selection(lo, hi, |x0, x1| {
                 let wash = (
-                    (inner.x0 - pad).round() as i32,
-                    y.round() as i32,
-                    (inner.x0 + w + pad).round() as i32,
-                    (y + h).round() as i32,
+                    (x + x0).round() as i32,
+                    top,
+                    (x + x1).round() as i32,
+                    bottom,
                 );
-                frame.rounded_rect(wash, (2.0 * s).round(), None, theme.link, 70);
-            }
-            self.paint_text(frame, &content, inner.x0, y, theme);
+                let color = theme.color(Role::Selection);
+                frame.rounded_rect(wash, (2.0 * s).round(), None, color, alpha);
+            });
         }
-        self.find.caret = inner.x0 + w + s;
-        if !self.find.fresh || query.is_empty() {
-            let cx = (inner.x0 + w + s).round() as i32;
+        self.paint_text(frame, &text.content, x, y, theme);
+        if self.find.focused {
+            let cx = self.find.caret.round() as i32;
             let top = (field.y0 + 6.0 * s).round() as i32;
             let bottom = (field.y1 - 6.0 * s).round() as i32;
             frame.fill_rect(cx, top, cx + line.max(1), bottom, theme.text);
@@ -857,6 +1379,15 @@ impl View {
             );
         }
     }
+}
+
+/// What a selection made in the field asks of the shell: that it be offered as the primary
+/// selection, which needs the clipboard.
+fn selected() -> Outcome {
+    #[cfg(feature = "clipboard")]
+    return Outcome::Selected;
+    #[cfg(not(feature = "clipboard"))]
+    Outcome::Redraw
 }
 
 #[cfg(all(test, feature = "embed-fonts"))]

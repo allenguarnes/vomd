@@ -8,8 +8,9 @@
 # with Xvfb, sway, xclip, xsel, wl-clipboard, xdotool and wtype, where scripts/clipboard-
 # check-inside.sh drives it with real key and mouse events and pastes with the real programs:
 # CLIPBOARD and PRIMARY, short and long (X11's INCR, Wayland's pipe), Latin-1 `STRING`, another
-# program taking the selection away, `primary_selection = off`, a window with no seat. See the
-# header of that script for what is checked.
+# program taking the selection away, `primary_selection = off`, a window with no seat, and VOMD
+# reading what other programs offer, as a paste into the find bar does (with `clip_probe read`
+# as well as with keys). See the header of that script for what is checked.
 #
 # VOMD_CLIP_IMAGE overrides the image the servers run in (debian:13); VOMD_CLIP_BIN is a directory
 # with the `vomd` binary and the `clip_probe` example to use instead of building them (they must

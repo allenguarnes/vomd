@@ -29,6 +29,8 @@ use crate::text::{Align, Para, ParaLayout, TextCtx, TextStyle};
 use crate::theme::{DARK, LIGHT, Role, Theme};
 use crate::toolbar::{self, Toolbar};
 
+#[cfg(any(feature = "clipboard", feature = "find"))]
+mod clicks;
 #[cfg(feature = "clipboard")]
 mod copybtn;
 #[cfg(feature = "find")]
@@ -111,12 +113,9 @@ pub enum Action {
     /// Show or hide the table of contents panel (`C`).
     #[cfg(feature = "toc")]
     ToggleToc,
-    /// Open the find bar, or focus it again (`Ctrl+F`).
+    /// Show or hide the find bar (`Ctrl+F`, the toolbar's button).
     #[cfg(feature = "find")]
     Find,
-    /// Show or hide the find bar (the toolbar's button).
-    #[cfg(feature = "find")]
-    ToggleFind,
     /// Escape: closes the find bar if it's open, else the toolbar's dropdown if it's open, else
     /// the contents panel if it covers the document, else clears the selection, else quits.
     Escape,
@@ -147,9 +146,16 @@ pub enum Outcome {
     /// Everything was selected: repaint, and offer it as the primary selection.
     #[cfg(feature = "clipboard")]
     Selected,
-    /// Copy the selection ([`View::copy_content`]) to the clipboard.
+    /// Copy what is selected ([`View::offered`]) to the clipboard.
     #[cfg(feature = "clipboard")]
     Copy,
+    /// Text was cut from the find bar's field: offer it ([`View::take_cut`]) as the clipboard.
+    #[cfg(all(feature = "clipboard", feature = "find"))]
+    Cut,
+    /// Paste the selection into the find bar's field: read it (the shell does, off the main
+    /// thread), and give the text to [`View::find_paste`] with the ticket of [`View::find_ticket`].
+    #[cfg(all(feature = "clipboard", feature = "find"))]
+    Paste(crate::clipboard::Which),
     Quit,
 }
 
@@ -1012,9 +1018,7 @@ impl View {
             #[cfg(feature = "toc")]
             Action::ToggleToc => self.set_toc(!self.toc.open),
             #[cfg(feature = "find")]
-            Action::Find => self.find_focus(),
-            #[cfg(feature = "find")]
-            Action::ToggleFind => self.set_find(!self.find.open),
+            Action::Find => self.set_find(!self.find.open),
             Action::ToggleRemote => {
                 if self.remote_count == 0 {
                     return Outcome::Nothing;
@@ -1078,21 +1082,24 @@ impl View {
     /// scrollbar is showing. Hovering the track's column shows it (before any press, since the
     /// pointer moves there first), so only a press that arrives without a move, as from touch
     /// or a script, still reaches a link under a hidden one.
-    /// Returns true if the window needs a repaint: the toolbar or the scrollbar took the press, or
-    /// the selection changed.
+    /// Returns true if the window needs a repaint: the toolbar or the scrollbar took the press, the
+    /// selection changed, or the find bar's field lost the keyboard.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
         #[cfg(feature = "clipboard")]
         self.cancel_copy();
         let ctx = self.toolbar_ctx();
         if self.toolbar.press(&ctx, x, y) {
             self.pressed = None;
+            // (A press elsewhere is no part of a double click on the find bar's field.)
+            #[cfg(feature = "find")]
+            self.find_clicks_end();
             #[cfg(feature = "clipboard")]
             self.cancel_select();
             return true;
         }
-        // The find bar's: its buttons, and the rest of it, which does nothing.
+        // The find bar's: its buttons, its field, and the rest of it, which does nothing.
         #[cfg(feature = "find")]
-        if self.press_find(x, y) {
+        if self.press_find(x, y, now) {
             self.pressed = None;
             #[cfg(feature = "clipboard")]
             self.cancel_select();
@@ -1117,16 +1124,22 @@ impl View {
             self.copy_look();
             return true;
         }
-        // Not that either: remember the link under it, for a click on release.
+        // Not that either: a click on the document, which takes the keyboard from the find bar's
+        // field (a repaint, for its caret and selection go), and remember the link under it, for a
+        // click on release.
+        #[cfg(feature = "find")]
+        let blurred = !taken && self.in_area(x, y) && self.find_blur();
+        #[cfg(not(feature = "find"))]
+        let blurred = false;
         self.pressed = if taken { None } else { self.link_at(x, y) };
         // Not the scrollbar's either: a press on text, which may start a selection.
         #[cfg(feature = "clipboard")]
         if taken {
             self.cancel_select();
         } else {
-            return self.press_text(x, y, now);
+            return self.press_text(x, y, now) | blurred;
         }
-        taken
+        taken | blurred
     }
 
     /// The scrollbar's thumb if (`x`, `y`) is in its column: the thumb and its margin to the
@@ -1209,6 +1222,43 @@ impl View {
 
     pub fn dragging(&self) -> bool {
         self.drag.is_some()
+    }
+
+    /// Shift is held down (a click then extends the selection).
+    #[cfg(any(feature = "clipboard", feature = "find"))]
+    pub fn set_shift(&mut self, shift: bool) {
+        #[cfg(feature = "clipboard")]
+        {
+            self.select.shift = shift;
+        }
+        #[cfg(feature = "find")]
+        self.find_shift(shift);
+    }
+
+    /// Whether the pointer is over text, which shows the text cursor: the find bar's field, or
+    /// the document's text (not over the toolbar or the scrollbar, and not over a link, whose
+    /// cursor is the hand), and all the while a selection is dragged.
+    #[cfg(any(feature = "clipboard", feature = "find"))]
+    pub fn text_cursor(&self, x: f64, y: f64) -> bool {
+        #[cfg(feature = "find")]
+        if self.find_dragging() || self.find_over_field(x, y) {
+            return true;
+        }
+        #[cfg(feature = "clipboard")]
+        return self.over_text(x, y);
+        #[cfg(not(feature = "clipboard"))]
+        false
+    }
+
+    /// What a copy offers: the text selected in the find bar's field while it has the keyboard,
+    /// else the document's selection.
+    #[cfg(feature = "clipboard")]
+    pub fn offered(&self) -> Option<crate::copy::Content> {
+        #[cfg(feature = "find")]
+        if self.find_focused() {
+            return self.find_content();
+        }
+        self.copy_content()
     }
 
     // ---- Links and headings ---------------------------------------------------------------

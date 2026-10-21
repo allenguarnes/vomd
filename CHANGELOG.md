@@ -14,9 +14,17 @@ and versions follow [Semantic Versioning](https://semver.org/).
   the way down unless it is in view already, however far it is. `Enter`, `F3` and `Ctrl+G` go to the
   next match and `Shift` with them to the previous, around the ends, as the bar's buttons do; the
   wheel over the bar does nothing, and `Esc` or its close button closes the bar and clears the marks
-  (the query is kept, shown selected, for the next time). While it is open the letter keys are typed
-  into it, `Backspace` and `Ctrl+Backspace` delete a character or a word, an input method's text is
-  typed too, and the `Ctrl` shortcuts, the arrows and the page keys still work on the document. Case
+  (the query is kept, shown selected, for the next time); `Ctrl+F` and the button open and close it.
+  What to look for is a one-line text field with the keyboard while the bar is open: the letter keys
+  are typed into it, an input method's text too, the caret goes anywhere (the arrows, `Ctrl` for
+  words, `Home` and `End`, a click), `Shift`, a drag, a double click (a word) and a triple click
+  select, `Backspace` and `Delete` delete a character or, with `Ctrl`, a word, the text scrolls to
+  keep the caret in view, and `Up`, `Down`, the page keys and the `Ctrl` shortcuts that aren't the
+  field's still work on the document. `Ctrl+C`, `Ctrl+X` and `Ctrl+V` (and `Ctrl+Insert`,
+  `Shift+Insert`) copy, cut and paste its text, a selection in it is offered as the primary
+  selection, and a middle click on it pastes that; a paste is the first line, read in the
+  background and never holding the window up. A click on the document gives the keyboard back to
+  the document, the bar and its marks staying, and `F3` and `Ctrl+G` still step. Case
   is ignored for every script. Only the text shown is searched, never markup or an address, and no
   match runs from one block into another or from one table cell into the next; a very long
   paragraph's pieces count as one block. Every match is counted, but only the 10,000 around the

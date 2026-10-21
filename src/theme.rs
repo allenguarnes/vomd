@@ -19,7 +19,7 @@ pub enum Role {
     AlertWarning,
     AlertCaution,
     /// Behind selected text.
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "find"))]
     Selection,
     /// Behind the matches of a find, and behind the current one.
     #[cfg(feature = "find")]
@@ -44,7 +44,7 @@ pub struct Theme {
     pub table_stripe: Rgb,
     pub alerts: [Rgb; 5],
     /// Painted under selected text, which keeps its own color: a blue that reads on the page.
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "find"))]
     pub selection: Rgb,
     /// Painted under the matches of a find, and under the current match: a soft yellow, and a
     /// stronger orange, that text still reads on.
@@ -66,7 +66,7 @@ pub const LIGHT: Theme = Theme {
     table_stripe: 0xf6f8fa,
     alerts: [0x0969da, 0x1a7f37, 0x8250df, 0x9a6700, 0xcf222e],
     // Primer's #0969da at 20% over white.
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "find"))]
     selection: 0xcde1f8,
     #[cfg(feature = "find")]
     find_match: 0xffe98f,
@@ -86,7 +86,7 @@ pub const DARK: Theme = Theme {
     table_stripe: 0x151b23,
     alerts: [0x4493f8, 0x3fb950, 0xab7df8, 0xd29922, 0xf85149],
     // Primer's #388bfd at 40% over the page.
-    #[cfg(feature = "clipboard")]
+    #[cfg(any(feature = "clipboard", feature = "find"))]
     selection: 0x1e4273,
     #[cfg(feature = "find")]
     find_match: 0x5c4a14,
@@ -111,7 +111,7 @@ impl Theme {
             Role::AlertImportant => self.alerts[2],
             Role::AlertWarning => self.alerts[3],
             Role::AlertCaution => self.alerts[4],
-            #[cfg(feature = "clipboard")]
+            #[cfg(any(feature = "clipboard", feature = "find"))]
             Role::Selection => self.selection,
             #[cfg(feature = "find")]
             Role::FindMatch => self.find_match,

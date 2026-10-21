@@ -200,7 +200,7 @@ impl Item {
             .into(),
             Item::Reload => "Reload (R)".into(),
             #[cfg(feature = "find")]
-            Item::Find if ctx.find => "Close find (Esc)".into(),
+            Item::Find if ctx.find => "Close find (Ctrl+F)".into(),
             #[cfg(feature = "find")]
             Item::Find => "Find (Ctrl+F)".into(),
             Item::Settings => "Settings".into(),
@@ -243,7 +243,7 @@ impl Item {
             Item::Theme => Command::Action(Action::CycleTheme),
             Item::Reload => Command::Action(Action::Reload),
             #[cfg(feature = "find")]
-            Item::Find => Command::Action(Action::ToggleFind),
+            Item::Find => Command::Action(Action::Find),
             Item::Settings => Command::Settings,
             Item::More => return None,
         })

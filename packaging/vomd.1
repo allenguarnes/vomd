@@ -78,12 +78,27 @@ setting starts with the panel open.
 Find in the document.
 A bar below the toolbar takes what is typed, and every match is marked in the text, the current one
 more strongly, with its place among the matches ("3 / 17") in the bar.
-While the bar is open the letter keys are text, Backspace deletes, and
-.BR Enter ", " F3 " and " Ctrl+G
-go to the next match and with Shift to the previous.
+The key opens the bar and, when it is open, closes it; so does the toolbar's search button.
 A short selection of one line is the query when the bar opens.
+While the field has the keyboard, which it does from the bar's opening until a click on the
+document, the letter keys are text, the arrows, Home and End move the caret and with Shift select
+(with Ctrl, the arrows go by words),
+.BR Backspace " and " Delete
+delete a character or, with Ctrl, a word,
+.B Ctrl+A
+selects all, and a click, a drag, a double click and a triple click place the caret and select.
+.BR Ctrl+C ", " Ctrl+X " and " Ctrl+V
+(or
+.BR Ctrl+Insert " and " Shift+Insert )
+copy, cut and paste the clipboard (its first line), and a middle click on the field pastes the
+primary selection there.
+.BR Enter ", " F3 " and " Ctrl+G
+go to the next match and with Shift to the previous;
+after a click on the document only
+.BR F3 " and " Ctrl+G
+do, and the keys are the document's again.
 .B Esc
-or the bar's close button closes it.
+or the bar's close button closes the bar.
 .TP
 .B W
 Wide layout on or off: the text spans the window instead of stopping at
@@ -118,7 +133,7 @@ Copy the selection to the clipboard, as plain text.
 The selection made with the mouse (or by Ctrl+A) is also offered as the primary selection, which
 a middle click pastes (X11 and Wayland); the
 .B primary_selection
-setting turns that off.
+setting turns that off (a middle click on the find bar's field still pastes what other programs offer).
 .TP
 .BR Backspace ", " Alt+Left ", " Ctrl+[
 Back, after following a link to another document.

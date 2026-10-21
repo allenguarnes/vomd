@@ -129,8 +129,10 @@ Each window is its own process, so opening another file starts another window.
 | `T` | Theme: system → light → dark |
 | `B` | Show / hide the toolbar |
 | `C` | Show / hide the contents panel |
-| `Ctrl+F` | Find in the document: open the find bar, or select its query to type a new one |
-| `Enter` `Shift+Enter`, `F3` `Shift+F3`, `Ctrl+G` `Ctrl+Shift+G` | In the find bar: next / previous match |
+| `Ctrl+F` | Find in the document: open the find bar, or close it when it is open |
+| `Enter` `Shift+Enter`, `F3` `Shift+F3`, `Ctrl+G` `Ctrl+Shift+G` | In the find bar: next / previous match (`Enter` only while the field has the keyboard) |
+| `←` `→`, `Ctrl+←` `Ctrl+→`, `Home` `End` | In the find bar's field: move the caret by a character, by a word, to an end; `Shift` selects |
+| `Ctrl+A`, `Ctrl+C` `Ctrl+X` `Ctrl+V` | In the find bar's field: select all, copy, cut, paste (`Ctrl+Insert`, `Shift+Insert` too) |
 | `W` | Wide layout on / off: the text spans the window instead of stopping at `line_width` |
 | `I` | Load remote images for this document (press again to hide them) |
 | `R`, `F5` | Reload |
@@ -176,22 +178,40 @@ heading, a click on the document or `Esc` closes it. A document without headings
 Headings inside footnotes, and headings with no text, are not listed. The panel's size
 follows the display's scale and not the zoom.
 
-**Find.** `Ctrl+F` (or the toolbar's search button) opens a bar below the toolbar and puts what
-you type into it, with the text you had selected if that was one short line. Every match in the
-text shows, in yellow, and the current one in orange, with its place among them in the bar ("3 /
-17", or "No matches"); the first one from where you are reading is the current one, and the
-document scrolls to put it about a third of the way down unless it is in view already. `Enter` (or
-`F3`, `Ctrl+G`, or the bar's ˅ button) goes to the next match and `Shift+Enter` (the ˄ button) to
-the previous one, around the ends; the wheel and the scroll keys move the page and leave the
-current match as it is. Case does not matter, and only the text you read is searched, never a
-link's address or the markup; a match never runs from one paragraph, heading or table cell into
-another. Every match is counted, but in a text with more than 10,000 only the 10,000 around the
-current one are marked. While the bar is open the letters you type go into it, so `Q`, `C` and the
-other letter keys are text, and `Ctrl+` shortcuts, the arrows and the page keys still work on the
-document. `Backspace` deletes a character, `Ctrl+Backspace` a word. `Esc` or the bar's ✕ closes it
-and clears the marks; the query is kept, shown selected, for the next `Ctrl+F`. A reload keeps the
-bar open and searches the new text again. The bar is as high as the toolbar and follows the
-display's scale and not the zoom.
+**Find.** `Ctrl+F` (or the toolbar's search button) opens a bar below the toolbar, with the text
+you had selected as what to look for if that was one short line, and `Ctrl+F` or the button again
+closes it. Every match in the text shows, in yellow, and the current one in orange, with its place
+among them in the bar ("3 / 17", or "No matches"); the first one from where you are reading is
+the current one, and the document scrolls to put it about a third of the way down unless it is in
+view already. `Enter` (or `F3`, `Ctrl+G`, or the bar's ˅ button) goes to the next match and
+`Shift+Enter` (the ˄ button) to the previous one, around the ends; the wheel and the scroll keys
+move the page and leave the current match as it is. Case does not matter, and only the text you
+read is searched, never a link's address or the markup; a match never runs from one paragraph,
+heading or table cell into another. Every match is counted, but in a text with more than 10,000
+only the 10,000 around the current one are marked.
+
+What to look for is typed into a one-line text field, which has the keyboard while the bar is
+open, so `Q`, `C` and the other letter keys are text, and the up and down arrows and the page keys
+still scroll the document. The caret goes anywhere, by the arrows, by words with `Ctrl`, to the
+ends with `Home` and `End`, or with a click; `Shift` with these, a drag, a double click (a word)
+or a triple click selects, and `Ctrl+A` selects all. What is typed, committed by an input method
+or pasted replaces the selection; `Backspace` and `Delete` delete it or a character, and with
+`Ctrl` a word. The text scrolls to keep the caret in view, and a drag past either end of the field
+scrolls it. `Ctrl+C` (or `Ctrl+Insert`) copies the selected text, `Ctrl+X` cuts it, and `Ctrl+V`
+(or `Shift+Insert`) pastes the clipboard at the caret; a selection made in the field is also
+offered as the primary selection (see `primary_selection` below), which a middle click on the field
+pastes at the click; that reads the primary selection whatever the setting says, for it governs
+only what VOMD offers. A paste is its first line only, with tabs as spaces and no other control
+character, and what the query holds is at most 256 characters. The paste is read in the
+background, so a program that is slow to answer, or none at all, never holds the window up; it is
+given up on after about two seconds and pastes nothing. A click on the document gives the keyboard
+back to the document: the bar stays open and the matches stay marked, the letter keys, `Ctrl+C`
+and `Ctrl+A` are the document's again, and `F3` and `Ctrl+G` (with `Shift`, back) still step, while
+`Enter` is left to the document. A click on the field, or closing the bar and opening it again,
+gives the field the keyboard. `Esc` or the bar's ✕ closes the bar, whoever has the keyboard, and
+clears the marks; the query is kept, shown selected, for the next `Ctrl+F`. A reload keeps the bar
+open and searches the new text again. The bar is as high as the toolbar and follows the display's
+scale and not the zoom.
 
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends
@@ -215,7 +235,7 @@ it with every key listed and commented out:
 | `font_size` | `16` (10–32) |
 | `line_width` | `80` (40–200 characters) |
 | `wide` | `false`, `true` (the text spans the window; `line_width` is ignored) |
-| `primary_selection` | `on`, `off` (selecting text offers it for a middle click; `Ctrl+C` is not affected) |
+| `primary_selection` | `on`, `off` (selecting text offers it for a middle click; `Ctrl+C` is not affected, and neither is pasting with a middle click in the find bar's field) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed family such as `Noto Sans` |
 
 Theme, zoom, toolbar, contents panel, wide layout and window size are saved automatically when you

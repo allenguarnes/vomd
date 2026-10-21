@@ -150,3 +150,74 @@ fn a_pasted_code_block_is_its_code_to_the_byte() {
         big.len()
     );
 }
+
+#[test]
+fn a_selection_read_through_a_pipe_is_all_of_it_up_to_the_end() {
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let thread = std::thread::spawn(move || {
+        writer.write_all("héllo\nwörld".as_bytes()).unwrap();
+    });
+    let bytes = read_within(reader, READ_CAP, Duration::from_secs(5)).expect("the pipe ended");
+    thread.join().unwrap();
+    assert_eq!(decode(&bytes, false), "héllo\nwörld");
+    // An empty answer is empty, not a failure.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(writer);
+    assert_eq!(
+        read_within(reader, READ_CAP, Duration::from_secs(5)),
+        Some(Vec::new())
+    );
+}
+
+#[test]
+fn a_long_selection_is_cut_at_the_cap_whatever_the_writer_does() {
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    // More than the cap, written for as long as someone reads (the writer then fails).
+    let thread = std::thread::spawn(move || {
+        let piece = [b'x'; 4096];
+        while writer.write_all(&piece).is_ok() {}
+    });
+    let bytes = read_within(reader, 10_000, Duration::from_secs(5)).expect("the cap was reached");
+    assert_eq!(bytes.len(), 10_000);
+    thread.join().unwrap();
+}
+
+#[test]
+fn an_owner_that_holds_the_pipe_and_says_nothing_is_given_up_on() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        read_within(reader, READ_CAP, Duration::from_millis(200)),
+        None
+    );
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(5));
+    drop(writer);
+    // One that writes some and then stalls is given up on as well: its half text is no text.
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(b"half").unwrap();
+    assert_eq!(
+        read_within(reader, READ_CAP, Duration::from_millis(200)),
+        None
+    );
+    drop(writer);
+}
+
+#[test]
+fn the_types_a_paste_is_asked_for_come_in_order_of_preference() {
+    let pick = |offered: &[&str]| {
+        TEXT_TYPES
+            .into_iter()
+            .find(|t| offered.iter().any(|m| m == t))
+    };
+    assert_eq!(
+        pick(&["image/png", "STRING", "UTF8_STRING"]),
+        Some("UTF8_STRING")
+    );
+    assert_eq!(
+        pick(&["text/plain", "text/plain;charset=utf-8"]),
+        Some("text/plain;charset=utf-8")
+    );
+    assert_eq!(pick(&["STRING"]), Some("STRING"));
+    assert_eq!(pick(&["image/png", "text/html"]), None);
+}
