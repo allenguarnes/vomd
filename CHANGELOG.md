@@ -3,6 +3,32 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Windows 10 (1803) and newer, and Windows 11, on x86-64: every feature Linux has, from one
+  `vomd.exe` that needs nothing installed (the C runtime is linked in). The release has
+  `vomd-<version>-x86_64-windows.zip`.
+  - Copy and paste use the Windows clipboard: a copy is made when a program pastes it, with CR LF
+    line ends, and is kept on the clipboard when the window closes. Windows has no primary
+    selection, so `primary_selection` doesn't apply.
+  - Open uses the system's Open dialog; links open in the default browser and ⚙ opens the
+    settings file (`%APPDATA%\vomd\settings.ini`) in the default app for `.ini` files.
+  - Remote images are fetched with the `curl.exe` Windows comes with.
+  - SVGs are drawn in separate `vomd.exe` processes, each in a job object that ends it with
+    VOMD and limits its memory and CPU time, as on Linux.
+  - The theme and the display's scale follow the system as they change, files can be dropped on
+    the window, and the window fits the screen above the taskbar.
+  - `vomd --help` and `--version` print in the console they were typed in; an error that stops
+    VOMD when no console started it (a bad command line from a shortcut) shows in a message box.
+  - The executable has its icon, version information and a manifest (per-monitor DPI awareness).
+
+### Fixed
+- An emoji that its font builds from several glyphs, one for each person joined by a zero-width
+  joiner (Segoe UI Emoji's families and couples), shows every person, not only the first.
+- Every invisible formatting character Unicode lists (also the Hangul fillers and the musical
+  formatting characters) is left out of the text, as the others were, instead of showing as a box.
+
 ## [1.5.0] - 2026-10-22
 
 ### Added
@@ -194,6 +220,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.5.0...HEAD
 [1.5.0]: https://github.com/allenguarnes/vomd/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/allenguarnes/vomd/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/allenguarnes/vomd/compare/v1.2.0...v1.3.0

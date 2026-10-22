@@ -115,8 +115,15 @@ fn primary_selection_is_a_switch_with_a_platform_default() {
     const {
         assert!(DEFAULT_PRIMARY, "on where there is a primary selection")
     };
+    // Windows has no primary selection: its template leaves the setting out.
+    #[cfg(windows)]
+    {
+        assert!(!TEMPLATE.contains("primary_selection"));
+        return;
+    }
     // The template documents it at that default, and writing it replaces the template's line
     // and keeps the rest of the file.
+    #[cfg_attr(windows, allow(unreachable_code))]
     let line = format!(
         "# primary_selection = {}",
         if DEFAULT_PRIMARY { "on" } else { "off" }
@@ -363,6 +370,11 @@ fn template_is_all_defaults() {
         "font_sans",
         "font_mono",
     ] {
+        // (Windows has no primary selection, and its template no line for it.)
+        if cfg!(windows) && key == "primary_selection" {
+            assert!(s.get(key).is_none());
+            continue;
+        }
         assert!(s.get(key).is_some(), "{key} documented");
     }
     assert_eq!(Prefs::from_settings(&s), Prefs::default());

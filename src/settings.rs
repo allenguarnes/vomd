@@ -794,10 +794,27 @@ impl Store {
     }
 }
 
-/// The template with the default of `primary_selection` the platform has (see
-/// [`DEFAULT_PRIMARY`]): `on` or `off`.
+/// The template's lines for `primary_selection`, with its default (`on` or `off`).
+#[cfg(not(windows))]
+macro_rules! primary {
+    ($default:literal) => {
+        concat!(
+            "
+# Selecting text with the mouse (or Ctrl+A) offers it as the primary selection, which a middle
+# click pastes elsewhere: on or off. Ctrl+C copies to the clipboard either way, and a middle click
+# on the find bar's field pastes what other programs offer either way.
+# primary_selection = ",
+            $default,
+            "
+"
+        )
+    };
+}
+
+/// The template with the platform's lines for `primary_selection` (see [`DEFAULT_PRIMARY`]): its
+/// default, or none on Windows, which has no primary selection.
 macro_rules! template {
-    ($primary:literal) => {
+    ($primary:expr) => {
         concat!(
             "\
 # VOMD settings. Remove the # in front of a line to change it; delete a line to go back to
@@ -832,14 +849,9 @@ macro_rules! template {
 
 # Wide layout: the text spans the window instead of stopping at line_width (W toggles it).
 # wide = false
-
-# Selecting text with the mouse (or Ctrl+A) offers it as the primary selection, which a middle
-# click pastes elsewhere: on or off. Ctrl+C copies to the clipboard either way, and a middle click
-# on the find bar's field pastes what other programs offer either way.
-# primary_selection = ",
+",
             $primary,
             "
-
 # Fonts: default (built in) or the name of an installed family, e.g. Noto Sans. VOMD finds
 # the files once and remembers them below as font_sans_path / font_mono_path. A family that
 # isn't installed falls back to the built-in font.
@@ -853,9 +865,11 @@ macro_rules! template {
 /// The file written by the ⚙ action when there is none: every key commented out at its
 /// default, with a line of explanation.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
-pub const TEMPLATE: &str = template!("on");
-#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
-pub const TEMPLATE: &str = template!("off");
+pub const TEMPLATE: &str = template!(primary!("on"));
+#[cfg(not(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios"))))))]
+pub const TEMPLATE: &str = template!(primary!("off"));
+#[cfg(windows)]
+pub const TEMPLATE: &str = template!("");
 
 /// Create the file from [`TEMPLATE`] if it doesn't exist (a dangling symlink gets the file at
 /// its target). Returns true if it was created.

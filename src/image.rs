@@ -34,13 +34,17 @@ mod webp;
 
 #[doc(hidden)]
 pub use exif::orientation as exif_orientation;
+/// The binary's allocator on Windows (see `svg::process::windows`).
+#[cfg(all(feature = "svg", windows))]
+#[doc(hidden)]
+pub use svg::process::SvgChildAllocator;
 /// SVGs drawn in a process of their own (see `svg::process`).
-#[cfg(all(feature = "svg", target_os = "linux"))]
+#[cfg(all(feature = "svg", any(target_os = "linux", windows)))]
 pub use svg::process::{
     ARG as SVG_PROCESS_ARG, child as svg_child, running as svg_children,
     set_program as set_svg_program,
 };
-#[cfg(all(feature = "svg", target_os = "linux"))]
+#[cfg(all(feature = "svg", any(target_os = "linux", windows)))]
 #[doc(hidden)]
 pub use svg::process::{
     EAT as SVG_TEST_EAT, SPIN as SVG_TEST_SPIN, set_cpu_limit as set_svg_cpu_limit,

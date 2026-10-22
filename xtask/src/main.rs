@@ -10,10 +10,23 @@ use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
+#[cfg(unix)]
 mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
 const SIZE_BUDGET: [u64; 2] = [5_550_000, 3_000_000];
+/// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
+/// there: PE has no relocation tables to pack, and the C runtime is linked in.
+const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_500_000, 2_000_000];
+
+/// The size budgets of the system this runs on.
+fn size_budget() -> [u64; 2] {
+    if cfg!(windows) {
+        WINDOWS_SIZE_BUDGET
+    } else {
+        SIZE_BUDGET
+    }
+}
 const COLD_BUDGET_MS: f64 = 100.0;
 const WARM_BUDGET_MS: f64 = 50.0;
 /// Idle RSS, 50 KB document, 1080p window.
@@ -107,6 +120,11 @@ fn baseline_cpu() -> bool {
 const RELEASE_FLAGS: &str =
     "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1fllvm-args=-inline-threshold=10";
 
+/// [`RELEASE_FLAGS`] for Windows (MSVC): the C runtime linked in and the inline threshold, as
+/// `.cargo/config.toml` has them.
+const WINDOWS_RELEASE_FLAGS: &str =
+    "-C\x1ftarget-feature=+crt-static\x1f-C\x1fllvm-args=-inline-threshold=10";
+
 /// A cargo command in the repository with [`RELEASE_FLAGS`] for what it builds.
 fn release_cargo() -> Command {
     let mut cmd = Command::new(env!("CARGO"));
@@ -116,6 +134,8 @@ fn release_cargo() -> Command {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )) {
         cmd.env("CARGO_ENCODED_RUSTFLAGS", RELEASE_FLAGS);
+    } else if cfg!(all(windows, target_env = "msvc")) {
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", WINDOWS_RELEASE_FLAGS);
     }
     cmd
 }
@@ -135,7 +155,9 @@ fn cargo_build(extra: &[&str], target_dir: &str) -> PathBuf {
         .status()
         .expect("run cargo");
     assert!(status.success(), "cargo build failed");
-    root().join(target_dir).join("release/vomd")
+    root()
+        .join(target_dir)
+        .join(format!("release/vomd{}", env::consts::EXE_SUFFIX))
 }
 
 fn size() -> bool {
@@ -143,7 +165,7 @@ fn size() -> bool {
         return false;
     }
     let mut ok = true;
-    for ((label, extra, dir), budget) in BUILDS.into_iter().zip(SIZE_BUDGET) {
+    for ((label, extra, dir), budget) in BUILDS.into_iter().zip(size_budget()) {
         let bin = cargo_build(extra, dir);
         let len = fs::metadata(&bin).expect("binary").len();
         let pass = len <= budget;
@@ -162,10 +184,15 @@ fn size() -> bool {
 /// Drop the binary from the page cache so the first run approximates a cold start.
 /// (Shared libraries stay cached; a true cold start needs root to drop all caches.)
 fn evict(path: &Path) {
-    use std::os::fd::AsRawFd;
-    if let Ok(f) = fs::File::open(path) {
-        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(f) = fs::File::open(path) {
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
     }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// A `vomd-bench` line's `key=value` fields.
@@ -698,14 +725,148 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
     ok
 }
 
-/// The release files, each with a `.sha256`: the tarball `dist/vomd-<version>-x86_64-linux.tar.gz`
-/// holding the binary, the desktop entry, the icon, the man page, README, CHANGELOG and the
-/// licenses (ours and those of the embedded fonts), and the Debian package and AppImage made from the same files
-/// (`pkg`).
+/// The release files of the system this runs on: [`dist_linux`]'s, or on Windows
+/// [`dist_windows`]'s.
 fn dist(release: bool) -> bool {
     if !baseline_cpu() {
         return false;
     }
+    #[cfg(windows)]
+    {
+        // (No glibc floor to check, so nothing differs for a release.)
+        let _ = release;
+        dist_windows()
+    }
+    #[cfg(unix)]
+    return dist_linux(release);
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = release;
+        eprintln!("dist: Linux and Windows only");
+        false
+    }
+}
+
+/// The files that go with the binary in every release archive (source, name in the archive): the
+/// README and its image, at the path it names, the changelog and the licenses, ours and those of
+/// the fonts and icons built into the binary.
+const DIST_DOCS: [(&str, &str); 6] = [
+    ("README.md", "README.md"),
+    ("assets/icon@2x.png", "assets/icon@2x.png"),
+    ("CHANGELOG.md", "CHANGELOG.md"),
+    ("LICENSE", "LICENSE"),
+    ("assets/fonts/LICENSE-Inter.txt", "LICENSE-Inter.txt"),
+    (
+        "assets/fonts/LICENSE-JetBrainsMono.txt",
+        "LICENSE-JetBrainsMono.txt",
+    ),
+];
+
+/// The version in Cargo.toml (xtask's own may lag behind it).
+fn vomd_version() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let manifest = fs::read_to_string(root().join("Cargo.toml")).expect("Cargo.toml");
+    let ours = manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \""))
+        .and_then(|v| v.strip_suffix('"'))
+        .expect("version in Cargo.toml")
+        .to_owned();
+    if ours != version {
+        eprintln!("note: xtask {version}, vomd {ours}");
+    }
+    ours
+}
+
+/// Copy `files` (source in the repository, name under `stage`) into `stage`.
+fn stage_files<'a>(stage: &Path, files: impl IntoIterator<Item = (&'a Path, &'a str)>) {
+    for (from, to) in files {
+        let to = stage.join(to);
+        fs::create_dir_all(to.parent().unwrap()).expect("create dist/ subdirectory");
+        fs::copy(root().join(from), to).unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
+    }
+}
+
+/// The Windows release: `dist/vomd-<version>-x86_64-windows.zip` holding `vomd.exe` (its icon,
+/// manifest and version information built in by `build.rs`), README, CHANGELOG and the licenses,
+/// and its `.sha256`.
+#[cfg(windows)]
+fn dist_windows() -> bool {
+    let bin = cargo_build(&[], "target");
+    let len = fs::metadata(&bin).expect("binary").len();
+    let budget = WINDOWS_SIZE_BUDGET[0];
+    if len > budget {
+        eprintln!("error: the binary is {len} bytes, over the {budget} budget");
+        return false;
+    }
+    let ours = vomd_version();
+    let name = format!("vomd-{ours}-x86_64-windows");
+    let dist = root().join("dist");
+    let stage = dist.join(&name);
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).expect("create dist/");
+    let docs = DIST_DOCS.iter().map(|&(from, to)| (Path::new(from), to));
+    let lucide = (
+        Path::new("assets/fonts/LICENSE-Lucide.txt"),
+        "LICENSE-Lucide.txt",
+    );
+    stage_files(
+        &stage,
+        [(bin.as_path(), "vomd.exe"), lucide]
+            .into_iter()
+            .chain(docs),
+    );
+    let zip = dist.join(format!("{name}.zip"));
+    let _ = fs::remove_file(&zip);
+    // The system's bsdtar writes a zip when the archive's name says so (`-a`).
+    let ok = Command::new("tar")
+        .current_dir(&dist)
+        .args(["-a", "-c", "-f"])
+        .arg(&zip)
+        .arg(&name)
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = fs::remove_dir_all(&stage);
+    if !ok {
+        eprintln!("tar (zip) failed");
+        return false;
+    }
+    println!("wrote {}", zip.display());
+    write_sum_windows(&zip)
+}
+
+/// `<file>.sha256` next to `file`, in `sha256sum`'s format, from `certutil` (every Windows has it).
+#[cfg(windows)]
+fn write_sum_windows(file: &Path) -> bool {
+    let out = Command::new("certutil")
+        .arg("-hashfile")
+        .arg(file)
+        .arg("SHA256")
+        .output();
+    let sum = out.ok().filter(|o| o.status.success()).and_then(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.replace(' ', ""))
+            .find(|l| l.len() == 64 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(|l| l.to_ascii_lowercase())
+    });
+    let Some(sum) = sum else {
+        eprintln!("certutil failed for {}", file.display());
+        return false;
+    };
+    let name = file.file_name().unwrap().to_string_lossy();
+    let line = format!("{sum}  {name}\n");
+    fs::write(format!("{}.sha256", file.display()), &line).expect("write the checksum");
+    print!("{line}");
+    true
+}
+
+/// The Linux release files, each with a `.sha256`: the tarball
+/// `dist/vomd-<version>-x86_64-linux.tar.gz` holding the binary, the desktop entry, the icon, the
+/// man page, README, CHANGELOG and the licenses (ours and those of the embedded fonts), and the
+/// Debian package and AppImage made from the same files (`pkg`).
+#[cfg(unix)]
+fn dist_linux(release: bool) -> bool {
     let bin = cargo_build(&[], "target");
     // The binary that ships is held to the budget here, where it is built (in the Debian 12
     // container for a release), not only where `budgets` builds one.
@@ -738,50 +899,25 @@ fn dist(release: bool) -> bool {
             }
         }
     }
-    let version = env!("CARGO_PKG_VERSION");
-    let manifest = fs::read_to_string(root().join("Cargo.toml")).expect("Cargo.toml");
-    let ours = manifest
-        .lines()
-        .find_map(|l| l.strip_prefix("version = \""))
-        .and_then(|v| v.strip_suffix('"'))
-        .expect("version in Cargo.toml");
-    if ours != version {
-        eprintln!("note: xtask {version}, vomd {ours}");
-    }
+    let ours = vomd_version();
+    let ours = ours.as_str();
     let name = format!("vomd-{ours}-x86_64-linux");
     let dist = root().join("dist");
     let stage = dist.join(&name);
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage).expect("create dist/");
-    let files: [(&Path, &str); 11] = [
-        (&bin, "vomd"),
+    let files = [
+        (bin.as_path(), "vomd"),
         (Path::new("packaging/vomd.desktop"), "vomd.desktop"),
         (Path::new("packaging/vomd.1"), "vomd.1"),
         (Path::new("assets/icon.svg"), "vomd.svg"),
-        (Path::new("README.md"), "README.md"),
-        // The README's image, at the path it names.
-        (Path::new("assets/icon@2x.png"), "assets/icon@2x.png"),
-        (Path::new("CHANGELOG.md"), "CHANGELOG.md"),
-        (Path::new("LICENSE"), "LICENSE"),
-        // The fonts and icons built into the binary.
-        (
-            Path::new("assets/fonts/LICENSE-Inter.txt"),
-            "LICENSE-Inter.txt",
-        ),
-        (
-            Path::new("assets/fonts/LICENSE-JetBrainsMono.txt"),
-            "LICENSE-JetBrainsMono.txt",
-        ),
         (
             Path::new("assets/fonts/LICENSE-Lucide.txt"),
             "LICENSE-Lucide.txt",
         ),
     ];
-    for (from, to) in files {
-        let to = stage.join(to);
-        fs::create_dir_all(to.parent().unwrap()).expect("create dist/ subdirectory");
-        fs::copy(root().join(from), to).unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
-    }
+    let docs = DIST_DOCS.iter().map(|&(from, to)| (Path::new(from), to));
+    stage_files(&stage, files.into_iter().chain(docs));
     let tarball = dist.join(format!("{name}.tar.gz"));
     // Reproducible, as the packages are: the same entry order, owner and time, and a gzip with
     // no name or time.
@@ -816,12 +952,14 @@ fn dist(release: bool) -> bool {
 }
 
 /// The oldest glibc release binaries support: RELR relocations need 2.36.
+#[cfg(unix)]
 const GLIBC_FLOOR: (u32, u32) = (2, 36);
 
 /// The newest `GLIBC_x.y` version an undefined symbol of `bin` names (`objdump -T`). Weak ones
 /// count too: the binary runs without them, but an older glibc's loader prints "weak version
 /// `GLIBC_x.y' not found" at every start (Rust's std links `pidfd_spawnp` weakly when the build
 /// machine's glibc has it).
+#[cfg(unix)]
 fn glibc_floor(bin: &Path) -> Option<(u32, u32)> {
     let out = Command::new("objdump").arg("-T").arg(bin).output().ok()?;
     if !out.status.success() {

@@ -1,5 +1,6 @@
-# Linux runs everything, budgets and packages included; Windows and macOS are compile checks
-# only (unsupported until P14). Mirrors `just ci` and `cargo xtask budgets`.
+# Linux runs everything, budgets and packages included; Windows runs clippy, the tests and the
+# size budget; macOS is a compile check only (unsupported). Mirrors `just ci` and
+# `cargo xtask budgets`.
 name: CI
 
 on:
@@ -83,12 +84,30 @@ jobs:
       - name: Select, copy and paste, short and 5 MB, on X11 and Wayland
         run: scripts/clipboard-check.sh
 
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # bash, so that every command's failure fails the step (pwsh only checks the last).
+      - name: Clippy (every feature set)
+        shell: bash
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --no-default-features --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features images,embed-fonts --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features svg --locked -- -D warnings
+      - name: Tests and goldens
+        run: cargo test --locked
+      - name: Tests without default features
+        run: cargo test --lib --no-default-features --features images,embed-fonts --locked
+      - name: Size budget
+        run: cargo xtask size
+
   compile-check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain (rust-toolchain.toml)

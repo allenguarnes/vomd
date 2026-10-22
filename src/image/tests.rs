@@ -4180,11 +4180,12 @@ fn an_svg_that_takes_too_long_is_given_up() {
     layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
     assert_eq!(images.deadline(), None);
     let boxes = [(1, 512, 512), (2, 30, 20), (3, 48, 32)];
-    // The worker takes the SVG first (measured, and asked for again: then it's slow).
+    // The worker takes the SVG first (measured, and asked for again: then it's slow). Only it is
+    // asked for, so the logo can't be drawn before the slow one is given up.
     let t = Instant::now();
     loop {
         assert!(t.elapsed() < Duration::from_secs(10), "never given up");
-        images.request(&boxes, 3);
+        images.request(&boxes[..1], 1);
         std::thread::sleep(Duration::from_millis(2));
         if images.expire(Instant::now()) {
             break;

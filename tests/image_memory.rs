@@ -1,6 +1,8 @@
 //! What decoding images allocates, counted (review rounds 3 to 8): in a test binary of
 //! its own, with a counting allocator, so nothing else runs while it counts: each test takes
-//! [`serial`] first, and the others wait without allocating.
+//! [`serial`] first, and the others wait without allocating. The remote tests stand a shell
+//! script in for `curl` on `PATH`, so they run on Unix only (Windows runs the `curl.exe` of its
+//! system directory, which comes first).
 #![cfg(feature = "images")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -36,18 +38,18 @@ static ALLOW: AtomicUsize = AtomicUsize::new(0);
 /// [`ALLOW`], and where: for the report of a run that fails.
 /// What the mix was doing (its last step), for the report of a failure in a thread that doesn't
 /// know ([`room_probe`]).
-#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+#[cfg_attr(not(all(feature = "remote-images", unix)), allow(dead_code))]
 static STEP: Mutex<String> = Mutex::new(String::new());
 /// The most times one URL was fetched in a viewport that did not change, over a run of the mix
 /// (the storm detector, [`mix::Epoch`]).
-#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+#[cfg_attr(not(all(feature = "remote-images", unix)), allow(dead_code))]
 static MOST_FETCHES: AtomicUsize = AtomicUsize::new(0);
 /// The most times one URL may be fetched in a viewport that did not change: two, once for
 /// what the pause of the fetchers gave up (and a fetch that has been given up is not again) and
 /// once for the rest; three in the profiles with heavy images (bodies of 3 to 4 MB whose decodes
 /// run only alone, with the fetchers held off), where a body that came and was waiting is let go
 /// for the decode of another that runs alone, and is fetched again ([`mix::Epoch`]).
-#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+#[cfg_attr(not(all(feature = "remote-images", unix)), allow(dead_code))]
 static FETCH_BOUND: AtomicUsize = AtomicUsize::new(2);
 static TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRIP: Mutex<String> = Mutex::new(String::new());
@@ -75,7 +77,7 @@ thread_local! {
 }
 
 /// Run `f` with what this thread allocates counted as `tag`'s.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn tagged<T>(tag: Tag, f: impl FnOnce() -> T) -> T {
     let before = TAG.with(|t| t.replace(tag));
     let out = f();
@@ -121,7 +123,7 @@ fn trip(live: usize, limit: usize) {
 }
 
 /// Where the first allocation past what is allowed was made, if one was, for a failure's message.
-#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+#[cfg_attr(not(all(feature = "remote-images", unix)), allow(dead_code))]
 fn trip_report() -> String {
     if TRIPPED.load(Relaxed) {
         TRIP.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -223,7 +225,7 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 /// What `f` leaves allocated by this thread (what a page's `Doc` and `Layout` are, for one).
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn built<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = MINE.with(|m| m.get());
     let out = tagged(Tag::Page, f);
@@ -239,14 +241,14 @@ fn mark() -> usize {
 }
 
 /// The image code's live bytes now ([`Tag::Image`]); their peak is counted from the last [`mark`].
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn image_live() -> usize {
     IMAGE_LIVE.load(Relaxed)
 }
 
 /// How far the image code's live bytes (from [`image_live`]) got over `start` since the last
 /// look, which is where the next one's peak is counted from: no peak falls between two.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn image_step_over(start: usize) -> usize {
     let now = IMAGE_LIVE.load(Relaxed);
     IMAGE_PEAK.swap(now, Relaxed).saturating_sub(start)
@@ -449,7 +451,7 @@ fn pending_results_stay_in_the_budget() {
 /// A grayscale PNG of `side` × `side` zeros (a few hundred KB, whatever its size in pixels), and
 /// then `pad` bytes after its `IEND`: what the decoder never reads, to make the file as big as
 /// the fetchers allow.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn png_padded(side: u32, total: usize) -> Vec<u8> {
     let mut out = Vec::new();
     {
@@ -473,7 +475,7 @@ fn png_padded(side: u32, total: usize) -> Vec<u8> {
 /// and 43.7 MB were live over the start in a 33.5 MB budget, until the decode was done. The
 /// fetches are the system `curl`'s, a script in front of it on `PATH` that serves files of a
 /// scratch directory (nothing is fetched from anywhere).
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn navigating_during_a_remote_decode_stays_in_the_budget() {
     let _serial = serial();
@@ -791,14 +793,14 @@ fn jpeg_variant(base: &[u8], marker: u8, w: u16, h: u16, comps: &[u8], ns: usize
 /// then held open for 5 seconds, as a transfer that doesn't end) and logs the URLs it is asked for in
 /// `dir/curl.log`: nothing is fetched from anywhere. The tests run one at a time, so setting
 /// `PATH` is safe.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn fake_curl(dir: &Path, serve: &Path) {
     fake_curl_hold(dir, serve, "5");
 }
 
 /// [`fake_curl`] with `hold` as the seconds a `slow` name is held open for after all its bytes,
 /// and a `trickle` name between its halves (a transfer that still needs credit when it is held off).
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn fake_curl_hold(dir: &Path, serve: &Path, hold: &str) {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
@@ -825,7 +827,7 @@ fn fake_curl_hold(dir: &Path, serve: &Path, hold: &str) {
 }
 
 /// How many times `fake_curl` was run so far.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn curl_runs(dir: &Path) -> usize {
     std::fs::read_to_string(dir.join("curl.log")).map_or(0, |log| log.lines().count())
 }
@@ -851,7 +853,7 @@ fn frames(
 
 /// [`frames`] without the first frame: the viewport hasn't changed, only what the threads do
 /// makes anything happen.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn events(
     images: &mut Images,
     doc: &Doc,
@@ -872,9 +874,9 @@ const QUIET: Duration = Duration::from_secs(20);
 
 /// Run `f` with what it allocates counted as the driver's, not the image code's (see [`Tag`]).
 fn driver<T>(f: impl FnOnce() -> T) -> T {
-    #[cfg(feature = "remote-images")]
+    #[cfg(all(feature = "remote-images", unix))]
     return tagged(Tag::Driver, f);
-    #[cfg(not(feature = "remote-images"))]
+    #[cfg(not(all(feature = "remote-images", unix)))]
     f()
 }
 
@@ -1145,7 +1147,7 @@ fn removed_slots_leave_no_room_behind() {
 /// alt text while the document is open (a repaint, a reload: nothing is fetched again), and is
 /// fetched again when the document is opened again, which it wasn't: the body stayed cached and
 /// the failure with it, whatever documents came between, and the `curl` log had one line.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn a_failed_remote_decode_is_fetched_again_when_reopened() {
     let _serial = serial();
@@ -1696,7 +1698,7 @@ fn tall_png() -> Vec<u8> {
 /// open for 5 seconds. It was let in alone, beside what they held: 36,838,378 bytes live over the
 /// start in a 33,554,432 budget (24,842,622 now; a debug build). The fetchers are a `curl` in
 /// front of the real one on `PATH`.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn a_decode_that_does_not_fit_waits_for_the_downloads() {
     let _serial = serial();
@@ -1769,7 +1771,7 @@ fn a_decode_that_does_not_fit_waits_for_the_downloads() {
 /// which evicts them all. `sizes` kept its 20,000 URLs, their strings and its table: 35,064,224
 /// bytes live over the start at most in a 33,554,432 budget, 34,231,019 after the decode (debug
 /// build; 32,321,766 and 31,805,759 now).
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn evicting_the_last_slot_of_a_url_forgets_its_record() {
     let _serial = serial();
@@ -1836,7 +1838,7 @@ fn evicting_the_last_slot_of_a_url_forgets_its_record() {
 /// with the same local PNG: the queue's 1.6 MB stayed allocated with nothing counting it,
 /// 34,418,492 bytes live over the start at most in a 33,554,432 budget (33,902,487 after; a debug
 /// build, 32,321,568 and 31,805,563 now).
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn stopping_the_fetch_queue_gives_back_its_room() {
     let _serial = serial();
@@ -1927,7 +1929,7 @@ fn stopping_the_fetch_queue_gives_back_its_room() {
 /// a frame (`events`), so the decode starts only if that poll says a repaint is needed. It
 /// was never started: no transfer, no decode, a poll that said no a hundred times in a row, and
 /// the fetchers held off until something else asked for a frame.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn a_transfer_that_gives_up_for_the_pause_starts_the_decode_held_back_for_it() {
     let _serial = serial();
@@ -2157,7 +2159,7 @@ fn attaching_a_document_of_long_paths_keeps_no_copy_of_them() {
 /// request evicted it. Now their entries are small enough for it to stay, and a document with
 /// as many images as the cache has no room for beside it has it evicted before its tables are made.
 /// The fetch is a `curl` in front of the real one on `PATH` (nothing is fetched from anywhere).
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn attaching_makes_room_before_it_makes_the_tables() {
     let _serial = serial();
@@ -2438,7 +2440,7 @@ fn a_request_for_many_local_images_stays_in_the_budget() {
 /// a URL of 40 MiB took 8 MiB more than the budget (41,943,040 bytes of the image code's live
 /// over the start with it in a document, in a budget of 33,554,432), and so did a copy of any
 /// other of that size. It is refused with nothing allocated.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn an_oversized_url_is_refused_before_it_is_copied() {
     let _serial = serial();
@@ -2508,7 +2510,7 @@ fn an_oversized_url_is_refused_before_it_is_copied() {
 /// could not evict it for the tables of the document with 80,000 images, and nothing asked for
 /// another poll: they stayed unbuilt for good, every image of the document showing its alt text,
 /// the decode's bitmap (the old document's) in a slot of the cache, workers and fetchers idle.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn the_tables_of_a_document_waiting_for_a_decode_are_made_without_a_poll_asked_for() {
     let _serial = serial();
@@ -2781,7 +2783,7 @@ fn no_room_now_is_not_a_failed_image() {
 /// boxes it had room for before it protected what it keeps, the protection took the room away,
 /// and the request, refused, returned with nothing asked for while a body admitted to be decoded
 /// alone sat in the cache and the fetchers were held off for it. Every one is decoded now.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn a_request_refused_after_protecting_still_decodes_the_admitted_body() {
     let _serial = serial();
@@ -2843,7 +2845,7 @@ fn a_request_refused_after_protecting_still_decodes_the_admitted_body() {
 /// wake, for `until` to hold or `deadline` to pass, the pixels never painted (a window on Wayland
 /// that has not had its frame callback runs its event loop, and so asks for images again, with
 /// no frame painted since: `View::tick`). Returns whether `until` held, and how many wakes it took.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn unpainted(
     images: &mut Images,
     doc: &Doc,
@@ -2876,7 +2878,7 @@ fn unpainted(
 /// be evicted, and the decode that does not fit beside it was run over the budget (34,623,006
 /// bytes of the image code live over the start, 33,554,432 allowed, with no pixel painted): what
 /// is protected is what a frame painted, and the PNG goes to make room.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn results_nobody_painted_are_evictable() {
     let _serial = serial();
@@ -2950,7 +2952,7 @@ fn results_nobody_painted_are_evictable() {
 /// each for a URL that is one), and charged, which evicts nothing: the image code's live bytes
 /// went from 33,472,686 to 33,612,062 (57,630 over the 33,554,432 allowed), and only then was the bitmap
 /// (not painted) evicted. The set is made with the document's tables, for its distinct URLs.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn a_request_for_many_references_to_one_url_allocates_nothing_over_the_budget() {
     let _serial = serial();
@@ -3008,7 +3010,7 @@ fn a_request_for_many_references_to_one_url_allocates_nothing_over_the_budget() 
 }
 
 /// How many times the fake `curl` was run for each URL (the most of any one), and in all.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn curl_per_url(dir: &Path) -> (usize, usize) {
     let log = std::fs::read_to_string(dir.join("curl.log")).unwrap_or_default();
     let mut runs: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -3029,7 +3031,7 @@ fn curl_per_url(dir: &Path) -> (usize, usize) {
 /// the boxes asked for got shorter with each body that arrived, and their bodies were fetched
 /// again and again while the decodes before them were never reached: decoding stopped at 576 of
 /// 701, with 9,338 curl runs and 10,616 wakes after a minute, in a viewport that did not change.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn remote_beside_a_bitmap(n: usize) {
     let _serial = serial();
     use vomd::render::Pixels;
@@ -3120,7 +3122,7 @@ fn remote_beside_a_bitmap(n: usize) {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn seven_hundred_remote_images_beside_a_bitmap_are_all_decoded() {
     remote_beside_a_bitmap(700);
@@ -3129,7 +3131,7 @@ fn seven_hundred_remote_images_beside_a_bitmap_are_all_decoded() {
 /// (Six and a half minutes in a debug build, where a request for 2,000 boxes over 4,000 slots is
 /// 4 million comparisons of strings, and the window's frame of them as many again, a thousand
 /// times over: `cargo test --release --test image_memory -- --ignored two_thousand`.)
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 #[ignore = "six minutes in a debug build; run in release: cargo test --release --test image_memory -- --ignored two_thousand"]
 fn two_thousand_remote_images_beside_a_bitmap_are_all_decoded() {
@@ -3145,7 +3147,7 @@ fn two_thousand_remote_images_beside_a_bitmap_are_all_decoded() {
 /// took it for one that is not: its body was dropped for room as one near the viewport, and
 /// fetched again by the next request, which did not defer it as it does one near: 784 fetches
 /// and 785 wakes in 8 s, and only the PNG decoded.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn references_beside_a_heavy_image(refs: usize) {
     let _serial = serial();
     let dir = scratch(&format!("refs-{refs}"));
@@ -3221,19 +3223,19 @@ fn references_beside_a_heavy_image(refs: usize) {
     );
 }
 
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn references_below_the_viewport_cap_beside_a_heavy_image_both_load() {
     references_beside_a_heavy_image(4_095);
 }
 
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn references_at_the_viewport_cap_beside_a_heavy_image_both_load() {
     references_beside_a_heavy_image(4_096);
 }
 
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn references_above_the_viewport_cap_beside_a_heavy_image_both_load() {
     references_beside_a_heavy_image(4_500);
@@ -3249,7 +3251,7 @@ fn references_above_the_viewport_cap_beside_a_heavy_image_both_load() {
 /// 4,501 decoded for good. The PNGs are loaded in batches by the documents of 32 first (the
 /// images stay cached when the next document is opened), which brings the case to the state the
 /// full document reaches and keeps the test short.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 fn distinct_images_beside_a_heavy_image(n: u32) {
     let _serial = serial();
     let dir = scratch(&format!("distinct-{n}"));
@@ -3337,14 +3339,14 @@ fn distinct_images_beside_a_heavy_image(n: u32) {
     assert!(most <= 2, "a URL was fetched {most} times");
 }
 
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 #[test]
 fn distinct_images_above_the_viewport_cap_beside_a_heavy_image_all_load() {
     distinct_images_beside_a_heavy_image(4_500);
 }
 
 /// The sites that make room ([`vomd::image::set_room_probe`]), in the order the counts are kept.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 const ROOM_SITES: [&str; 8] = [
     "attach: tables",
     "slot list",
@@ -3357,7 +3359,7 @@ const ROOM_SITES: [&str; 8] = [
 ];
 
 /// How many times each of [`ROOM_SITES`] made room in a run that was watched, and, last, any other.
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 static ROOM_CALLS: [AtomicUsize; ROOM_SITES.len() + 1] =
     [const { AtomicUsize::new(0) }; ROOM_SITES.len() + 1];
 
@@ -3367,7 +3369,7 @@ static ROOM_CALLS: [AtomicUsize; ROOM_SITES.len() + 1] =
 /// where it is, not at the end of the operation; and when the room is said to be made, they are
 /// within it with the allocation that is asked for (a `make_room` whose answer leaves the
 /// allocation over the budget is wrong: whatever it left out of its arithmetic is the failure).
-#[cfg(all(feature = "remote-images", debug_assertions))]
+#[cfg(all(all(feature = "remote-images", unix), debug_assertions))]
 fn room_probe(site: &'static str, bytes: usize, granted: Option<bool>) {
     let base = BASE.load(Relaxed);
     if base == 0 {
@@ -3394,7 +3396,7 @@ fn room_probe(site: &'static str, bytes: usize, granted: Option<bool>) {
     }
 }
 
-#[cfg(feature = "remote-images")]
+#[cfg(all(feature = "remote-images", unix))]
 mod mix {
     use super::*;
 

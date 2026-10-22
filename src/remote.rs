@@ -121,7 +121,7 @@ pub(crate) type ForcedFetch =
 
 /// [`ForcedFetch`] with `curl`.
 fn forced_fetch(url: &str, cancel: &Arc<AtomicBool>) -> Result<Vec<u8>, Refusal> {
-    fetch_cancellable("curl", url, FORCED_LIMITS, &|_| true, Some(cancel)).map_err(|e| match e {
+    fetch_cancellable(&curl(), url, FORCED_LIMITS, &|_| true, Some(cancel)).map_err(|e| match e {
         Error::TooLarge => Refusal::Ceiling(FORCED_LIMITS.bytes),
         _ => Refusal::Failed,
     })
@@ -170,9 +170,25 @@ pub fn fetchable(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// The `curl` to run. On Windows the one the system ships (`System32\curl.exe`, there since
+/// Windows 10 1803) when it is there: a bare name would also be looked for in the directory
+/// VOMD was started from, such as a downloads folder, before the system's. Elsewhere `curl`,
+/// found on `PATH`.
+fn curl() -> String {
+    #[cfg(windows)]
+    if let Some(system) = std::env::var_os("SystemRoot")
+        .map(|root| std::path::Path::new(&root).join(r"System32\curl.exe"))
+        .filter(|p| p.is_file())
+        .and_then(|p| p.into_os_string().into_string().ok())
+    {
+        return system;
+    }
+    "curl".into()
+}
+
 /// Fetch `url` with the system `curl` within `limits`.
 pub fn fetch(url: &str, limits: Limits) -> Result<Vec<u8>, Error> {
-    fetch_with("curl", url, limits, &|_| true).map(cut_to_size)
+    fetch_with(&curl(), url, limits, &|_| true).map(cut_to_size)
 }
 
 /// [`fetch`] with `program` standing in for `curl`, taking credit as the body is read. The body
@@ -196,7 +212,8 @@ fn fetch_cancellable(
     if !fetchable(url) {
         return Err(Error::Refused);
     }
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         // `-q` only works as the first argument.
         .args([
             "-q",
@@ -219,12 +236,18 @@ fn fetch_cancellable(
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Error::NoCurl,
-            _ => Error::Failed,
-        })?;
+        .stderr(Stdio::null());
+    // A console program started by a GUI one gets a console window of its own unless told not to.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::NoCurl,
+        _ => Error::Failed,
+    })?;
     let stdout = child.stdout.take();
     let child = Arc::new(Mutex::new(child));
     // `--max-time` is per transfer: whatever keeps this one running past it is killed, which
@@ -347,7 +370,7 @@ pub(crate) type Fetcher = Arc<dyn Fn(&str, Grant) -> Fetched + Send + Sync>;
 
 /// Fetch a remote image: its bytes and natural size, if it's of a format this build decodes.
 fn fetch_image(url: &str, grant: Grant) -> Fetched {
-    let bytes = fetch_with("curl", url, LIMITS, grant)?;
+    let bytes = fetch_with(&curl(), url, LIMITS, grant)?;
     image_of(bytes)
 }
 

@@ -13,3 +13,7 @@ rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inl
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=10"]
+
+# Windows: the C runtime linked in (no VCRUNTIME140.dll to install), and the same inline threshold.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "llvm-args=-inline-threshold=10"]

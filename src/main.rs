@@ -39,17 +39,31 @@ use vomd::toolbar::Command;
 use vomd::view::CodeCopy;
 use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
 
+/// On Windows, a failed allocation in an SVG's process ends it with the code that says so (see
+/// `image::svg_child`); elsewhere, and in VOMD's own process, the system's allocator as it is.
+#[cfg(all(feature = "svg", windows))]
+#[global_allocator]
+static ALLOCATOR: vomd::image::SvgChildAllocator = vomd::image::SvgChildAllocator;
+
 /// Idle layout runs in slices this long between events.
 const IDLE_SLICE: Duration = Duration::from_millis(4);
-/// What the empty window says. Dropping a file only works on X11 (winit can't take drops on
-/// Wayland), so it is only offered there.
+/// What the empty window says. Dropping a file works on X11 and Windows (winit can't take drops
+/// on Wayland), so it is only offered there.
 fn empty_message(wayland: bool) -> String {
-    let drop = if wayland || !cfg!(all(unix, not(target_os = "macos"))) {
+    let drop = if wayland || !cfg!(any(windows, all(unix, not(target_os = "macos")))) {
         ""
     } else {
         ", or drop one here"
     };
     format!("Press Ctrl+O to open a Markdown file{drop}")
+}
+
+/// End the event loop. Also wakes it: on Windows, winit only looks at the request after its next
+/// message, and a window that failed to open (or a bench's first frame, painted before the window
+/// shows) may never get one.
+fn quit(event_loop: &ActiveEventLoop, proxy: &EventLoopProxy<UserEvent>) {
+    event_loop.exit();
+    let _ = proxy.send_event(UserEvent::Quit);
 }
 
 /// Whether the window system is Wayland, by the connection winit made (not by the environment,
@@ -70,6 +84,7 @@ fn parent_name(handle: Option<RawWindowHandle>) -> String {
     match handle {
         Some(RawWindowHandle::Xlib(h)) => format!("x11:{:x}", h.window),
         Some(RawWindowHandle::Xcb(h)) => format!("x11:{:x}", h.window),
+        Some(RawWindowHandle::Win32(h)) => format!("win32:{:x}", h.hwnd.get()),
         _ => String::new(),
     }
 }
@@ -95,6 +110,8 @@ enum UserEvent {
     /// ticket the paste was asked for with, which says whether the field is still the one.
     #[cfg(all(feature = "clipboard", feature = "find"))]
     Pasted(u32, Option<String>),
+    /// Only wakes the loop after `quit` asked it to end (see there).
+    Quit,
 }
 
 /// How long the first window waits for the portal's dark preference before painting with
@@ -311,7 +328,7 @@ impl App {
                     self.start.elapsed().as_secs_f64() * 1e3,
                     platform::peak_rss_kb()
                 );
-                event_loop.exit();
+                quit(event_loop, &self.proxy);
             }
         }
         self.scan_fonts();
@@ -798,7 +815,7 @@ impl App {
                     self.paste(which, ticket);
                 }
             }
-            Outcome::Quit => event_loop.exit(),
+            Outcome::Quit => quit(event_loop, &self.proxy),
         }
     }
 }
@@ -838,23 +855,46 @@ impl ApplicationHandler<UserEvent> for App {
         ))]
         let attrs =
             winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "vomd", "vomd");
+        // The executable's icon (build.rs puts it in as resource 1), for the title bar and the
+        // taskbar: winit gives a window none of its own.
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+            let icon = winit::window::Icon::from_resource(1, None).ok();
+            attrs.with_window_icon(icon.clone()).with_taskbar_icon(icon)
+        };
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
-                eprintln!("vomd: cannot create a window: {e}");
+                platform::fatal(&format!("vomd: cannot create a window: {e}"));
                 self.exit_code = 1;
-                event_loop.exit();
+                quit(event_loop, &self.proxy);
                 return;
             }
         };
+        // Windows places a new window where it likes, which can put its bottom under the
+        // taskbar: it is moved (or made smaller) to fit the work area before it is shown.
+        #[cfg(windows)]
+        if let (Some(area), Ok(pos)) = (platform::work_area(), window.outer_position()) {
+            let (outer, inner) = (window.outer_size(), window.inner_size());
+            let ((x, y), (w, h)) =
+                platform::fit_in(area, (pos.x, pos.y), (outer.width, outer.height));
+            if (w, h) != (outer.width, outer.height) {
+                let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+                    inner.width.saturating_sub(outer.width - w),
+                    inner.height.saturating_sub(outer.height - h),
+                ));
+            }
+            window.set_outer_position(PhysicalPosition::new(x, y));
+        }
         let surface = softbuffer::Context::new(window.clone())
             .and_then(|cx| softbuffer::Surface::new(&cx, window.clone()));
         let surface = match surface {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("vomd: cannot draw to the window: {e}");
+                platform::fatal(&format!("vomd: cannot draw to the window: {e}"));
                 self.exit_code = 1;
-                event_loop.exit();
+                quit(event_loop, &self.proxy);
                 return;
             }
         };
@@ -863,7 +903,7 @@ impl ApplicationHandler<UserEvent> for App {
             Err(e) => {
                 eprintln!("vomd: {e}");
                 self.exit_code = 1;
-                event_loop.exit();
+                quit(event_loop, &self.proxy);
                 return;
             }
         };
@@ -922,6 +962,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.view = Some(view);
         self.gfx = Some(Gfx { window, surface });
         self.apply(&prefs);
+        // The window shows once its first frame is painted (see `paint`). Windows never sends a
+        // hidden window the paint a redraw asks for, so there the first frame is painted now.
+        #[cfg(windows)]
+        self.paint(event_loop);
+        #[cfg(not(windows))]
         self.redraw();
     }
 
@@ -956,6 +1001,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.resolve_families();
             }
+            UserEvent::Quit => {}
             UserEvent::Images => {
                 if let Some(view) = self.view.as_mut()
                     && view.poll_images(Instant::now())
@@ -1005,12 +1051,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let Some(view) = self.view.as_mut() else {
             if let WindowEvent::CloseRequested = event {
-                event_loop.exit();
+                quit(event_loop, &self.proxy);
             }
             return;
         };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => quit(event_loop, &self.proxy),
             WindowEvent::Resized(size) => {
                 view.resize(size.width, size.height);
                 self.redraw();
@@ -1258,7 +1304,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn main() {
     // Started by VOMD to draw an SVG (`image::svg_child`): that, and nothing else.
-    #[cfg(all(feature = "svg", target_os = "linux"))]
+    #[cfg(all(feature = "svg", any(target_os = "linux", windows)))]
     if let Some(code) = vomd::image::svg_child() {
         std::process::exit(code);
     }
@@ -1267,6 +1313,10 @@ fn main() {
     // SVGs are drawn by this same binary, in processes that can be killed.
     #[cfg(all(feature = "svg", target_os = "linux"))]
     vomd::image::set_svg_program("/proc/self/exe".into());
+    #[cfg(all(feature = "svg", windows))]
+    if let Ok(exe) = std::env::current_exe() {
+        vomd::image::set_svg_program(exe);
+    }
     platform::attach_console();
     let (input, no_settings) = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Cli::Help) => {
@@ -1279,7 +1329,7 @@ fn main() {
         }
         Ok(Cli::Run { input, no_settings }) => (input, no_settings),
         Err(e) => {
-            eprintln!("vomd: {e}\n\n{}", cli::USAGE);
+            platform::fatal(&format!("vomd: {e}\n\n{}", cli::USAGE));
             std::process::exit(2);
         }
     };
@@ -1300,7 +1350,7 @@ fn main() {
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(el) => el,
         Err(e) => {
-            eprintln!("vomd: cannot connect to the display: {e}");
+            platform::fatal(&format!("vomd: cannot connect to the display: {e}"));
             std::process::exit(1);
         }
     };
@@ -1363,22 +1413,15 @@ fn bench_size() -> Option<(f64, f64)> {
 
 /// Family names in settings compare case-insensitively.
 /// Open `path` in the default editor and wait for the launcher (run off the main thread).
-/// Returns why it failed, for a toast: no application, no way to start it, or `xdg-open`
-/// giving up. A terminal's exit status is the editor's, so it isn't judged.
+/// Returns why it failed, for a toast (see `platform::open_file`).
 fn open_in_editor(path: &std::path::Path) -> Option<String> {
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
-    match platform::open_file(path) {
-        Err(e) => Some(format!("Can't open {name}: {e}")),
-        Ok((mut child, opener)) => match child.wait() {
-            Ok(status) if !status.success() && matches!(opener, platform::Opener::XdgOpen) => {
-                Some(format!("Can't open {name}: xdg-open failed ({status})"))
-            }
-            _ => None,
-        },
-    }
+    platform::open_file(path)
+        .err()
+        .map(|e| format!("Can't open {name}: {e}"))
 }
 
 fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
@@ -1407,10 +1450,10 @@ mod tests {
     use winit::window::Theme;
 
     #[test]
-    fn the_empty_window_offers_a_drop_only_on_x11() {
+    fn the_empty_window_offers_a_drop_where_winit_takes_one() {
         assert_eq!(
             empty_message(false),
-            if cfg!(all(unix, not(target_os = "macos"))) {
+            if cfg!(any(windows, all(unix, not(target_os = "macos")))) {
                 "Press Ctrl+O to open a Markdown file, or drop one here"
             } else {
                 "Press Ctrl+O to open a Markdown file"
@@ -1444,6 +1487,10 @@ mod tests {
         let wayland = WaylandWindowHandle::new(NonNull::dangling());
         assert_eq!(parent_name(Some(RawWindowHandle::Wayland(wayland))), "");
         assert_eq!(parent_name(None), "");
+        // A Win32 window is its HWND, also in hex.
+        let hwnd = std::num::NonZeroIsize::new(0x1_02a4).unwrap();
+        let win32 = RawWindowHandle::Win32(winit::raw_window_handle::Win32WindowHandle::new(hwnd));
+        assert_eq!(parent_name(Some(win32)), "win32:102a4");
     }
 
     /// Open's answer (or a link, or a drop) pushes the old document on the back stack from a

@@ -2,10 +2,10 @@
 
 # VOMD: View-Only Markdown
 
-A tiny, fast Markdown viewer for the Linux desktop. Double-click a `.md` file and it appears,
-rendered the way GitHub shows it, in well under a tenth of a second. It is one 5.5 MB binary
-with its fonts built in. It doesn't use a web engine or a GUI toolkit, and it never touches
-the network unless you ask it to.
+A tiny, fast Markdown viewer for Linux and Windows. Double-click a `.md` file and it appears,
+rendered the way GitHub shows it, in well under a tenth of a second. It is one binary with its
+fonts built in, 5.5 MB on Linux and 4.3 MB on Windows. It doesn't use a web engine or a GUI
+toolkit, and it never touches the network unless you ask it to.
 
 - **CommonMark and GitHub Flavored Markdown**: tables, task lists, strikethrough, footnotes,
   alerts (`> [!NOTE]`), autolinks, and YAML front matter (hidden).
@@ -21,8 +21,8 @@ the network unless you ask it to.
   memory and time (an SVG stops after 3 seconds, but a clicked one runs until it is done or has
   used 120 seconds of CPU), and it's abandoned if you leave the page.
 - **Selecting and copying text**: drag, double-click a word, triple-click a block, or press
-  `Ctrl+A`; `Ctrl+C` copies it as plain text, and what you select is also pasted by a middle
-  click (X11 and Wayland). A code block shows a copy button, as on GitHub, when the pointer is
+  `Ctrl+A`; `Ctrl+C` copies it as plain text, and on X11 and Wayland what you select is also
+  pasted by a middle click. A code block shows a copy button, as on GitHub, when the pointer is
   over it.
 - **Contents panel**: `C` shows the headings in a panel at the left, with the current one
   marked; a click jumps to a heading.
@@ -71,6 +71,14 @@ It mounts itself with FUSE, which most desktops have (`fuse3`). Without it, run 
 `--appimage-extract-and-run`. An AppImage doesn't register itself as the app for `.md`
 files; an integration tool such as Gear Lever or AppImageLauncher can.
 
+**Windows:** from v1.6.0, each [release](https://github.com/allenguarnes/vomd/releases) has
+`vomd-<version>-x86_64-windows.zip`, for Windows 10 (1803) or newer and Windows 11 on x86-64. It
+holds `vomd.exe`, which needs nothing else: unzip it anywhere and run it, or drop a `.md` file
+on it. The binary isn't signed, so SmartScreen may say it comes from an unknown publisher the
+first time (More info, then Run anyway). To make VOMD the app for `.md` files, right-click one,
+choose Open with, then Choose another app, find `vomd.exe` with "Choose an app on your PC" and
+select Always. VOMD itself never writes to the registry.
+
 **Release tarball:** each [release](https://github.com/allenguarnes/vomd/releases) has
 `vomd-<version>-x86_64-linux.tar.gz` (glibc 2.36 or newer, any x86-64 CPU). It needs the same
 run-time libraries as the AppImage (see below):
@@ -98,10 +106,11 @@ sudo apt install libwayland-client0 libxkbcommon0 \
   libxcursor1 libxi6
 ```
 
-**From source:** you need a stable Rust toolchain.
+**From source:** you need a stable Rust toolchain, and on Windows the Visual Studio Build Tools
+(the "Desktop development with C++" workload) for the MSVC linker.
 
 ```sh
-# Builds target/release/vomd:
+# Builds target/release/vomd (vomd.exe on Windows):
 cargo build --release
 # Without SVG (SVGs show their alt text):
 cargo build --release --no-default-features --features images,remote-images,embed-fonts,clipboard,toc,find
@@ -111,8 +120,9 @@ cargo build --release --no-default-features
 
 The Cargo features are `images` (PNG, JPEG, GIF, WebP), `svg` (SVG and svgz, with `images`),
 `remote-images` (via the system `curl`), `embed-fonts`, `clipboard` (selecting and copying
-text), `toc` (the contents panel) and `find` (find in page). All seven are on by default. The
-build without SVG is 4.1 MB, and the smallest one 3.0 MB.
+text), `toc` (the contents panel) and `find` (find in page). All seven are on by default. On
+Linux the build without SVG is 4.1 MB, and the smallest one 3.0 MB; on Windows the smallest one
+is 1.9 MB.
 
 ## Usage
 
@@ -154,7 +164,7 @@ Each window is its own process, so opening another file starts another window.
 | `Ctrl+A` | Select everything |
 | `Ctrl+C`, `Ctrl+Insert` | Copy the selection |
 | `Backspace`, `Alt+←`, `Ctrl+[` | Back |
-| `Ctrl+O` | Open a file (the desktop's file dialog) |
+| `Ctrl+O` | Open a file (the desktop's file dialog, or the Windows one) |
 | `Esc` | Close the open menu, else the find bar if it is open, else the contents panel if it covers the document, else clear the selection, else quit |
 | `Q`, `Ctrl+W` | Quit |
 
@@ -166,7 +176,8 @@ use it (see `primary_selection` below). A long selection is made only when somet
 so copying all of a very large document costs nothing until then. Dragging past the top or bottom
 of the window scrolls. On X11 a selection goes with the window that owns it, so as the window
 closes VOMD asks the clipboard manager (the desktop's, if it runs one) to keep the clipboard; on
-Wayland the compositor's own manager does that.
+Wayland the compositor's own manager does that. Windows has no primary selection; there, a copy
+is made for the clipboard to keep when the window closes, and its lines end in CR LF.
 
 **Copying a code block.** While the pointer is over a code block, a copy button shows in its
 upper right corner, as on GitHub, and a click copies the block's code to the clipboard (not to
@@ -226,11 +237,14 @@ scale and not the zoom.
 The toolbar has buttons for these, and its ⚙ button opens the settings file. Open uses the
 desktop portal's file chooser, or zenity or kdialog when there is none; the `.deb` recommends
 one of them, the Arch packages list them as optional dependencies, and the AppImage needs one
-on a desktop without a portal chooser (a bare window manager).
+on a desktop without a portal chooser (a bare window manager). On Windows it uses the system's
+Open dialog, and ⚙ opens the file in the app set for `.ini` files (Notepad unless you changed
+it).
 
 ## Settings
 
-`$XDG_CONFIG_HOME/vomd/settings.ini` (usually `~/.config/vomd/settings.ini`). It is optional,
+`$XDG_CONFIG_HOME/vomd/settings.ini` (usually `~/.config/vomd/settings.ini`), or
+`%APPDATA%\vomd\settings.ini` on Windows. It is optional,
 holds plain `key = value` lines, and is applied as soon as the window gets focus. ⚙ creates
 it with every key listed and commented out:
 
@@ -245,7 +259,7 @@ it with every key listed and commented out:
 | `font_size` | `16` (10–32) |
 | `line_width` | `80` (40–200 characters) |
 | `wide` | `false`, `true` (the text spans the window; `line_width` is ignored) |
-| `primary_selection` | `on`, `off` (selecting text offers it for a middle click; `Ctrl+C` is not affected, and neither is pasting with a middle click in the find bar's field) |
+| `primary_selection` | `on`, `off` (X11 and Wayland: selecting text offers it for a middle click; `Ctrl+C` is not affected, and neither is pasting with a middle click in the find bar's field) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed family such as `Noto Sans` |
 
 Theme, zoom, toolbar, contents panel, wide layout and window size are saved automatically when you
@@ -255,7 +269,8 @@ change them.
 
 VOMD makes no network requests of its own. Remote (`http`/`https`) images show as
 placeholders until you press `I` (or click the toolbar's image button) for that document.
-They are then fetched with the system `curl`, at most 4 at a time, limited to 12 MiB and
+They are then fetched with the system `curl` (on Windows, the `curl.exe` Windows comes with), at
+most 4 at a time, limited to 12 MiB and
 15 seconds each, and kept in memory only. `remote_images = always` loads them for every
 document without asking, which lets any document you open contact the servers its images are
 on. `never` removes the option. An SVG never loads anything: references to other files or URLs
@@ -265,17 +280,18 @@ can be stopped: after 3 seconds, or after 120 seconds of CPU when you clicked to
 
 ## Limitations
 
-- **Linux only** for now. The code is portable and compiles for Windows and macOS, but those
-  are untested and unsupported until a later release.
-- Selecting and copying, and the code blocks' copy button, work on X11 and Wayland only; there
-  is no keyboard selection (Shift and the arrows), the button can't be reached from the
+- **Linux and Windows.** The code compiles for macOS, but macOS is untested and unsupported.
+- Selecting and copying, and the code blocks' copy button, work on X11, Wayland and Windows (not
+  macOS); there is no keyboard selection (Shift and the arrows), the button can't be reached from the
   keyboard, and a word is a run of letters, digits and marks (a run of Chinese or Japanese
   characters counts as one word).
 - No screen-reader support (AccessKit would add too much to the binary). Text scaling comes
   from the system scale factor that winit reports (`Xft.dpi` on X11, the output scale on
-  Wayland).
-- Drag-and-drop works on X11 only, because winit doesn't support it on Wayland; there, open
-  files with Ctrl+O or the toolbar's folder button.
+  Wayland, the display's scale on Windows).
+- Drag-and-drop works on X11 and Windows, because winit doesn't support it on Wayland; there,
+  open files with Ctrl+O or the toolbar's folder button.
+- On Windows, emoji come from Segoe UI Emoji, which has no flags: a flag shows as its two
+  letters, as in other Windows apps.
 - Math and Mermaid show as text and code.
 - Animated GIFs and WebPs show their first frame.
 - SVGs: text uses VOMD's fonts (Inter and JetBrains Mono, or your `font_sans`/`font_mono`), so
@@ -287,7 +303,7 @@ can be stopped: after 3 seconds, or after 120 seconds of CPU when you clicked to
 ## Development
 
 `just ci` runs formatting, clippy (every feature set), the tests, and Windows/macOS compile
-checks. `cargo xtask budgets` measures every performance budget against a release build (it
+checks; CI also runs clippy, the tests and the size budget on Windows. `cargo xtask budgets` measures every performance budget against a release build (it
 needs a display). `cargo xtask images` runs the image memory tests, each in its own process and
 as many at once as there are CPUs (`-j N`, `--runs K` to repeat), much faster than
 `cargo test` on a machine with several cores. `just fuzz <doc|image|layout|settings|svg>

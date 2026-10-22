@@ -1,5 +1,5 @@
-//! Everything OS-specific. Other modules use only portable std. Non-Linux branches
-//! compile but are untested until P14.
+//! Everything OS-specific. Other modules use only portable std. Linux and Windows are
+//! supported; the macOS branches compile but are untested.
 
 /// The system theme when winit can't tell (`Window::theme()` is `None`). On Linux, dark if
 /// `GTK_THEME` names a dark variant (`Adwaita:dark`), otherwise light.
@@ -10,7 +10,7 @@ pub fn fallback_dark() -> bool {
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     {
-        // TODO(P14): winit reports the theme on Windows and macOS; nothing to fall back to.
+        // winit reports the theme on Windows and macOS: nothing to fall back to.
         false
     }
 }
@@ -24,11 +24,14 @@ fn gtk_theme_dark(value: Option<&str>) -> bool {
 /// Let `--help` and `--version` print when started from a terminal. A no-op except on Windows,
 /// where the GUI subsystem detaches the console.
 pub fn attach_console() {
-    // TODO(P14): AttachConsole(ATTACH_PARENT_PROCESS) on Windows.
+    #[cfg(windows)]
+    windows::attach_console();
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod desktop;
+#[cfg(windows)]
+mod windows;
 
 /// The file name patterns Open offers as Markdown (the first filter of its dialog).
 pub const MARKDOWN_GLOBS: [&str; 5] = ["*.md", "*.markdown", "*.mdown", "*.mkd", "*.mkdn"];
@@ -36,9 +39,10 @@ pub const MARKDOWN_GLOBS: [&str; 5] = ["*.md", "*.markdown", "*.mdown", "*.mkd",
 /// The title of Open's dialog.
 const OPEN_TITLE: &str = "Open a Markdown file";
 
-/// Ask the user for a file to open, starting in `folder`: the desktop portal's file chooser,
-/// else `zenity` or `kdialog`. `parent` names the window the portal's dialog belongs to
-/// (`x11:<id>`; empty for none). Blocks until the dialog closes: run it off the main thread.
+/// Ask the user for a file to open, starting in `folder`: on Linux the desktop portal's file
+/// chooser, else `zenity` or `kdialog`; on Windows the common Open dialog. `parent` names the
+/// window the dialog belongs to (`x11:<id>` for the portal, `win32:<hwnd>` on Windows; empty for
+/// none). Blocks until the dialog closes: run it off the main thread.
 /// `Ok(None)` when the user picked nothing; `Err` says, in words for the window, why there was
 /// no dialog.
 pub fn choose_file(
@@ -55,39 +59,46 @@ pub fn choose_file(
             Choice::Unavailable => desktop::choose_with_tools(OPEN_TITLE, folder),
         }
     }
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(windows)]
     {
-        // TODO(P14): the native dialogs.
+        windows::choose_file(OPEN_TITLE, parent, folder)
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
         let _ = (parent, folder, OPEN_TITLE);
         Err("Open has no file dialog on this system yet".into())
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-pub use desktop::Opener;
-
-/// What started the application (see `desktop::Opener`).
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-pub enum Opener {
-    XdgOpen,
-}
-
-/// Start the default application for the local file `path`, the way the desktop would, also
-/// when it runs in a terminal. Returns the launcher, to be waited on off the main thread (it
-/// can block on `xdg-mime`, so call it off the main thread too). Errors say why in words fit
-/// for the window.
-pub fn open_file(path: &std::path::Path) -> std::io::Result<(std::process::Child, Opener)> {
+/// Start the default application for the local file `path`, the way the desktop would (on
+/// Linux also when it runs in a terminal), and wait for the launcher: it can block on
+/// `xdg-mime` or the shell, so call it off the main thread. Errors say why in words fit for the
+/// window: no application, no way to start it, or the launcher giving up.
+pub fn open_file(path: &std::path::Path) -> Result<(), String> {
     if !path.is_absolute() {
-        return Err(std::io::ErrorKind::InvalidInput.into());
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).to_string());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        desktop::open_file(path)
+        let (mut child, opener) = desktop::open_file(path).map_err(|e| e.to_string())?;
+        // A terminal's exit status is the editor's, so it isn't judged.
+        match child.wait() {
+            Ok(status) if !status.success() && matches!(opener, desktop::Opener::XdgOpen) => {
+                Err(format!("xdg-open failed ({status})"))
+            }
+            _ => Ok(()),
+        }
     }
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(windows)]
     {
-        // TODO(P14): untested.
-        launcher(path.as_os_str()).map(|c| (c, Opener::XdgOpen))
+        windows::open_file(path)
+    }
+    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    {
+        let _ = launcher(path.as_os_str())
+            .and_then(|mut c| c.wait())
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
@@ -99,32 +110,62 @@ pub fn open(target: &std::ffi::OsStr) -> std::io::Result<()> {
     if target.to_string_lossy().starts_with('-') {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
-    let mut child = launcher(target)?;
-    // Reap it in the background so it doesn't linger as a zombie.
-    std::thread::spawn(move || child.wait());
-    Ok(())
+    #[cfg(windows)]
+    {
+        windows::open(target)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut child = launcher(target)?;
+        // Reap it in the background so it doesn't linger as a zombie.
+        std::thread::spawn(move || child.wait());
+        Ok(())
+    }
 }
 
 /// The platform's opener started on `target`, not waited for.
+#[cfg(not(windows))]
 fn launcher(target: &std::ffi::OsStr) -> std::io::Result<std::process::Child> {
     use std::process::{Command, Stdio};
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = Command::new("xdg-open");
     #[cfg(target_os = "macos")]
-    // TODO(P14): untested.
+    // Untested.
     let mut cmd = Command::new("open");
-    #[cfg(windows)]
-    // TODO(P14): untested.
-    let mut cmd = {
-        let mut c = Command::new("rundll32");
-        c.arg("url.dll,FileProtocolHandler");
-        c
-    };
     cmd.arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+}
+
+/// The desktop's work area, the primary monitor less the taskbar, in physical pixels: x, y,
+/// width and height. Windows only: elsewhere `None` (the window system places windows itself).
+pub fn work_area() -> Option<(i32, i32, u32, u32)> {
+    #[cfg(windows)]
+    return windows::work_area();
+    #[cfg(not(windows))]
+    None
+}
+
+/// Where a window of outer size `size` at `pos` goes to be inside `area` (all physical pixels),
+/// and the outer size it may have: no bigger than the area, moved in from an edge it crosses,
+/// and centered vertically if it reached past the bottom (where the taskbar is).
+pub fn fit_in(
+    (ax, ay, aw, ah): (i32, i32, u32, u32),
+    (x, y): (i32, i32),
+    (w, h): (u32, u32),
+) -> ((i32, i32), (u32, u32)) {
+    let (w, h) = (w.min(aw), h.min(ah));
+    let right = ax.saturating_add_unsigned(aw - w);
+    let bottom = ay.saturating_add_unsigned(ah - h);
+    let x = x.clamp(ax, right);
+    let y = if y > bottom {
+        ay.saturating_add_unsigned((ah - h) / 2)
+    } else {
+        y.max(ay)
+    };
+    ((x, y), (w, h))
 }
 
 /// Open `path` for reading without ever waiting for a writer: where the platform's `O_NONBLOCK`
@@ -168,7 +209,8 @@ pub fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File
         // O_NONBLOCK is 0x0004 on Apple and every BSD.
         options.custom_flags(0x0004);
     }
-    // TODO(P14): other targets (Windows, other Linux architectures) open plainly.
+    // Other targets open plainly. Windows has no FIFOs among its files (its named pipes are
+    // `\\.\pipe\` paths, which aren't local files to VOMD), so nothing there can block.
     options.open(path)
 }
 
@@ -194,23 +236,41 @@ pub fn tune_allocator() {
     }
 }
 
+/// Say why VOMD can't go on: on stderr, and on Windows also in a message box when stderr goes
+/// nowhere (no console was there to attach to and it isn't redirected), as for a program started
+/// from Explorer or a shortcut, which would otherwise end without a word.
+pub fn fatal(message: &str) {
+    eprintln!("{message}");
+    #[cfg(windows)]
+    windows::show_if_unseen(message);
+}
+
 /// Errors go to stderr only when someone can see them.
 pub fn stderr_is_tty() -> bool {
     use std::io::IsTerminal;
     std::io::stderr().is_terminal()
 }
 
-/// Resident set size now in KB, for `VOMD_BENCH` (0 where unknown).
+/// Resident set size now in KB, for `VOMD_BENCH` (0 where unknown). On Windows, the working
+/// set.
 pub fn rss_kb() -> u64 {
+    #[cfg(windows)]
+    return windows::working_set_kb().0;
+    #[cfg(not(windows))]
     status_kb("VmRSS:")
 }
 
-/// Peak resident set size in KB, for `VOMD_BENCH` (0 where unknown).
+/// Peak resident set size in KB, for `VOMD_BENCH` (0 where unknown). On Windows, the peak
+/// working set.
 pub fn peak_rss_kb() -> u64 {
+    #[cfg(windows)]
+    return windows::working_set_kb().1;
+    #[cfg(not(windows))]
     status_kb("VmHWM:")
 }
 
 /// A `/proc/self/status` field in kB (0 if unknown).
+#[cfg(not(windows))]
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn status_kb(field: &str) -> u64 {
     #[cfg(target_os = "linux")]
@@ -226,7 +286,7 @@ fn status_kb(field: &str) -> u64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // TODO(P14): GetProcessMemoryInfo / task_info.
+        // Untested: task_info on macOS.
         0
     }
 }
@@ -240,6 +300,33 @@ mod tests {
         let err = open(std::ffi::OsStr::new("--help")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(open(std::ffi::OsStr::new("-x")).is_err());
+    }
+
+    #[test]
+    fn windows_fit_in_the_work_area() {
+        let area = (0, 0, 1600, 950);
+        // Inside already: left alone.
+        assert_eq!(fit_in(area, (100, 50), (900, 800)), ((100, 50), (900, 800)));
+        // Past the bottom: centered vertically, as tall as it was.
+        assert_eq!(
+            fit_in(area, (137, 130), (900, 900)),
+            ((137, 25), (900, 900))
+        );
+        // Taller than the area: as tall as the area, at its top.
+        assert_eq!(
+            fit_in(area, (137, 130), (900, 1100)),
+            ((137, 0), (900, 950))
+        );
+        // Past the right edge and above the top: moved in.
+        assert_eq!(
+            fit_in(area, (1200, -20), (900, 600)),
+            ((700, 0), (900, 600))
+        );
+        // An area that doesn't start at the origin (a taskbar on the left or top).
+        assert_eq!(
+            fit_in((60, 40, 1000, 700), (0, 0), (500, 500)),
+            ((60, 40), (500, 500))
+        );
     }
 
     #[test]
@@ -298,7 +385,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn reads_peak_rss() {
         assert!(peak_rss_kb() > 0);

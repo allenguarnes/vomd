@@ -2,7 +2,7 @@
 //! is what VOMD's own process draws, and one that takes too long, isn't wanted any more, runs out
 //! of memory or outlives its parent is killed, with nothing of it left. The tests take [`serial`]
 //! first: what the children are told to do ([`set_svg_test`]) is for all of them.
-#![cfg(all(feature = "svg", target_os = "linux"))]
+#![cfg(all(feature = "svg", any(target_os = "linux", windows)))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -284,6 +284,7 @@ fn a_child_out_of_memory_is_refused_for_memory() {
 
 /// The job a child that does `mode` ([`SVG_TEST_SPIN`], [`SVG_TEST_EAT`]) reads: what the parent
 /// writes (see `svg::process`), the SVG empty.
+#[cfg(target_os = "linux")]
 fn job_of(mode: u8) -> Vec<u8> {
     let mut job = Vec::new();
     job.extend_from_slice(&64u32.to_le_bytes());
@@ -300,6 +301,7 @@ fn job_of(mode: u8) -> Vec<u8> {
 
 /// The drawing process of `job`, started by this process as VOMD does (with `data` bytes of data
 /// and `cpu` seconds of CPU), with nothing on its output.
+#[cfg(target_os = "linux")]
 fn child_of(dir: &Path, job: &[u8], data: u64, cpu: u64) -> std::process::Child {
     std::fs::write(dir.join("job"), job).unwrap();
     std::process::Command::new(env!("CARGO_BIN_EXE_vomd"))
@@ -313,6 +315,7 @@ fn child_of(dir: &Path, job: &[u8], data: u64, cpu: u64) -> std::process::Child 
 }
 
 /// A child doesn't outlive the process that started it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_child_dies_with_its_parent() {
     let _s = serial();
@@ -391,6 +394,7 @@ fn badges_drawn_apart_are_quick() {
 
 /// A child that runs out of memory or CPU time ends by an exit code, not by the signal the limit
 /// ends a process with: that dumps core, and the system's crash reports named VOMD for it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_child_at_its_limits_exits_by_a_code() {
     use std::os::unix::process::ExitStatusExt;
@@ -416,6 +420,7 @@ fn a_child_at_its_limits_exits_by_a_code() {
 
 /// A child is named for what it does (the system's process lists and reports would say `exe`,
 /// the name of the file it is run through), and dumps no core.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_child_is_named_and_dumps_no_core() {
     let dir = scratch("named");

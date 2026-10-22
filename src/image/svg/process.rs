@@ -4,17 +4,21 @@
 //! usvg's parse and parts of resvg can't be stopped once started, and what they do grows faster
 //! than the counts before the parse can always say: in a process, a drawing that takes too long
 //! (the deadline), isn't wanted any more (cancelled: its document or box changed, or it was given
-//! up) or outlives VOMD is killed, and nothing of it is left in VOMD. The child dies with the
-//! thread that started it (`PR_SET_PDEATHSIG`), and has hard limits of its own as a backstop
+//! up) or outlives VOMD is killed, and nothing of it is left in VOMD. On Linux the child dies with
+//! the thread that started it (`PR_SET_PDEATHSIG`), and has hard limits of its own as a backstop
 //! (`RLIMIT_DATA` about its charge, `RLIMIT_CPU`): one stopped by them is refused for memory or
 //! time, never a crash of VOMD's. It ends by its own exit code then, not by a signal that would
 //! dump core (the system's crash reports would name VOMD): the signals the limits end a process
-//! with are caught, and no core is dumped for any other.
+//! with are caught, and no core is dumped for any other. On Windows a job object of its own does
+//! the same: the child is killed when VOMD closes the job (as it does when it ends, however it
+//! ends), its committed memory and its CPU time are capped, and it can start no process; a
+//! failed allocation in it exits with the memory code instead of aborting (which would be a crash
+//! for Windows Error Reporting).
 //!
 //! The child opens no display, reads no settings and fetches nothing: it reads the job, and the
 //! font files the job names (the faces VOMD's own text is set in), and nothing else, as SVGs drawn
 //! in VOMD did. The protocol needs no version: the child is the same file as the parent
-//! (`/proc/self/exe`).
+//! (`/proc/self/exe`; on Windows the running executable, which can't be replaced while it runs).
 //!
 //! The job, little-endian: the box (`u32` × 2), the charge (`u64`), forced (`u8`) and the forced
 //! load's memory (`u64`), a test mode (`u8`, [`set_test`]), the SVG's record (`SvgCost`), the
@@ -23,10 +27,7 @@
 //! embedded images were left out, the box, and `0xAARRGGBB` per pixel), what it needs (an
 //! `SvgCost`), or why it is refused.
 
-use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -135,7 +136,8 @@ pub(super) fn draw(
         .saturating_add(charge)
         .saturating_add(stack)
         .saturating_add(HEADROOM);
-    let spawned = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg(ARG)
         .arg(std::process::id().to_string())
         .arg(data.to_string())
@@ -143,14 +145,27 @@ pub(super) fn draw(
         .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let Ok(child) = spawned else {
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // (VOMD has no console, but a test's binary may: the child gets none either way.)
+        command.creation_flags(windows::CREATE_NO_WINDOW);
+    }
+    let Ok(child) = command.spawn() else {
         let caps = Caps::of(limits);
         return render_in(bytes, svg, (w, h), charge, &caps, cancel, fonts);
     };
     inline.store(false, Ordering::SeqCst);
+    // The child reads its job before it does anything: it is in its job object before then, and
+    // if it couldn't be put in one it is still killed at the deadline or when cancelled.
+    #[cfg(windows)]
+    let job = windows::Job::confine(&child, data, cpu);
     let mut child = Running::new(child);
+    #[cfg(windows)]
+    {
+        child.1 = job;
+    }
     let mut job = Vec::new();
     put_job(
         &mut job,
@@ -179,13 +194,18 @@ pub(super) fn draw(
     }
 }
 
-/// A child, killed and waited for when this goes, whatever it is doing: none is left behind.
-struct Running(Child);
+/// A child, killed and waited for when this goes, whatever it is doing: none is left behind. On
+/// Windows, with its job object (closed after it).
+struct Running(Child, #[cfg(windows)] Option<windows::Job>);
 
 impl Running {
     fn new(child: Child) -> Running {
         RUNNING.fetch_add(1, Ordering::SeqCst);
-        Running(child)
+        Running(
+            child,
+            #[cfg(windows)]
+            None,
+        )
     }
 
     /// How the child ended (it closed its stdout), or `None` if `cancel` was set first.
@@ -215,6 +235,7 @@ impl Drop for Running {
 /// out-of-memory killer), or anything else, broken. The child says which of the first two by its
 /// exit code; the signals are for one that died before it could (or was killed past its hard
 /// limit).
+#[cfg(unix)]
 fn refusal_of(status: ExitStatus) -> Refusal {
     use std::os::unix::process::ExitStatusExt;
     match (status.code(), status.signal()) {
@@ -292,13 +313,7 @@ fn fill(out: &mut ChildStdout, buf: &mut [u8], cancel: &AtomicBool) -> Result<()
         if cancelled(cancel) {
             return Err(Stop::Cancelled);
         }
-        let mut fd = PollFd {
-            fd: out.as_raw_fd(),
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid `pollfd`, as the count says.
-        if unsafe { poll(&mut fd, 1, POLL_MS) } <= 0 {
+        if !readable(out, POLL_MS) {
             continue;
         }
         match out.read(&mut buf[at..]) {
@@ -380,10 +395,10 @@ fn put_job(
         out.extend_from_slice(&index.to_le_bytes());
         match fonts.origins.get(i) {
             Some(FontOrigin::File(path)) => {
-                let path = path.as_os_str().as_bytes();
+                let path = path_bytes(path);
                 out.push(FILE);
                 out.extend_from_slice(&(path.len() as u32).to_le_bytes());
-                out.extend_from_slice(path);
+                out.extend_from_slice(&path);
             }
             Some(FontOrigin::Embedded(at)) => {
                 out.push(EMBEDDED);
@@ -465,7 +480,7 @@ fn get_job(r: &mut Input<impl Read>) -> Option<Job> {
                 let origin = match r.u8()? {
                     FILE => {
                         let len = r.u32()? as usize;
-                        FontOrigin::File(PathBuf::from(OsString::from_vec(r.vec(len)?)))
+                        FontOrigin::File(path_of(r.vec(len)?)?)
                     }
                     _ => FontOrigin::Embedded(r.usize().unwrap_or(usize::MAX)),
                 };
@@ -514,6 +529,7 @@ pub fn child() -> Option<i32> {
     Some(child_run(parent, data, cpu))
 }
 
+#[cfg(target_os = "linux")]
 fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
     // The limits end a process with a signal that dumps core (a crash in the system's reports,
     // and a core of an SVG's memory on disk): they end it by an exit code instead (`_exit`: it
@@ -537,6 +553,19 @@ fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
     crate::platform::tune_allocator();
     set_limit(RLIMIT_CPU, cpu, cpu.saturating_add(1));
     set_limit(RLIMIT_DATA, data, data);
+    draw_job()
+}
+
+/// The child on Windows: its job object (made by the parent) holds its limits and ends it with
+/// VOMD, so only what its allocations do when they fail is set here.
+#[cfg(windows)]
+fn child_run(_parent: u64, _data: u64, _cpu: u64) -> i32 {
+    windows::child_setup();
+    draw_job()
+}
+
+/// Read the job, draw it, write the result: the exit code.
+fn draw_job() -> i32 {
     // A panic is a broken SVG's (no message: nobody reads it).
     std::panic::set_hook(Box::new(|_| std::process::exit(EXIT_PANIC)));
     let Some(job) = get_job(&mut Input(std::io::stdin().lock())) else {
@@ -620,6 +649,67 @@ fn write_result(out: &mut impl Write, r: &Rendered) -> std::io::Result<()> {
 
 // ---- The system's -------------------------------------------------------------------------
 
+/// A font file's path as the job carries it: its bytes on Unix, its UTF-16 units on Windows.
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+}
+
+/// [`path_bytes`] read back (`None`: not a path's).
+fn path_of(bytes: Vec<u8>) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let (units, rest) = bytes.as_chunks::<2>();
+        if !rest.is_empty() {
+            return None;
+        }
+        let units: Vec<u16> = units.iter().map(|&b| u16::from_le_bytes(b)).collect();
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
+    }
+}
+
+/// Whether `out` has something to read (or has ended), waiting `ms` at the most.
+#[cfg(target_os = "linux")]
+fn readable(out: &ChildStdout, ms: i32) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fd = PollFd {
+        fd: out.as_raw_fd(),
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`, as the count says.
+    unsafe { poll(&mut fd, 1, ms) > 0 }
+}
+
+/// Whether `out` has something to read (or has ended), waiting `ms` at the most. An anonymous
+/// pipe can't be waited on: it is looked at, and slept on while it is empty.
+#[cfg(windows)]
+fn readable(out: &ChildStdout, ms: i32) -> bool {
+    if windows::available(out) {
+        return true;
+    }
+    std::thread::sleep(Duration::from_millis(ms as u64));
+    false
+}
+
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct PollFd {
     fd: i32,
@@ -627,22 +717,33 @@ struct PollFd {
     revents: i16,
 }
 
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct RLimit {
     cur: u64,
     max: u64,
 }
 
+#[cfg(target_os = "linux")]
 const POLLIN: i16 = 1;
+#[cfg(target_os = "linux")]
 const PR_SET_PDEATHSIG: i32 = 1;
+#[cfg(target_os = "linux")]
 const PR_SET_NAME: i32 = 15;
+#[cfg(target_os = "linux")]
 const SIGABRT: i32 = 6;
+#[cfg(target_os = "linux")]
 const SIGKILL: i32 = 9;
+#[cfg(target_os = "linux")]
 const SIGXCPU: i32 = 24;
+#[cfg(target_os = "linux")]
 const RLIMIT_CPU: i32 = 0;
+#[cfg(target_os = "linux")]
 const RLIMIT_DATA: i32 = 2;
+#[cfg(target_os = "linux")]
 const RLIMIT_CORE: i32 = 4;
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, n: u64, timeout_ms: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
@@ -653,6 +754,7 @@ unsafe extern "C" {
 }
 
 /// The handler of the signals the limits end the child with: exit with the code that says which.
+#[cfg(target_os = "linux")]
 extern "C" fn stopped(signal: i32) {
     let code = if signal == SIGXCPU {
         EXIT_SLOW
@@ -664,11 +766,19 @@ extern "C" fn stopped(signal: i32) {
 }
 
 /// Set the soft and hard limits of `resource` (lowering them needs no privilege).
+#[cfg(target_os = "linux")]
 fn set_limit(resource: i32, cur: u64, max: u64) {
     let limit = RLimit { cur, max };
     // SAFETY: a valid `rlimit`.
     unsafe { setrlimit(resource, &limit) };
 }
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::Allocator as SvgChildAllocator;
+#[cfg(windows)]
+use windows::refusal_of;
 
 #[cfg(test)]
 mod tests;

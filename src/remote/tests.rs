@@ -72,6 +72,12 @@ fn tiny_jpeg_with_exif() -> Vec<u8> {
 fn respond(mut s: TcpStream, status: &str, headers: &str, body: &[u8]) {
     let _ = write!(s, "HTTP/1.1 {status}\r\n{headers}Connection: close\r\n\r\n");
     let _ = s.write_all(body);
+    // A graceful close: end the sending side, then wait for the client to close its own
+    // (bounded). Closing at once can reset the connection on Windows, and curl then loses
+    // what it hasn't read yet ("Recv failure", exit 56).
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = std::io::copy(&mut s, &mut std::io::sink());
 }
 
 /// What `/slow` waits for.

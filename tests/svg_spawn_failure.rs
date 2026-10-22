@@ -2,7 +2,7 @@
 //! processes left; here, no such program): each is drawn in VOMD's own process then, which can't
 //! be killed, so the SVGs after one that took too long wait for it, as they do when SVGs are not
 //! drawn apart. (Alone in its binary: the program is set once for all the tests in it.)
-#![cfg(all(feature = "svg", target_os = "linux"))]
+#![cfg(all(feature = "svg", any(target_os = "linux", windows)))]
 
 use std::path::Path;
 use std::time::{Duration, Instant};

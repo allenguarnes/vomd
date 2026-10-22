@@ -5,5 +5,5 @@ edition = "2024"
 publish = false
 
 # Dev-only tooling; never shipped.
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

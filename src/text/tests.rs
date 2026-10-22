@@ -264,9 +264,33 @@ fn emoji_sequences_stay_together() {
     assert_eq!(checked, 3);
 }
 
+/// A font may make one glyph of a joiner and the character after it: Segoe UI Emoji makes each
+/// member of a family after the first so. Such a glyph is drawn, though the joiner itself isn't.
+/// (Only where Segoe UI Emoji is installed, as on Windows.)
+#[test]
+fn glyphs_made_of_joiners_are_drawn() {
+    let Some(segoe) = fallback::find_file(&["seguiemj.ttf"]) else {
+        return;
+    };
+    let mut fonts = Fonts::new().unwrap();
+    let face = fonts.add_fallback(&segoe, 0).expect("Segoe UI Emoji loads");
+    let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+    let shaped = TextCtx::default().shape(&fonts, &para(text));
+    let glyphs: Vec<_> = shaped
+        .clusters
+        .iter()
+        .flat_map(|c| &shaped.glyphs[c.glyphs.start as usize..c.glyphs.end as usize])
+        .collect();
+    assert_eq!(glyphs.len(), 4, "one glyph per member");
+    let zwj = fonts.face(face).glyph('\u{200D}');
+    assert!(glyphs.iter().all(|g| g.id != 0 && g.id != zwj));
+    let l = TextCtx::default().layout(&fonts, &para(text), 1000.0, Align::Start, 1.5);
+    assert_eq!(l.glyphs.len(), 4);
+}
+
 #[test]
 fn default_ignorables_are_invisible() {
-    let text = "a\u{200F}b\u{00AD}c\u{FEFF}";
+    let text = "a\u{200F}b\u{00AD}c\u{FEFF}d\u{3164}e\u{1D173}f\u{2060}";
     let fonts = Fonts::new().unwrap();
     let shaped = TextCtx::default().shape(&fonts, &para(text));
     assert!(shaped.missing.is_empty(), "{:?}", shaped.missing);
@@ -280,9 +304,9 @@ fn default_ignorables_are_invisible() {
         }
         assert_eq!(c.advance, 0.0, "{src:?} takes space");
     }
-    // Only the three letters are drawn.
+    // Only the letters are drawn.
     let l = TextCtx::default().layout(&fonts, &para(text), 1000.0, Align::Start, 1.5);
-    assert_eq!(l.glyphs.len(), 3);
+    assert_eq!(l.glyphs.len(), 6);
 }
 
 #[test]

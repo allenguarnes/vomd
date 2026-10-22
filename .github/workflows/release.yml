@@ -1,7 +1,8 @@
 # A `v*` tag builds the Linux x86_64 release (baseline x86-64, no target-cpu, in a Debian 12
-# container), checks the budgets and the .deb and AppImage on Debian and Ubuntu, and attaches
-# the tarball, .deb and AppImage, their checksums and the budget report to the GitHub release,
-# whose notes are the version's CHANGELOG section.
+# container), checks the budgets and the .deb and AppImage on Debian and Ubuntu, builds and
+# tests the Windows x86_64 zip, and attaches the tarball, .deb, AppImage and zip, their
+# checksums and the budget report to the GitHub release, whose notes are the version's CHANGELOG
+# section.
 name: Release
 
 on:
@@ -45,6 +46,45 @@ jobs:
         run: scripts/pkg-build.sh
       - name: The .deb and AppImage on Debian 12, Debian 13 and Ubuntu 24.04
         run: scripts/pkg-check.sh
+      # (The report goes in dist/ too, so the artifact's files are all at its top level.)
+      - run: cp budgets.md dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.sha256
+            dist/budgets.md
+          if-no-files-found: error
+
+  windows-x86_64:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test --locked
+      - name: The zip (fails on an oversized binary)
+        run: cargo xtask dist --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [linux-x86_64, windows-x86_64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,10 +110,10 @@ jobs:
             echo "A shared runner is two to three times slower than the machine the time budgets"
             echo "are for, so start and scroll times are reported here, not gated."
             echo
-            cat budgets.md
+            cat dist/budgets.md
             echo
             echo "</details>"
           } > notes.md
           gh release create "$GITHUB_REF_NAME" --title "VOMD $GITHUB_REF_NAME" \
-            --notes-file notes.md dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.sha256 \
-            budgets.md
+            --notes-file notes.md dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.zip \
+            dist/*.sha256 dist/budgets.md

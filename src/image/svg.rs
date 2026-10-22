@@ -461,7 +461,7 @@ pub(crate) enum Refusal {
     /// Too much work to draw at this size ([`MAX_WORK`]), or drawing took too long.
     Slow,
     /// Its drawing ran out of the memory its process may have (`process`).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Memory,
 }
 
@@ -2542,7 +2542,7 @@ pub(super) fn draw(
     inline: &AtomicBool,
     fonts: &mut Fonts,
 ) -> Rendered {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(program) = process::program() {
         return process::draw(
             program, bytes, svg, size, charge, limits, cancel, inline, fonts,
@@ -2554,9 +2554,9 @@ pub(super) fn draw(
 
 /// Whether SVGs are drawn in processes of their own, which are killed when they are given up.
 pub(super) fn apart() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     return process::program().is_some();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     false
 }
 
@@ -3175,7 +3175,7 @@ fn fit_to_rect(r: tiny_skia::IntRect, max: tiny_skia::IntRect) -> Option<tiny_sk
     tiny_skia::IntRect::from_ltrb(left, top, right, bottom)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(super) mod process;
 #[cfg(test)]
 pub(super) mod tests;

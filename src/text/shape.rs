@@ -165,13 +165,22 @@ pub fn is_combining_mark(c: char) -> bool {
 /// Default-ignorable code points (formatting characters, bidi controls, variation selectors):
 /// never drawn, so they never count as missing and take the face of their neighbors.
 fn is_default_ignorable(c: char) -> bool {
+    // Unicode's Default_Ignorable_Code_Point, all of it: swash leaves out the glyphs of the
+    // same characters, unless they were turned into others (see `shape`).
     matches!(c,
-        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{180B}'..='\u{180F}'
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}'..='\u{1160}'
+        | '\u{17B4}'..='\u{17B5}'
+        | '\u{180B}'..='\u{180F}'
         | '\u{200B}'..='\u{200F}'
         | '\u{202A}'..='\u{202E}'
         | '\u{2060}'..='\u{206F}'
+        | '\u{3164}'
         | '\u{FE00}'..='\u{FE0F}'
         | '\u{FEFF}'
+        | '\u{FFA0}'
+        | '\u{FFF0}'..='\u{FFF8}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
         | '\u{E0000}'..='\u{E0FFF}')
 }
 
@@ -422,12 +431,17 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
         } else {
             &[]
         };
+        // swash would drop every glyph that stands for an invisible character, also one a
+        // substitution made of it and the next ones: Segoe UI Emoji makes each member of a family
+        // (👨‍👩‍👧) from a zero-width joiner and the person after it. Such glyphs are kept here,
+        // and the ones that are still the invisible characters' own are dropped below.
         let mut shaper = ctx
             .builder(font)
             .size(run.size)
             .script(run.script)
             .direction(dir)
             .features(off.iter().copied())
+            .retain_ignorables(true)
             .build();
         shaper.add_str(&text[run.range.clone()]);
         let base = run.range.start as u32;
@@ -454,17 +468,28 @@ pub fn shape(ctx: &mut ShapeContext, fonts: &Fonts, para: &Para) -> Shaped {
             // Invisible formatting characters render nothing, even when the face lacks them:
             // a cluster that is all of them drops every `.notdef`, one that carries them next
             // to a base (`e` + variation selector + mark) drops one per such character.
+            let face = fonts.face(run.face);
             let invisible = src.chars().all(is_default_ignorable);
+            let ignorables = src.chars().any(is_default_ignorable);
             let mut unseen = src
                 .chars()
-                .filter(|&ch| is_default_ignorable(ch) && fonts.face(run.face).glyph(ch) == 0)
+                .filter(|&ch| is_default_ignorable(ch) && face.glyph(ch) == 0)
                 .count();
+            // An invisible character's own glyph (a soft hyphen's hyphen, a joiner's empty
+            // glyph), as swash would have dropped it; a glyph substituted for it stays.
+            let own = |id: u16| {
+                ignorables
+                    && id != 0
+                    && src
+                        .chars()
+                        .any(|ch| is_default_ignorable(ch) && face.glyph(ch) == id)
+            };
             let g0 = glyphs.len() as u32;
             let mut advance = 0.0;
             for g in c.glyphs.iter().filter(|g| {
                 let drop = g.id == 0 && (invisible || unseen > 0);
                 unseen -= (drop && unseen > 0) as usize;
-                !drop
+                !drop && !own(g.id)
             }) {
                 glyphs.push(Glyph {
                     id: g.id,
