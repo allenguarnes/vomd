@@ -8,7 +8,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Added
 - Windows 10 (1803) and newer, and Windows 11, on x86-64: every feature Linux has, from one
   `vomd.exe` that needs nothing installed (the C runtime is linked in). The release has
-  `vomd-<version>-x86_64-windows.zip`.
+  `vomd-<version>-x86_64-windows-portable.zip`. `vomd.exe` isn't code-signed yet, so the first
+  time it runs, SmartScreen shows "Windows protected your PC": click More info, then Run anyway
+  (see the README's Install section).
   - Copy and paste use the Windows clipboard: a copy is made when a program pastes it, with CR LF
     line ends, and is kept on the clipboard when the window closes. Windows has no primary
     selection, so `primary_selection` doesn't apply.

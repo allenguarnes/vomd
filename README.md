@@ -72,12 +72,30 @@ It mounts itself with FUSE, which most desktops have (`fuse3`). Without it, run 
 files; an integration tool such as Gear Lever or AppImageLauncher can.
 
 **Windows:** from v1.6.0, each [release](https://github.com/allenguarnes/vomd/releases) has
-`vomd-<version>-x86_64-windows.zip`, for Windows 10 (1803) or newer and Windows 11 on x86-64. It
-holds `vomd.exe`, which needs nothing else: unzip it anywhere and run it, or drop a `.md` file
-on it. The binary isn't signed, so SmartScreen may say it comes from an unknown publisher the
-first time (More info, then Run anyway). To make VOMD the app for `.md` files, right-click one,
-choose Open with, then Choose another app, find `vomd.exe` with "Choose an app on your PC" and
-select Always. VOMD itself never writes to the registry.
+`vomd-<version>-x86_64-windows-portable.zip`, for Windows 10 (1803) or newer and Windows 11 on
+x86-64. It holds `vomd.exe`, which needs nothing else installed.
+
+> [!IMPORTANT]
+> **`vomd.exe` isn't code-signed yet, so Windows will probably warn you the first time you run
+> it.** This is expected and doesn't mean the file is harmful. Microsoft Defender SmartScreen
+> shows "Windows protected your PC" for programs from a publisher it doesn't know yet, and every
+> unsigned program starts out that way. To run VOMD, click **More info**, then **Run anyway**.
+> Windows remembers the choice, so you see this only once.
+>
+> The zip is built and uploaded by the public
+> [release workflow](https://github.com/allenguarnes/vomd/actions/workflows/release.yml) from the
+> tagged source, and each one has a `.sha256` file next to it. To check that your download
+> matches, run `certutil -hashfile vomd-<version>-x86_64-windows-portable.zip SHA256` in a
+> terminal and compare the result with that file. Signed builds and an installer are planned.
+
+1. Unzip it anywhere (your user folder, for example).
+2. Run `vomd.exe`, or drop a `.md` file on it.
+3. To make VOMD the app for `.md` files: right-click a `.md` file, choose **Open with**, then
+   **Choose another app**, find `vomd.exe` with **Choose an app on your PC**, and select
+   **Always**.
+
+VOMD itself never writes to the registry, so to remove it, delete the folder (and
+`%APPDATA%\vomd` if you made a settings file).
 
 **Release tarball:** each [release](https://github.com/allenguarnes/vomd/releases) has
 `vomd-<version>-x86_64-linux.tar.gz` (glibc 2.36 or newer, any x86-64 CPU). It needs the same

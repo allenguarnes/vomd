@@ -787,9 +787,9 @@ fn stage_files<'a>(stage: &Path, files: impl IntoIterator<Item = (&'a Path, &'a 
     }
 }
 
-/// The Windows release: `dist/vomd-<version>-x86_64-windows.zip` holding `vomd.exe` (its icon,
-/// manifest and version information built in by `build.rs`), README, CHANGELOG and the licenses,
-/// and its `.sha256`.
+/// The portable Windows release: `dist/vomd-<version>-x86_64-windows-portable.zip` holding
+/// `vomd.exe` (its icon, manifest and version information built in by `build.rs`), README,
+/// CHANGELOG and the licenses, and its `.sha256`.
 #[cfg(windows)]
 fn dist_windows() -> bool {
     let bin = cargo_build(&[], "target");
@@ -800,7 +800,7 @@ fn dist_windows() -> bool {
         return false;
     }
     let ours = vomd_version();
-    let name = format!("vomd-{ours}-x86_64-windows");
+    let name = format!("vomd-{ours}-x86_64-windows-portable");
     let dist = root().join("dist");
     let stage = dist.join(&name);
     let _ = fs::remove_dir_all(&stage);
