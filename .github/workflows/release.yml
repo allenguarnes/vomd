@@ -90,14 +90,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # The notes are this version's CHANGELOG section, its wrapped lines joined (GitHub
-          # shows every line break in release notes).
+          # shows every line break in release notes); a nested item keeps its indent.
           version="${GITHUB_REF_NAME#v}"
           awk -v head="## [$version]" '
             index($0, head) == 1 { on = 1; next }
             on && (/^## / || /^\[[^]]+\]: /) { exit }
             !on { next }
             /^$/ || /^#/ { if (buf != "") print buf; buf = ""; print; next }
-            /^- / { if (buf != "") print buf; buf = $0; next }
+            /^ *- / { if (buf != "") print buf; buf = $0; next }
             { sub(/^ +/, ""); buf = buf == "" ? $0 : buf " " $0 }
             END { if (buf != "") print buf }
           ' CHANGELOG.md > changes.md
