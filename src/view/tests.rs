@@ -2901,38 +2901,43 @@ mod with_fonts {
             v.press(100.0, y, Instant::now());
             assert_eq!(v.click(100.0, y), None);
         };
-        // (The frames each showed: partial paints of the remote's box, and of the local's.)
-        let run = |v: &mut View, buf: &mut [u32], time: Duration| {
-            let (t, mut remote, mut local) = (Instant::now(), 0, 0);
-            while t.elapsed() < time {
-                let now = Instant::now();
-                let tick = v.tick(now, Some(now));
-                if v.poll_images(now) || tick.redraw {
-                    v.paint(buf, 2050, now);
-                    v.request_images();
-                } else if !v.damage().is_empty() {
-                    let rects = v.damage().to_vec();
-                    remote += usize::from(rects.iter().any(|r| r.y0 < 1100));
-                    local += usize::from(rects.iter().any(|r| r.y0 > 1100 && r.y0 < 2200));
-                    v.paint_rects(buf, 2050, &rects, now);
+        // (The frames each showed: partial paints of the remote's box, and of the local's; for
+        // at least `time`, then until `done` says so, as a slow machine shows its first frames
+        // late.)
+        let run =
+            |v: &mut View, buf: &mut [u32], time: Duration, done: &dyn Fn(usize, usize) -> bool| {
+                let (t, mut remote, mut local) = (Instant::now(), 0, 0);
+                while t.elapsed() < time || (!done(remote, local) && t.elapsed() < time * 10) {
+                    let now = Instant::now();
+                    let tick = v.tick(now, Some(now));
+                    if v.poll_images(now) || tick.redraw {
+                        v.paint(buf, 2050, now);
+                        v.request_images();
+                    } else if !v.damage().is_empty() {
+                        let rects = v.damage().to_vec();
+                        remote += usize::from(rects.iter().any(|r| r.y0 < 1100));
+                        local += usize::from(rects.iter().any(|r| r.y0 > 1100 && r.y0 < 2200));
+                        v.paint_rects(buf, 2050, &rects, now);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            (remote, local)
-        };
+                (remote, local)
+            };
         click(&mut v, 100.0);
-        assert!(run(&mut v, &mut buf, Duration::from_secs(1)).0 >= 3);
+        let remote_plays = |remote: usize, _: usize| remote >= 3;
+        assert!(run(&mut v, &mut buf, Duration::from_secs(1), &remote_plays).0 >= 3);
         v.resize(2050, 3500);
         buf.resize(2050 * 3500, 0);
         settle(&mut v);
         v.paint(&mut buf, 2050, Instant::now());
         v.request_images();
-        let (remote, local) = run(&mut v, &mut buf, Duration::from_secs(3));
+        let (remote, local) = run(&mut v, &mut buf, Duration::from_secs(3), &remote_plays);
         assert!(remote >= 3, "the remote one plays: {remote}");
         assert_eq!(local, 0);
         assert_eq!(v.images.anim_state(2), Some(AnimState::Waiting));
         click(&mut v, 1200.0);
-        let (remote, local) = run(&mut v, &mut buf, Duration::from_secs(2));
+        let both_play = |remote: usize, local: usize| remote >= 3 && local >= 3;
+        let (remote, local) = run(&mut v, &mut buf, Duration::from_secs(2), &both_play);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(local >= 3, "the local one plays past the limits: {local}");
         assert!(remote >= 3, "the remote one plays on: {remote}");

@@ -275,20 +275,23 @@ pub fn peak_rss_kb() -> u64 {
 fn status_kb(field: &str) -> u64 {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix(field))
-                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
-            })
-            .unwrap_or(0)
+        std::fs::read_to_string("/proc/self/status").map_or(0, |s| status_field(&s, field))
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Untested: task_info on macOS.
         0
     }
+}
+
+/// A field of a `/proc/self/status` read, in kB (0 if missing).
+#[cfg(target_os = "linux")]
+fn status_field(status: &str, field: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix(field))
+        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -388,9 +391,21 @@ mod tests {
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn reads_peak_rss() {
+        assert!(rss_kb() > 0);
         assert!(peak_rss_kb() > 0);
-        // The current size first: tests running beside this one may grow it, and the peak with it.
-        let now = rss_kb();
-        assert!((1..=peak_rss_kb()).contains(&now));
+        // Both from one reading. Read apart, the peak can be less than the size read before it:
+        // Linux's VmHWM is the larger of the size now and a mark it updates only now and then,
+        // so memory that tests running beside this one free in between can take both down.
+        #[cfg(target_os = "linux")]
+        let (now, peak) = {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            (
+                status_field(&status, "VmRSS:"),
+                status_field(&status, "VmHWM:"),
+            )
+        };
+        #[cfg(windows)]
+        let (now, peak) = windows::working_set_kb();
+        assert!((1..=peak).contains(&now));
     }
 }
