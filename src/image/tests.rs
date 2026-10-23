@@ -3865,6 +3865,14 @@ fn the_bookkeeping_is_charged_by_capacity_and_given_back() {
     images.attach(&doc, &mut layout);
     images.set_remote(true, &doc, &mut layout);
     images.request(&[], 0);
+    // (The fetchers take their URLs from the queue on their own threads: once all four have,
+    // nothing more is taken from it until the gate opens, and what is charged holds still.)
+    let t = Instant::now();
+    while starts.load(std::sync::atomic::Ordering::SeqCst) < 4 {
+        assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    images.request(&[], 0);
     // The list of sources, their strings, the set of URLs, what a request builds for each of
     // them, and the queue (4 are being fetched).
     let busy = images.bookkeeping_bytes();
