@@ -5293,8 +5293,14 @@ fn due_frames_share_a_tick_and_ticks_are_capped() {
     images.set_anim_clock(Some(t0));
     images.set_animations(true);
     let placed = [(1, 12, 8, 0), (2, 12, 8, 20)];
+    // (The deadline is the soonest due: both next frames are made before it is theirs.)
+    let next_made = |i: &mut Images, id| {
+        let key = i.key(id);
+        key.and_then(|k| i.anim_at(&k))
+            .is_some_and(|at| i.playing(at).due().is_some())
+    };
     paint_placed_until(&mut images, &doc, &mut layout, &placed, |i| {
-        anim_shows_frame(i, 1) && anim_shows_frame(i, 2) && i.anim_deadline().is_some()
+        anim_shows_frame(i, 1) && anim_shows_frame(i, 2) && next_made(i, 1) && next_made(i, 2)
     });
     let due = images.anim_deadline().unwrap();
     let mut shown = images.advance(due);
@@ -8653,8 +8659,28 @@ fn a_body_played_past_the_limits_is_no_room_for_another_animation() {
     pump(&doc, &mut layout, &mut images, &boxes, |i, _| {
         boxes.iter().all(|&(id, w, h)| i.pixels(id, w, h).is_some())
     });
-    place_only(&mut images, &placed);
-    images.painted();
+    // (The remote one shows its frame, but its still is painted as well: `pump` paints nothing
+    // its polls see, so that still may have gone for the others', to be asked for again once
+    // painted. Until it comes the local one has room, and may be read and play. The page is
+    // weighed settled: the three stills cached, the local one waiting and let go.)
+    let t = Instant::now();
+    loop {
+        place_only(&mut images, &placed);
+        images.painted();
+        let settled = boxes
+            .iter()
+            .all(|&(id, w, h)| images.key(id).is_some_and(|k| images.cache.has(&k, w, h)));
+        if settled
+            && images.anim_state(2) == Some(AnimState::Waiting)
+            && images.anim_at(&Key::Local(2)).is_none()
+        {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+        images.request(&boxes, boxes.len());
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
     let swaps = play_partially(
         &mut images,
         &doc,
