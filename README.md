@@ -30,7 +30,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.webp" width="900" alt="Double-clicking a Markdown file in a file manager opens it in VOMD at once; selecting four more and pressing Enter opens four rendered windows together">
+  <img src="assets/demo.webp" width="900" alt="Double-clicking a Markdown file in a file manager opens it in VOMD at once; selecting four and pressing Enter opens four rendered windows together">
 </p>
 
 ## Why VOMD
@@ -58,7 +58,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
-  <img src="assets/screenshot-light.png" width="900" alt="VOMD showing a runbook with a diagram, an alert and a table">
+  <img src="assets/screenshot-light.png" width="900" alt="VOMD showing a tour of itself: a diagram of how VOMD draws a page, a tip and a table">
 </picture>
 
 ## Install
