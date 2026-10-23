@@ -279,6 +279,8 @@ struct App {
     /// The window system is Wayland (known once the window exists).
     wayland: bool,
     mods: ModifiersState,
+    /// Keys that were down when the window got focus (see [`view::HeldKeys`]).
+    held_keys: view::HeldKeys,
     cursor: PhysicalPosition<f64>,
     /// The pointer is over the window (hover tracking).
     cursor_in: bool,
@@ -1249,6 +1251,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // Changes made here are in the file before another window (or an editor) is used.
             WindowEvent::Focused(false) => {
+                self.held_keys.clear();
                 // A button released elsewhere isn't seen: the drag ends here.
                 #[cfg(feature = "clipboard")]
                 {
@@ -1301,7 +1304,14 @@ impl ApplicationHandler<UserEvent> for App {
                     view.zoom_wheel_end();
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } if self
+                .held_keys
+                .is_user_press(event.physical_key, event.state, is_synthetic) =>
+            {
                 // The find bar, when open, has the keys that are text first.
                 #[cfg(feature = "find")]
                 let typed =
@@ -1589,6 +1599,7 @@ fn main() {
         choosing: false,
         wayland: false,
         mods: ModifiersState::empty(),
+        held_keys: view::HeldKeys::default(),
         cursor: PhysicalPosition::new(0.0, 0.0),
         cursor_in: false,
         pointer: false,

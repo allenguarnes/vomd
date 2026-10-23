@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use unicode_bidi::{BidiClass, bidi_class};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::event::ElementState;
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 
 use crate::cli::Input;
 use crate::doc::{Doc, Heading};
@@ -208,6 +209,43 @@ impl ThemeMode {
             ThemeMode::Light => ThemeMode::Dark,
             ThemeMode::Dark => ThemeMode::System,
         }
+    }
+}
+
+/// The keys that were already down when a window got focus. winit reports each as a synthetic
+/// press, and on X11 and Windows its auto-repeat then arrives as ordinary presses too: acting on
+/// either would close every window in turn while `Q` is held. Such a key does nothing until it
+/// comes up (or focus is lost), and a key pressed in the window repeats as usual.
+#[derive(Default)]
+pub struct HeldKeys(Vec<PhysicalKey>);
+
+impl HeldKeys {
+    /// Whether a key event is a press by the user, to act on.
+    pub fn is_user_press(
+        &mut self,
+        key: PhysicalKey,
+        state: ElementState,
+        synthetic: bool,
+    ) -> bool {
+        let held = self.0.iter().position(|k| *k == key);
+        match (state, synthetic, held) {
+            (ElementState::Released, ..) => {
+                if let Some(i) = held {
+                    self.0.swap_remove(i);
+                }
+                false
+            }
+            (ElementState::Pressed, true, None) => {
+                self.0.push(key);
+                false
+            }
+            (ElementState::Pressed, synthetic, held) => !synthetic && held.is_none(),
+        }
+    }
+
+    /// Focus is lost: whatever is held now is known afresh on the next focus.
+    pub fn clear(&mut self) {
+        self.0.clear();
     }
 }
 

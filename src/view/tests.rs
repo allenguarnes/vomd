@@ -2,7 +2,7 @@ use super::*;
 // Only the tests that need the embedded fonts use it.
 #[cfg(all(feature = "images", feature = "embed-fonts"))]
 use crate::layout::{ImageSize, Refusal};
-use winit::keyboard::SmolStr;
+use winit::keyboard::{KeyCode, SmolStr};
 
 fn ch(s: &str) -> Key {
     Key::Character(SmolStr::new(s))
@@ -105,6 +105,37 @@ fn keys() {
     for (key, mods, want) in cases {
         assert_eq!(key_action(&key, mods), want, "{key:?} {mods:?}");
     }
+}
+
+/// A key held when the window gets focus arrives as a synthetic press, and on X11 and Windows
+/// its auto-repeat as ordinary presses: none of them acts, or `Q` held down would close the next
+/// window once the first is gone.
+#[test]
+fn held_keys_at_focus_do_not_act_until_released() {
+    use ElementState::{Pressed, Released};
+    let key = |c| PhysicalKey::Code(c);
+    let (q, down) = (key(KeyCode::KeyQ), key(KeyCode::ArrowDown));
+    let mut held = HeldKeys::default();
+    // Q was down before the window had focus: the synthetic press, then the repeats.
+    assert!(!held.is_user_press(q, Pressed, true));
+    for _ in 0..3 {
+        assert!(!held.is_user_press(q, Pressed, false));
+    }
+    // A key pressed in the window acts, and its repeats too.
+    for _ in 0..3 {
+        assert!(held.is_user_press(down, Pressed, false));
+    }
+    assert!(!held.is_user_press(down, Released, false));
+    // Q comes up (a synthetic release counts too): the next press is the user's.
+    assert!(!held.is_user_press(q, Released, false));
+    assert!(held.is_user_press(q, Pressed, false));
+    assert!(!held.is_user_press(q, Released, true));
+    // A synthetic press then focus lost: forgotten, a later press acts.
+    assert!(!held.is_user_press(q, Pressed, true));
+    held.clear();
+    assert!(held.is_user_press(q, Pressed, false));
+    // Releases never act.
+    assert!(!held.is_user_press(down, Released, false));
 }
 
 #[test]
