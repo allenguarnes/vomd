@@ -118,7 +118,16 @@ impl Plan {
         for label in stubs {
             text.push_str("[^");
             text.push_str(label);
-            text.push_str("]: x\n");
+            // (A label that ends in an odd number of backslashes, which its definition spelled
+            // with a space after, would have the `]` escaped. The one space stays under
+            // pulldown-cmark's length limit for labels, which the definition's own space is
+            // counted in, and no other label gets longer.)
+            let backslashes = label.bytes().rev().take_while(|&b| b == b'\\').count();
+            text.push_str(if backslashes % 2 == 1 {
+                " ]: x\n"
+            } else {
+                "]: x\n"
+            });
         }
         if !stubs.is_empty() {
             // (Controls other than the blanks and line breaks, U+0009 to U+000D, which no label

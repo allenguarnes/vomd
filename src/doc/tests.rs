@@ -4171,3 +4171,112 @@ fn a_heading_of_no_letters_or_digits_is_bare() {
     assert_eq!(whole, parts);
     assert_eq!(whole.headings.iter().filter(|h| h.bare).count(), 3);
 }
+
+/// A footnote label that ends in backslashes: the label is the text trimmed, and the stub that
+/// declares it to a segment must read back as the same label. `[^a\\\]` would have the `]`
+/// escaped, so the stub is no definition and the reference in its segment is text.
+#[test]
+fn segmented_parse_declares_a_footnote_label_that_ends_in_backslashes() {
+    let filler = "Filler text for the cut.\n\n".repeat(8);
+    for label in ["a\\\\\\", "a\\ b\\\\\\", "\\\\\\"] {
+        let src = format!(
+            "A note[^{label} ] here.\n\n{filler}Another[^{label} \t]\n\n{filler}\
+             [^{label} ]: The note.\n\n{filler}"
+        );
+        for budget in [1, 90, 700] {
+            let n = assert_same(label, &src, budget);
+            if budget <= 90 {
+                assert!(n >= 3, "{label}: {n} segments");
+            }
+        }
+    }
+}
+
+/// The input of a fuzz finding (first byte: the segment budget, 16 + 8 * 35 = 296; the rest the
+/// document, decoded lossily): a footnote definition whose label ends in a backslash and a
+/// space, defined in the last segment and referred to in the one before.
+#[test]
+fn segmented_parse_of_the_footnote_label_fuzz_finding_matches() {
+    let data = include_bytes!("../../fuzz/seeds/doc/footnote-label-ends-in-backslashes.bin");
+    let (&b, rest) = data.split_first().unwrap();
+    let src = String::from_utf8_lossy(rest);
+    let budget = 16 + usize::from(b) * 8;
+    let n = assert_same("fuzz finding", &src, budget);
+    assert!(n >= 2, "{n} segments");
+}
+
+/// A document with `label` defined in the last of its segments and referred to in the first, the
+/// definition spelled the way it must be to end in `backslashes` backslashes (a space after an
+/// odd number of them, or else they would escape the `]`).
+fn footnote_label_document(label: &str, backslashes: usize) -> String {
+    let label = format!("{label}{}", "\\".repeat(backslashes));
+    let space = if backslashes % 2 == 1 { " " } else { "" };
+    let filler = "Filler text for the cut.\n\n".repeat(8);
+    format!("See[^{label}{space}] here.\n\n{filler}[^{label}{space}]: NOTEBODY\n\n{filler}end\n")
+}
+
+/// A footnote (a definition that is not text) in `doc`.
+fn has_the_note(doc: &Doc) -> bool {
+    doc.text.contains("NOTEBODY") && !doc.text.contains("]:")
+}
+
+/// pulldown-cmark takes a footnote label of fewer than 1000 "codepoints" (every non-ASCII byte,
+/// 2 for a backslash escape, 1 for a run of blanks, none for other ASCII). The stub that declares
+/// a defined label to a segment must be a definition for every label the whole parse accepts,
+/// at the limit and one under, whatever backslashes it ends in.
+#[test]
+fn segmented_parse_declares_every_footnote_label_the_whole_parse_accepts() {
+    // (A unit of the label, its cost in the limit, and the lengths to try: around the limit.)
+    let units = [
+        ("雪", 3, 331..=335),
+        ("é", 2, 497..=501),
+        ("\\!", 2, 497..=501),
+        ("a", 0, 4999..=5000),
+    ];
+    for (unit, cost, counts) in units {
+        for n in counts {
+            for backslashes in 0..=3 {
+                let src = footnote_label_document(&unit.repeat(n), backslashes);
+                let whole = Doc::parse_whole(&src);
+                // A label well under the limit is a note.
+                if n * cost + 4 < 1000 {
+                    assert!(has_the_note(&whole), "{unit} x {n} + {backslashes}");
+                }
+                for budget in [1, 400, 1500] {
+                    assert_same(&format!("{unit} x {n} + {backslashes}"), &src, budget);
+                }
+            }
+        }
+    }
+}
+
+/// The reduced input of a finding in review: a label of 333 characters of 3 bytes, 999 of the
+/// 999 the limit takes, referred to and defined in two segments of a document that is cut.
+#[test]
+fn segmented_parse_declares_a_footnote_label_at_the_length_limit() {
+    let label = "雪".repeat(333);
+    let src = format!("See[^{label}] here.\n\n[^{label}]: NOTEBODY\n\nend\n");
+    let (whole, parts) = Doc::fuzz_segments(&src, 16).unwrap();
+    assert!(has_the_note(&whole));
+    assert!(whole == parts);
+    let data = include_bytes!("../../fuzz/seeds/doc/footnote-label-at-the-length-limit.bin");
+    let (&b, rest) = data.split_first().unwrap();
+    let src = String::from_utf8_lossy(rest);
+    let (whole, parts) = Doc::fuzz_segments(&src, 16 + usize::from(b) * 8).unwrap();
+    assert!(whole == parts);
+}
+
+/// The same through [`Doc::parse`], which cuts a document past 1 MB.
+#[test]
+fn a_large_document_keeps_a_footnote_whose_label_is_at_the_length_limit() {
+    let label = "雪".repeat(333);
+    let src = format!(
+        "{}\n\nSee[^{label}] here.\n\n[^{label}]: NOTEBODY\n\n{}\n\nend\n",
+        "prefix ".repeat(2600),
+        "postfix ".repeat(140_000),
+    );
+    assert!(src.len() > SEGMENT_THRESHOLD);
+    let doc = Doc::parse(&src);
+    assert!(has_the_note(&doc));
+    assert!(doc == Doc::parse_whole(&src));
+}
