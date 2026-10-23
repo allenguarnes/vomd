@@ -241,6 +241,61 @@ fn raw_html() {
     ));
 }
 
+/// Whitespace in a block of HTML follows the browser's rule: a run of spaces, tabs and newlines
+/// is one space, also between two tags with nothing else there; the start and end of a block have
+/// none.
+#[test]
+fn html_block_whitespace_collapses_like_a_browser() {
+    let text_of = |src: &str| {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        let blocks: Vec<&str> = doc
+            .blocks
+            .iter()
+            .map(|b| {
+                let spans = doc.block_spans(b);
+                &doc.text[spans[0].start as usize..spans[spans.len() - 1].end as usize]
+            })
+            .collect();
+        blocks.join("|")
+    };
+    // The badge row: the alt texts of the images, one space apart.
+    assert_eq!(
+        text_of(
+            "<p align=\"center\">\n  <a href=\"r\"><img src=\"r.svg\" alt=\"Latest release\"></a>\n  \
+             <a href=\"c\"><img src=\"c.svg\" alt=\"CI\"></a>\t\n  \
+             <a href=\"l\"><img src=\"l.svg\" alt=\"License: MIT\"></a>\n</p>\n"
+        ),
+        "Latest release CI License: MIT"
+    );
+    // The link row, and a paragraph that wraps around a `<code>`.
+    assert_eq!(
+        text_of(
+            "<p align=\"center\">\n  <a href=\"#i\">Install</a> |\n  <a href=\"#k\">Keys</a> |\n  \
+             <a href=\"#s\">Settings</a>\n</p>\n\n\
+             <p align=\"center\">\n  Double-click a <code>.md</code> file and it\n  opens.\n</p>\n\n\
+             <p align=\"center\"><b>Bold.</b></p>\n"
+        ),
+        "Install | Keys | Settings|Double-click a .md file and it opens.|Bold."
+    );
+    // A space between tags is in neither element: not underlined, not bold.
+    let doc = Doc::parse("<div>\n<a href=\"x\">one</a>\n<b>two</b>\n</div>\n");
+    let styles: Vec<(&str, u16)> = doc
+        .spans
+        .iter()
+        .map(|s| (&doc.text[s.start as usize..s.end as usize], s.style))
+        .collect();
+    assert_eq!(
+        styles,
+        [("one", style::LINK), (" ", 0), ("two", style::BOLD)]
+    );
+    // No space after a line break, and a no-break space is not collapsed.
+    assert_eq!(
+        text_of("<p>a <br>\n b&nbsp;&nbsp;c</p>\n"),
+        "a\nb\u{a0}\u{a0}c"
+    );
+}
+
 /// Inline HTML that GitHub styles, script/style content dropped, flattened HTML
 /// table cells kept apart, and GFM autolinks.
 #[test]
@@ -3762,7 +3817,7 @@ fn custom_element_names_are_not_built_in_tags() {
             "a <i-x>x</i-x> <code-block>y</code-block> <a-b href=\"u\">z</a-b>",
             "a x y z",
         ),
-        ("<div>a <sup.x>x</sup.x> <s_t>y</s_t></div>", "a xy"),
+        ("<div>a <sup.x>x</sup.x> <s_t>y</s_t></div>", "a x y"),
         ("<div>a <b-widget>x</b-widget> c</div>", "a x c"),
         ("a<br-x>b", "ab"),
         ("<div>a<br-x>b<hr-x>c<p-x>d</div>", "abcd"),

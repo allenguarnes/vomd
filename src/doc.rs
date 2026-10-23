@@ -579,6 +579,10 @@ struct HtmlInline {
     sub: u32,
     /// Inside `<script>` or `<style>` (the tag name): content is dropped.
     skip: Option<&'static str>,
+    /// A space owed to the next content of a block of HTML, as its style and link: whitespace
+    /// that ended the text before a tag. It is written with what follows, so none is left at the
+    /// end of a block, and it is in the style of where it was, not of the tag after it.
+    gap: Option<(u16, u32)>,
 }
 
 impl Builder {
@@ -1100,8 +1104,11 @@ impl Builder {
             // `<b>` before there was a block.
             self.begin(BlockKind::Paragraph);
         }
-        let style = self.style() | extra_style;
-        let link = self.link();
+        self.push_text(s, self.style() | extra_style, self.link(), image);
+    }
+
+    /// Append `s` to the open block (see `text`) in the given style and link.
+    fn push_text(&mut self, s: &str, style: u16, link: u32, image: u32) {
         let start = self.doc.text.len() as u32;
         if let Some(img) = (image as usize)
             .checked_sub(1)
@@ -1579,8 +1586,13 @@ impl Builder {
                 continue;
             }
             match name.as_str() {
-                "br" => self.text("\n", 0, 0),
+                "br" => {
+                    // As in a browser, spaces before a line break are dropped.
+                    self.html_inline.gap = None;
+                    self.text("\n", 0, 0);
+                }
                 "img" => {
+                    self.html_gap();
                     let src = attr(tag, "src").map_or_else(String::new, |s| decode_entities(&s));
                     let alt = attr(tag, "alt").map(|a| decode_entities(&a));
                     let want = |name, width| {
@@ -1600,7 +1612,10 @@ impl Builder {
                     self.close()
                 }
                 // Cells of an HTML table, flattened: keep them apart.
-                "td" | "th" if block && closing => self.text(" ", 0, 0),
+                "td" | "th" if block && closing => {
+                    self.html_inline.gap = None;
+                    self.text(" ", 0, 0);
+                }
                 _ => {}
             }
         }
@@ -1650,17 +1665,23 @@ impl Builder {
         true
     }
 
+    /// Text in raw HTML. In a block it follows a browser's whitespace rule: a run of spaces, tabs
+    /// and newlines is one space, also between two tags, and there is none at the start of the
+    /// block, after a line break or at its end (see `HtmlInline::gap`).
     fn html_text(&mut self, s: &str, block: bool) {
         if !block {
             self.text(&decode_entities(s), 0, 0);
             return;
         }
-        // Block HTML: collapse whitespace like a browser would.
         let decoded = decode_entities(s);
         let mut out = String::with_capacity(decoded.len());
-        let mut space = self.doc.text.ends_with(' ') || self.open.is_none();
+        let blank = self.open.as_ref().is_none_or(|open| {
+            open.span_start as usize == self.doc.spans.len() || self.doc.text.ends_with('\n')
+        });
+        let mut space = blank || self.doc.text.ends_with(' ') || self.html_inline.gap.is_some();
         for c in decoded.chars() {
-            if c.is_whitespace() {
+            // A no-break space (`&nbsp;`) is not whitespace to HTML.
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c') {
                 if !space {
                     out.push(' ');
                     space = true;
@@ -1670,8 +1691,24 @@ impl Builder {
                 space = false;
             }
         }
-        if !out.trim().is_empty() {
+        let owed = out.ends_with(' ');
+        if owed {
+            out.pop();
+        }
+        let written = !out.is_empty();
+        if written {
+            self.html_gap();
             self.text(&out, 0, 0);
+        }
+        if owed && (written || !blank) {
+            self.html_inline.gap = Some((self.style(), self.link()));
+        }
+    }
+
+    /// Write the space that whitespace before a tag owes to what comes next.
+    fn html_gap(&mut self) {
+        if let Some((style, link)) = self.html_inline.gap.take() {
+            self.push_text(" ", style, link, 0);
         }
     }
 
