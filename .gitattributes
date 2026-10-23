@@ -1,0 +1,5 @@
+# Text files keep LF line ends in every checkout (the tests read fixtures and compare
+# goldens byte for byte, and a Windows checkout would otherwise make them CRLF).
+* text=auto eol=lf
+# Fuzz seeds are inputs as they are, line ends included.
+fuzz/seeds/** -text
