@@ -3,6 +3,18 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] - 2026-10-24
+
+### Fixed
+- Raw HTML shows the space between elements the way a browser does: the badges and links in a
+  README's `<p align="center">` header no longer run together ("Latest releaseCILicense: MIT"),
+  and a block of HTML has no space at its start or end.
+- Holding `Q` (or `Ctrl`+`W`, or `Esc`) no longer goes on to close the other VOMD windows one after
+  another. A key that is already down when a window gets the focus does nothing, however long you
+  keep holding it, until you let go.
+- A very large document (over 1 MB) with a footnote whose label ends in a backslash is laid out
+  the same as when it is read whole.
+
 ## [1.6.0] - 2026-10-23
 
 ### Added
@@ -240,6 +252,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[1.6.1]: https://github.com/allenguarnes/vomd/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/allenguarnes/vomd/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/allenguarnes/vomd/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/allenguarnes/vomd/compare/v1.3.0...v1.4.0
