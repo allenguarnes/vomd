@@ -1,22 +1,33 @@
-<div align="center">
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/vomd-full-logo.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/vomd-full-logo-light.svg">
+    <img alt="VOMD" src="assets/vomd-full-logo-light.svg" width="320">
+  </picture>
+</p>
 
-<img src="assets/icon@2x.png" width="112" alt="VOMD icon">
+<p align="center">
+  <a href="https://github.com/allenguarnes/vomd/releases/latest"><img src="https://img.shields.io/github/v/release/allenguarnes/vomd?style=flat" alt="Latest release"></a>
+  <a href="https://github.com/allenguarnes/vomd/actions/workflows/ci.yml"><img src="https://github.com/allenguarnes/vomd/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-607e60?style=flat" alt="Platforms: Linux and Windows"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat" alt="License: MIT"></a>
+</p>
 
-# VOMD
+<p align="center"><b>View-Only Markdown: a tiny, fast Markdown viewer for Linux and Windows.</b></p>
 
-**View-Only Markdown: a tiny, fast Markdown viewer for Linux and Windows.**
+<p align="center">
+  Double-click a <code>.md</code> file and it opens in well under a tenth of a second, rendered
+  the way GitHub shows it.
+</p>
 
-Double-click a `.md` file and it opens in well under a tenth of a second, rendered the way GitHub
-shows it.
-
-[![Release](https://img.shields.io/github/v/release/allenguarnes/vomd)](https://github.com/allenguarnes/vomd/releases/latest)
-[![CI](https://github.com/allenguarnes/vomd/actions/workflows/ci.yml/badge.svg)](https://github.com/allenguarnes/vomd/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-
-[Install](#install) · [Keys](#keys) · [Settings](#settings) · [Privacy](#privacy) ·
-[Changelog](CHANGELOG.md)
-
-</div>
+<p align="center">
+  <a href="#install">Install</a> |
+  <a href="#keys">Keys</a> |
+  <a href="#settings">Settings</a> |
+  <a href="#privacy">Privacy</a> |
+  <a href="CHANGELOG.md">Changelog</a> |
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
 <p align="center">
   <img src="assets/demo.webp" width="900" alt="Double-clicking a Markdown file in a file manager opens it in VOMD at once; selecting four more and pressing Enter opens four rendered windows together">
