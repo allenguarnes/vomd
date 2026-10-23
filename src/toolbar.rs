@@ -1,9 +1,10 @@
 //! The toolbar: one slim bar docked at the top, never over the text.
 //!
-//! Left: Back, Open, contents. Right: remote images (only when the document has any), zoom (− 100% +), wide
-//! layout, theme, reload, find, settings. Buttons for features that aren't built yet are absent. On
-//! narrow windows the right group collapses into a `⋯` button with a small dropdown, the one
-//! popup in the app: zoom first, then remote images, wide layout, theme, ...
+//! Left: Back, Open, contents. Right: remote images (only when the document has any), animations
+//! (only when it has an animated image), zoom (− 100% +), wide layout, theme, reload, find,
+//! settings. Buttons for features that aren't built yet are absent. On narrow windows the right
+//! group collapses into a `⋯` button with a small dropdown, the one popup in the app: zoom first,
+//! then remote images and animations, wide layout, theme, ...
 //! A tooltip with the name and shortcut appears after 500 ms. Icons are glyphs of an embedded
 //! Lucide subset, drawn through the glyph cache, so they're crisp at every scale.
 //!
@@ -55,6 +56,9 @@ pub(crate) mod icon {
     /// Wide layout is off (the button widens) and on (it narrows).
     pub const UNFOLD: char = '\u{e43d}';
     pub const FOLD: char = '\u{e43b}';
+    /// Animations are off (the button plays them) and on (it pauses them).
+    pub const PLAY: char = '\u{e13c}';
+    pub const PAUSE: char = '\u{e12e}';
     /// The copy button on code blocks, and its mark once the code is copied.
     #[cfg(feature = "clipboard")]
     pub const COPY: char = '\u{e09e}';
@@ -81,6 +85,8 @@ pub enum Item {
     Contents,
     /// Load or hide remote images, with a badge counting them.
     Images,
+    /// Animations on or off.
+    Animations,
     ZoomOut,
     /// The percentage between − and +; clicking it resets the zoom.
     ZoomReset,
@@ -135,6 +141,10 @@ pub struct Ctx {
     pub no_curl: bool,
     /// The remote-images button pulses (once, after the first frame).
     pub pulse: bool,
+    /// The document has an animated image (false: no animations button).
+    pub animated: bool,
+    /// Animations play.
+    pub animations: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -187,6 +197,8 @@ impl Item {
                 let s = if ctx.remote == 1 { "" } else { "s" };
                 format!("Load {} remote image{s} (I)", ctx.remote)
             }
+            Item::Animations if ctx.animations => "Pause animations (A)".into(),
+            Item::Animations => "Play animations (A)".into(),
             Item::ZoomOut => "Zoom out (Ctrl+−)".into(),
             Item::ZoomReset => format!("Reset zoom {}% (Ctrl+0)", ctx.zoom),
             Item::ZoomIn => "Zoom in (Ctrl+=)".into(),
@@ -215,6 +227,8 @@ impl Item {
             #[cfg(feature = "toc")]
             Item::Contents => icon::LIST,
             Item::Images => icon::IMAGE,
+            Item::Animations if ctx.animations => icon::PAUSE,
+            Item::Animations => icon::PLAY,
             Item::ZoomOut => icon::MINUS,
             Item::ZoomIn => icon::PLUS,
             Item::Wide if ctx.wide => icon::FOLD,
@@ -236,6 +250,7 @@ impl Item {
             #[cfg(feature = "toc")]
             Item::Contents => Command::Action(Action::ToggleToc),
             Item::Images => Command::Action(Action::ToggleRemote),
+            Item::Animations => Command::Action(Action::ToggleAnimations),
             Item::ZoomOut => Command::Action(Action::ZoomOut),
             Item::ZoomReset => Command::Action(Action::ZoomReset),
             Item::ZoomIn => Command::Action(Action::ZoomIn),
@@ -261,11 +276,13 @@ impl Item {
 /// The right group's items, left to right, with their logical widths and collapse groups: the
 /// lowest group collapses into `⋯` first. The remote-images button is the first, and only there
 /// when the document has remote images; it goes after the zoom (collapsed alone, `⋯` would take
-/// its place for nothing). Wide layout goes just before the theme and collapses just before it.
-/// Find goes after reload, and ⚙ is the last, and only there with a settings file.
+/// its place for nothing). The animations button follows it, only there when the document has an
+/// animated image, and goes with it. Wide layout goes just before the theme and collapses just
+/// before it. Find goes after reload, and ⚙ is the last, and only there with a settings file.
 #[cfg(feature = "find")]
-const RIGHT: [(Item, f32, u8); 9] = [
+const RIGHT: [(Item, f32, u8); 10] = [
     (Item::Images, BUTTON, 1),
+    (Item::Animations, BUTTON, 1),
     (Item::ZoomOut, BUTTON, 0),
     (Item::ZoomReset, PERCENT, 0),
     (Item::ZoomIn, BUTTON, 0),
@@ -276,8 +293,9 @@ const RIGHT: [(Item, f32, u8); 9] = [
     (Item::Settings, BUTTON, 6),
 ];
 #[cfg(not(feature = "find"))]
-const RIGHT: [(Item, f32, u8); 8] = [
+const RIGHT: [(Item, f32, u8); 9] = [
     (Item::Images, BUTTON, 1),
+    (Item::Animations, BUTTON, 1),
     (Item::ZoomOut, BUTTON, 0),
     (Item::ZoomReset, PERCENT, 0),
     (Item::ZoomIn, BUTTON, 0),
@@ -292,8 +310,14 @@ const RIGHT: [(Item, f32, u8); 8] = [
 const CONTENTS_GROUP: u8 = 7;
 
 /// The right group's items in this window.
-fn right_items(ctx: &Ctx) -> &'static [(Item, f32, u8)] {
-    &RIGHT[usize::from(ctx.remote == 0)..RIGHT.len() - 1 + usize::from(ctx.settings)]
+fn right_items(ctx: &Ctx) -> Vec<(Item, f32, u8)> {
+    let shown = |item| match item {
+        Item::Images => ctx.remote > 0,
+        Item::Animations => ctx.animated,
+        Item::Settings => ctx.settings,
+        _ => true,
+    };
+    RIGHT.into_iter().filter(|r| shown(r.0)).collect()
 }
 
 /// How many of the right group's leading groups don't fit and collapse into `⋯`.

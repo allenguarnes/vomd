@@ -366,6 +366,7 @@ fn template_is_all_defaults() {
         "font_size",
         "line_width",
         "wide",
+        "animations",
         "primary_selection",
         "font_sans",
         "font_mono",
@@ -633,6 +634,36 @@ fn toc_is_a_bool_saved_like_the_wide_toggle() {
     again.set("toc", "false", Instant::now());
     again.flush().unwrap();
     assert!(!Store::open(Some(path)).prefs().toc);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `animations` is off without a line for it, takes `on`/`off` like the other switches, and is
+/// saved as `on`/`off` over the template's commented default.
+#[test]
+fn animations_are_off_by_default_and_saved_like_the_wide_toggle() {
+    assert!(!Prefs::default().animations);
+    for (v, want) in [("on", true), ("True", true), ("off", false), ("0", false)] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("animations = {v}")));
+        assert_eq!(p.animations, want, "{v}");
+    }
+    for v in ["", "auto", "2"] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("animations = {v}")));
+        assert!(!p.animations, "{v:?} is ignored");
+    }
+    assert!(TEMPLATE.contains("# animations = off"));
+    assert!(TEMPLATE.contains("A toggles it"));
+    let dir = temp_dir("animations");
+    let path = dir.join("settings.ini");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&path, "theme = dark\n# animations = off\n").unwrap();
+    let mut st = Store::open(Some(path.clone()));
+    st.set("animations", "on", Instant::now());
+    st.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "theme = dark\nanimations = on\n"
+    );
+    assert!(Store::open(Some(path)).prefs().animations);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

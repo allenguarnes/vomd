@@ -4,7 +4,7 @@
 
 A tiny, fast Markdown viewer for Linux and Windows. Double-click a `.md` file and it appears,
 rendered the way GitHub shows it, in well under a tenth of a second. It is one binary with its
-fonts built in, 5.5 MB on Linux and 4.3 MB on Windows. It doesn't use a web engine or a GUI
+fonts built in, 5.6 MB on Linux and 4.3 MB on Windows. It doesn't use a web engine or a GUI
 toolkit, and it never touches the network unless you ask it to.
 
 - **CommonMark and GitHub Flavored Markdown**: tables, task lists, strikethrough, footnotes,
@@ -20,6 +20,10 @@ toolkit, and it never touches the network unless you ask it to.
   clicking loads it anyway (Ctrl+click when the image is a link). Loading it can use a lot of
   memory and time (an SVG stops after 3 seconds, but a clicked one runs until it is done or has
   used 120 seconds of CPU), and it's abandoned if you leave the page.
+- **Animated GIFs and WebPs**: off by default; `A`, the toolbar's play button or
+  `animations = on` plays them, with the frame timing browsers use. A paused one shows a ▶ badge,
+  and a click plays or pauses that image alone (Ctrl+click when it is a link). They play only
+  while on screen and the window can be seen, within the same image memory as still images.
 - **Selecting and copying text**: drag, double-click a word, triple-click a block, or press
   `Ctrl+A`; `Ctrl+C` copies it as plain text, and on X11 and Wayland what you select is also
   pasted by a middle click. A code block shows a copy button, as on GitHub, when the pointer is
@@ -172,12 +176,14 @@ Each window is its own process, so opening another file starts another window.
 | `Ctrl+A`, `Ctrl+C` `Ctrl+X` `Ctrl+V` | In the find bar's field: select all, copy, cut, paste (`Ctrl+Insert`, `Shift+Insert` too) |
 | `W` | Wide layout on / off: the text spans the window instead of stopping at `line_width` |
 | `I` | Load remote images for this document (press again to hide them) |
+| `A` | Animations on / off: animated GIFs and WebPs play, or show their first frame (for every image, whatever was clicked) |
 | `R`, `F5` | Reload |
 | Click a link | Follow it; hover shows where it goes |
 | Drag | Select text (a drag that starts on a link selects, and doesn't follow it) |
 | Double-click, triple-click | Select a word, a paragraph (or a heading, code block, table row) |
 | `Shift` + click | Extend the selection |
 | Click an image's placeholder marked *click to load* | Load it beyond VOMD's limits (`Ctrl` + click when the image is a link) |
+| Click an animated image | Play or pause it alone, beyond VOMD's limits if it is over them (`Ctrl` + click when the image is a link) |
 | Click the copy button of a code block | Copy the block's code (the button shows at the block's upper right while the pointer is over it) |
 | `Ctrl+A` | Select everything |
 | `Ctrl+C`, `Ctrl+Insert` | Copy the selection |
@@ -277,11 +283,12 @@ it with every key listed and commented out:
 | `font_size` | `16` (10–32) |
 | `line_width` | `80` (40–200 characters) |
 | `wide` | `false`, `true` (the text spans the window; `line_width` is ignored) |
+| `animations` | `off`, `on` (animated GIFs and WebPs play; `A` toggles it) |
 | `primary_selection` | `on`, `off` (X11 and Wayland: selecting text offers it for a middle click; `Ctrl+C` is not affected, and neither is pasting with a middle click in the find bar's field) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed family such as `Noto Sans` |
 
-Theme, zoom, toolbar, contents panel, wide layout and window size are saved automatically when you
-change them.
+Theme, zoom, toolbar, contents panel, wide layout, animations and window size are saved
+automatically when you change them.
 
 ## Privacy
 
@@ -311,10 +318,10 @@ can be stopped: after 3 seconds, or after 120 seconds of CPU when you clicked to
 - On Windows, emoji come from Segoe UI Emoji, which has no flags: a flag shows as its two
   letters, as in other Windows apps.
 - Math and Mermaid show as text and code.
-- Animated GIFs and WebPs show their first frame.
+- An animated WebP with an EXIF orientation shows its first frame only.
 - SVGs: text uses VOMD's fonts (Inter and JetBrains Mono, or your `font_sans`/`font_mono`), so
   it can look different from a browser's. Images embedded in an SVG are drawn; references to
-  other files or URLs are never followed. There is no animation or scripting.
+  other files or URLs are never followed. SVG animation isn't played, and there is no scripting.
 - AVIF, HEIC, BMP, TIFF and ICO images show their alt text.
 - `<img>` sizes in `em`, `vw` and other units than px and % are ignored.
 
@@ -324,7 +331,7 @@ can be stopped: after 3 seconds, or after 120 seconds of CPU when you clicked to
 checks; CI also runs clippy, the tests and the size budget on Windows. `cargo xtask budgets` measures every performance budget against a release build (it
 needs a display). `cargo xtask images` runs the image memory tests, each in its own process and
 as many at once as there are CPUs (`-j N`, `--runs K` to repeat), much faster than
-`cargo test` on a machine with several cores. `just fuzz <doc|image|layout|settings|svg>
+`cargo test` on a machine with several cores. `just fuzz <doc|image|anim|layout|settings|svg>
 [seconds]` fuzzes on the stable toolchain.
 `vendor/` holds three crates VOMD patches, used through `[patch.crates-io]`: resvg 0.46 (its
 raster images go to VOMD's decoders, and drawing can be cancelled), image-webp 0.2.4 (a

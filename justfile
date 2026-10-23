@@ -33,7 +33,7 @@ budgets:
 images *args:
     cargo xtask images {{args}}
 
-# Fuzz a target (doc, image, layout, settings, svg) on stable for SECONDS.
+# Fuzz a target (doc, image, anim, layout, settings, svg) on stable for SECONDS.
 fuzz target seconds="60":
     scripts/fuzz.sh {{target}} {{seconds}}
 

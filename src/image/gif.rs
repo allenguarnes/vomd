@@ -1,12 +1,18 @@
 //! GIF: the first frame, as a browser shows a still GIF and the first moment of an animated
 //! one. Its size and cost come from the blocks before the first image ([`walk`]); the decoder is
 //! given those blocks without their extensions (all but the frame's graphic control: no XMP,
-//! ICC profile or comment is kept), and its rows are streamed to the resampler as RGBA.
+//! ICC profile or comment is kept), and its rows are streamed to the resampler as RGBA. An
+//! animation's frames are found by [`frames`] and decoded one at a time by [`frame`], the same
+//! way (`anim.rs` draws them).
 
 use std::io::{Read, Seek};
 use std::sync::atomic::AtomicBool;
 
-use super::{Bitmap, Format, Header, MAX_HEADER_SCAN, Rows, Sampling, cancelled, resample_rows};
+use super::anim::{Dispose, Entry, Found, Head};
+use super::{
+    Bitmap, Format, GIF_FIXED, Header, Loops, MAX_HEADER_SCAN, Rows, Sampling, cancelled,
+    resample_rows,
+};
 
 /// What [`walk`] finds before the first image of a GIF.
 struct Blocks {
@@ -200,6 +206,187 @@ pub(super) fn decode(
     }
     let size = (u32::from(b.screen.0), u32::from(b.screen.1));
     resample_rows(&mut rows, size, 4, (w, h), sampling, cancel)
+}
+
+/// Past the sub-blocks starting at `at` (each its length and as many bytes, to one of length 0):
+/// `None` if `bytes` ends first.
+fn sub_blocks(bytes: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let len = usize::from(*bytes.get(at)?);
+        at += 1 + len;
+        if len == 0 {
+            return Some(at);
+        }
+    }
+}
+
+/// The frames of the GIF `bytes`, each given to `each` in order until it says stop: every image
+/// after the screen descriptor and global color table, with the delay, disposal and transparent
+/// color of the last graphic control before it, and the loop count of a `NETSCAPE2.0` (or
+/// `ANIMEXTS1.0`) extension; to the trailer, or the first block that is neither, or is cut short,
+/// or is an image with no pixels (a frame is only given if its data is whole). The screen is the
+/// one [`walk`] makes for the first frame. `None` if `walk` finds no first frame. Reads block
+/// headers and sub-block lengths only.
+pub(super) fn frames(bytes: &[u8], mut each: impl FnMut(Found) -> bool) -> Option<Head> {
+    let b = walk(&mut std::io::Cursor::new(bytes.get(2..)?))?;
+    let le = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let mut at = 13 + usize::try_from(b.table).ok()?;
+    // The last graphic control's disposal, delay (cs) and transparent index.
+    let mut control = (Dispose::Keep, 0u16, None);
+    // No loop extension: played once.
+    let mut loops = Loops::Plays(1);
+    loop {
+        match bytes.get(at) {
+            Some(0x21) => {
+                let Some(&label) = bytes.get(at + 1) else {
+                    break;
+                };
+                let data = at + 2;
+                if let (0xF9, Some([4, g @ ..])) = (label, bytes.get(data..data + 5)) {
+                    let dispose = match (g[0] >> 2) & 7 {
+                        2 => Dispose::Background,
+                        3 => Dispose::Previous,
+                        _ => Dispose::Keep,
+                    };
+                    control = (dispose, le(g, 1), (g[0] & 1 != 0).then_some(g[3]));
+                }
+                if label == 0xFF
+                    && matches!(
+                        bytes.get(data..data + 12),
+                        Some([
+                            11, b'N', b'E', b'T', b'S', b'C', b'A', b'P', b'E', b'2', b'.', b'0'
+                        ]) | Some([
+                            11, b'A', b'N', b'I', b'M', b'E', b'X', b'T', b'S', b'1', b'.', b'0'
+                        ])
+                    )
+                    && let Some([3, 1, lo, hi]) = bytes.get(data + 12..data + 16)
+                {
+                    // Repetitions after the first play, as Chrome and Firefox read it.
+                    loops = match u16::from_le_bytes([*lo, *hi]) {
+                        0 => Loops::Forever,
+                        n => Loops::Plays(u32::from(n) + 1),
+                    };
+                }
+                let Some(end) = sub_blocks(bytes, data) else {
+                    break;
+                };
+                at = end;
+            }
+            Some(0x2C) => {
+                let Some(d) = bytes.get(at + 1..at + 10) else {
+                    break;
+                };
+                let rect = [le(d, 0), le(d, 2), le(d, 4), le(d, 6)];
+                let local = if d[8] & 0x80 != 0 {
+                    3 << ((d[8] & 7) + 1)
+                } else {
+                    0
+                };
+                // The LZW code size, then the data's sub-blocks.
+                let Some(end) = sub_blocks(bytes, at + 10 + local + 1) else {
+                    break;
+                };
+                let (Ok(start), Ok(len)) = (u32::try_from(at), u32::try_from(end - at)) else {
+                    break;
+                };
+                if rect[2] == 0 || rect[3] == 0 {
+                    break;
+                }
+                let (dispose, delay, transparent) =
+                    std::mem::replace(&mut control, (Dispose::Keep, 0, None));
+                let pixels = usize::from(rect[2]) * usize::from(rect[3]);
+                let found = Found {
+                    entry: Entry {
+                        at: start,
+                        len,
+                        rect,
+                        delay: u32::from(delay) * 10,
+                        dispose,
+                        blend: false,
+                        transparent,
+                    },
+                    out: pixels,
+                    working: GIF_FIXED,
+                };
+                if !each(found) {
+                    break;
+                }
+                at = end;
+            }
+            _ => break,
+        }
+    }
+    let table = u32::try_from(b.table).ok()?;
+    Some(Head {
+        size: (u32::from(b.screen.0), u32::from(b.screen.1)),
+        loops,
+        table,
+    })
+}
+
+/// Frame `e` of the GIF `bytes` (whose global color table is `table` bytes, see [`frames`]): its
+/// palette indices into `out` (its width × height, rows in order: an interlaced frame's are put
+/// in place), and its colors into `colors`, premultiplied, 0 for the transparent index and for
+/// those past the palette's end (they leave the canvas as it is). The decoder is given the
+/// screen, the global color table and the frame's own blocks, and holds at most
+/// [`GIF_FIXED`] beside `out`. `None` if the frame doesn't decode, or `cancel` is set.
+pub(super) fn frame(
+    bytes: &[u8],
+    table: u32,
+    e: &Entry,
+    colors: &mut [u32; 256],
+    out: &mut Vec<u8>,
+    cancel: &AtomicBool,
+) -> Option<()> {
+    let table = bytes.get(13..13 + table as usize)?;
+    let (at, len) = (e.at as usize, e.len as usize);
+    let blocks = bytes.get(at..at.checked_add(len)?)?;
+    // The screen isn't checked against the frame, which may reach past it (it is clipped): it is
+    // only made a size the decoder takes.
+    let mut head = [0u8; 13];
+    head.copy_from_slice(bytes.get(..13)?);
+    head[6..10].copy_from_slice(&[1, 0, 1, 0]);
+    // (The still's stream with no control block: one type, so the decoder is built in once.)
+    let stream = (&head[..]).chain(table).chain(&[][..]).chain(blocks);
+    let (fw, fh) = e.size();
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    let limit = std::num::NonZeroU64::new((fw * fh) as u64)?;
+    options.set_memory_limit(gif::MemoryLimit::Bytes(limit));
+    options.check_frame_consistency(false);
+    let mut d = options.read_info(stream).ok()?;
+    let f = d.next_frame_info().ok()??;
+    if [f.left, f.top, f.width, f.height] != e.rect {
+        return None;
+    }
+    let interlaced = f.interlaced;
+    colors.fill(0);
+    for (c, rgb) in colors.iter_mut().zip(d.palette().ok()?.as_chunks::<3>().0) {
+        *c = 0xFF00_0000 | u32::from(rgb[0]) << 16 | u32::from(rgb[1]) << 8 | u32::from(rgb[2]);
+    }
+    if let Some(t) = e.transparent {
+        colors[usize::from(t)] = 0;
+    }
+    out.clear();
+    out.resize(fw * fh, 0);
+    // Interlaced rows come in four passes: every eighth from 0, every eighth from 4, every
+    // fourth from 2, every second from 1.
+    let passes: &[(usize, usize)] = if interlaced {
+        &[(0, 8), (4, 8), (2, 4), (1, 2)]
+    } else {
+        &[(0, 1)]
+    };
+    for &(start, step) in passes {
+        for y in (start..fh).step_by(step) {
+            if cancelled(cancel) {
+                return None;
+            }
+            if !d.fill_buffer(&mut out[y * fw..(y + 1) * fw]).ok()? {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 /// A GIF's first frame as rows of its screen, RGBA: from the decoder a row at a time, or from

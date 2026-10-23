@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [doc, image, layout, settings, svg]
+        target: [doc, image, anim, layout, settings, svg]
     steps:
       - uses: actions/checkout@v4
       - name: Nightly and cargo-fuzz
@@ -37,6 +37,8 @@ jobs:
             cp fixtures/images/* fuzz/corpus/image/
           elif [ "${{ matrix.target }}" = svg ]; then
             cp fixtures/images/*.svg* fuzz/corpus/svg/
+          elif [ "${{ matrix.target }}" = anim ]; then
+            cp fixtures/images/*.gif fixtures/images/*.webp fuzz/corpus/anim/
           elif [ "${{ matrix.target }}" != settings ]; then
             find fixtures -maxdepth 1 -name '*.md' -size -16k -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
           fi
@@ -49,7 +51,7 @@ jobs:
       - name: Fuzz
         run: |
           case ${{ matrix.target }} in
-            doc | image | svg) max_len=65536 ;; layout) max_len=16384 ;; *) max_len=4096 ;;
+            doc | image | anim | svg) max_len=65536 ;; layout) max_len=16384 ;; *) max_len=4096 ;;
           esac
           # An SVG that takes long to draw is what the `svg` target looks for.
           timeout=10; extra=

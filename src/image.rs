@@ -22,6 +22,8 @@ use crate::doc::{Doc, ImageRef};
 use crate::layout::{ImageSize, Layout, Refusal};
 use crate::settings::RemoteImages;
 
+#[cfg(feature = "images")]
+mod anim;
 mod exif;
 #[cfg(feature = "images")]
 mod forced;
@@ -89,6 +91,37 @@ pub struct Bitmap {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u32>,
+}
+
+/// How many times an animation plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loops {
+    Forever,
+    /// Plays in all, at least one.
+    Plays(u32),
+}
+
+/// An animated GIF or WebP, as the worker finds it when it decodes the first frame: two frames
+/// or more. Its canvas (the size of its first frame's bitmap before resampling) and loop count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnimInfo {
+    pub size: (u32, u32),
+    pub loops: Loops,
+}
+
+/// What an animated image does, as its badge, its hover note and a click see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimState {
+    /// It plays (or will, once its frames are made).
+    Playing,
+    /// The window's animations are off, the reader paused it, or it has played to its end.
+    Paused,
+    /// It doesn't fit beside the animations above it on screen: it plays once they scroll off.
+    Waiting,
+    /// It is over VOMD's limits for one animation: only a click plays it.
+    Over,
+    /// Its frames couldn't be fetched (its still is shown): a click tries again.
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +238,53 @@ pub fn header(r: &mut (impl Read + Seek)) -> Option<(Format, u32, u32)> {
         let (w, h2) = h.shown();
         (h.format, w, h2)
     })
+}
+
+/// Plays the animated GIF or WebP `bytes` from its first frame for `steps` frames at most, at its
+/// own size, giving `each` the frame drawn, the canvas (premultiplied `0xAARRGGBB`) and what of
+/// it changed (left, top, width, height), for tests and the fuzzer, which count what it
+/// allocates. Returns the canvas's size and what playing it is charged beside `bytes` and what is
+/// made of the canvas; `None` if it isn't an animation, or that is over `room` (checked once the
+/// index is made, which is small, before the canvas is).
+#[cfg(feature = "images")]
+#[doc(hidden)]
+pub fn play_frames(
+    bytes: &[u8],
+    steps: usize,
+    room: usize,
+    mut each: impl FnMut(usize, &[u32], [u32; 4]),
+) -> Option<((u32, u32), usize)> {
+    let mut index = anim::Index::new(bytes)?;
+    let held = index.held();
+    if held > room {
+        return None;
+    }
+    let mut canvas = anim::Canvas::new(&index);
+    for _ in 0..steps {
+        match canvas.step(&mut index, bytes, &NO_CANCEL) {
+            anim::Advance::Drawn { frame, dirty, .. } => {
+                each(frame, &canvas.px, [dirty.x, dirty.y, dirty.w, dirty.h]);
+            }
+            _ => break,
+        }
+    }
+    Some((index.size, held))
+}
+
+/// Plays the animated GIF or WebP `bytes` resampled to `size` until `shows` frames were shown,
+/// as the window and the anim thread play it ([`anim::play_box`]), for tests that count what it
+/// allocates or look at its frames. Returns what it is charged beside `bytes`; `None` if it isn't
+/// an animation, or that is over `room`.
+#[cfg(feature = "images")]
+#[doc(hidden)]
+pub fn play_box(
+    bytes: Arc<Vec<u8>>,
+    size: (u32, u32),
+    shows: usize,
+    room: usize,
+    each: impl FnMut(&Bitmap),
+) -> Option<usize> {
+    anim::play_box(bytes, size, shows, room, each)
 }
 
 /// [`header`] of an image in memory.
@@ -1569,23 +1649,27 @@ fn resample_rows(
                 *a += r * weight;
             }
         }
-        for px in acc.as_chunks::<4>().0 {
-            // Color sums carry a factor 255 from the alpha they're premultiplied by.
-            let ch = |v: f32, scale: f32| (v / scale).round().clamp(0.0, 255.0) as u32;
-            let a = ch(px[3], 1.0);
-            let (r, g, b) = (
-                ch(px[0], 255.0).min(a),
-                ch(px[1], 255.0).min(a),
-                ch(px[2], 255.0).min(a),
-            );
-            data.push(a << 24 | r << 16 | g << 8 | b);
-        }
+        data.extend(acc.as_chunks::<4>().0.iter().map(pack));
     }
     rows.finish().then_some(Bitmap {
         width: w,
         height: h,
         data,
     })
+}
+
+/// A target pixel's sums (premultiplied r, g, b and alpha, as [`reduce_row`] makes them) as
+/// premultiplied `0xAARRGGBB`.
+fn pack(px: &[f32; 4]) -> u32 {
+    // Color sums carry a factor 255 from the alpha they're premultiplied by.
+    let ch = |v: f32, scale: f32| (v / scale).round().clamp(0.0, 255.0) as u32;
+    let a = ch(px[3], 1.0);
+    let (r, g, b) = (
+        ch(px[0], 255.0).min(a),
+        ch(px[1], 255.0).min(a),
+        ch(px[2], 255.0).min(a),
+    );
+    a << 24 | r << 16 | g << 8 | b
 }
 
 /// One source row (`channels` bytes a pixel) averaged along its width into `out`, four floats
@@ -1816,6 +1900,11 @@ enum Data {
     /// A fetched remote image's bytes, to decode at whatever size its box needs.
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
     Bytes(Bytes),
+    /// An animation playing (or paused) in a box ([`anim::Playing`]): the frame it shows, and
+    /// what makes the next. It is charged [`anim::Playing::cost`], what it holds at most, also
+    /// while a step runs on the anim thread with its engine.
+    #[cfg(feature = "images")]
+    Anim(Box<anim::Playing>),
 }
 
 struct Slot {
@@ -1860,6 +1949,8 @@ impl Slot {
         let buffer = match &self.data {
             Data::Pixels(b) => b.data.capacity() * 4,
             Data::Bytes(b) => b.capacity(),
+            #[cfg(feature = "images")]
+            Data::Anim(p) => p.cost,
         };
         let key = match &self.key {
             Key::Local(_) => 0,
@@ -1877,7 +1968,7 @@ impl Slot {
     fn pixels(&self) -> Option<&Bitmap> {
         match &self.data {
             Data::Pixels(b) => Some(b),
-            Data::Bytes(_) => None,
+            _ => None,
         }
     }
 
@@ -1899,6 +1990,10 @@ impl Slot {
             || match &self.data {
                 Data::Pixels(_) => self.painted_in(frame),
                 Data::Bytes(_) => self.used >= frame,
+                // (Its engine is on the anim thread while a step runs: what that holds stays
+                // charged until it is back.)
+                #[cfg(feature = "images")]
+                Data::Anim(p) => self.painted_in(frame) || p.running,
             }
     }
 
@@ -1927,6 +2022,11 @@ struct Cache {
     /// per-URL records, the slot list itself: [`Images::bookkeeping_bytes`]), which comes out of
     /// the budget too, so that whatever a container keeps is paid for by the room it takes.
     overhead: usize,
+    /// What the anim thread's jobs hold outside the slots: an animation's file and index while
+    /// it is read, and the steps of animations whose slots went while they ran
+    /// ([`anim::Anims::out`]).
+    #[cfg(feature = "images")]
+    anims: usize,
     /// The URLs of the remote slots removed since [`Images::forget_evicted`] last looked: what is
     /// kept of a URL that has no slot left, and isn't the document's, is forgotten.
     dropped: Vec<Arc<str>>,
@@ -1951,6 +2051,8 @@ impl Cache {
             reserve: 0,
             fetching: 0,
             overhead: 0,
+            #[cfg(feature = "images")]
+            anims: 0,
             dropped: Vec::new(),
             expect: 0,
             floor: 0,
@@ -1960,9 +2062,13 @@ impl Cache {
 
     /// What is set aside beside the slots: decoding, the fetchers, the bookkeeping.
     fn held(&self) -> usize {
-        self.reserve
+        let held = self
+            .reserve
             .saturating_add(self.fetching)
-            .saturating_add(self.overhead)
+            .saturating_add(self.overhead);
+        #[cfg(feature = "images")]
+        let held = held.saturating_add(self.anims);
+        held
     }
 
     /// What the slot list holds, and the list of URLs waiting to be forgotten: the capacity of
@@ -2078,6 +2184,8 @@ impl Cache {
                         (a.width, a.height) == (b.width, b.height)
                     }
                     (Data::Bytes(_), Data::Bytes(_)) => true,
+                    #[cfg(feature = "images")]
+                    (Data::Anim(_), Data::Anim(_)) => true,
                     _ => false,
                 }
         };
@@ -2098,6 +2206,8 @@ impl Cache {
         // for one that has the image keeps them, and until then anything may have the room.)
         let used = match data {
             Data::Pixels(_) if current => self.frame,
+            #[cfg(feature = "images")]
+            Data::Anim(_) => self.frame,
             _ => 0,
         };
         let slot = Slot {
@@ -2130,6 +2240,8 @@ impl Cache {
             if match &s.data {
                 Data::Pixels(b) => (b.width, b.height) == (w, h),
                 Data::Bytes(_) => true,
+                #[cfg(feature = "images")]
+                Data::Anim(_) => false,
             } && s.key == *key
             {
                 s.protect = true;
@@ -2230,7 +2342,13 @@ impl Cache {
     /// ([`Cache::stuck`]) and what is set aside ([`Cache::held`]), once everything that can be is:
     /// nothing is evicted to find out.
     fn can_fit(&self, extra: usize) -> bool {
+        self.can_fit_without(extra, 0)
+    }
+
+    /// [`Cache::can_fit`] with `freed` of what can't be evicted let go.
+    fn can_fit_without(&self, extra: usize, freed: usize) -> bool {
         self.stuck()
+            .saturating_sub(freed)
             .saturating_add(self.held())
             .saturating_add(extra)
             <= self.cap
@@ -2254,6 +2372,8 @@ impl Cache {
         reserve: usize,
         fetching: usize,
     ) -> bool {
+        #[cfg(feature = "images")]
+        let kept = kept.saturating_add(self.anims);
         kept.saturating_add(self.overhead)
             .saturating_add(reserve)
             .saturating_add(fetching)
@@ -2316,6 +2436,11 @@ impl Cache {
             let k = keep(s);
             if !k {
                 debug_assert!(!s.pinned(), "a slot a decode holds was dropped");
+                #[cfg(feature = "images")]
+                debug_assert!(
+                    !matches!(&s.data, Data::Anim(p) if p.running),
+                    "an animation whose step runs was dropped"
+                );
                 *bytes -= s.cost();
                 if let Key::Remote(url) = &s.key {
                     dropped.push(url.clone());
@@ -2474,6 +2599,9 @@ pub(crate) enum Done {
         refused: Option<Refusal>,
         /// An SVG drawn without some of its embedded images, for VOMD's limits.
         skipped: bool,
+        /// The pixels are an animation's first frame ([`anim::detect`]).
+        #[cfg(feature = "images")]
+        anim: Option<AnimInfo>,
         /// The job was told to stop and made nothing: its image is given up already.
         cancelled: bool,
         /// The worker that made it, which waits until the result is taken ([`Worker::taken`]).
@@ -2486,6 +2614,9 @@ pub(crate) enum Done {
         origin: forced::Origin,
         result: Result<forced::Loaded, Refusal>,
     },
+    /// The anim thread did job `serial` ([`anim::Job`]).
+    #[cfg(feature = "images")]
+    Anim { serial: u64, output: anim::Output },
     /// A remote image was fetched: its bytes and natural size, or why not.
     #[cfg(feature = "remote-images")]
     Fetched {
@@ -2600,6 +2731,8 @@ impl Worker {
                 need: made.need,
                 refused: made.refused,
                 skipped: made.skipped,
+                #[cfg(feature = "images")]
+                anim: made.anim,
                 cancelled: made.cancelled,
                 worker: theirs.clone(),
             };
@@ -2750,6 +2883,8 @@ struct Made {
     need: Option<SvgCost>,
     refused: Option<Refusal>,
     skipped: bool,
+    #[cfg(feature = "images")]
+    anim: Option<AnimInfo>,
     /// The job was told to stop ([`Images::expire`]) and made nothing: the image was given up
     /// already, and has its own reason, not this result's.
     cancelled: bool,
@@ -2830,8 +2965,11 @@ fn decode_in(bytes: &[u8], job: &Job, room: usize, state: &mut WorkerState) -> M
         &state.cancel,
         fonts,
     ) {
+        // Whether the image is animated is read from the bytes held already: block and chunk
+        // headers only, nothing allocated.
         Ok(b) => Made {
             bitmap: Some(b),
+            anim: anim::detect(bytes),
             ..Made::default()
         },
         Err(refused) => Made {
@@ -2992,6 +3130,14 @@ pub struct Images {
     /// SVGs drawn without some of their embedded images, for VOMD's limits: a click draws them
     /// with ([`Images::force`]).
     partial: Vec<Key>,
+    /// The animated images found by their decodes ([`Done::Decoded::anim`]): the current
+    /// document's local ones, and the remote ones of its URLs or cached (a remote image's pixels
+    /// may be cached from another document, and not decoded again).
+    #[cfg(feature = "images")]
+    animated: Vec<(Key, AnimInfo)>,
+    /// The animations, besides those in the cache ([`anim::Anims`]).
+    #[cfg(feature = "images")]
+    anims: anim::Anims,
     /// An image was chosen to load past the limits since the last poll: it is laid out anew.
     repaint: bool,
     /// The loads past the limits the reader asked for ([`forced`]).
@@ -3226,6 +3372,10 @@ impl Default for Images {
             held_due: false,
             refused: Vec::new(),
             partial: Vec::new(),
+            #[cfg(feature = "images")]
+            animated: Vec::new(),
+            #[cfg(feature = "images")]
+            anims: anim::Anims::default(),
             repaint: false,
             #[cfg(feature = "images")]
             forced: forced::Forced::default(),
@@ -3467,6 +3617,7 @@ impl Images {
         // when they are in view.
         #[cfg(feature = "images")]
         {
+            self.detach_anims();
             self.forced.abandon();
             self.forced.stale();
             self.forced_ids = Vec::new();
@@ -3697,6 +3848,8 @@ impl Images {
                     match &s.data {
                         Data::Pixels(b) => format!("pixels {}x{}", b.width, b.height),
                         Data::Bytes(_) => "bytes".to_string(),
+                        #[cfg(feature = "images")]
+                        Data::Anim(p) => format!("animation {}x{}", p.size.0, p.size.1),
                     },
                     if s.unevictable(c.frame) { " kept" } else { "" },
                     if s.pinned() { " pinned" } else { "" },
@@ -3876,6 +4029,8 @@ impl Images {
     /// A new frame is being painted: what it paints is the most recently used.
     pub fn begin_frame(&mut self) {
         self.cache.frame += 1;
+        #[cfg(feature = "images")]
+        self.anims.placed.clear();
     }
 
     /// Ask for the boxes near the viewport, most wanted first: (image id, width, height) in
@@ -4043,6 +4198,8 @@ impl Images {
         let mut fetch: Vec<Arc<str>> = Vec::new();
         #[cfg(feature = "remote-images")]
         let mut deferred: Vec<Arc<str>> = Vec::new();
+        #[cfg(feature = "remote-images")]
+        let mut anim_bodies: Vec<Key> = Vec::new();
         let mut wanted = 0usize;
         // The bodies that decodes read are held in the cache beside them (a job's source is an
         // `Arc` of the slot's bytes: [`Slot::pinned`]), so what is kept for the images near the
@@ -4116,6 +4273,10 @@ impl Images {
             }
             if cached {
                 self.cache.touch(&key, w, h);
+                #[cfg(feature = "remote-images")]
+                if n < on_screen {
+                    anim_bodies.push(key);
+                }
                 continue;
             }
             // The allowance is for as much work as was worked out.
@@ -4272,6 +4433,13 @@ impl Images {
         // meets when it arrives (`Cache::room_for`), so if the state doesn't change it is
         // admitted and the loop is over, and if it does not fit nothing is fetched until
         // something changes. (Its image coming into view is the other way: handled above.)
+        #[cfg(feature = "remote-images")]
+        for key in anim_bodies {
+            if let Some(url) = self.body_for_anim(&key, reserve) {
+                fetch.push(url);
+                starting = true;
+            }
+        }
         #[cfg(feature = "remote-images")]
         for url in deferred {
             let fits = self.deferred_need(&url).is_some_and(|(cost, decode)| {
@@ -4660,6 +4828,13 @@ impl Images {
         #[cfg(feature = "remote-images")]
         let paused = self.remote.paused();
         while let Ok(done) = self.rx.try_recv() {
+            // A frame made ahead shows when it is due ([`Images::anim_deadline`]): only an
+            // animation's first frame needs a repaint now.
+            #[cfg(feature = "images")]
+            if let Done::Anim { serial, output } = done {
+                any |= self.anim_done(serial, output);
+                continue;
+            }
             any = true;
             self.take_done(done, Some((doc, &mut *layout)));
         }
@@ -4701,6 +4876,14 @@ impl Images {
                 self.sync_remote(doc, layout);
             }
         }
+        // The animations painted are made their next frames, and those asked for are read.
+        #[cfg(feature = "images")]
+        self.pump_anims();
+        // (What the steps and the results above did to the states painted last.)
+        #[cfg(feature = "images")]
+        {
+            any |= self.state_changed();
+        }
         self.cache.unprotect();
         any
     }
@@ -4718,6 +4901,8 @@ impl Images {
                 need,
                 refused,
                 skipped,
+                #[cfg(feature = "images")]
+                anim,
                 cancelled,
                 worker,
             } => {
@@ -4742,13 +4927,24 @@ impl Images {
                 }
                 match bitmap {
                     Some(b) => {
+                        // (Kept, as any body, for an animation that is to play: it is played
+                        // from it.)
                         #[cfg(feature = "remote-images")]
-                        if let Key::Remote(url) = &key {
+                        if let Key::Remote(url) = &key
+                            && !(anim.is_some() && self.anims.wanted(&key))
+                        {
                             self.cache.release_bytes(url);
                         }
                         // (At most one entry an image of the document, cleared with it.)
                         if skipped && !self.partial.contains(&key) {
                             self.partial.push(key.clone());
+                        }
+                        // (At most one entry an image too: one decoded again finds it there.)
+                        #[cfg(feature = "images")]
+                        if let Some(info) = anim
+                            && !self.animated.iter().any(|(k, _)| *k == key)
+                        {
+                            self.animated.push((key.clone(), info));
                         }
                         self.decodes += 1;
                         self.charge_bookkeeping();
@@ -4759,12 +4955,20 @@ impl Images {
                         let (w, h) = (b.width, b.height);
                         let current = doc_gen == self.doc_gen;
                         let key_kept = key.clone();
-                        if self.store(key, Data::Pixels(b), current).is_ok() && page.is_some() {
-                            // (Kept to the end of the poll that took it: the window paints it
-                            // next, and what the rest of the poll does, the bodies it lets in and
-                            // the room it makes, doesn't take it out first. After the poll
-                            // nothing keeps it but a frame that painted it.)
-                            self.cache.protect(&key_kept, w, h);
+                        if self.store(key, Data::Pixels(b), current).is_ok() {
+                            if page.is_some() {
+                                // (Kept to the end of the poll that took it: the window paints
+                                // it next, and what the rest of the poll does, the bodies it
+                                // lets in and the room it makes, doesn't take it out first.
+                                // After the poll nothing keeps it but a frame that painted it.)
+                                self.cache.protect(&key_kept, w, h);
+                            }
+                        } else {
+                            // (No place: nothing holds a late result's URL, nor what it found.)
+                            #[cfg(feature = "images")]
+                            if !self.anim_owned(&key_kept) {
+                                self.animated.retain(|(k, _)| *k != key_kept);
+                            }
                         }
                     }
                     // It could not be decoded: the data is bad, or over VOMD's limits. The image
@@ -4783,6 +4987,10 @@ impl Images {
                 origin,
                 result,
             } => self.take_forced(doc_gen, origin, result, page),
+            #[cfg(feature = "images")]
+            Done::Anim { serial, output } => {
+                self.anim_done(serial, output);
+            }
             #[cfg(feature = "remote-images")]
             Done::Fetched { url, result } => self.arrived(url, result, page.is_some()),
         }
@@ -4994,6 +5202,16 @@ impl Images {
             }));
             self.remote
                 .retain_sizes(|u, size| urls.contains(u) || (size.is_some() && cached.contains(u)));
+            // What is known of a remote animation lives as long as its still or animation is
+            // cached, or the document has it: back at it, nothing is decoded again to find it
+            // out. Past that it is forgotten ([`Images::forget_evicted`] does so for a slot
+            // evicted later).
+            #[cfg(feature = "images")]
+            {
+                let owned =
+                    |k: &Key| matches!(k, Key::Remote(u) if urls.contains(u) || cached.contains(u));
+                keep_anims(&mut self.animated, &mut self.anims, &owned);
+            }
         }
         if let Some(extra) = fit {
             fit_map(&mut self.deferred, extra);
@@ -5021,6 +5239,13 @@ impl Images {
     /// (the box is known when it is asked for, and the reserve is made then).
     #[cfg(feature = "remote-images")]
     fn decode_estimate(&self, url: &Arc<str>, bytes: &Bytes) -> usize {
+        // A body fetched again for its animation isn't decoded (its still is cached): what reading
+        // it holds is charged by `start_anim`. (A key left in `fetched` whose still was evicted
+        // since is fetched for the image.)
+        #[cfg(feature = "images")]
+        if self.cache.has_url(url) && self.anims.is_fetched(url) {
+            return 0;
+        }
         let Some(header) = info_of(bytes) else {
             return 0;
         };
@@ -5243,7 +5468,20 @@ impl Images {
             !own || self.remote.has_room_for(&url),
             "the table of sizes has room for the document's URLs"
         );
-        let taken = self.remote.take_fetched(&url, result, own);
+        // An animation's body that couldn't be fetched is the animation's failure, not the image's:
+        // its still is shown, so the size and the still it has stay; a click asks again.
+        #[cfg(feature = "images")]
+        let lost = matches!(&result, Err(e) if !matches!(e, crate::remote::Error::NoCurl | crate::remote::Error::Yielded))
+            && self.body_lost(&url);
+        #[cfg(not(feature = "images"))]
+        let lost = false;
+        let taken = if lost {
+            None
+        } else {
+            self.remote.take_fetched(&url, result, own)
+        };
+        #[cfg(feature = "images")]
+        let arrived = taken.is_some();
         if keep {
             self.undefer(&url);
         }
@@ -5273,6 +5511,19 @@ impl Images {
                 }
             }
             (_, taken) => drop(taken),
+        }
+        // An animation's body is asked for again until it comes, kept or not (dropped for room, it
+        // is asked for again once it would fit: `body_for_anim` looks at the record of the drop).
+        #[cfg(feature = "images")]
+        self.anims
+            .fetched
+            .retain(|k| !matches!(k, Key::Remote(u) if *u == url));
+        // (A body that came, whatever it was fetched for, ends the failure of its animation.)
+        #[cfg(feature = "images")]
+        if arrived {
+            self.anims
+                .failed
+                .retain(|k| !matches!(k, Key::Remote(u) if *u == url));
         }
         // The fetchers' credit goes last: the body is in the cache, charged there, or freed.
         self.remote.release(&url);
@@ -5408,10 +5659,22 @@ impl Images {
                 }
             }
             gone.retain(|u| !self.urls.contains(u));
+            #[cfg(feature = "images")]
+            self.forget_anim_urls(&gone);
             self.remote.forget_sizes(&gone);
         }
         // (The list's buffer is given back, not kept for the next removals.)
         self.cache.dropped = Vec::new();
+    }
+
+    /// Forget what is known of the remote animations at `gone`, the URLs that nothing holds any
+    /// more (no document, no slot): that they are animated, and what was refused for them or
+    /// forced. Their strings are charged by whoever holds them, and these lists would hold the
+    /// last of them.
+    #[cfg(all(feature = "remote-images", feature = "images"))]
+    fn forget_anim_urls(&mut self, gone: &std::collections::HashSet<Arc<str>>) {
+        let gone = |k: &Key| matches!(k, Key::Remote(u) if gone.contains(u));
+        keep_anims(&mut self.animated, &mut self.anims, &|k| !gone(k));
     }
 
     /// Give back the room the table of sizes has left when most of it was forgotten (a cache of
@@ -5487,6 +5750,8 @@ impl Images {
         #[cfg(feature = "images")]
         {
             n = n
+                .saturating_add(vec_bytes(&self.animated))
+                .saturating_add(self.anims.bookkeeping())
                 .saturating_add(self.forced.bookkeeping())
                 .saturating_add(vec_bytes(&self.forced_ids));
         }
@@ -5678,6 +5943,305 @@ impl Images {
         self.key(id).is_some_and(|k| self.partial.contains(&k))
     }
 
+    /// Image `id`'s animation, if its decode found it is one: its canvas and loop count.
+    pub fn animated(&self, id: u32) -> Option<AnimInfo> {
+        #[cfg(feature = "images")]
+        {
+            let key = self.key(id)?;
+            self.animated
+                .iter()
+                .find_map(|(k, info)| (*k == key).then_some(*info))
+        }
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
+    /// Whether animations play (the window's `A`): every animated image plays from its next
+    /// paint, but those the reader chose otherwise for.
+    pub fn animations(&self) -> bool {
+        #[cfg(feature = "images")]
+        return self.anims.on;
+        #[cfg(not(feature = "images"))]
+        false
+    }
+
+    /// Animations play, or not, all of them: the choices made for single images are forgotten.
+    /// One stopped keeps the frame it shows.
+    pub fn set_animations(&mut self, on: bool) {
+        #[cfg(feature = "images")]
+        {
+            self.anims.on = on;
+            self.anims.choices = Vec::new();
+            if on {
+                // (Pressing play asks again for the animations whose body couldn't be fetched.)
+                self.anims.failed = Vec::new();
+                self.restart_ended(None);
+            }
+            (self.wake)();
+        }
+        #[cfg(not(feature = "images"))]
+        let _ = on;
+    }
+
+    /// The reader asked image `id`'s animation to play (whatever the window's choice), for the
+    /// document's life. One over VOMD's limits plays past them: the reader asked for it.
+    pub fn play(&mut self, id: u32) {
+        self.choose_anim(id, true);
+    }
+
+    /// The reader asked image `id`'s animation to stop where it is, for the document's life.
+    pub fn pause(&mut self, id: u32) {
+        self.choose_anim(id, false);
+    }
+
+    fn choose_anim(&mut self, id: u32, play: bool) {
+        #[cfg(feature = "images")]
+        {
+            let Some(key) = self.key(id) else {
+                return;
+            };
+            if play {
+                // (A click tries again an animation whose body couldn't be fetched.)
+                anim::retain_keys(&mut self.anims.failed, &|k| *k != key);
+                self.restart_ended(Some(&key));
+            }
+            self.anims.choices.retain(|c| c.0 != key);
+            self.anims.choices.push((key.clone(), play));
+            // One over the limits, or that wouldn't fit beside the others now it is to play, plays
+            // past them: the reader asked for it.
+            if play && !self.anims.forced.contains(&key) {
+                let over = self.anims.refusal(&key) == Some(true) || {
+                    let shown = self.anims_shown();
+                    self.reallocate(&shown);
+                    self.unstall(id, &key);
+                    self.anims.waits(&key)
+                };
+                if over {
+                    self.anims.forced.push(key);
+                }
+            }
+            // (Its badge comes or goes.)
+            self.repaint = true;
+            (self.wake)();
+        }
+        #[cfg(not(feature = "images"))]
+        let _ = (id, play);
+    }
+
+    /// Whether image `id` is animated and plays (its frames once they are made, its still till
+    /// then).
+    pub fn is_playing(&self, id: u32) -> bool {
+        #[cfg(feature = "images")]
+        {
+            self.animated(id).is_some() && self.key(id).is_some_and(|k| self.anims.wanted(&k))
+        }
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
+    /// Whether image `id`'s animation doesn't play for VOMD's limits (one animation's, or all
+    /// of them together's): [`Images::play`] plays it past them.
+    pub fn anim_over(&self, id: u32) -> bool {
+        #[cfg(feature = "images")]
+        {
+            self.key(id).is_some_and(|k| {
+                (self.anims.refusal(&k) == Some(true) || self.anims.waits(&k))
+                    && !self.anims.forced.contains(&k)
+            })
+        }
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
+    /// What image `id`'s animation does: `None` when it isn't one, or is one VOMD can't play
+    /// (broken, or over the forced-load ceiling).
+    pub fn anim_state(&self, id: u32) -> Option<AnimState> {
+        #[cfg(feature = "images")]
+        {
+            if self.animated.is_empty() {
+                return None;
+            }
+            let key = self.key(id)?;
+            if !self.animated.iter().any(|(k, _)| *k == key) {
+                return None;
+            }
+            let forced = self.anims.forced.contains(&key);
+            Some(match self.anims.refusal(&key) {
+                Some(false) => return None,
+                _ if !self.anims.wanted(&key) || self.anim_ended(&key) => AnimState::Paused,
+                Some(true) if !forced => AnimState::Over,
+                _ if self.anims.failed.contains(&key) => AnimState::Failed,
+                _ if !forced && self.anims.waits(&key) => AnimState::Waiting,
+                _ => AnimState::Playing,
+            })
+        }
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
+    /// Whether the document has an animated image (one decoded so far): the toolbar's
+    /// animations button shows.
+    pub fn has_animated(&self) -> bool {
+        // (The remote ones known from other documents, still cached, don't count.)
+        #[cfg(feature = "images")]
+        return self.animated.iter().any(|(k, _)| match k {
+            Key::Local(_) => true,
+            #[cfg(feature = "remote-images")]
+            Key::Remote(url) => self.urls.contains(url),
+            #[cfg(not(feature = "remote-images"))]
+            Key::Remote(_) => false,
+        });
+        #[cfg(not(feature = "images"))]
+        false
+    }
+
+    /// When the next frame of an animation painted in the last frame is due: its frame made, and
+    /// the one it shows shown its delay. `None` when none is (nothing plays, or what plays waits
+    /// for a paint or for the anim thread, which wakes the window): no timer.
+    pub fn anim_deadline(&self) -> Option<std::time::Instant> {
+        #[cfg(feature = "images")]
+        {
+            if self.anims.idle() {
+                return None;
+            }
+            let frame = self.cache.frame;
+            let slots = self.cache.slots.iter().filter_map(|s| match &s.data {
+                Data::Anim(p) => Some((&s.key, &**p)),
+                _ => None,
+            });
+            let outside = self.anims.outside.iter().map(|(k, p)| (k, &**p));
+            let due = slots
+                .chain(outside)
+                .filter(|(k, p)| p.painted == frame.saturating_add(1) && self.anims.wanted(k))
+                .filter_map(|(_, p)| p.due())
+                .min();
+            anim::next_tick(due, self.anims.last)
+        }
+        #[cfg(not(feature = "images"))]
+        None
+    }
+
+    /// Show the next frame of every animation painted in the last frame whose next frame is due
+    /// by `now` (or [`anim::COALESCE`] after: one repaint for them), unless frames were shown
+    /// less than [`anim::CAP`] before, and run the steps of those whose frame shown was painted.
+    /// Returns the images whose frame changed (to paint again).
+    pub fn advance(&mut self, now: std::time::Instant) -> Vec<u32> {
+        #[cfg(feature = "images")]
+        {
+            if self.anims.idle() {
+                return Vec::new();
+            }
+            if self.anims.last.is_some_and(|t| now < t + anim::CAP) {
+                self.pump_anims();
+                return Vec::new();
+            }
+            let frame = self.cache.frame;
+            let mut keys = Vec::new();
+            for at in self.anims_at() {
+                let key = self.key_at(at).clone();
+                let wanted = self.anims.wanted(&key);
+                let p = self.playing(at);
+                if wanted
+                    && p.painted == frame.saturating_add(1)
+                    && p.due().is_some_and(|d| anim::shows_at(d, now))
+                {
+                    p.swap();
+                    self.note_ended(at);
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+            if !keys.is_empty() {
+                self.anims.last = Some(now);
+            }
+            self.pump_anims();
+            self.ids_of(&keys)
+        }
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = now;
+            Vec::new()
+        }
+    }
+
+    /// A frame was painted: the animations it showed have their next frames made (each is made
+    /// once the one before was painted, never ahead).
+    pub fn painted(&mut self) {
+        #[cfg(feature = "images")]
+        if !self.anims.idle() {
+            self.pump_anims();
+        }
+    }
+
+    /// The box animated image `id` was painted in in the last frame (frame pixels), if it was.
+    #[cfg(feature = "images")]
+    fn anim_placed(&self, id: u32) -> Option<(i32, i32, i32, i32)> {
+        let placed = self.anims.placed.iter();
+        placed.filter(|p| p.0 == id).find_map(|p| p.1)
+    }
+
+    /// The boxes the images `ids` (what [`Images::advance`] showed) were painted in in the last
+    /// frame, `None` if an animation was painted in none (what changed is not known). One that
+    /// is the image of more than one has a box where each is in view: one that isn't has none.
+    #[cfg(feature = "images")]
+    pub fn anim_boxes(&self, ids: &[u32]) -> Option<Vec<(i32, i32, i32, i32)>> {
+        let mut boxes = Vec::new();
+        for &id in ids {
+            match self.anim_placed(id) {
+                Some(b) => boxes.push(b),
+                None => {
+                    let key = self.key(id);
+                    let other = |&o: &u32| self.key(o) == key && self.anim_placed(o).is_some();
+                    if !ids.iter().any(other) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(boxes)
+    }
+
+    /// Whether an animation painted in the last frame plays (it has frames to come).
+    pub fn animating(&self) -> bool {
+        #[cfg(feature = "images")]
+        {
+            if self.anims.idle() {
+                return false;
+            }
+            let frame = self.cache.frame;
+            let slots = self.cache.slots.iter().filter_map(|s| match &s.data {
+                Data::Anim(p) => Some((&s.key, &**p)),
+                _ => None,
+            });
+            let outside = self.anims.outside.iter().map(|(k, p)| (k, &**p));
+            slots.chain(outside).any(|(k, p)| {
+                p.painted == frame.saturating_add(1) && !p.ended() && self.anims.wanted(k)
+            })
+        }
+        #[cfg(not(feature = "images"))]
+        false
+    }
+
+    /// Paint animations as if at `clock` (`None`: now), for tests.
+    #[cfg(feature = "images")]
+    #[doc(hidden)]
+    pub fn set_anim_clock(&mut self, clock: Option<std::time::Instant>) {
+        self.anims.clock = clock;
+    }
+
     /// The reader clicked image `id`'s placeholder (or an SVG drawn without its embedded images):
     /// load it past VOMD's limits, on a thread of its own ([`forced`]), from its next request on,
     /// and lay it out at its natural size (a box while it loads). Returns true if it will be.
@@ -5693,22 +6257,16 @@ impl Images {
             let Some(origin) = forced_origin(img, self.base.as_deref()) else {
                 return false;
             };
-            self.forced.choose(origin.clone());
             // Every image of the document from that file or URL.
-            for (i, other) in doc.images.iter().enumerate() {
-                let other_id = i as u32 + 1;
-                if other.src == img.src && !self.forced_ids.iter().any(|f| f.0 == other_id) {
-                    self.forced_ids.push((other_id, origin.clone()));
-                }
-            }
+            let ids: Vec<u32> = (doc.images.iter().enumerate())
+                .filter(|(_, other)| other.src == img.src)
+                .map(|(i, _)| i as u32 + 1)
+                .collect();
+            self.force_ids(&origin, &ids);
             let size = self.forced_size(&origin);
-            for (i, other) in doc.images.iter().enumerate() {
-                if other.src == img.src {
-                    layout.set_image(doc, i as u32 + 1, size);
-                }
+            for id in ids {
+                layout.set_image(doc, id, size);
             }
-            self.repaint = true;
-            (self.wake)();
             true
         }
         #[cfg(not(feature = "images"))]
@@ -5716,6 +6274,19 @@ impl Images {
             let _ = (id, doc, layout);
             false
         }
+    }
+
+    /// Load the images `ids`, of `origin`, past VOMD's limits from their next request on.
+    #[cfg(feature = "images")]
+    fn force_ids(&mut self, origin: &forced::Origin, ids: &[u32]) {
+        self.forced.choose(origin.clone());
+        for &id in ids {
+            if !self.forced_ids.iter().any(|f| f.0 == id) {
+                self.forced_ids.push((id, origin.clone()));
+            }
+        }
+        self.repaint = true;
+        (self.wake)();
     }
 
     /// The size layout gives an image chosen to load past the limits: its natural size (a 4:3
@@ -5771,11 +6342,37 @@ impl Images {
         result: Result<forced::Loaded, Refusal>,
         page: Option<(&Doc, &mut Layout)>,
     ) {
+        #[cfg(feature = "remote-images")]
+        let mut page = page;
         let size = match result {
             Ok(loaded) => {
                 let (w, h) = loaded.natural;
+                // (Its key is the image's of the document it was loaded for.)
+                if let Some(info) = loaded.anim
+                    && doc_gen == self.doc_gen
+                {
+                    let ids = self
+                        .forced_ids
+                        .iter()
+                        .filter(|f| f.1 == origin)
+                        .map(|f| f.0);
+                    for key in ids.filter_map(|id| self.key(id)).collect::<Vec<_>>() {
+                        if !self.animated.iter().any(|(k, _)| *k == key) {
+                            self.animated.push((key, info));
+                        }
+                    }
+                }
                 self.forced.loaded(origin.clone(), loaded, self.cache.frame);
                 ImageSize::Pixels(w, h)
+            }
+            // (Only the body of an animation whose still is the cache's was fetched past the
+            // limits: [`Images::body_lost`].)
+            #[cfg(feature = "remote-images")]
+            Err(why) if matches!(&origin, forced::Origin::Url(url) if self.body_lost(url)) => {
+                self.forced.unchoose(&origin);
+                // (Its layout stays.)
+                page = None;
+                ImageSize::Refused(why)
             }
             Err(why) => {
                 self.forced.failed(origin.clone(), why);
@@ -5793,6 +6390,21 @@ impl Images {
         if matches!(size, ImageSize::Refused(_)) {
             self.forced_ids.retain(|f| f.1 != origin);
         }
+    }
+
+    /// The body of the remote animation at `url`, fetched again to play it (or played past the
+    /// limits), didn't come: the animation failed, not the image, whose still is the cache's and
+    /// stays; a click asks again. Whether it was that.
+    #[cfg(feature = "remote-images")]
+    fn body_lost(&mut self, url: &Arc<str>) -> bool {
+        let key = Key::Remote(url.clone());
+        let lost = self.cache.has_url(url)
+            && (self.anims.is_fetched(url) || self.anims.forced.contains(&key));
+        if lost {
+            self.anims.failed.push(key.clone());
+            self.anim_changed(&key);
+        }
+        lost
     }
 
     /// Whether a load past the limits runs or waits (the tests).
@@ -5911,11 +6523,1098 @@ fn same_fonts(a: &crate::fonts::SvgFonts, b: &crate::fonts::SvgFonts) -> bool {
     (a.sans, a.mono) == (b.sans, b.mono) && faces(a) == faces(b)
 }
 
+/// Where an animation is: a slot of the cache, or played past the limits.
+#[cfg(feature = "images")]
+#[derive(Clone, Copy)]
+enum At {
+    Slot(usize),
+    Outside(usize),
+}
+
+// ---- Animations -----------------------------------------------------------------------------
+
+// Which animations play is decided as a whole, not one by one: the allocation
+// ([`anim::allocate`]) is a function of what was painted in the last frame (the animated images
+// in view, on screen first from the top down, one box a key), whether each is to play (the
+// window's `A`, the reader's choice), what each holds at its frame size (measured once a key and
+// size, [`anim::Anims::costs`]), the refusals and those played past the limits (which take no
+// part), and the room the cache has for them. It walks them in their order and lets each play
+// that fits beside those before it, within [`anim::ANIM_ALL_MAX`] and that room; the others wait.
+// What is done follows from it ([`Images::pump_anims`]): one it plays that isn't made is read
+// (room made for it from those it doesn't play), one held that waits is let go once its step is
+// back, and steps are run only for those it plays. The same inputs make the same allocation, and
+// once it is followed nothing is left to do, so nothing repeats while nothing changes.
+//
+// An animation is read and indexed on the anim thread, and plays from that once it is known to
+// fit: it holds a slot ([`Data::Anim`]), charged what it holds at most. One over the limits plays
+// only past them, outside the cache, once the reader asks ([`Images::play`]). Each frame is
+// pulled: a step is run on the anim thread only once the frame shown was painted, and its result
+// is shown when the one before has been shown its delay ([`Images::advance`]), so an animation
+// that isn't painted (off screen, a window that doesn't paint) costs nothing, and is evicted like
+// any slot. One that comes back is read again, from its first frame.
+#[cfg(feature = "images")]
+impl Images {
+    /// Where the animation of `key` is, if it is made.
+    fn anim_at(&self, key: &Key) -> Option<At> {
+        if let Some(i) = self
+            .cache
+            .slots
+            .iter()
+            .position(|s| matches!(s.data, Data::Anim(_)) && s.key == *key)
+        {
+            return Some(At::Slot(i));
+        }
+        let i = self.anims.outside.iter().position(|o| o.0 == *key)?;
+        Some(At::Outside(i))
+    }
+
+    /// Where the animation `serial` is, if it is made.
+    fn anim_of(&mut self, serial: u64) -> Option<At> {
+        self.anims_at()
+            .into_iter()
+            .find(|&at| self.playing(at).serial == serial)
+    }
+
+    fn playing(&mut self, at: At) -> &mut anim::Playing {
+        match at {
+            At::Slot(i) => match &mut self.cache.slots[i].data {
+                Data::Anim(p) => p,
+                _ => unreachable!("an animation's slot"),
+            },
+            At::Outside(i) => &mut self.anims.outside[i].1,
+        }
+    }
+
+    fn key_at(&self, at: At) -> &Key {
+        match at {
+            At::Slot(i) => &self.cache.slots[i].key,
+            At::Outside(i) => &self.anims.outside[i].0,
+        }
+    }
+
+    /// Every animation made, where it is.
+    fn anims_at(&self) -> Vec<At> {
+        let slots = self.cache.slots.iter().enumerate();
+        slots
+            .filter(|(_, s)| matches!(s.data, Data::Anim(_)))
+            .map(|(i, _)| At::Slot(i))
+            .chain((0..self.anims.outside.len()).map(At::Outside))
+            .collect()
+    }
+
+    /// What the animations hold in the cache, and the reads for them.
+    #[cfg(test)]
+    fn anims_held(&self) -> usize {
+        self.anim_slots_cost().saturating_add(self.cache.anims)
+    }
+
+    /// What the animations' slots hold.
+    fn anim_slots_cost(&self) -> usize {
+        let slots = self.cache.slots.iter();
+        slots
+            .filter(|s| matches!(s.data, Data::Anim(_)))
+            .map(Slot::cost)
+            .sum()
+    }
+
+    /// The state of the animation of `key` changed other than by a frame (it was let go, or
+    /// refused): if it is in view, its still and its badge are painted.
+    fn anim_changed(&mut self, key: &Key) {
+        if self.placed_top(key).is_some() {
+            self.repaint = true;
+            (self.wake)();
+        }
+    }
+
+    /// The top of the highest box image `key` was painted in in the last frame (`i32::MAX` for
+    /// one whose pixels only were asked for), if it was.
+    fn placed_top(&self, key: &Key) -> Option<i32> {
+        let placed = self.anims.placed.iter();
+        placed
+            .filter(|p| self.key(p.0).as_ref() == Some(key))
+            .map(|p| p.1.map_or(i32::MAX, |r| r.1))
+            .min()
+    }
+
+    /// The animations painted in the last frame, one a key, in the order they are weighed in:
+    /// on screen from the top down (one whose pixels only were asked for last). Each is its first
+    /// image, and the frame size that image is painted at: the one size its frames are made at,
+    /// whatever the size of its other images.
+    fn anims_shown(&self) -> Vec<(u32, Key, (u32, u32))> {
+        let mut placed: Vec<_> = (self.anims.placed.iter())
+            .filter_map(|p| Some((p.1.map_or(i32::MAX, |r| r.1), p.0, p.3?)))
+            .collect();
+        placed.sort_unstable_by_key(|p| (p.0, p.1));
+        // (Only a remote image can be the image of two ids.)
+        let mut seen: std::collections::HashSet<&Arc<str>> = std::collections::HashSet::new();
+        let mut shown = Vec::with_capacity(placed.len());
+        for (_, id, size) in placed {
+            if let Src::Remote(url) = self.src(id)
+                && !seen.insert(url)
+            {
+                continue;
+            }
+            if let Some(key) = self.key(id) {
+                shown.push((id, key, size));
+            }
+        }
+        shown
+    }
+
+    /// Whether image `id` (of `key`) is played past the limits: the reader chose so, or chose
+    /// its still to be loaded past them.
+    fn anim_forced(&self, id: u32, key: &Key) -> bool {
+        self.anims.forced.contains(key) || self.forced_ids.iter().any(|f| f.0 == id)
+    }
+
+    /// What reading the animation of image `id` holds before it plays (its file, its path, the
+    /// index; a remote one's body is weighed as a body, [`Images::anim_body`]), found once (and
+    /// again when [`Images::start_anim`] finds the file changed): `None` if its file can't be
+    /// read any more.
+    fn read_cost(&mut self, id: u32, key: &Key) -> Option<usize> {
+        if let Some(r) = self.anims.reads.iter().find(|r| r.0 == *key) {
+            return Some(r.1);
+        }
+        let Src::File(src) = self.src(id) else {
+            return Some(anim::MEASURE_FIXED);
+        };
+        let path = local_path(src, self.base.as_deref())?;
+        let len = std::fs::metadata(&path).ok()?.len().min(MAX_FILE) as usize;
+        let cost = len
+            .saturating_add(path.as_os_str().len() + STR_OVERHEAD)
+            .saturating_add(anim::MEASURE_FIXED);
+        if self.anims.reads.len() < VIEW_MAX {
+            self.anims.reads.push((key.clone(), cost));
+        }
+        Some(cost)
+    }
+
+    /// What the allocation weighs of the animations `shown` ([`anim::Bid`]), in their order: those
+    /// to play (wanted, and not refused, failed, ended or played past the limits) at what they
+    /// hold, or will. One held at its frame size holds what it holds; one that isn't, what it was
+    /// measured to hold there, and at least what reading it holds (it is read again to play), or
+    /// only that until it is measured. One whose file went, or whose reading alone is over the
+    /// limits, is refused here.
+    fn anim_bids(&mut self, shown: &[(u32, Key, (u32, u32))]) -> Vec<anim::Bid> {
+        let mut bids = Vec::with_capacity(shown.len());
+        for (id, key, size) in shown {
+            let slot = match self.anim_at(key) {
+                Some(At::Slot(i)) => Some(&self.cache.slots[i]),
+                _ => None,
+            };
+            let p = slot.and_then(|s| match &s.data {
+                Data::Anim(p) => Some(&**p),
+                _ => None,
+            });
+            if !self.anims.wanted(key)
+                || self.anim_forced(*id, key)
+                || self.anims.refusal(key).is_some()
+                || self.anims.failed.contains(key)
+                || self.anim_ended(key)
+            {
+                continue;
+            }
+            // (What a slot holds beside its animation: its overhead, its URL.)
+            let held = slot.zip(p).and_then(|(s, p)| {
+                let at = p.cost_at(*size)?;
+                Some(at.saturating_add(s.cost() - p.cost))
+            });
+            let cost = match held {
+                Some(cost) => cost,
+                None => {
+                    let Some(read) = self.read_cost(*id, key) else {
+                        self.anims.refuse(key.clone(), false);
+                        self.anim_changed(key);
+                        continue;
+                    };
+                    if read > anim::ANIM_ALL_MAX {
+                        self.anims.refuse(key.clone(), true);
+                        self.anim_changed(key);
+                        continue;
+                    }
+                    self.anims.cost(key, *size).map_or(read, |c| c.max(read))
+                }
+            };
+            bids.push(anim::Bid {
+                key: key.clone(),
+                size: *size,
+                cost,
+                body: self.anim_body(key),
+            });
+        }
+        bids
+    }
+
+    /// What the body of the remote animation `key` holds beside its slot once it plays, cached
+    /// (held for it, or not), or to be fetched again for it: then with what fetching it and its
+    /// decode need beside it, the test [`Images::body_for_anim`] fetches it at (0 for a local
+    /// one). Letting the animation go frees it ([`Images::anim_room`]).
+    fn anim_body(&self, key: &Key) -> usize {
+        #[cfg(feature = "remote-images")]
+        if let Key::Remote(url) = key {
+            let cached = self.cache.peek_bytes(url).map(|b| Slot::bytes_cost(url, b));
+            let fetched = self
+                .deferred_need(url)
+                .map(|(cost, decode)| (cost + decode).saturating_add(crate::remote::FETCH_RESERVE));
+            return cached.or(fetched).unwrap_or(0);
+        }
+        let _ = key;
+        0
+    }
+
+    /// The room the cache has for the animations painted: its budget less what stays whatever
+    /// they do (the bookkeeping, the pixels painted in this frame, the steps of animations gone).
+    /// The bodies remote animations play from are their bids' ([`Images::anim_body`]): a paused
+    /// one's goes with it. One played past the limits plays from the cached body it was read
+    /// from, if it was: that body stays while it does (it bids for nothing, and isn't let go for
+    /// room), so it is fixed too. What comes and goes as images load (the decodes' reserve, the
+    /// fetchers', a request's wishes) is left out, so that the allocation doesn't come and go
+    /// with it: a read waits for it instead ([`Images::anim_room`]).
+    fn anims_room_now(&self) -> usize {
+        let frame = self.cache.frame;
+        let fixed: usize = (self.cache.slots.iter())
+            .filter(|s| match &s.data {
+                Data::Pixels(_) => s.painted_in(frame),
+                Data::Bytes(_) => s.pinned() && self.anims.outside.iter().any(|o| o.0 == s.key),
+                _ => false,
+            })
+            .map(Slot::cost)
+            .sum();
+        let gone: usize = (self.anims.out.iter())
+            .filter(|o| o.size == (0, 0))
+            .map(|o| o.cost)
+            .sum();
+        self.cache
+            .cap
+            .saturating_sub(fixed)
+            .saturating_sub(self.cache.overhead)
+            .saturating_sub(gone)
+    }
+
+    /// Make the allocation again ([`anim::allocate`]) if what it weighs changed.
+    fn reallocate(&mut self, shown: &[(u32, Key, (u32, u32))]) {
+        anim::retain_keys(&mut self.anims.stalled, &|k| {
+            shown.iter().any(|s| s.1 == *k)
+        });
+        let bids = self.anim_bids(shown);
+        let room = self.anims_room_now();
+        let alloc = &self.anims.alloc;
+        if bids != alloc.bids || room != alloc.room {
+            self.anims.alloc = anim::allocate(bids, room);
+        }
+    }
+
+    /// Make room for an animation the allocation lets play: `slot` beside the animations' slots
+    /// within [`anim::ANIM_ALL_MAX`], and `max(slot, read)` in the cache (it is read, then holds
+    /// its slot). The animations let go for it are those the allocation doesn't play (paused,
+    /// ended, off screen): those not painted first, least recently used first, then those
+    /// painted, from the bottom up. One running a step is not (it is asked for no more, and let go
+    /// once it is back). Nothing goes if not enough can. Whether it fits.
+    fn anim_room(&mut self, slot: usize, read: usize) -> bool {
+        let frame = self.cache.frame;
+        let need = slot.max(read);
+        let held = self.anim_slots_cost();
+        let mut can = Vec::new();
+        for s in &self.cache.slots {
+            let Data::Anim(p) = &s.data else {
+                continue;
+            };
+            if p.running || self.anims.alloc.play.contains(&s.key) {
+                continue;
+            }
+            let rank = match self.placed_top(&s.key) {
+                Some(top) if s.painted_in(frame) => (true, -i64::from(top)),
+                _ => (false, s.used as i64),
+            };
+            let stuck = if s.unevictable(frame) { s.cost() } else { 0 };
+            can.push((
+                rank,
+                s.cost(),
+                stuck + self.body_freed(&s.key),
+                s.key.clone(),
+            ));
+        }
+        can.sort_unstable_by_key(|c| c.0);
+        self.charge_bookkeeping();
+        let (mut freed, mut stuck, mut keys) = (0usize, 0usize, Vec::new());
+        let mut can = can.into_iter();
+        while held.saturating_sub(freed).saturating_add(slot) > anim::ANIM_ALL_MAX
+            || !self.cache.can_fit_without(need, stuck)
+        {
+            let Some((_, cost, unstuck, key)) = can.next() else {
+                return false;
+            };
+            freed = freed.saturating_add(cost);
+            stuck = stuck.saturating_add(unstuck);
+            keys.push(key);
+        }
+        for key in keys {
+            if let Some(at @ At::Slot(_)) = self.anim_at(&key) {
+                self.drop_anim(at);
+            }
+        }
+        true
+    }
+
+    /// What letting the held animation of `key` go frees beside its slot: the body of a remote
+    /// one, if nothing else holds it (a step, a decode).
+    fn body_freed(&self, key: &Key) -> usize {
+        #[cfg(feature = "remote-images")]
+        if let Key::Remote(url) = key {
+            let body = self
+                .cache
+                .peek_bytes(url)
+                .filter(|b| Arc::strong_count(b) == 2);
+            return body.map_or(0, |b| Slot::bytes_cost(url, b));
+        }
+        let _ = key;
+        0
+    }
+
+    /// Image `id` is painted at `w` × `h`: whether its animation has a frame to show. Its frames
+    /// are made at [`anim::frame_size`] (which the paint enlarges to the box): that size is noted
+    /// for the allocation ([`Images::pump_anims`]), which plays it or not.
+    fn anim_shows(&mut self, id: u32, w: u32, h: u32) -> bool {
+        let Some(key) = self.key(id) else {
+            return false;
+        };
+        let Some((_, info)) = self.animated.iter().find(|(k, _)| *k == key) else {
+            return false;
+        };
+        let size = anim::frame_size(info.size, (w, h));
+        let placed = &mut self.anims.placed;
+        if let Some(p) = placed.iter_mut().find(|p| p.0 == id) {
+            p.3 = Some(size);
+        } else if placed.len() < VIEW_MAX {
+            placed.push((id, None, None, Some(size)));
+        }
+        let frame = self.cache.frame;
+        // Its still is painted as well, whatever is shown: it is what shows when the animation
+        // goes, and one asked for and not painted would be evicted by the next still's decode, to
+        // be asked for again, and so on.
+        let (cw, ch) = clamp_box(w, h);
+        self.cache.pixels(&key, cw, ch);
+        let Some(at) = self.anim_at(&key) else {
+            return false;
+        };
+        // (Painted with its still while its first frame is made: it is on screen all the same.)
+        let clock = self.anims.clock;
+        let p = self.playing(at);
+        p.painted = frame.saturating_add(1);
+        let shows = p.front().is_some();
+        if shows && p.shown.is_none() {
+            p.shown = Some(clock.unwrap_or_else(std::time::Instant::now));
+        }
+        if let At::Slot(i) = at {
+            let slot = &mut self.cache.slots[i];
+            slot.used = frame;
+            slot.painted = frame.saturating_add(1);
+        }
+        shows
+    }
+
+    /// The frame shown of image `id`'s animation ([`Images::anim_shows`] said it has one).
+    fn anim_front(&mut self, id: u32) -> Option<&Bitmap> {
+        let at = self.anim_at(&self.key(id)?)?;
+        self.playing(at).front()
+    }
+
+    /// Whether an animation painted in the last frame is in another state than it was painted
+    /// in (it ended, was refused, waits, plays): its badge, or its lack of one, is stale, and
+    /// the window needs a repaint. Every change is asked for once, here, whatever made it.
+    #[cfg(feature = "images")]
+    fn state_changed(&mut self) -> bool {
+        let mut changed = false;
+        for i in 0..self.anims.placed.len() {
+            let state = self.anim_state(self.anims.placed[i].0);
+            let painted = &mut self.anims.placed[i].2;
+            if *painted != state {
+                *painted = state;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Make what is made of the animations what the allocation says: those painted that wait
+    /// (or are to play past the limits) and are held go (once a step running is back), their
+    /// stills shown; those it plays that aren't made are read, room made for them first; those
+    /// played past the limits are read as they are painted. How many things it set going: none,
+    /// once it is so. (Those held that don't play, paused or ended, stay until their room is
+    /// wanted: [`Images::anim_room`].)
+    fn settle_anims(&mut self, shown: &[(u32, Key, (u32, u32))]) -> usize {
+        let mut n = 0;
+        for (id, key, _) in shown {
+            let forced = self.anim_forced(*id, key);
+            if !(forced || self.anims.waits(key)) {
+                continue;
+            }
+            if let Some(at @ At::Slot(_)) = self.anim_at(key)
+                && !self.playing(at).running
+            {
+                self.drop_anim(at);
+                n += 1;
+            }
+        }
+        for (id, key, size) in shown {
+            let cost = if self.anim_forced(*id, key) {
+                if !self.anims.wanted(key) || self.anim_ended(key) {
+                    continue;
+                }
+                None
+            } else {
+                let alloc = &self.anims.alloc;
+                if !alloc.play.contains(key) {
+                    continue;
+                }
+                let bid = alloc.bids.iter().find(|b| b.key == *key);
+                Some(bid.map_or(0, |b| b.cost))
+            };
+            n += usize::from(self.start_anim(*id, key.clone(), *size, cost));
+        }
+        n
+    }
+
+    /// Weigh the animations painted and do what that says ([`Images::settle_anims`], until it
+    /// says nothing more: letting one go changes what the others are weighed with), then run
+    /// the steps of those whose frame shown was painted: those it plays, and those played past
+    /// the limits.
+    fn pump_anims(&mut self) {
+        if self.anims.idle() {
+            return;
+        }
+        let shown = self.anims_shown();
+        let ceiling = self.forced.ceiling.unwrap_or_else(forced::ceiling);
+        // (Each is made at the frame size of its first image painted, whatever its others'. One
+        // played past the limits is made at a new one only within the forced ceiling, as it was
+        // at its first: else it plays on at its own, enlarged to the box.)
+        for (_, key, size) in &shown {
+            if let Some(at) = self.anim_at(key) {
+                let p = self.playing(at);
+                let outside = matches!(at, At::Outside(_));
+                if !outside || *size == p.size || p.force(ceiling, *size) {
+                    p.want = *size;
+                } else {
+                    p.want = p.size;
+                }
+            }
+        }
+        // (Each round lets go, or reads, what it does once: it ends with one that does
+        // nothing.)
+        let mut rounds = 0;
+        loop {
+            self.reallocate(&shown);
+            let n = self.settle_anims(&shown);
+            #[cfg(test)]
+            {
+                self.anims.effects += n;
+            }
+            if n == 0 {
+                break;
+            }
+            rounds += 1;
+            if rounds > 3 * shown.len() + 2 {
+                debug_assert!(false, "the allocation settles");
+                break;
+            }
+        }
+        // (Room made for one may evict another, which moves the slots: each is found anew.)
+        let frame = self.cache.frame;
+        let serials: Vec<u64> = self
+            .anims_at()
+            .into_iter()
+            .map(|at| self.playing(at).serial)
+            .collect();
+        for serial in serials {
+            let Some(at) = self.anim_of(serial) else {
+                continue;
+            };
+            let p = self.playing(at);
+            // One played past the limits goes once it isn't painted (it isn't the cache's to
+            // evict): it is read again when it is.
+            if let At::Outside(_) = at
+                && p.painted < frame
+                && !p.running
+            {
+                self.drop_anim(at);
+                continue;
+            }
+            let resized = p.want != p.size && (p.engine.is_some() || p.is_kept());
+            let wants = p.wants_step(frame) || (resized && !p.running);
+            let key = self.key_at(at);
+            let plays = matches!(at, At::Outside(_)) || self.anims.alloc.play.contains(key);
+            if wants && plays && self.anims.wanted(key) {
+                self.step_anim(at);
+            }
+        }
+        self.anims.live = !self.anims_at().is_empty();
+    }
+
+    /// The URL of the fetched image `key` to fetch again, to play its animation: one that is
+    /// to play (the allocation plays it, or the reader chose to past the limits), whose body is
+    /// no longer cached (it is played from it), listed until it comes. Remote images are on: it
+    /// is fetched as any image is ([`Images::request`]), and only then.
+    #[cfg(feature = "remote-images")]
+    fn body_for_anim(&mut self, key: &Key, reserve: usize) -> Option<Arc<str>> {
+        let Key::Remote(url) = key else {
+            return None;
+        };
+        let wanted = self.remote.on
+            && self.remote.size(url) != Some(None)
+            && self.animated.iter().any(|(k, _)| k == key)
+            && self.anims.wanted(key)
+            && !self.anims.failed.contains(key)
+            && match self.anims.refusal(key) {
+                None => true,
+                Some(over) => over && self.anims.forced.contains(key),
+            }
+            && (self.anims.fetched.contains(key) || self.anims.fetched.len() < VIEW_MAX)
+            && self.anim_at(key).is_none()
+            && !self.anims.out.iter().any(|o| o.key == *key)
+            && self.cache.peek_bytes(url).is_none();
+        if !wanted {
+            return None;
+        }
+        // One asked for is listed again until it comes (each request replaces the fetchers'
+        // queue; one in flight isn't fetched twice).
+        if self.anims.fetched.contains(key) {
+            return Some(url.clone());
+        }
+        // One dropped for room is fetched again once it would fit; one the reader chose to play
+        // past the limits is fetched past them, as a click on its still does ([`Images::force`]),
+        // and plays from that body.
+        if let Some((cost, decode)) = self.deferred_need(url)
+            && !self
+                .cache
+                .would_fit(cost, decode, reserve, self.fetch_reserve(true))
+        {
+            let origin = forced::Origin::Url(url.clone());
+            if self.anims.forced.contains(key) && !self.forced_ids.iter().any(|f| f.1 == origin) {
+                let ids = self.ids_of(std::slice::from_ref(key));
+                self.force_ids(&origin, &ids);
+            }
+            return None;
+        }
+        // (One that waits is fetched again once the allocation plays it, or a click does.)
+        if !self.anims.forced.contains(key) && !self.anims.alloc.play.contains(key) {
+            return None;
+        }
+        self.anims.fetched.push(key.clone());
+        Some(url.clone())
+    }
+
+    /// Have the anim thread read and index image `id`'s animation for the frame size `size`:
+    /// within the limits, where the allocation gave it `cost` (room made for it first), or past
+    /// them (`None`). Nothing is done if it is made or being read, or if the room isn't free yet
+    /// (a step of one let go for it is running, a decode holds it): a later pump does it. One
+    /// whose file can't be read any more is refused (no badge, nothing read again). Whether it
+    /// was set going.
+    fn start_anim(&mut self, id: u32, key: Key, size: (u32, u32), cost: Option<usize>) -> bool {
+        let doc_gen = self.doc_gen;
+        if self.anim_at(&key).is_some()
+            || self
+                .anims
+                .out
+                .iter()
+                .any(|o| o.key == key && o.doc_gen == doc_gen)
+            || self.anims.refusal(&key) == Some(false)
+        {
+            return false;
+        }
+        let forced = cost.is_none();
+        let forced_id = self
+            .forced_ids
+            .iter()
+            .find(|f| f.0 == id)
+            .map(|f| f.1.clone());
+        let source = match (&forced_id, self.src(id).clone()) {
+            (Some(forced::Origin::File(path)), _) => Source::File(path.clone()),
+            (Some(forced::Origin::Url(url)), _) => match self.forced.body(url) {
+                Some(b) => Source::Bytes(b),
+                None => return false,
+            },
+            (None, Src::File(src)) => match local_path(&src, self.base.as_deref()) {
+                Some(path) => Source::File(path),
+                None => return false,
+            },
+            // (Played from its body, kept for it or fetched again for it as images are
+            // fetched: [`Images::body_for_anim`].)
+            (None, Src::Remote(url)) => match self.cache.bytes_of(&url) {
+                Some(b) => Source::Bytes(b),
+                // (Room is made for it to be fetched again in: those it lets go don't come back.)
+                None => {
+                    if let Some(cost) = cost
+                        && !self.anim_room(cost, self.anim_body(&key))
+                    {
+                        self.stall(&key);
+                    }
+                    return false;
+                }
+            },
+            (None, Src::None) => return false,
+        };
+        let (own, path) = match &source {
+            Source::File(p) => match std::fs::metadata(p) {
+                Ok(m) => (
+                    m.len().min(MAX_FILE) as usize,
+                    p.as_os_str().len() + STR_OVERHEAD,
+                ),
+                Err(_) => {
+                    self.anims.refuse(key.clone(), false);
+                    self.anim_changed(&key);
+                    return true;
+                }
+            },
+            Source::Bytes(_) => (0, 0),
+        };
+        let read = if forced {
+            0
+        } else {
+            own.saturating_add(path).saturating_add(anim::MEASURE_FIXED)
+        };
+        // A file that changed since it was weighed is weighed (and measured) anew: the allocation
+        // decides again whether it plays at what it holds now.
+        if let Some(r) = self.anims.reads.iter_mut().find(|r| r.0 == key)
+            && !forced
+            && r.1 != read
+        {
+            r.1 = read;
+            self.anims.retain_costs(&|c| c.0 != key);
+            return true;
+        }
+        if let Some(cost) = cost
+            && !(self.anim_room(cost, read) && self.make_room("anim index", read))
+        {
+            self.stall(&key);
+            return false;
+        }
+        anim::retain_keys(&mut self.anims.stalled, &|k| *k != key);
+        #[cfg(test)]
+        if !forced && self.anims.cost(&key, size).is_none() {
+            self.anims.measures.push((key.clone(), size));
+        }
+        let serial = self.anims.next_serial();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.anims.out.push(anim::Out {
+            serial,
+            key,
+            doc_gen,
+            size,
+            cost: read,
+            forced,
+            cancel: cancel.clone(),
+        });
+        self.cache.anims = self.cache.anims.saturating_add(read);
+        self.anims.live = true;
+        let task = anim::Task::Measure {
+            source,
+            limit: if forced { usize::MAX } else { own },
+        };
+        let job = anim::Job {
+            serial,
+            task,
+            cancel,
+            wake: self.wake.clone(),
+        };
+        self.anims.player.send(job, &self.tx);
+        true
+    }
+
+    /// The animation of `key`, which the allocation plays, can't be given its room: if nothing
+    /// under way gives any back (a step of one it doesn't play, a read, a decode, a fetch), the
+    /// room weighed isn't there, and it waits ([`anim::Anims::waits`]: its badge says so, and a
+    /// click plays it past the limits) rather than seem to play without a frame.
+    fn stall(&mut self, key: &Key) {
+        let play = &self.anims.alloc.play;
+        let stepping = (self.cache.slots.iter())
+            .any(|s| matches!(&s.data, Data::Anim(p) if p.running && !play.contains(&s.key)));
+        let decoding = !(self.worker.as_ref().is_none_or(Worker::idle)
+            && self.retired.iter().all(Worker::idle_of));
+        #[cfg(feature = "remote-images")]
+        let decoding = decoding || self.remote.busy();
+        let reading = !self.anims.out.is_empty();
+        if !(stepping || decoding || reading || self.anims.stalled.contains(key)) {
+            self.anims.stalled.push(key.clone());
+        }
+    }
+
+    /// The stalled animation of image `id` ([`Images::stall`]), which the allocation plays, is
+    /// given its room now if it is there: it came back while nothing started it (it was paused),
+    /// and then it plays within the limits, not past them.
+    fn unstall(&mut self, id: u32, key: &Key) {
+        if !self.anims.stalled.contains(key) || !self.anims.alloc.play.contains(key) {
+            return;
+        }
+        let Some(cost) = (self.anims.alloc.bids.iter())
+            .find(|b| b.key == *key)
+            .map(|b| b.cost)
+        else {
+            return;
+        };
+        // (As [`Images::start_anim`] weighs it: a remote one whose body went is fetched again.)
+        #[cfg(feature = "remote-images")]
+        let fetch = matches!(key, Key::Remote(url) if self.cache.peek_bytes(url).is_none());
+        #[cfg(not(feature = "remote-images"))]
+        let fetch = false;
+        let read = if fetch {
+            Some(self.anim_body(key))
+        } else {
+            self.read_cost(id, key)
+        };
+        if read.is_some_and(|read| self.anim_room(cost, read)) {
+            anim::retain_keys(&mut self.anims.stalled, &|k| k != key);
+        }
+    }
+
+    /// Run the next step of the animation at `at` on the anim thread: made at the box it was
+    /// last painted in, which is made room for first if that holds more. One whose frames are
+    /// kept is read again for a new box; one that doesn't fit at it stops.
+    fn step_anim(&mut self, at: At) {
+        let p = self.playing(at);
+        if p.want != p.size {
+            if !p.resize() {
+                return self.drop_anim(at);
+            }
+            if let At::Slot(_) = at {
+                let (old, new) = (p.cost, p.charge());
+                let grow = new.saturating_sub(old);
+                let key = self.key_at(at).clone();
+                if new > anim::ANIM_ONE_MAX
+                    || !(self.anim_room(grow, 0) && self.make_room("anim box", grow))
+                {
+                    // (Room was made: the slot may have moved.)
+                    if let Some(at) = self.anim_at(&key) {
+                        self.drop_anim(at);
+                    }
+                    return;
+                }
+                // (`make_room` evicts: find it again.)
+                let Some(at) = self.anim_at(&key) else {
+                    return;
+                };
+                self.recharge(at);
+                return self.send_step(at);
+            }
+        }
+        self.send_step(at);
+    }
+
+    fn send_step(&mut self, at: At) {
+        let wake = self.wake.clone();
+        let p = self.playing(at);
+        let Ok((engine, size, spare)) = p.task() else {
+            return;
+        };
+        let job = anim::Job {
+            serial: p.serial,
+            task: anim::Task::Step {
+                engine,
+                size,
+                spare,
+            },
+            cancel: p.cancel.clone(),
+            wake,
+        };
+        self.anims.player.send(job, &self.tx);
+    }
+
+    /// Set the charge of the animation at `at` to what it holds now ([`anim::Playing::charge`]).
+    fn recharge(&mut self, at: At) {
+        let p = self.playing(at);
+        let (old, new) = (p.cost, p.charge());
+        p.cost = new;
+        if let At::Slot(_) = at {
+            self.cache.bytes = self.cache.bytes - old + new;
+        }
+    }
+
+    /// Whether the animation of `key` has played its loops: its last frame stays while it is
+    /// held, its still once it is let go, and it isn't played again until the reader asks.
+    fn anim_ended(&self, key: &Key) -> bool {
+        self.anims.ended.contains(key)
+    }
+
+    /// Note it if the animation at `at` has played its loops (it stays so, held or not).
+    fn note_ended(&mut self, at: At) {
+        if self.playing(at).ended() && !self.anim_ended(self.key_at(at)) {
+            let key = self.key_at(at).clone();
+            self.anims.ended.push(key);
+        }
+    }
+
+    /// The animations that have played their loops (of `key`, or all) play again from their
+    /// first frame: those whose frames are kept at once, the others read again (their still
+    /// shows meanwhile).
+    fn restart_ended(&mut self, key: Option<&Key>) {
+        match key {
+            Some(key) => anim::retain_keys(&mut self.anims.ended, &|k| k != key),
+            None => self.anims.ended = Vec::new(),
+        }
+        for at in self.anims_at().into_iter().rev() {
+            if key.is_some_and(|k| k != self.key_at(at)) {
+                continue;
+            }
+            let p = self.playing(at);
+            if p.ended() && !p.rewind() {
+                self.drop_anim(at);
+            }
+        }
+    }
+
+    /// Drop the animation at `at` (not running): its image shows its still until it is read
+    /// again.
+    fn drop_anim(&mut self, at: At) {
+        let key = self.key_at(at).clone();
+        self.anim_changed(&key);
+        match at {
+            At::Slot(i) => {
+                self.cache.remove(i);
+                self.cache.trim();
+            }
+            At::Outside(i) => {
+                self.anims.outside.swap_remove(i);
+            }
+        }
+    }
+
+    /// Whether the document or the cache holds the image of `key` (a remote one's URL is held by
+    /// the document's list or by a slot): what is known of an animation is kept only then.
+    fn anim_owned(&self, key: &Key) -> bool {
+        match key {
+            Key::Local(_) => true,
+            #[cfg(feature = "remote-images")]
+            Key::Remote(url) => self.urls.contains(url) || self.cache.has_url(url),
+            #[cfg(not(feature = "remote-images"))]
+            Key::Remote(_) => false,
+        }
+    }
+
+    /// The anim thread read and indexed the animation of job `serial`: it plays, if it is still
+    /// wanted and fits, from its first frame.
+    fn anim_measured(&mut self, serial: u64, engine: Option<Box<anim::Engine>>) {
+        let Some(i) = self.anims.out.iter().position(|o| o.serial == serial) else {
+            return;
+        };
+        let out = self.anims.out.swap_remove(i);
+        self.cache.anims -= out.cost;
+        // (Its body, if it was fetched again for it, was read: it may be again.)
+        anim::retain_keys(&mut self.anims.fetched, &|k| *k != out.key);
+        let stale = matches!(out.key, Key::Local(_)) && out.doc_gen != self.doc_gen;
+        // (A remote one nothing holds any more leaves nothing behind, a refusal included.)
+        if stale
+            || !self.anim_owned(&out.key)
+            || !self.anims.wanted(&out.key)
+            || self.anim_at(&out.key).is_some()
+        {
+            return;
+        }
+        let Some(mut engine) = engine else {
+            return self.anims.refuse(out.key, false);
+        };
+        if out.forced {
+            let ceiling = self.forced.ceiling.unwrap_or_else(forced::ceiling);
+            if !engine.force(ceiling, out.size) {
+                return self.anims.refuse(out.key, false);
+            }
+            let mut p = anim::Playing::new(serial, engine, out.size, false);
+            // (It was painted when it was asked for.)
+            p.painted = self.cache.frame.saturating_add(1);
+            self.anims.outside.push((out.key, Box::new(p)));
+            self.anims.live = true;
+            return self.send_step(At::Outside(self.anims.outside.len() - 1));
+        }
+        let keep = engine.keeps(out.size);
+        if !keep {
+            engine.lean(out.size, anim::ANIM_ONE_MAX);
+        }
+        let p = anim::Playing::new(serial, engine, out.size, keep);
+        let slot = p
+            .cost
+            .saturating_add(SLOT_OVERHEAD)
+            .saturating_add(match &out.key {
+                Key::Local(_) => 0,
+                Key::Remote(url) => str_bytes(url),
+            });
+        if p.cost > anim::ANIM_ONE_MAX {
+            return self.anims.refuse(out.key, true);
+        }
+        // What it holds is known now: it plays if the allocation, weighing that, plays it at the
+        // size it was read for, and there is room (else it is read again when there is).
+        let shown = self.anims_shown();
+        self.anims
+            .note_cost(out.key.clone(), out.size, slot, &shown);
+        self.reallocate(&shown);
+        let size = shown.iter().find(|s| s.1 == out.key).map(|s| s.2);
+        if size != Some(out.size)
+            || !self.anims.alloc.play.contains(&out.key)
+            || !self.anim_room(slot, 0)
+        {
+            return;
+        }
+        let key = out.key.clone();
+        if self.store(out.key, Data::Anim(Box::new(p)), true).is_err() {
+            return;
+        }
+        self.anims.live = true;
+        if let Some(at) = self.anim_at(&key) {
+            self.send_step(at);
+        }
+    }
+
+    /// The anim thread did job `serial`: whether an animation has a frame to show that it
+    /// didn't have (its first).
+    fn anim_done(&mut self, serial: u64, output: anim::Output) -> bool {
+        match output {
+            anim::Output::Measured(engine) => {
+                self.anim_measured(serial, engine);
+                false
+            }
+            anim::Output::Stepped(engine, made) => {
+                let shown = self
+                    .anim_of(serial)
+                    .map(|at| self.playing(at).front().is_some());
+                self.anim_stepped(serial, engine, made);
+                let now = self
+                    .anim_of(serial)
+                    .map(|at| self.playing(at).front().is_some());
+                shown == Some(false) && now == Some(true)
+            }
+        }
+    }
+
+    /// The anim thread made a step of the animation of `serial`: it is back with its result.
+    /// One that went meanwhile (its document did) is let go, and its charge with it.
+    fn anim_stepped(&mut self, serial: u64, engine: Box<anim::Engine>, made: anim::Made) {
+        let at = self
+            .anims_at()
+            .into_iter()
+            .find(|&at| self.playing(at).serial == serial);
+        let Some(at) = at else {
+            if let Some(i) = self.anims.out.iter().position(|o| o.serial == serial) {
+                self.cache.anims -= self.anims.out.swap_remove(i).cost;
+            }
+            return;
+        };
+        self.playing(at).took(engine, made);
+        self.recharge(at);
+        self.note_ended(at);
+    }
+
+    /// A document is attached: the old one's local animations go (a step running is let go
+    /// when it is back, charged until then), and so do the choices made for its images.
+    fn detach_anims(&mut self) {
+        let doc_gen = self.doc_gen;
+        for o in &self.anims.out {
+            if matches!(o.key, Key::Local(_)) {
+                o.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        for at in self.anims_at().into_iter().rev() {
+            if !matches!(self.key_at(at), Key::Local(_)) {
+                continue;
+            }
+            let p = self.playing(at);
+            if p.running {
+                p.cancel.store(true, Ordering::Relaxed);
+                let (serial, cost) = match at {
+                    At::Slot(i) => (p.serial, self.cache.slots[i].cost()),
+                    At::Outside(_) => (p.serial, 0),
+                };
+                let key = self.key_at(at).clone();
+                self.anims.out.push(anim::Out {
+                    serial,
+                    key,
+                    doc_gen,
+                    size: (0, 0),
+                    cost,
+                    forced: false,
+                    cancel: Arc::default(),
+                });
+                self.cache.anims = self.cache.anims.saturating_add(cost);
+            }
+            match at {
+                At::Slot(i) => self.cache.remove(i),
+                At::Outside(i) => {
+                    self.anims.outside.swap_remove(i);
+                }
+            }
+        }
+        self.anims.choices = Vec::new();
+        // (The remote ones are pruned to the new document's URLs with the other records.)
+        keep_anims(&mut self.animated, &mut self.anims, &|k| {
+            matches!(k, Key::Remote(_))
+        });
+        self.anims.reads = Vec::new();
+        self.anims.alloc = anim::Alloc::default();
+        self.anims.fetched = Vec::new();
+        self.anims.failed = Vec::new();
+        self.anims.placed = Vec::new();
+    }
+
+    /// The ids of the document's images of `keys`.
+    fn ids_of(&self, keys: &[Key]) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for (i, src) in self.srcs.iter().enumerate() {
+            let id = i as u32 + 1;
+            let key = match src {
+                Src::File(_) => Key::Local(id),
+                Src::Remote(url) => Key::Remote(url.clone()),
+                Src::None => continue,
+            };
+            if keys.contains(&key) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+}
+
+/// Forget what is known of the animations whose keys `keep` doesn't keep: that they are
+/// `animated`, and the rest ([`anim::Anims::keep`]); the room their lists held is given back.
+#[cfg(feature = "images")]
+fn keep_anims(
+    animated: &mut Vec<(Key, AnimInfo)>,
+    anims: &mut anim::Anims,
+    keep: &dyn Fn(&Key) -> bool,
+) {
+    animated.retain(|(k, _)| keep(k));
+    anims.keep(keep);
+    shrink_vec(animated);
+    shrink_vec(&mut anims.costs);
+    shrink_vec(&mut anims.refused);
+    shrink_vec(&mut anims.forced);
+}
+
 impl crate::render::Pixels for Images {
+    #[cfg(feature = "images")]
+    fn placed(&mut self, id: u32, rect: (i32, i32, i32, i32)) {
+        if self.anims.idle() || self.animated(id).is_none() {
+            return;
+        }
+        // (Painted in the state it is in now, whichever paint it is.)
+        let state = self.anim_state(id);
+        let placed = &mut self.anims.placed;
+        if let Some(p) = placed.iter_mut().find(|p| p.0 == id) {
+            (p.1, p.2) = (Some(rect), state);
+        } else if placed.len() < VIEW_MAX {
+            placed.push((id, Some(rect), state, None));
+        }
+    }
+
+    #[cfg(feature = "images")]
+    fn paused(&self, id: u32) -> bool {
+        self.anim_state(id).is_some_and(|s| s != AnimState::Playing)
+    }
+
     fn pixels(&mut self, id: u32, w: u32, h: u32) -> Option<&Bitmap> {
         // Loaded past the limits: those pixels, at whatever size they were last (a zoom shows
         // them until the new ones come), else what the cache has (an SVG drawn without its
         // embedded images, until it is drawn with them).
+        // An animation shows its frame once it has one (playing or paused), else its still.
+        #[cfg(feature = "images")]
+        if !self.anims.idle() && self.anim_shows(id, w, h) {
+            return self.anim_front(id);
+        }
         #[cfg(feature = "images")]
         if let Some((_, origin)) = self.forced_ids.iter().find(|f| f.0 == id) {
             let frame = self.cache.frame;

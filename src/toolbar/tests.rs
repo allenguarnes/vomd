@@ -23,6 +23,8 @@ fn ctx(width: u32) -> Ctx {
         remote_on: false,
         no_curl: false,
         pulse: false,
+        animated: false,
+        animations: false,
     }
 }
 
@@ -609,6 +611,55 @@ fn the_remote_images_button() {
     assert_eq!(
         s.overflow[..4],
         [Item::Images, Item::ZoomOut, Item::ZoomReset, Item::ZoomIn]
+    );
+}
+
+/// With an animated image in the document, the animations button follows the remote-images one
+/// (or leads the right group), plays or pauses them all, says which with its icon and label, and
+/// goes into `⋯` with the remote-images button, after the zoom.
+#[test]
+fn the_animations_button() {
+    assert!(!items(&slots(&ctx(900))).contains(&Item::Animations));
+    let c = Ctx {
+        animated: true,
+        ..ctx(900)
+    };
+    let s = slots(&c);
+    assert_eq!(items(&s).last(), Some(&Item::Animations));
+    let both = Ctx { remote: 2, ..c };
+    let s2 = slots(&both);
+    let r = |s: &Slots, i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;
+    assert!(r(&s2, Item::Images).x1 <= r(&s2, Item::Animations).x0 + 0.01);
+    assert!(r(&s2, Item::Animations).x1 <= r(&s2, Item::ZoomOut).x0 + 0.01);
+    assert_eq!(Item::Animations.label(&c), "Play animations (A)");
+    assert_eq!(Item::Animations.icon(&c), Some(icon::PLAY));
+    let on = Ctx {
+        animations: true,
+        ..c
+    };
+    assert_eq!(Item::Animations.label(&on), "Pause animations (A)");
+    assert_eq!(Item::Animations.icon(&on), Some(icon::PAUSE));
+    let mut t = Toolbar::default();
+    let (x, y) = center(&s, Item::Animations);
+    assert!(t.press(&c, x, y));
+    assert_eq!(
+        t.release(&c, x, y),
+        (true, Some(Command::Action(Action::ToggleAnimations)))
+    );
+    // Narrow: after the zoom, it goes with the remote-images button.
+    let s = slots(&Ctx {
+        width: 232 + FIND as u32,
+        ..both
+    });
+    assert_eq!(
+        s.overflow[..5],
+        [
+            Item::Images,
+            Item::Animations,
+            Item::ZoomOut,
+            Item::ZoomReset,
+            Item::ZoomIn
+        ]
     );
 }
 

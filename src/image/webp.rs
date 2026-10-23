@@ -1,11 +1,14 @@
 //! WebP: lossy, lossless, with alpha, and the first frame of an animation. The header is read
 //! from the RIFF chunks (a `VP8X` file's are walked for its EXIF orientation and the kind of its
-//! image); `image-webp` decodes the whole frame, which is resampled like a JPEG's.
+//! image); `image-webp` decodes the whole frame, which is resampled like a JPEG's. An
+//! animation's frames are found by [`frames`], and each is decoded by [`frame`] as a still made
+//! of its chunks (`anim.rs` draws them).
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::AtomicBool;
 
-use super::{Bitmap, Format, Frame, Header, MAX_HEADER_SCAN, Sampling, exif, resample};
+use super::anim::{Dispose, Entry, Found, Head};
+use super::{Bitmap, Format, Frame, Header, Loops, MAX_HEADER_SCAN, Sampling, exif, resample};
 use crate::layout::Refusal;
 
 /// What decoding a WebP holds for each pixel besides its output, by kind of image, in bytes
@@ -298,6 +301,161 @@ pub(super) fn decode(
         channels,
     };
     Ok(resample(frame, w, h, sampling, cancel))
+}
+
+/// The frames of the animated WebP `bytes`, each given to `each` in order until it says stop:
+/// every `ANMF` chunk, with the loop count of the `ANIM` chunk before it; to the end of the file
+/// or the RIFF, or the first frame that is cut short, reaches past the canvas (`libwebp` refuses
+/// those), or holds no image. `None` if it isn't a `VP8X` file with the animation flag, or a side
+/// of its canvas is over [`MAX_SOURCE_SIDE`](super::MAX_SOURCE_SIDE). Reads chunk headers, the
+/// frames' and their first chunk's, only.
+pub(super) fn frames(bytes: &[u8], mut each: impl FnMut(Found) -> bool) -> Option<Head> {
+    let le24 = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], 0]);
+    let le32 = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let head = bytes.get(..30)?;
+    if &head[..4] != b"RIFF" || &head[8..16] != b"WEBPVP8X" || head[20] & 0x02 == 0 {
+        return None;
+    }
+    let (w, h) = (le24(head, 24) + 1, le24(head, 27) + 1);
+    if w > super::MAX_SOURCE_SIDE || h > super::MAX_SOURCE_SIDE {
+        return None;
+    }
+    let end = bytes.len().min((le32(head, 4) as usize).saturating_add(8));
+    let first = le32(head, 16) as usize;
+    let mut at = 20usize.saturating_add(first).saturating_add(first & 1);
+    let mut loops = Loops::Plays(1);
+    while let Some(chunk) = bytes
+        .get(at..at.saturating_add(8))
+        .filter(|_| at + 8 <= end)
+    {
+        let len = le32(chunk, 4) as usize;
+        let data = at + 8;
+        let Some(body) = bytes
+            .get(data..data.saturating_add(len))
+            .filter(|_| data + len <= end)
+        else {
+            break;
+        };
+        match &chunk[..4] {
+            b"ANIM" if len >= 6 => {
+                loops = match u16::from_le_bytes([body[4], body[5]]) {
+                    0 => Loops::Forever,
+                    n => Loops::Plays(u32::from(n)),
+                };
+            }
+            b"ANMF" => {
+                if len < 24 {
+                    break;
+                }
+                let (x, y) = (2 * le24(body, 0), 2 * le24(body, 3));
+                let (fw, fh) = (le24(body, 6) + 1, le24(body, 9) + 1);
+                if x + fw > w || y + fh > h {
+                    break;
+                }
+                let payload = &body[16..];
+                let Some((out, working)) = frame_cost(payload, fw, fh) else {
+                    break;
+                };
+                let found = Found {
+                    entry: Entry {
+                        at: u32::try_from(data + 16).ok()?,
+                        len: u32::try_from(payload.len()).ok()?,
+                        // (Inside a canvas of at most 65,535 a side.)
+                        rect: [x, y, fw, fh].map(|v| v as u16),
+                        delay: le24(body, 12),
+                        dispose: if body[15] & 1 != 0 {
+                            Dispose::Background
+                        } else {
+                            Dispose::Keep
+                        },
+                        blend: body[15] & 2 == 0,
+                        transparent: None,
+                    },
+                    out,
+                    working,
+                };
+                if !each(found) {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        at = data + len + (len & 1);
+    }
+    Some(Head {
+        size: (w, h),
+        loops,
+        table: 0,
+    })
+}
+
+/// The RIFF and `VP8X` headers of the still a frame is decoded as.
+const STILL_HEAD: usize = 30;
+
+/// What decoding a frame of `w` × `h` whose data is `data` holds: its pixels (RGBA, or RGB for
+/// a lossy frame without an `ALPH` chunk), and what the decoder holds beside them
+/// ([`working`] and [`WEBP_FIXED`](super::WEBP_FIXED)) and the still it reads; `None` if the data doesn't start with
+/// an image chunk. A lossless frame is read with alpha, which a frame always has.
+fn frame_cost(data: &[u8], w: u32, h: u32) -> Option<(usize, usize)> {
+    let (kind, alpha) = match data.get(..4)? {
+        b"ALPH" => (Kind::Lossy, true),
+        b"VP8 " => (Kind::Lossy, false),
+        b"VP8L" => (Kind::Lossless, true),
+        _ => return None,
+    };
+    let out = (w as usize * h as usize).saturating_mul(if alpha { 4 } else { 3 });
+    // (And the still made of it, a copy of its chunks: see `frame`.)
+    let working = working(kind, alpha, w, h, data.len())
+        .saturating_add(super::WEBP_FIXED)
+        .saturating_add(STILL_HEAD + data.len());
+    Some((out, working))
+}
+
+/// Frame `e` of the animated WebP `bytes` (see [`frames`]), decoded into `out` by `read_image`
+/// as a still of its own chunks, copied after the headers of a canvas the frame's size (so the patched decoder's checks hold: a lossy image of another
+/// size than the frame says is refused before it is decoded), with the memory and Huffman
+/// limits of a still of its size and kind (`forced`: the Huffman codes may have that room, less
+/// the rest of the decode, as a still loaded past the limits). Returns its channels: 4, or 3 for
+/// a lossy frame without alpha. `None` if it doesn't decode.
+pub(super) fn frame(
+    bytes: &[u8],
+    e: &Entry,
+    out: &mut Vec<u8>,
+    forced: Option<usize>,
+) -> Option<usize> {
+    let data = bytes.get(e.at as usize..)?.get(..e.len as usize)?;
+    let (fw, fh) = (u32::from(e.rect[2]), u32::from(e.rect[3]));
+    let (size, working) = frame_cost(data, fw, fh)?;
+    let alpha = &data[..4] != b"VP8 ";
+    let mut head = [0u8; STILL_HEAD];
+    head[..4].copy_from_slice(b"RIFF");
+    head[4..8].copy_from_slice(&u32::try_from(22 + data.len()).ok()?.to_le_bytes());
+    head[8..16].copy_from_slice(b"WEBPVP8X");
+    head[16] = 10;
+    head[20] = if alpha { 0x10 } else { 0 };
+    head[24..27].copy_from_slice(&(fw - 1).to_le_bytes()[..3]);
+    head[27..30].copy_from_slice(&(fh - 1).to_le_bytes()[..3]);
+    // A copy, read as the stills are (one reader's type: the decoder is built in once).
+    let mut still = Vec::with_capacity(head.len() + data.len());
+    still.extend_from_slice(&head);
+    still.extend_from_slice(data);
+    let mut d = image_webp::WebPDecoder::new(Cursor::new(&still[..])).ok()?;
+    let channels = if alpha { 4 } else { 3 };
+    if d.dimensions() != (fw, fh) || d.has_alpha() != alpha || d.output_buffer_size() != Some(size)
+    {
+        return None;
+    }
+    d.set_memory_limit(working);
+    // An animation played past the limits has the room it was played in instead, less what the
+    // rest of the frame's decode holds beside the codes (as `decode` gives a forced still).
+    let huffman = huffman_limit(fw, fh);
+    d.set_huffman_limit(forced.map_or(huffman, |room| {
+        room.saturating_sub(working.saturating_sub(huffman))
+    }));
+    out.clear();
+    out.resize(size, 0);
+    d.read_image(out).ok()?;
+    Some(channels)
 }
 
 #[cfg(test)]

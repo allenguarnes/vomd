@@ -47,6 +47,15 @@ static ALLOCATOR: vomd::image::SvgChildAllocator = vomd::image::SvgChildAllocato
 
 /// Idle layout runs in slices this long between events.
 const IDLE_SLICE: Duration = Duration::from_millis(4);
+/// How often whether the window is minimized is looked at while it plays without the keyboard.
+#[cfg(feature = "images")]
+const MIN_CHECK: Duration = Duration::from_secs(1);
+/// On X11 an OS redraw (part of the window uncovered, without a compositor) that comes while an
+/// animation's redraw is pending arrives as one `RedrawRequested` with it, which paints only the
+/// animation: the uncovered part would stay stale. So while animations play, one of their frames
+/// is painted whole at least this often there.
+#[cfg(feature = "images")]
+const WHOLE_EVERY: Duration = Duration::from_secs(1);
 /// What the empty window says. Dropping a file works on X11 and Windows (winit can't take drops
 /// on Wayland), so it is only offered there.
 fn empty_message(wayland: bool) -> String {
@@ -61,6 +70,17 @@ fn empty_message(wayland: bool) -> String {
 /// End the event loop. Also wakes it: on Windows, winit only looks at the request after its next
 /// message, and a window that failed to open (or a bench's first frame, painted before the window
 /// shows) may never get one.
+/// softbuffer's rectangle for a damaged part of the window (`None` if it is empty).
+#[cfg(feature = "images")]
+fn to_rect(c: &vomd::render::Clip) -> Option<softbuffer::Rect> {
+    Some(softbuffer::Rect {
+        x: u32::try_from(c.x0).ok()?,
+        y: u32::try_from(c.y0).ok()?,
+        width: NonZeroU32::new(u32::try_from(c.x1 - c.x0).ok()?)?,
+        height: NonZeroU32::new(u32::try_from(c.y1 - c.y0).ok()?)?,
+    })
+}
+
 fn quit(event_loop: &ActiveEventLoop, proxy: &EventLoopProxy<UserEvent>) {
     event_loop.exit();
     let _ = proxy.send_event(UserEvent::Quit);
@@ -198,6 +218,9 @@ enum Bench {
     /// the process. Fallback font scans run as in a real window (they're part of its idle RSS);
     /// [`Bench::FirstFrame`] skips them.
     Idle,
+    /// `idle-end`: [`Bench::Idle`], the window scrolled to the end of the document once its
+    /// first frame is painted (past what it showed at the top).
+    IdleAtEnd,
 }
 
 /// Make the toolbar's Back follow the back stack. The toolbar accepts clicks by this too, so
@@ -283,7 +306,38 @@ struct App {
     #[cfg(feature = "find")]
     ime: Option<(u32, u32, u32, u32)>,
     shown: bool,
+    /// The window has the keyboard: while it hasn't, whether it was minimized is looked at
+    /// now and then if an animation plays (X11 says nothing when it is).
+    #[cfg(feature = "images")]
+    focused: bool,
+    /// The window was found minimized, or said it is covered whole: animations wait.
+    #[cfg(feature = "images")]
+    minimized: bool,
+    #[cfg(feature = "images")]
+    occluded: bool,
+    /// When whether the window is minimized is next looked at.
+    #[cfg(feature = "images")]
+    min_check: Option<Instant>,
+    /// What changed in the frame presented last, which only the animations changed (`None`:
+    /// anything may have).
+    #[cfg(feature = "images")]
+    last_damage: Option<Vec<vomd::render::Clip>>,
+    /// When a frame was last painted whole ([`WHOLE_EVERY`]).
+    #[cfg(feature = "images")]
+    whole_at: Option<Instant>,
+    /// Animations as last applied from or saved to the settings.
+    #[cfg(feature = "images")]
+    anim_set: bool,
     exit_code: i32,
+}
+
+/// A paint that can't be made (a minimized window has no size) drops what the animations changed
+/// of it, which `about_to_wait` would ask to paint again for as long as it was there, and the
+/// next paint is whole.
+#[cfg(feature = "images")]
+fn declined(pending: &Cell<bool>, view: &mut View) {
+    view.discard_damage();
+    pending.set(true);
 }
 
 impl App {
@@ -294,29 +348,127 @@ impl App {
         }
     }
 
+    /// Paint again only what the animations changed ([`View::damage`]), unless more is asked
+    /// for by then ([`App::redraw`]).
+    #[cfg(feature = "images")]
+    fn redraw_damage(&self) {
+        if let Some(g) = &self.gfx {
+            g.window.request_redraw();
+        }
+    }
+
+    /// Look at whether the window is minimized (then again a second later, while it isn't and
+    /// hasn't the keyboard): animations wait while it is.
+    #[cfg(feature = "images")]
+    fn check_minimized(&mut self, now: Instant) {
+        let Some(g) = &self.gfx else {
+            return;
+        };
+        self.minimized = g.window.is_minimized() == Some(true);
+        self.min_check = (!self.minimized).then_some(now + MIN_CHECK);
+        self.sync_hidden();
+    }
+
+    /// Tell the view whether the window can be seen.
+    #[cfg(feature = "images")]
+    fn sync_hidden(&mut self) {
+        let hidden = self.minimized || self.occluded;
+        if self.view.as_mut().is_some_and(|v| v.set_hidden(hidden)) {
+            self.redraw();
+        }
+    }
+
     fn paint(&mut self, event_loop: &ActiveEventLoop) {
-        self.redraw_pending.set(false);
+        #[cfg_attr(not(feature = "images"), allow(unused_mut, unused_variables))]
+        let mut asked = self.redraw_pending.replace(false);
         let (Some(gfx), Some(view)) = (self.gfx.as_mut(), self.view.as_mut()) else {
             return;
         };
         let size = gfx.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            #[cfg(feature = "images")]
+            declined(&self.redraw_pending, view);
             return;
         };
         if gfx.surface.resize(w, h).is_err() {
+            #[cfg(feature = "images")]
+            declined(&self.redraw_pending, view);
             return;
         }
         let Ok(mut buf) = gfx.surface.buffer_mut() else {
+            #[cfg(feature = "images")]
+            declined(&self.redraw_pending, view);
             return;
         };
         // The Resized and ScaleFactorChanged handlers keep the view's size; this only covers a
         // frame painted before their event arrives (the buffer must match what is painted).
         if view.size() != (w.get(), h.get()) {
             view.resize(w.get(), h.get());
+            #[cfg(feature = "images")]
+            {
+                asked = true;
+            }
         }
-        view.paint(&mut buf, w.get() as usize, Instant::now());
-        vomd::render::opaque(&mut buf);
-        if buf.present().is_err() {
+        // A window that paints was shown again.
+        #[cfg(feature = "images")]
+        if self.minimized && gfx.window.is_minimized() != Some(true) {
+            self.minimized = false;
+            view.set_hidden(self.occluded);
+            asked = true;
+        }
+        let stride = w.get() as usize;
+        let now = Instant::now();
+        // Only what the animations changed, if nothing else did and the buffer holds the frame
+        // before (or the one before that, and what changed in the last one is known); on X11,
+        // whole now and then all the same.
+        #[cfg(feature = "images")]
+        let changed = (!asked && !view.damage().is_empty()).then(|| view.damage().to_vec());
+        #[cfg(feature = "images")]
+        let stale = cfg!(all(unix, not(target_os = "macos")))
+            && !self.wayland
+            && self.whole_at.is_none_or(|t| now >= t + WHOLE_EVERY);
+        #[cfg(feature = "images")]
+        let rects = changed.as_deref().filter(|_| !stale).and_then(|changed| {
+            vomd::render::damage(changed, buf.age(), self.last_damage.as_deref())
+        });
+        #[cfg(feature = "images")]
+        if let Some(rects) = &rects {
+            view.paint_rects(&mut buf, stride, rects, now);
+            vomd::render::opaque_rects(&mut buf, stride, rects);
+        }
+        #[cfg(feature = "images")]
+        let whole = rects.is_none();
+        #[cfg(not(feature = "images"))]
+        let whole = true;
+        if whole {
+            view.paint(&mut buf, stride, now);
+            vomd::render::opaque(&mut buf);
+            #[cfg(feature = "images")]
+            {
+                self.whole_at = Some(now);
+            }
+        }
+        // While animations play, the next frame waits for the compositor to want one (Wayland:
+        // none comes for a window that can't be seen, so they wait too).
+        #[cfg(feature = "images")]
+        if view.animating() {
+            gfx.window.pre_present_notify();
+        }
+        #[cfg(feature = "images")]
+        let presented = match rects {
+            Some(rects) => {
+                buf.present_with_damage(&rects.iter().filter_map(to_rect).collect::<Vec<_>>())
+            }
+            None => buf.present(),
+        };
+        #[cfg(not(feature = "images"))]
+        let presented = buf.present();
+        // (However it was painted: a buffer two frames old misses only that of this one.)
+        #[cfg(feature = "images")]
+        {
+            self.last_damage = changed.filter(|_| presented.is_ok());
+        }
+        if presented.is_err() {
             return;
         }
         if !self.shown {
@@ -329,6 +481,10 @@ impl App {
                     platform::peak_rss_kb()
                 );
                 quit(event_loop, &self.proxy);
+            }
+            if self.bench == Some(Bench::IdleAtEnd) {
+                view.apply(view::Action::Bottom, now);
+                self.redraw();
             }
         }
         self.scan_fonts();
@@ -357,6 +513,14 @@ impl App {
         }
         self.toolbar_shown = prefs.toolbar;
         self.wide_set = prefs.wide;
+        // (Only a change: applying the same again would forget what clicks chose for images.)
+        #[cfg(feature = "images")]
+        {
+            if view.animations() != prefs.animations {
+                view.set_animations(prefs.animations);
+            }
+            self.anim_set = prefs.animations;
+        }
         #[cfg(feature = "toc")]
         {
             view.set_toc(prefs.toc);
@@ -435,6 +599,15 @@ impl App {
                 self.wide_set = wide;
                 self.store
                     .set("wide", if wide { "true" } else { "false" }, now);
+            }
+            #[cfg(feature = "images")]
+            {
+                let on = view.animations();
+                if on != self.anim_set {
+                    self.anim_set = on;
+                    self.store
+                        .set("animations", if on { "on" } else { "off" }, now);
+                }
             }
             #[cfg(feature = "toc")]
             {
@@ -1084,9 +1257,29 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 #[cfg(feature = "find")]
                 view.release_find_drag();
+                #[cfg(feature = "images")]
+                {
+                    self.focused = false;
+                    if view.animating() {
+                        self.check_minimized(now);
+                    }
+                }
                 self.save(|s| s.flush());
             }
+            #[cfg(feature = "images")]
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                self.sync_hidden();
+            }
             WindowEvent::Focused(true) => {
+                #[cfg(feature = "images")]
+                {
+                    self.focused = true;
+                    self.min_check = None;
+                    if std::mem::take(&mut self.minimized) {
+                        self.sync_hidden();
+                    }
+                }
                 // (`reload` keeps a pipe's document: its stamp says nothing.)
                 if let Input::File(path) = &self.input
                     && view::stamp(path) != self.stamp
@@ -1270,13 +1463,35 @@ impl ApplicationHandler<UserEvent> for App {
         // Idle layout starts once the first frame is out. The scrollbar's deadline is checked
         // on every turn, so it hides on time while measuring keeps the loop polling.
         let tick = view.tick(now, self.shown.then(|| now + IDLE_SLICE));
+        #[cfg(feature = "images")]
+        let damaged = !view.damage().is_empty();
         if tick.redraw {
             self.redraw();
         }
+        #[cfg(feature = "images")]
+        if !tick.redraw && damaged {
+            self.redraw_damage();
+        }
         self.scan_fonts();
         self.save(|s| s.poll(now));
+        // (X11 says nothing when a window is minimized: while one without the keyboard plays,
+        // it is looked at once a second.)
+        #[cfg(feature = "images")]
+        let save = {
+            let playing = !self.focused && self.view.as_ref().is_some_and(View::animating);
+            if !playing {
+                self.min_check = None;
+            } else if self.min_check.is_none_or(|t| now >= t) {
+                self.check_minimized(now);
+            }
+            [self.store.deadline(), self.min_check]
+                .into_iter()
+                .flatten()
+                .min()
+        };
+        #[cfg(not(feature = "images"))]
         let save = self.store.deadline();
-        if self.bench == Some(Bench::Idle)
+        if matches!(self.bench, Some(Bench::Idle | Bench::IdleAtEnd))
             && self.shown
             && !self.idle_reported
             && !matches!(tick.wake, Wake::Poll)
@@ -1333,12 +1548,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let bench = std::env::var_os("VOMD_BENCH").map(|v| {
-        if v == "idle" {
-            Bench::Idle
-        } else {
-            Bench::FirstFrame
-        }
+    let bench = std::env::var_os("VOMD_BENCH").map(|v| match v.to_str() {
+        Some("idle") => Bench::Idle,
+        Some("idle-end") => Bench::IdleAtEnd,
+        _ => Bench::FirstFrame,
     });
     // Settings come first: they size the window and set theme and zoom.
     let store = Store::open(if no_settings { None } else { settings::path() });
@@ -1393,6 +1606,20 @@ fn main() {
         #[cfg(feature = "find")]
         ime: None,
         shown: false,
+        #[cfg(feature = "images")]
+        focused: true,
+        #[cfg(feature = "images")]
+        minimized: false,
+        #[cfg(feature = "images")]
+        occluded: false,
+        #[cfg(feature = "images")]
+        min_check: None,
+        #[cfg(feature = "images")]
+        last_damage: None,
+        #[cfg(feature = "images")]
+        whole_at: None,
+        #[cfg(feature = "images")]
+        anim_set: false,
         exit_code: 0,
     };
     if let Err(e) = event_loop.run_app(&mut app) {

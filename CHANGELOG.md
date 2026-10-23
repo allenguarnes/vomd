@@ -6,6 +6,24 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Animated GIFs and WebPs play, on every platform. They are off by default, so they keep showing
+  their first frame until you turn them on: the `animations = on` setting, the `A` key, or the
+  toolbar's play button (shown when the document has an animated image), which are saved like `W`.
+  - A paused animated image shows a ▶ badge at its lower left (on images of 48 × 48 pixels or
+    more), and a click plays or pauses that image alone, whether animations are on or off.
+    `Ctrl`+click does it on an image that is a link, whose click follows the link.
+  - Timing is the browsers': a frame delay of 10 ms or less plays as 100 ms, and 20 ms (50 frames
+    a second) is the fastest. Loop counts are honored, and the last frame stays, with the badge:
+    a click (or `A` off and on) plays it again from the start.
+  - An animation plays only while it is on screen, and waits while the window is minimized,
+    covered whole (X11), or not drawn by the compositor (Wayland); it keeps playing in a window
+    that is visible without the keyboard. With nothing playing VOMD uses no CPU, and only the
+    animated images are painted again for each frame.
+  - Frames are made on a thread of their own and use the 32 MiB image memory: small animations
+    are kept whole, larger ones are decoded frame by frame, and at most half of that memory goes
+    to animations. A README-sized GIF (640 × 360, or 800 × 600) plays by itself on a 2× HiDPI
+    screen too. One over VOMD's limits shows its first frame and the badge, and a click plays
+    it anyway, as *click to load* does for images.
 - Windows 10 (1803) and newer, and Windows 11, on x86-64: every feature Linux has, from one
   `vomd.exe` that needs nothing installed (the C runtime is linked in). The release has
   `vomd-<version>-x86_64-windows-portable.zip`. `vomd.exe` isn't code-signed yet, so the first

@@ -5043,3 +5043,184 @@ fn svg_jobs_hold_what_they_are_charged() {
     }
     println!("SVG jobs within their reservation; the least room: {least:?}");
 }
+
+/// An animated WebP of a `w` × `h` canvas, played forever, of the frames `frames` (their
+/// rectangle, flags and image chunks).
+fn webp_anim(w: u32, h: u32, frames: &[([u32; 4], u8, &[u8])]) -> Vec<u8> {
+    let le24 = |v: u32| v.to_le_bytes()[..3].to_vec();
+    let mut vp8x = vec![0x12, 0, 0, 0];
+    vp8x.extend(le24(w - 1));
+    vp8x.extend(le24(h - 1));
+    let mut chunks = vec![(b"VP8X", vp8x), (b"ANIM", vec![0; 6])];
+    for &([x, y, fw, fh], flags, image) in frames {
+        let mut d = Vec::new();
+        for v in [x / 2, y / 2, fw - 1, fh - 1, 50] {
+            d.extend(le24(v));
+        }
+        d.push(flags);
+        d.extend(image);
+        chunks.push((b"ANMF", d));
+    }
+    webp_of(&chunks)
+}
+
+/// The animations the charges of playing are checked with: GIFs (interlaced, local palettes,
+/// every disposal) and WebPs (lossy, with alpha, lossless) of frames of many sizes.
+fn animations() -> Vec<(&'static str, Vec<u8>)> {
+    let mut seed = 7u32;
+    let mut noise = |n: usize, modulo: u32| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                ((seed >> 16) % modulo) as u8
+            })
+            .collect()
+    };
+    let mut gif = Vec::new();
+    {
+        let palette: Vec<u8> = (0..=255u8).flat_map(|i| [i, 255 - i, i / 2]).collect();
+        let mut e = gif::Encoder::new(&mut gif, 300, 200, &palette).unwrap();
+        e.set_repeat(gif::Repeat::Infinite).unwrap();
+        let dispose = [
+            gif::DisposalMethod::Keep,
+            gif::DisposalMethod::Previous,
+            gif::DisposalMethod::Background,
+            gif::DisposalMethod::Previous,
+        ];
+        for (i, [left, top, width, height]) in [
+            [0u16, 0, 300, 200],
+            [10, 20, 200, 150],
+            [250, 150, 100, 100],
+            [0, 0, 120, 60],
+            [40, 40, 260, 160],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let frame = gif::Frame {
+                left,
+                top,
+                width,
+                height,
+                interlaced: i % 2 == 1,
+                transparent: Some(3),
+                dispose: dispose[i % 4],
+                palette: (i == 2).then(|| noise(3 * 16, 256)),
+                buffer: noise(usize::from(width) * usize::from(height), 256).into(),
+                ..gif::Frame::default()
+            };
+            e.write_frame(&frame).unwrap();
+        }
+    }
+    let rgba = |w: u32, h: u32, alpha: bool, noise: &mut dyn FnMut(usize, u32) -> Vec<u8>| {
+        let mut px = noise((w * h * 4) as usize, 256);
+        if !alpha {
+            for p in px.as_chunks_mut::<4>().0 {
+                p[3] = 255;
+            }
+        }
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&px, w, h, image_webp::ColorType::Rgba8)
+            .unwrap();
+        out[12..].to_vec()
+    };
+    let (a, b) = (
+        rgba(400, 300, true, &mut noise),
+        rgba(120, 80, false, &mut noise),
+    );
+    // The lossy frames of `big-anim.webp`: with an `ALPH` chunk, and without.
+    let big = fixture("big-anim.webp");
+    let frame_data = |n: usize| {
+        let mut at = 12 + 8 + 10 + 8 + 6;
+        for _ in 0..n {
+            at += 8 + u32::from_le_bytes(big[at + 4..at + 8].try_into().unwrap()) as usize;
+        }
+        let len = u32::from_le_bytes(big[at + 4..at + 8].try_into().unwrap()) as usize;
+        big[at + 8 + 16..at + 8 + len].to_vec()
+    };
+    let (lossy_alpha, lossy) = (frame_data(0), frame_data(1));
+    let mixed = webp_anim(
+        1024,
+        768,
+        &[
+            ([0, 0, 1024, 768], 2, &lossy_alpha),
+            ([100, 100, 400, 300], 1, &a),
+            ([0, 0, 1024, 768], 0, &lossy),
+            ([500, 600, 120, 80], 0, &b),
+        ],
+    );
+    vec![
+        ("a GIF of five frames", gif),
+        ("anim.gif", fixture("anim.gif")),
+        ("anim.webp", fixture("anim.webp")),
+        ("big-anim.webp", big),
+        ("a WebP of lossy and lossless frames", mixed),
+    ]
+}
+
+/// Playing an animation holds no more than it is charged (`Index::held`): the index, the canvas,
+/// what is saved of it for a GIF frame disposed to the previous, and one frame's decode at the
+/// most any frame holds, for GIFs (interlaced, local palettes, every disposal) and WebPs (lossy,
+/// with alpha, lossless) of frames of many sizes.
+#[test]
+fn playing_an_animation_stays_in_its_charge() {
+    let _serial = serial();
+    for (what, bytes) in animations() {
+        let start = mark();
+        let mut frames = 0;
+        let (_, held) =
+            vomd::image::play_frames(&bytes, 12, usize::MAX, |_, _, _| frames += 1).expect(what);
+        let peak = peak_over(start);
+        assert_eq!(frames, 12, "{what}: every frame decodes");
+        assert!(
+            peak <= held,
+            "{what}: {peak} bytes allocated, {held} charged"
+        );
+        eprintln!("{what}: {peak} of {held}");
+    }
+}
+
+/// Playing an animation resampled to its box, as the window plays it, holds no more than it is
+/// charged: streamed (the canvas and a frame's decode, the resampler, the frame shown and the one
+/// made), kept (all its frames, made while it streams its first play), and past the limits (one
+/// over `ANIM_ONE_MAX`, as a click plays it, under the ceiling it is checked against).
+#[test]
+fn playing_at_a_box_stays_in_its_charge() {
+    let _serial = serial();
+    for (what, bytes) in animations() {
+        let bytes = std::sync::Arc::new(bytes);
+        let (w, h) = vomd::image::header_of(&bytes)
+            .map(|(_, w, h)| (w, h))
+            .unwrap();
+        for size in [
+            (w, h),
+            (w.div_ceil(3), h.div_ceil(3)),
+            (w * 2, h * 2),
+            (w * 3 / 2, h * 3 / 2),
+            (16, 12),
+        ] {
+            // Then with a room under two bitmaps of the box: one, made again as each frame is
+            // shown, for a box that enlarges (none if it doesn't, or its frames are kept).
+            let mut room = usize::MAX;
+            for one in [false, true] {
+                let start = mark();
+                let mut shows = 0;
+                let Some(charge) =
+                    vomd::image::play_box(bytes.clone(), size, 14, room, |_| shows += 1)
+                else {
+                    assert!(one, "{what} at {size:?}");
+                    continue;
+                };
+                let peak = peak_over(start);
+                assert!(shows >= 2, "{what} at {size:?}: {shows} shown");
+                assert!(
+                    peak <= charge,
+                    "{what} at {size:?}: {peak} bytes allocated, {charge} charged"
+                );
+                eprintln!("{what} at {size:?}, {room}: {peak} of {charge}");
+                room = charge - 1;
+            }
+        }
+    }
+}

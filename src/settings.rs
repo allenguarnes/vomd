@@ -186,6 +186,8 @@ pub struct Prefs {
     pub font_mono_path: Option<FontPaths>,
     /// Selecting text offers it as the primary selection (pasted with the middle button).
     pub primary_selection: bool,
+    /// Animated GIFs and WebPs play (`A` toggles it); off, they show their first frame.
+    pub animations: bool,
 }
 
 /// What `primary_selection` is without a line for it: on where there is a primary selection (X11
@@ -215,6 +217,7 @@ impl Default for Prefs {
             font_sans_path: None,
             font_mono_path: None,
             primary_selection: DEFAULT_PRIMARY,
+            animations: false,
         }
     }
 }
@@ -300,6 +303,10 @@ impl Prefs {
                 .get("primary_selection")
                 .and_then(parse_bool)
                 .unwrap_or(d.primary_selection),
+            animations: s
+                .get("animations")
+                .and_then(parse_bool)
+                .unwrap_or(d.animations),
         }
     }
 }
@@ -849,6 +856,10 @@ macro_rules! template {
 
 # Wide layout: the text spans the window instead of stopping at line_width (W toggles it).
 # wide = false
+
+# Animated GIFs and WebPs: off (their first frame) or on (they play). A toggles it, and a
+# click on an animated image plays or pauses it alone.
+# animations = off
 ",
             $primary,
             "

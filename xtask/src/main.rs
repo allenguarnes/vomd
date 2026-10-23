@@ -14,7 +14,7 @@ use std::{env, fs};
 mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
-const SIZE_BUDGET: [u64; 2] = [5_550_000, 3_000_000];
+const SIZE_BUDGET: [u64; 2] = [5_620_000, 3_000_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
 const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_500_000, 2_000_000];
@@ -37,14 +37,19 @@ const RSS_HUGE_KB: [u64; 2] = [60_000, 55_000];
 /// the window system; a timer or a busy loop takes many more.
 const IDLE_TICKS: u64 = 1;
 const IDLE_WATCH: Duration = Duration::from_secs(3);
+/// Playing `anim.md`'s animations at its top in a 1080p window: 10% of one core over
+/// [`IDLE_WATCH`]. Reported, not gated, until CI has measured it.
+const PLAYING_TICKS: u64 = 30;
 const SCROLL_BUDGET_MS: f64 = 8.0;
+/// The image cache's budget, 32 MiB.
+const IMAGE_CACHE_KB: u64 = 32_768;
 /// Peak RSS with 50 images, local or remote: 30,000 KB idle and the image budget
 /// of 32 MiB. (The examples have no window, so no Wayland allowance.)
-const IMAGE_RSS_KB: u64 = 30_000 + 32_768;
+const IMAGE_RSS_KB: u64 = 30_000 + IMAGE_CACHE_KB;
 
 /// The window the RSS budgets are specified for (logical pixels; the CI display is 1x).
 const BENCH_SIZE: &str = "1920x1080";
-const STARTUP_FIXTURES: &[&str] = &["tiny.md", "readme.md", "spec.md", "huge.md"];
+const STARTUP_FIXTURES: &[&str] = &["tiny.md", "readme.md", "spec.md", "huge.md", "anim.md"];
 /// The warm start budget is for documents up to the CommonMark spec (200 KB): the 5 MB one is
 /// parsed whole before its first frame (≈ 37 ms of it), so it is held to the cold budget only
 /// and its warm start reported.
@@ -204,8 +209,22 @@ fn field(line: &str, key: &str) -> Option<f64> {
 
 /// Start vomd on `fixture` with `VOMD_BENCH=mode`; its stderr lines come through the channel.
 fn spawn(bin: &Path, fixture: &Path, mode: &str) -> Option<(Child, mpsc::Receiver<String>)> {
-    let mut child = Command::new(bin)
-        .arg("--no-settings")
+    spawn_with(bin, fixture, mode, None)
+}
+
+/// [`spawn`], with the settings of `config` (an `XDG_CONFIG_HOME`) in place of none.
+fn spawn_with(
+    bin: &Path,
+    fixture: &Path,
+    mode: &str,
+    config: Option<&Path>,
+) -> Option<(Child, mpsc::Receiver<String>)> {
+    let mut cmd = Command::new(bin);
+    match config {
+        Some(dir) => cmd.env("XDG_CONFIG_HOME", dir),
+        None => cmd.arg("--no-settings"),
+    };
+    let mut child = cmd
         .arg(fixture)
         .env("VOMD_BENCH", mode)
         .env("VOMD_BENCH_SIZE", BENCH_SIZE)
@@ -295,7 +314,8 @@ fn startup(bin: &Path, fixture: &Path) -> Option<(f64, f64, f64, u64)> {
 
 fn ensure_fixtures() {
     let dir = root().join("fixtures");
-    if !dir.join("huge.md").exists() || !dir.join("medium.md").exists() {
+    let made = ["huge.md", "medium.md", "anim.md", "anim/spin-20.gif"];
+    if !made.iter().all(|f| dir.join(f).exists()) {
         fixtures();
     }
 }
@@ -359,7 +379,13 @@ struct Idle {
 /// Run vomd until it is idle (`VOMD_BENCH=idle`), then watch it: its RSS and the CPU ticks it
 /// takes while nothing happens.
 fn idle(bin: &Path, fixture: &Path) -> Option<Idle> {
-    let (mut child, rx) = spawn(bin, fixture, "idle")?;
+    idle_with(bin, fixture, "idle", None)
+}
+
+/// [`idle`] in bench `mode` (`idle`, or `idle-end`: scrolled to the end), with the settings of
+/// `config` if there are any.
+fn idle_with(bin: &Path, fixture: &Path, mode: &str, config: Option<&Path>) -> Option<Idle> {
+    let (mut child, rx) = spawn_with(bin, fixture, mode, config)?;
     let pid = child.id();
     let result = (|| {
         let line = bench_line(&rx, Duration::from_secs(60))?;
@@ -381,9 +407,9 @@ fn idle(bin: &Path, fixture: &Path) -> Option<Idle> {
     result
 }
 
-/// The scroll frame time of a 4K window (`examples/paint_bench.rs`), built with `extra` features
-/// into `target_dir` like the binary of that build: p95 in ms.
-fn scroll_p95(fixture: &Path, extra: &[&str], target_dir: &str) -> Option<f64> {
+/// The scroll frame time of a 4K window (`examples/paint_bench.rs` with `args`), built with
+/// `extra` features into `target_dir` like the binary of that build: p95 in ms.
+fn scroll_p95(fixture: &Path, args: &[&str], extra: &[&str], target_dir: &str) -> Option<f64> {
     let out = release_cargo()
         .args(["run", "--release", "--locked", "--quiet", "--target-dir"])
         .arg(target_dir)
@@ -392,6 +418,7 @@ fn scroll_p95(fixture: &Path, extra: &[&str], target_dir: &str) -> Option<f64> {
         .arg("paint_bench")
         .arg("--")
         .arg(fixture)
+        .args(args)
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -603,12 +630,69 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
                 true,
             );
         }
+        if i > 0 {
+            continue;
+        }
+        // Animations: none play while they are off, or while none is on screen; playing, the
+        // CPU (advisory) and the memory (the idle budget and the image cache's).
+        let config = scratch("anim-config");
+        fs::create_dir_all(config.join("vomd")).expect("scratch settings");
+        fs::write(config.join("vomd/settings.ini"), "animations = on\n").expect("settings");
+        let on = Some(config.as_path());
+        for (what, mode, config, ticks, gated) in [
+            ("animations off", "idle", None, IDLE_TICKS, true),
+            ("on, scrolled past them", "idle-end", on, IDLE_TICKS, true),
+            ("on, playing at the top", "idle", on, PLAYING_TICKS, false),
+        ] {
+            let Some(r) = idle_with(&bin, &fixture("anim.md"), mode, config) else {
+                gated_row(
+                    format!("idle, anim.md, {what}"),
+                    label,
+                    "no output".into(),
+                    "idle".into(),
+                    false,
+                    true,
+                );
+                continue;
+            };
+            gated_row(
+                format!("CPU, anim.md, {what}, 1080p"),
+                label,
+                format!("{} ticks/{}s", r.ticks, IDLE_WATCH.as_secs()),
+                format!("≤ {ticks} ticks"),
+                r.ticks <= ticks,
+                gated,
+            );
+            if mode == "idle" && config.is_some() {
+                let budget = RSS_SMALL_KB[0] + IMAGE_CACHE_KB;
+                gated_row(
+                    format!("RSS, anim.md, {what}, 1080p"),
+                    label,
+                    mb(r.rss_kb),
+                    format!("≤ {}{allowance}", mb(budget)),
+                    r.rss_kb <= budget + frame_kb,
+                    true,
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&config);
     }
-    // Both builds have a scroll budget.
-    for (label, extra, dir) in BUILDS {
-        match scroll_p95(&fixture("readme.md"), extra, dir) {
+    // Both builds have a scroll budget; the default one's is held with animations playing too.
+    let scrolls = BUILDS
+        .into_iter()
+        .map(|(label, extra, dir)| ("scroll frame, 4K", "readme.md", &[][..], label, extra, dir))
+        .chain([(
+            "scroll frame, 4K, animations playing",
+            "anim.md",
+            &["--view", "--animations"][..],
+            BUILDS[0].0,
+            BUILDS[0].1,
+            BUILDS[0].2,
+        )]);
+    for (metric, name, args, label, extra, dir) in scrolls {
+        match scroll_p95(&fixture(name), args, extra, dir) {
             Some(p95) => gated_row(
-                "scroll frame, 4K, p95".into(),
+                format!("{metric}, p95"),
                 label,
                 format!("{p95:.2} ms"),
                 format!("≤ {SCROLL_BUDGET_MS} ms"),
@@ -616,7 +700,7 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
                 timings_gated,
             ),
             None => gated_row(
-                "scroll frame, 4K".into(),
+                metric.into(),
                 label,
                 "no output".into(),
                 "a measurement".into(),
@@ -1191,8 +1275,8 @@ fn images(args: &[String]) -> bool {
     passed == runs
 }
 
-/// Generate the large fixtures that aren't committed: `huge.md` (5 MB) and `medium.md` (the
-/// 50 KB document of the idle RSS budget).
+/// Generate the large fixtures that aren't committed: `huge.md` (5 MB), `medium.md` (the
+/// 50 KB document of the idle RSS budget) and `anim.md` with its GIFs.
 fn fixtures() -> bool {
     let dir = root().join("fixtures");
     let mut seed = fs::read_to_string(dir.join("readme.md")).expect("fixtures/readme.md");
@@ -1216,5 +1300,156 @@ fn fixtures() -> bool {
     }
     fs::write(dir.join("medium.md"), &medium).expect("write medium.md");
     println!("wrote fixtures/medium.md ({} bytes)", medium.len());
+    anim_fixtures(&dir);
     true
+}
+
+/// GIF-compress `px` (indices below `1 << min`): LZW of variable width, cleared when the table
+/// is full, in sub-blocks.
+fn lzw(min: u8, px: &[u8]) -> Vec<u8> {
+    let clear = 1u16 << min;
+    let first = clear + 2;
+    let mut table: std::collections::HashMap<(u16, u8), u16> = std::collections::HashMap::new();
+    let (mut next, mut width) = (first, u32::from(min) + 1);
+    let (mut bytes, mut acc, mut bits) = (Vec::new(), 0u32, 0u32);
+    let mut put = |code: u16, width: u32| {
+        acc |= u32::from(code) << bits;
+        bits += width;
+        while bits >= 8 {
+            bytes.push(acc as u8);
+            acc >>= 8;
+            bits -= 8;
+        }
+    };
+    put(clear, width);
+    let mut cur = u16::from(px[0]);
+    for &p in &px[1..] {
+        if let Some(&code) = table.get(&(cur, p)) {
+            cur = code;
+            continue;
+        }
+        put(cur, width);
+        // (The decoder's table is one code behind the encoder's.)
+        if next == 4096 {
+            put(clear, width);
+            table.clear();
+            (next, width) = (first, u32::from(min) + 1);
+        } else {
+            if u32::from(next) >= 1 << width && width < 12 {
+                width += 1;
+            }
+            table.insert((cur, p), next);
+            next += 1;
+        }
+        cur = u16::from(p);
+    }
+    put(cur, width);
+    if u32::from(next) >= 1 << width && width < 12 {
+        width += 1;
+    }
+    put(clear + 1, width);
+    if bits > 0 {
+        bytes.push(acc as u8);
+    }
+    let mut out = vec![min];
+    for chunk in bytes.chunks(255) {
+        out.push(chunk.len() as u8);
+        out.extend_from_slice(chunk);
+    }
+    out.push(0);
+    out
+}
+
+/// A looping GIF of `frames` (indices into `palette`, 16 colors; each with its delay in 1/100 s),
+/// whole frames of `w` × `h`; with `clear`, index 0 is transparent and each frame is cleared to
+/// it before the next.
+fn gif(w: u16, h: u16, palette: &[[u8; 3]; 16], clear: bool, frames: &[(Vec<u8>, u16)]) -> Vec<u8> {
+    let mut out = b"GIF89a".to_vec();
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&[0xf3, 0, 0]);
+    out.extend(palette.iter().flatten());
+    out.extend_from_slice(b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00");
+    for (px, delay) in frames {
+        let flags = if clear { 2 << 2 | 1 } else { 1 << 2 };
+        out.extend_from_slice(&[0x21, 0xf9, 4, flags]);
+        out.extend_from_slice(&delay.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0x2c, 0, 0, 0, 0]);
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&h.to_le_bytes());
+        out.push(0);
+        out.extend(lzw(4, px));
+    }
+    out.push(0x3b);
+    out
+}
+
+/// `anim.md` and its GIFs (`anim/`), for the animation budgets: two 640 × 360 demos at 10
+/// frames a second whose every pixel changes each frame, twenty 48 × 48 spinners (transparent,
+/// cleared each frame, at 25, 12.5 and 10 frames a second), then `readme.md`'s text, to scroll
+/// past them.
+fn anim_fixtures(dir: &Path) {
+    let anim = dir.join("anim");
+    fs::create_dir_all(&anim).expect("fixtures/anim");
+    let mut palette = [[0u8; 3]; 16];
+    for (i, c) in palette.iter_mut().enumerate() {
+        let i = i as u8;
+        *c = [i * 16, 255 - i * 12, 64 + i * 10];
+    }
+    for demo in 0..2u32 {
+        let frames: Vec<(Vec<u8>, u16)> = (0..10u32)
+            .map(|f| {
+                let (cx, cy) = (60 + f * 52, 120 + demo * 120);
+                let mut px = Vec::with_capacity(640 * 360);
+                for y in 0..360u32 {
+                    for x in 0..640u32 {
+                        let (dx, dy) = (x.abs_diff(cx), y.abs_diff(cy));
+                        px.push(if dx * dx + dy * dy < 50 * 50 {
+                            (14 + demo) as u8
+                        } else {
+                            ((x + y + f * 16 + demo * 7) / 40 % 12 + (x ^ y) % 2) as u8
+                        });
+                    }
+                }
+                (px, 10)
+            })
+            .collect();
+        let name = format!("demo-{}.gif", demo + 1);
+        fs::write(anim.join(&name), gif(640, 360, &palette, false, &frames)).expect("write a GIF");
+    }
+    let mut spinners = String::new();
+    for n in 0..20u32 {
+        let delay = [4, 8, 10][n as usize % 3];
+        let frames: Vec<(Vec<u8>, u16)> = (0..8u32)
+            .map(|f| {
+                let mut px = vec![0u8; 48 * 48];
+                for k in 0..8u32 {
+                    let a = std::f64::consts::TAU * f64::from(k) / 8.0;
+                    let (cx, cy) = (24.0 + 16.0 * a.cos(), 24.0 + 16.0 * a.sin());
+                    let color = 1 + ((k + 8 - f) % 8 + n) as u8 % 15;
+                    for y in 0..48 {
+                        for x in 0..48 {
+                            let (dx, dy) = (f64::from(x) - cx, f64::from(y) - cy);
+                            if dx * dx + dy * dy < 20.0 {
+                                px[(y * 48 + x) as usize] = color;
+                            }
+                        }
+                    }
+                }
+                (px, delay)
+            })
+            .collect();
+        let name = format!("spin-{:02}.gif", n + 1);
+        fs::write(anim.join(&name), gif(48, 48, &palette, true, &frames)).expect("write a GIF");
+        spinners.push_str(&format!("![spinner {}](anim/{name}) ", n + 1));
+    }
+    let readme = fs::read_to_string(dir.join("readme.md")).expect("fixtures/readme.md");
+    let md = format!(
+        "# Animations\n\nTwo demos and twenty spinners, for the animation budgets \
+         (made by `cargo xtask fixtures`).\n\n![demo 1](anim/demo-1.gif)\n\n\
+         ![demo 2](anim/demo-2.gif)\n\n{}\n\n## After the animations\n\n{readme}",
+        spinners.trim_end()
+    );
+    fs::write(dir.join("anim.md"), md).expect("write anim.md");
+    println!("wrote fixtures/anim.md and fixtures/anim/ (2 demos, 20 spinners)");
 }

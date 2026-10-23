@@ -103,6 +103,8 @@ pub(crate) struct Loaded {
     pub bitmap: Option<Bitmap>,
     pub natural: (u32, u32),
     pub body: Option<Bytes>,
+    /// The pixels are an animation's first frame ([`super::anim::detect`]).
+    pub anim: Option<super::AnimInfo>,
 }
 
 /// What a remote image is fetched with (`Remote::forced_fetch`).
@@ -214,10 +216,24 @@ impl Forced {
         }
     }
 
+    /// The load of `origin` is no longer wanted (it isn't loaded again, nor noted as failed).
+    #[cfg(feature = "remote-images")]
+    pub(crate) fn unchoose(&mut self, origin: &Origin) {
+        self.chosen.retain(|o| o != origin);
+    }
+
     /// Why the load of `origin` failed, if it did and (a file) it hasn't changed since.
     pub(crate) fn failure(&self, origin: &Origin) -> Option<Refusal> {
         let (_, why, stamp) = self.failed.iter().find(|f| f.0 == *origin)?;
         (*stamp == Stamp::of(origin)).then_some(*why)
+    }
+
+    /// The body of the remote image at `url`, if a load fetched it and it is kept.
+    pub(crate) fn body(&self, url: &str) -> Option<Bytes> {
+        self.bodies
+            .iter()
+            .find(|b| &*b.0 == url)
+            .map(|b| b.1.clone())
     }
 
     /// The natural size of the remote image at `url`, if a load fetched it.
@@ -527,6 +543,7 @@ fn load(job: &Job, env: &mut Env) -> Result<Loaded, Refusal> {
             bitmap: None,
             natural,
             body,
+            anim: None,
         });
     };
     let (w, h) = super::clamp_box(w, h);
@@ -554,6 +571,7 @@ fn load(job: &Job, env: &mut Env) -> Result<Loaded, Refusal> {
             bitmap: Some(bitmap),
             natural,
             body,
+            anim: super::anim::detect(&bytes),
         }),
         Err(Some(Refusal::Memory(n))) if n > 0 => Err(Refusal::Ceiling(n)),
         Err(_) => Err(Refusal::Failed),

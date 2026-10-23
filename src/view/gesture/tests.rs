@@ -505,7 +505,11 @@ fn ctrl_a_is_select_all() {
         crate::view::key_action(&a, ModifiersState::SUPER),
         Some(Action::SelectAll)
     );
-    assert_eq!(crate::view::key_action(&a, ModifiersState::empty()), None);
+    // Plain `a` toggles animations.
+    assert_eq!(
+        crate::view::key_action(&a, ModifiersState::empty()),
+        cfg!(feature = "images").then_some(Action::ToggleAnimations)
+    );
 }
 
 #[test]

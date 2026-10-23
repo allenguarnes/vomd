@@ -18,7 +18,7 @@ use vomd::render::{self, Clip, Frame, Pixels, Viewport};
 use vomd::select::Pos;
 use vomd::text::cache::GlyphCache;
 use vomd::theme::{DARK, LIGHT, Theme};
-#[cfg(any(feature = "clipboard", feature = "find"))]
+#[cfg(any(feature = "clipboard", feature = "find", feature = "images"))]
 use vomd::view::{ThemeMode, View};
 #[cfg(feature = "find")]
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -168,6 +168,12 @@ const CASES: &[Case] = &[
 /// limits.
 #[cfg(feature = "svg")]
 const FORMAT_CASES: &[(&str, f32)] = &[("formats", 1.0), ("formats-2x", 2.0)];
+
+/// `animated.md` painted by the viewer with animations off (the default): the GIF's first frame
+/// with the ▶ badge, and the toolbar with its animations button. Name, scale, dark.
+#[cfg(feature = "images")]
+const ANIM_CASES: &[(&str, f32, bool)] =
+    &[("anim-badge", 1.0, false), ("anim-badge-2x", 2.0, true)];
 
 /// What the pointer is doing at a code block's copy button.
 #[cfg(feature = "clipboard")]
@@ -476,6 +482,45 @@ fn render_formats(scale: f32, fonts: &Fonts) -> Rendered {
     (w, h, px)
 }
 
+/// An [`ANIM_CASES`] case painted: the whole of `animated.md` below the toolbar, once its image
+/// is found animated.
+#[cfg(feature = "images")]
+fn render_anim(scale: f32, dark: bool) -> Rendered {
+    let src = std::fs::read_to_string(root().join("fixtures/animated.md")).unwrap();
+    let w = (520.0 * scale).round() as u32;
+    let mut view = View::new(
+        Fonts::new().unwrap(),
+        Doc::parse(&src),
+        None,
+        (w, MAX_H as u32),
+        f64::from(scale),
+    );
+    view.set_theme_mode(if dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    });
+    view.set_toolbar(true);
+    view.set_image_base(Some(root().join("fixtures")));
+    while !view.idle(Instant::now() + Duration::from_secs(1)) {}
+    view.ensure();
+    let h = (view.layout().total_height().ceil() as u32 + view.top_inset()).clamp(1, MAX_H as u32);
+    view.resize(w, h);
+    view.ensure();
+    let mut px = vec![0; w as usize * h as usize];
+    let t = Instant::now();
+    while !view.animated() {
+        assert!(t.elapsed() < Duration::from_secs(60), "never decoded");
+        view.paint(&mut px, w as usize, Instant::now());
+        let now = Instant::now();
+        view.tick(now, Some(now));
+        std::thread::sleep(Duration::from_millis(5));
+        view.poll_images(Instant::now());
+    }
+    view.paint(&mut px, w as usize, Instant::now());
+    (w as usize, h as usize, px)
+}
+
 /// The button case painted: `(width, height, pixels)`, the whole of `codecopy.md`. The pointer
 /// is over its first code block, and the button is the first block's.
 #[cfg(feature = "clipboard")]
@@ -694,6 +739,12 @@ fn goldens() {
     );
     #[cfg(feature = "find")]
     let cases = cases.chain(FIND_CASES.iter().map(|case| (case.name, render_find(case))));
+    #[cfg(feature = "images")]
+    let cases = cases.chain(
+        ANIM_CASES
+            .iter()
+            .map(|&(name, scale, dark)| (name, render_anim(scale, dark))),
+    );
     #[cfg(feature = "svg")]
     let cases = cases.chain(
         FORMAT_CASES

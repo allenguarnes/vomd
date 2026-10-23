@@ -68,6 +68,16 @@ fn keys() {
         (ch("W"), shift, Some(Action::ToggleWide)),
         (ch("W"), ctrl, Some(Action::Quit)),
         (ch("w"), ModifiersState::ALT, None),
+        // Animations; Ctrl+A stays Select all (or nothing without selection support).
+        #[cfg(feature = "images")]
+        (ch("a"), none, Some(Action::ToggleAnimations)),
+        #[cfg(feature = "images")]
+        (ch("A"), shift, Some(Action::ToggleAnimations)),
+        #[cfg(not(feature = "images"))]
+        (ch("a"), none, None),
+        #[cfg(feature = "clipboard")]
+        (ch("a"), ctrl, Some(Action::SelectAll)),
+        (ch("a"), ModifiersState::ALT, None),
         // Contents; Ctrl+C stays Copy (or nothing without selection support).
         #[cfg(feature = "toc")]
         (ch("c"), none, Some(Action::ToggleToc)),
@@ -2213,6 +2223,845 @@ mod with_fonts {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(buf.iter().filter(|&&p| p == 0x119933).count(), 40 * 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An animation in view plays: the loop wakes when its next frame is due, and the tick
+    /// repaints. It waits (no timer) while the window can't be seen, is of no size, or doesn't
+    /// show it (scrolled away), and goes on when it is shown again.
+    #[cfg(feature = "images")]
+    #[test]
+    fn animations_play_only_while_the_window_shows_them() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-anim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gif = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/anim.gif");
+        std::fs::copy(gif, dir.join("anim.gif")).unwrap();
+        let mut v = view(&format!("![a](anim.gif)\n\n{}", paras(300)), 600, 400);
+        v.set_image_base(Some(dir.clone()));
+        v.images.set_animations(true);
+        let due = |v: &mut View| {
+            let t = Instant::now();
+            loop {
+                frame(v, Instant::now());
+                v.poll_images(Instant::now());
+                if let Some(due) = v.anim_deadline() {
+                    return due;
+                }
+                assert!(t.elapsed() < Duration::from_secs(20), "never due");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let at = due(&mut v);
+        assert!(v.animating());
+        assert!(v.deadline().is_some_and(|d| d <= at));
+        assert!(
+            !v.tick(at, Some(at)).redraw,
+            "only its box is painted again"
+        );
+        assert_eq!(v.damage().len(), 1, "its next frame is shown");
+        // Hidden (minimized, covered), then shown again.
+        due(&mut v);
+        assert!(!v.set_hidden(true));
+        assert_eq!(v.anim_deadline(), None);
+        assert!(!v.animating());
+        assert!(v.set_hidden(false), "shown again, it is painted again");
+        assert!(v.anim_deadline().is_some());
+        // Of no size.
+        v.resize(0, 0);
+        assert_eq!(v.anim_deadline(), None);
+        v.resize(600, 400);
+        due(&mut v);
+        // Scrolled away: the frame that doesn't paint it leaves nothing due.
+        v.scroll_by(1e9, Instant::now());
+        frame(&mut v, Instant::now());
+        assert_eq!(v.anim_deadline(), None);
+        assert!(!v.animating());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An animated image says "Click to play" with the hand under the pointer, and a click plays
+    /// or pauses it alone, whatever the window's animations; a drag doesn't. In a link a click
+    /// follows the link and Ctrl+click plays or pauses. `A` plays or pauses every one, and the
+    /// toolbar has its button once the document has an animated image.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_click_plays_or_pauses_an_animated_image() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-play-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gif = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/anim.gif");
+        std::fs::copy(&gif, dir.join("a.gif")).unwrap();
+        std::fs::copy(&gif, dir.join("b.gif")).unwrap();
+        let mut v = view(
+            "<img src=\"a.gif\" width=120>\n\n[<img src=\"b.gif\" width=120>](https://e.x/)\n\nText.",
+            600,
+            400,
+        );
+        v.set_image_base(Some(dir.clone()));
+        let now = Instant::now();
+        assert!(!v.toolbar_ctx().animated);
+        let t = Instant::now();
+        while v.images.anim_state(1).is_none() || v.images.anim_state(2).is_none() {
+            assert!(t.elapsed() < Duration::from_secs(20), "never decoded");
+            frame(&mut v, Instant::now());
+            v.poll_images(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(v.toolbar_ctx().animated && !v.toolbar_ctx().animations);
+        let state = |v: &View, id| v.images.anim_state(id).unwrap();
+        assert_eq!(state(&v, 1), AnimState::Paused);
+        let at = |v: &View, id| {
+            (0..600)
+                .flat_map(|x| (0..300).map(move |y| (f64::from(x), f64::from(y))))
+                .find(|&(x, y)| v.image_at(x, y) == Some(id))
+                .map(|(x, y)| (x + 10.0, y + 10.0))
+                .expect("on screen")
+        };
+        let (a, b) = (at(&v, 1), at(&v, 2));
+        // Under the pointer: the hand and the note; in a link, the link's.
+        v.hover(a.0, a.1);
+        assert_eq!(v.hover_note, Some(PLAY_NOTE));
+        assert!(v.over_force() && v.hovered().is_none());
+        v.hover(b.0, b.1);
+        assert!(!v.over_force(), "hand");
+        assert!(v.hovered().is_some(), "link");
+        // A click plays it, and the note says the next one pauses it; the other stays paused.
+        v.hover(a.0, a.1);
+        v.press(a.0, a.1, now);
+        assert_eq!(v.click(a.0, a.1), None);
+        assert_eq!(state(&v, 1), AnimState::Playing);
+        assert_eq!(state(&v, 2), AnimState::Paused);
+        assert_eq!(v.hover_note, Some(PAUSE_NOTE));
+        assert!(v.poll_images(Instant::now()), "repainted");
+        v.press(a.0, a.1, now + Duration::from_secs(1));
+        assert_eq!(v.click(a.0, a.1), None);
+        assert_eq!(state(&v, 1), AnimState::Paused);
+        // A drag from it changes nothing.
+        v.press(a.0, a.1, now + Duration::from_secs(2));
+        assert_eq!(v.click(a.0 + 300.0, a.1 + 100.0), None);
+        assert_eq!(state(&v, 1), AnimState::Paused);
+        // In a link: a click follows it, Ctrl+click plays the image.
+        let later = now + Duration::from_secs(5);
+        v.press(b.0, b.1, later);
+        assert_eq!(v.click(b.0, b.1).as_deref(), Some("https://e.x/"));
+        assert_eq!(state(&v, 2), AnimState::Paused);
+        v.set_ctrl(true);
+        v.press(b.0, b.1, later + Duration::from_secs(1));
+        assert_eq!(v.click(b.0, b.1), None, "not followed");
+        v.set_ctrl(false);
+        assert_eq!(state(&v, 2), AnimState::Playing);
+        // `A`: all of them play, what was chosen for one forgotten; again, none.
+        assert_eq!(v.apply(Action::ToggleAnimations, later), Outcome::Redraw);
+        assert!(v.animations() && v.toolbar_ctx().animations);
+        assert_eq!(
+            (state(&v, 1), state(&v, 2)),
+            (AnimState::Playing, AnimState::Playing)
+        );
+        v.press(a.0, a.1, later + Duration::from_secs(3));
+        v.click(a.0, a.1);
+        assert_eq!(state(&v, 1), AnimState::Paused);
+        v.apply(Action::ToggleAnimations, later);
+        assert!(!v.animations());
+        assert_eq!(
+            (state(&v, 1), state(&v, 2)),
+            (AnimState::Paused, AnimState::Paused)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The note of an animation that waits for room, or is over the limits: what it does, and
+    /// that a click plays it now.
+    #[test]
+    fn an_animation_that_does_not_play_says_why() {
+        assert_eq!(anim_note(AnimState::Paused), PLAY_NOTE);
+        assert_eq!(anim_note(AnimState::Playing), PAUSE_NOTE);
+        assert!(anim_note(AnimState::Waiting).ends_with("click to play now"));
+        assert!(!anim_note(AnimState::Waiting).contains("limits"));
+        assert_eq!(
+            anim_note(AnimState::Over),
+            "Over VOMD's animation limits · click to play anyway"
+        );
+    }
+
+    /// A view of `anim.gif` (6 × 4) in a box `width` wide (filling most of the window), between
+    /// headings and paragraphs, its animation on; and the directory it is in.
+    #[cfg(feature = "images")]
+    fn anim_view(w: u32, h: u32, width: u32) -> (View, std::path::PathBuf) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("vomd-view-damage-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gif = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/anim.gif");
+        std::fs::copy(gif, dir.join("anim.gif")).unwrap();
+        let src = format!(
+            "# Top\n\nSee [a link](https://example.com/x) here.\n\n\
+             <img src=\"anim.gif\" width={width}>\n\n## Below\n\n{}",
+            paras(40)
+        );
+        let mut v = view(&src, w, h);
+        v.set_image_base(Some(dir.clone()));
+        v.images.set_animations(true);
+        (v, dir)
+    }
+
+    /// An animation that ends (play-once, its frames kept or streamed) or is refused for what it
+    /// costs (over the limits) has its badge painted with no help: a window paints whole only
+    /// when asked, and its boxes when an animation changed them, and what it shows is what a
+    /// whole paint shows in that state.
+    #[cfg(feature = "images")]
+    #[test]
+    fn an_animation_that_ends_or_is_refused_paints_its_badge_by_itself() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-badge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut once = Vec::new();
+        {
+            let mut e = ::gif::Encoder::new(&mut once, 400, 300, &[255, 0, 0, 0, 255, 0]).unwrap();
+            for n in 0..6 {
+                let frame = ::gif::Frame {
+                    width: 400,
+                    height: 300,
+                    delay: 10,
+                    buffer: std::borrow::Cow::Owned(vec![n % 2; 400 * 300]),
+                    ..::gif::Frame::default()
+                };
+                e.write_frame(&frame).unwrap();
+            }
+        }
+        std::fs::write(dir.join("once.gif"), once).unwrap();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images");
+        std::fs::copy(fixtures.join("big-anim.webp"), dir.join("over.webp")).unwrap();
+        // (A box of 400: its frames are streamed; of 200: they are kept.)
+        for (file, width, end) in [
+            ("once.gif", 400, AnimState::Paused),
+            ("once.gif", 200, AnimState::Paused),
+            ("over.webp", 400, AnimState::Over),
+        ] {
+            let mut v = view(&format!("<img src=\"{file}\" width={width}>"), 480, 500);
+            v.set_image_base(Some(dir.clone()));
+            settle(&mut v);
+            let mut buf = vec![0; 480 * 500];
+            let t = Instant::now();
+            while v.images.animated(1).is_none() {
+                let now = Instant::now();
+                v.paint(&mut buf, 480, now);
+                v.request_images();
+                v.poll_images(now);
+                assert!(t.elapsed() < Duration::from_secs(10), "{file}: not decoded");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            while v.poll_images(Instant::now()) {}
+            v.images.set_animations(true);
+            let mut now = Instant::now();
+            v.images.set_anim_clock(Some(now));
+            v.paint(&mut buf, 480, now);
+            let t = Instant::now();
+            while v.images.anim_state(1) != Some(end) {
+                assert!(t.elapsed() < Duration::from_secs(10), "{file}: no end");
+                let mut redraw = v.poll_images(now);
+                if let Some(due) = v.anim_deadline() {
+                    now = now.max(due);
+                    v.images.set_anim_clock(Some(now));
+                    redraw |= v.expire(now);
+                }
+                if redraw {
+                    v.paint(&mut buf, 480, now);
+                } else if !v.damage().is_empty() {
+                    let rects = v.damage().to_vec();
+                    v.paint_rects(&mut buf, 480, &rects, now);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // What the wakes that follow ask for is painted too, and nothing else is.
+            for _ in 0..20 {
+                if v.poll_images(now) {
+                    v.paint(&mut buf, 480, now);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut whole = vec![0; 480 * 500];
+            v.paint(&mut whole, 480, now);
+            let stale = buf.iter().zip(&whole).filter(|(a, b)| a != b).count();
+            assert_eq!(stale, 0, "{file} at {width}: {end:?}: stale pixels");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An animation that waits beside another because their boxes are big is read again when a
+    /// zoom out makes them small, and plays (the cost it waited with was for the old box).
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_waiting_animation_plays_once_a_zoom_out_makes_it_fit() {
+        fn gif(w: u16, h: u16) -> Vec<u8> {
+            let palette: Vec<u8> = (0..64u8)
+                .flat_map(|i| [i * 4, 255 - i * 4, i * 2])
+                .collect();
+            let mut bytes = Vec::new();
+            {
+                let mut e = ::gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+                e.set_repeat(::gif::Repeat::Infinite).unwrap();
+                for n in 0..10 {
+                    let buffer = (0..usize::from(h))
+                        .flat_map(|y| {
+                            (0..usize::from(w)).map(move |x| ((x / 8 + y / 8 + n) % 64) as u8)
+                        })
+                        .collect();
+                    let frame = ::gif::Frame {
+                        width: w,
+                        height: h,
+                        delay: 10,
+                        buffer: std::borrow::Cow::Owned(buffer),
+                        ..Default::default()
+                    };
+                    e.write_frame(&frame).unwrap();
+                }
+            }
+            bytes
+        }
+        let dir = std::env::temp_dir().join(format!("vomd-view-zoom-fit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.gif"), gif(900, 600)).unwrap();
+        std::fs::write(dir.join("b.gif"), gif(800, 600)).unwrap();
+        let mut v = view(
+            "![above](a.gif)\n\n<img src=\"b.gif\" width=720>",
+            2050,
+            2560,
+        );
+        v.set_hidpi(2.0);
+        v.set_wide(true);
+        v.set_image_base(Some(dir.clone()));
+        let mut buf = vec![0; 2050 * 2560];
+        let mut run = |v: &mut View, time: Duration, until: &dyn Fn(&View) -> bool| {
+            let t = Instant::now();
+            while t.elapsed() < time && !until(v) {
+                let now = Instant::now();
+                v.paint(&mut buf, 2050, now);
+                v.tick(now, Some(now));
+                v.poll_images(now);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        run(&mut v, Duration::from_secs(10), &|v| {
+            v.images.animated(1).is_some() && v.images.animated(2).is_some()
+        });
+        v.set_animations(true);
+        // (At 2× the boxes are 1800 × 1200 and 1440 × 1080: two don't fit beside each other.)
+        run(&mut v, Duration::from_secs(10), &|v| {
+            v.images.anim_state(2) == Some(AnimState::Waiting)
+        });
+        assert_eq!(v.images.anim_state(1), Some(AnimState::Playing));
+        assert_eq!(v.images.anim_state(2), Some(AnimState::Waiting));
+        v.set_zoom(50);
+        run(&mut v, Duration::from_secs(10), &|v| {
+            v.images.anim_state(2) == Some(AnimState::Playing)
+        });
+        let state = v.images.anim_state(2);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(state, Some(AnimState::Playing), "zoomed out, both fit");
+    }
+
+    /// One remote animation in two boxes of different sizes, waiting beside the one above it (at
+    /// 2×, wide): the window settles, painting the changed boxes as the one above plays, not
+    /// whole again and again (each size is measured once, and neither undoes the other's).
+    #[cfg(all(feature = "images", feature = "remote-images"))]
+    #[test]
+    fn a_waiting_remote_animation_in_two_boxes_asks_for_no_stream_of_paints() {
+        fn gif(w: u16, h: u16) -> Vec<u8> {
+            let palette: Vec<u8> = (0..64u8)
+                .flat_map(|i| [i * 4, 255 - i * 4, i * 2])
+                .collect();
+            let mut bytes = Vec::new();
+            {
+                let mut e = ::gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+                e.set_repeat(::gif::Repeat::Infinite).unwrap();
+                for n in 0..10 {
+                    let buffer = (0..usize::from(h))
+                        .flat_map(|y| {
+                            (0..usize::from(w)).map(move |x| ((x / 8 + y / 8 + n) % 64) as u8)
+                        })
+                        .collect();
+                    let frame = ::gif::Frame {
+                        width: w,
+                        height: h,
+                        delay: 10,
+                        buffer: std::borrow::Cow::Owned(buffer),
+                        ..Default::default()
+                    };
+                    e.write_frame(&frame).unwrap();
+                }
+            }
+            bytes
+        }
+        let dir = std::env::temp_dir().join(format!("vomd-view-two-boxes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.gif"), gif(900, 600)).unwrap();
+        let body = std::sync::Arc::new(gif(800, 600));
+        let mut v = view(
+            "![holder](a.gif)\n\n<img src=\"https://x.y/b.gif\" width=720>\n\n\
+             <img src=\"https://x.y/b.gif\" width=360>",
+            2050,
+            3200,
+        );
+        v.set_hidpi(2.0);
+        v.set_wide(true);
+        v.set_image_base(Some(dir.clone()));
+        v.images
+            .remote
+            .set_fetcher(std::sync::Arc::new(move |_, _| {
+                Ok((body.clone(), 800, 600))
+            }));
+        v.set_remote_policy(crate::settings::RemoteImages::Always);
+        v.set_remote(true);
+        settle(&mut v);
+        let mut buf = vec![0; 2050 * 3200];
+        let t = Instant::now();
+        while (1..=3).any(|id| v.images.animated(id).is_none()) {
+            assert!(t.elapsed() < Duration::from_secs(10), "stills not loaded");
+            let now = Instant::now();
+            v.paint(&mut buf, 2050, now);
+            v.request_images();
+            v.poll_images(now);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while v.poll_images(Instant::now()) {}
+        v.set_animations(true);
+        v.paint(&mut buf, 2050, Instant::now());
+        let (mut full, mut partial) = (0, 0);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(2) {
+            let now = Instant::now();
+            let tick = v.tick(now, Some(now));
+            if v.poll_images(now) || tick.redraw {
+                full += 1;
+                v.paint(&mut buf, 2050, now);
+            } else if !v.damage().is_empty() {
+                partial += 1;
+                let rects = v.damage().to_vec();
+                v.paint_rects(&mut buf, 2050, &rects, now);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let state = v.images.anim_state(2);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(full <= 20, "{full} full paints");
+        assert!(
+            partial >= 3,
+            "the one above plays: {partial} partial paints"
+        );
+        assert_eq!(state, Some(AnimState::Waiting));
+    }
+
+    /// sol-6 M1 and M2, in a real 2× wide view: a remote 800×600, 90-frame, 8 MB GIF at
+    /// 1440×1080 beside a 1800×1800 still, normal limits, its body gone before it was measured:
+    /// fetching it doesn't fit beside the still, so it waits (it doesn't say it plays, with nothing
+    /// to make it). A click fetches it past the limits; that failing, only the animation fails:
+    /// its still stays, and a click asks again and plays it.
+    #[cfg(all(feature = "images", feature = "remote-images"))]
+    #[test]
+    fn a_remote_animation_whose_body_cant_be_fetched_waits_and_a_failed_click_keeps_its_still() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        fn gif(w: u16, h: u16) -> Vec<u8> {
+            let palette: Vec<u8> = (0..64u8)
+                .flat_map(|i| [i * 4, 255 - i * 4, i * 2])
+                .collect();
+            let mut bytes = Vec::new();
+            {
+                let mut e = ::gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+                e.set_repeat(::gif::Repeat::Infinite).unwrap();
+                for n in 0..90 {
+                    let buffer = (0..usize::from(h))
+                        .flat_map(|y| {
+                            (0..usize::from(w)).map(move |x| ((x / 8 + y / 8 + n) % 64) as u8)
+                        })
+                        .collect();
+                    let frame = ::gif::Frame {
+                        width: w,
+                        height: h,
+                        delay: 10,
+                        buffer: std::borrow::Cow::Owned(buffer),
+                        ..Default::default()
+                    };
+                    e.write_frame(&frame).unwrap();
+                }
+            }
+            bytes
+        }
+        let dir = std::env::temp_dir().join(format!("vomd-view-body-fails-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/alpha.png"),
+            dir.join("still.png"),
+        )
+        .unwrap();
+        let body = std::sync::Arc::new(gif(800, 600));
+        let outside = body.to_vec();
+        let mut v = view(
+            "<img src=\"https://x.y/a.gif\" width=720>\n\n\
+             <img src=\"still.png\" width=900 height=900>",
+            2050,
+            3200,
+        );
+        v.set_hidpi(2.0);
+        v.set_wide(true);
+        v.set_image_base(Some(dir.clone()));
+        v.images
+            .remote
+            .set_fetcher(std::sync::Arc::new(move |_, _| {
+                Ok((std::sync::Arc::new(body.to_vec()), 800, 600))
+            }));
+        let (attempts, fails) = (
+            std::sync::Arc::new(AtomicUsize::new(0)),
+            std::sync::Arc::new(AtomicBool::new(true)),
+        );
+        let (tries, fail) = (attempts.clone(), fails.clone());
+        v.images.remote.forced_fetch = std::sync::Arc::new(move |_, _| {
+            tries.fetch_add(1, Ordering::Relaxed);
+            if fail.load(Ordering::Relaxed) {
+                Err(Refusal::Failed)
+            } else {
+                Ok(outside.clone())
+            }
+        });
+        v.set_remote_policy(crate::settings::RemoteImages::Always);
+        v.set_remote(true);
+        settle(&mut v);
+        let mut buf = vec![0; 2050 * 3200];
+        let t = Instant::now();
+        while v.images.animated(1).is_none() || v.image_stats().decoded < 2 {
+            assert!(t.elapsed() < Duration::from_secs(10), "stills not loaded");
+            let now = Instant::now();
+            v.paint(&mut buf, 2050, now);
+            v.request_images();
+            v.poll_images(now);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        v.set_animations(true);
+        // (How many frames it showed: partial paints.)
+        let run = |v: &mut View, buf: &mut [u32], time: Duration| {
+            let (t, mut partial) = (Instant::now(), 0);
+            while t.elapsed() < time {
+                let now = Instant::now();
+                let tick = v.tick(now, Some(now));
+                if v.poll_images(now) || tick.redraw {
+                    v.paint(buf, 2050, now);
+                    v.request_images();
+                } else if !v.damage().is_empty() {
+                    let rects = v.damage().to_vec();
+                    v.paint_rects(buf, 2050, &rects, now);
+                    partial += 1;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            partial
+        };
+        // (Paints and requests that keep it asked for: its body goes for the still's room.)
+        let t = Instant::now();
+        while v.images.anim_state(1) != Some(AnimState::Waiting) {
+            assert!(t.elapsed() < Duration::from_secs(5), "it says it plays");
+            let now = Instant::now();
+            v.paint(&mut buf, 2050, now);
+            v.request_images();
+            v.poll_images(now);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        run(&mut v, &mut buf, Duration::from_millis(500));
+        assert_eq!(v.images.anim_state(1), Some(AnimState::Waiting));
+        let click = |v: &mut View| {
+            let now = Instant::now();
+            v.press(100.0, 100.0, now);
+            assert_eq!(v.click(100.0, 100.0), None);
+        };
+        click(&mut v);
+        run(&mut v, &mut buf, Duration::from_secs(1));
+        // (Not fetched again by itself: a request made before a load's result is taken may ask
+        // for it once more, and that is all.)
+        let tried = attempts.load(Ordering::Relaxed);
+        run(&mut v, &mut buf, Duration::from_millis(500));
+        assert!(tried >= 1);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            tried,
+            "fetched again by itself"
+        );
+        assert_eq!(v.layout.image_size(1), Some(ImageSize::Pixels(800, 600)));
+        assert_eq!(v.images.anim_state(1), Some(AnimState::Failed));
+        assert_eq!(v.playable_at(100.0, 100.0), Some(1));
+        fails.store(false, Ordering::Relaxed);
+        click(&mut v);
+        let partial = run(&mut v, &mut buf, Duration::from_secs(2));
+        assert!(partial >= 3, "played again: {partial} frames");
+        assert_eq!(v.images.anim_state(1), Some(AnimState::Playing));
+        assert!(attempts.load(Ordering::Relaxed) > tried);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// sol-7 M1, in a real 2× wide view: a looping remote 1300×1000, 40-frame GIF (9.9 MB),
+    /// clicked to play past the limits, plays from its cached body; a local 800×600, ten-frame
+    /// one and a still below it, all 1440×1080, come into view as the window grows. The body
+    /// is held while the remote one plays: the local one has no room beside it, so it waits
+    /// (no frame comes; it doesn't say it plays), and a click plays it past the limits too.
+    #[cfg(all(feature = "images", feature = "remote-images"))]
+    #[test]
+    fn an_animation_with_no_room_beside_a_body_played_past_the_limits_waits() {
+        fn gif(w: u16, h: u16, frames: usize) -> Vec<u8> {
+            let palette: Vec<u8> = (0..64u8)
+                .flat_map(|i| [i * 4, 255 - i * 4, i * 2])
+                .collect();
+            let mut bytes = Vec::new();
+            {
+                let mut e = ::gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+                e.set_repeat(::gif::Repeat::Infinite).unwrap();
+                for n in 0..frames {
+                    let buffer = (0..usize::from(h))
+                        .flat_map(|y| {
+                            (0..usize::from(w)).map(move |x| ((x / 8 + y / 8 + n) % 64) as u8)
+                        })
+                        .collect();
+                    let frame = ::gif::Frame {
+                        width: w,
+                        height: h,
+                        delay: 10,
+                        buffer: std::borrow::Cow::Owned(buffer),
+                        ..Default::default()
+                    };
+                    e.write_frame(&frame).unwrap();
+                }
+            }
+            bytes
+        }
+        let dir =
+            std::env::temp_dir().join(format!("vomd-view-forced-body-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("local.gif"), gif(800, 600, 10)).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/alpha.png"),
+            dir.join("still.png"),
+        )
+        .unwrap();
+        let body = gif(1300, 1000, 40);
+        let mut v = view(
+            "<img src=\"https://x.y/a.gif\" width=720 height=540>\n\n\
+             <img src=\"local.gif\" width=720 height=540>\n\n\
+             <img src=\"still.png\" width=720 height=540>",
+            2050,
+            1100,
+        );
+        v.set_hidpi(2.0);
+        v.set_wide(true);
+        v.set_image_base(Some(dir.clone()));
+        v.images
+            .remote
+            .set_fetcher(std::sync::Arc::new(move |_, _| {
+                Ok((std::sync::Arc::new(body.to_vec()), 1300, 1000))
+            }));
+        v.set_remote_policy(crate::settings::RemoteImages::Always);
+        v.set_remote(true);
+        v.set_animations(true);
+        settle(&mut v);
+        let mut buf = vec![0; 2050 * 1100];
+        let t = Instant::now();
+        while v.images.anim_state(1) != Some(AnimState::Over) {
+            assert!(t.elapsed() < Duration::from_secs(10), "not over the limits");
+            let now = Instant::now();
+            v.paint(&mut buf, 2050, now);
+            v.request_images();
+            v.poll_images(now);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let click = |v: &mut View, y: f64| {
+            v.press(100.0, y, Instant::now());
+            assert_eq!(v.click(100.0, y), None);
+        };
+        // (The frames each showed: partial paints of the remote's box, and of the local's.)
+        let run = |v: &mut View, buf: &mut [u32], time: Duration| {
+            let (t, mut remote, mut local) = (Instant::now(), 0, 0);
+            while t.elapsed() < time {
+                let now = Instant::now();
+                let tick = v.tick(now, Some(now));
+                if v.poll_images(now) || tick.redraw {
+                    v.paint(buf, 2050, now);
+                    v.request_images();
+                } else if !v.damage().is_empty() {
+                    let rects = v.damage().to_vec();
+                    remote += usize::from(rects.iter().any(|r| r.y0 < 1100));
+                    local += usize::from(rects.iter().any(|r| r.y0 > 1100 && r.y0 < 2200));
+                    v.paint_rects(buf, 2050, &rects, now);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (remote, local)
+        };
+        click(&mut v, 100.0);
+        assert!(run(&mut v, &mut buf, Duration::from_secs(1)).0 >= 3);
+        v.resize(2050, 3500);
+        buf.resize(2050 * 3500, 0);
+        settle(&mut v);
+        v.paint(&mut buf, 2050, Instant::now());
+        v.request_images();
+        let (remote, local) = run(&mut v, &mut buf, Duration::from_secs(3));
+        assert!(remote >= 3, "the remote one plays: {remote}");
+        assert_eq!(local, 0);
+        assert_eq!(v.images.anim_state(2), Some(AnimState::Waiting));
+        click(&mut v, 1200.0);
+        let (remote, local) = run(&mut v, &mut buf, Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(local >= 3, "the local one plays past the limits: {local}");
+        assert!(remote >= 3, "the remote one plays on: {remote}");
+        assert_eq!(v.images.anim_state(2), Some(AnimState::Playing));
+    }
+
+    /// Wait for the animation's next frame and show it (a tick at its time, which paints nothing
+    /// whole): what of the window it changed.
+    #[cfg(feature = "images")]
+    fn next_damage(v: &mut View) -> Vec<Clip> {
+        let t = Instant::now();
+        loop {
+            v.poll_images(Instant::now());
+            if let Some(at) = v.anim_deadline() {
+                assert!(!v.tick(at, Some(at)).redraw, "only the animation changed");
+                if !v.damage().is_empty() {
+                    return v.damage().to_vec();
+                }
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "no next frame");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A paint that can't be made (a minimized window has no size) drops what the animations
+    /// changed: the loop of the event loop asks to paint it for as long as it is there.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_paint_that_cannot_be_made_drops_the_damage() {
+        let (mut v, dir) = anim_view(640, 400, 600);
+        let t = Instant::now();
+        while v.anim_deadline().is_none() {
+            assert!(t.elapsed() < Duration::from_secs(20), "never plays");
+            frame(&mut v, Instant::now());
+            v.poll_images(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!next_damage(&mut v).is_empty());
+        v.discard_damage();
+        assert!(v.damage().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A frame painted only where the animation changed, over the frame before it (or over the
+    /// one before that, with what changed in between: Wayland's two buffers), is the frame
+    /// painted whole, whatever is over the image.
+    #[cfg(feature = "images")]
+    fn paints_in_part_as_whole(v: &mut View, what: &str) {
+        let (w, h) = v.size();
+        let whole = |v: &mut View| {
+            let mut buf = vec![0u32; (w * h) as usize];
+            v.paint(&mut buf, w as usize, Instant::now());
+            buf
+        };
+        let differ = |a: &[u32], b: &[u32]| a.iter().zip(b).filter(|(a, b)| a != b).count();
+        // Until it plays: its first frame painted, its next made.
+        let t = Instant::now();
+        while v.anim_deadline().is_none() {
+            assert!(t.elapsed() < Duration::from_secs(20), "{what}: never plays");
+            frame(v, Instant::now());
+            v.poll_images(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The buffer holds the frame before (X11, Windows).
+        let mut a = whole(v);
+        let changed = next_damage(v);
+        let rects = render::damage(&changed, 1, None).unwrap();
+        let before = a.clone();
+        v.paint_rects(&mut a, w as usize, &rects, Instant::now());
+        assert!(v.damage().is_empty());
+        assert!(differ(&a, &before) > 0, "{what}: a frame of its own");
+        let b = whole(v);
+        assert_eq!(
+            differ(&a, &b),
+            0,
+            "{what}: the frame before, painted in part"
+        );
+        // Two buffers: the one before last missed the last frame's change too.
+        let mut y = whole(v);
+        let c1 = next_damage(v);
+        assert_eq!(
+            render::damage(&c1, 2, None),
+            None,
+            "{what}: the last change unknown"
+        );
+        whole(v);
+        let c2 = next_damage(v);
+        let rects = render::damage(&c2, 2, Some(&c1)).unwrap();
+        v.paint_rects(&mut y, w as usize, &rects, Instant::now());
+        let b = whole(v);
+        assert_eq!(
+            differ(&y, &b),
+            0,
+            "{what}: two frames before, painted in part"
+        );
+    }
+
+    /// An animation's tick paints only its box, under and over everything else as a whole
+    /// paint has it: the selection's wash, find's marks, the contents panel, the scrollbar,
+    /// the link preview and the toolbar's dropdown.
+    #[cfg(feature = "images")]
+    #[test]
+    fn an_animation_tick_paints_its_box_as_a_whole_paint_does() {
+        let now = Instant::now();
+        type Setup = fn(&mut View);
+        let cases: [(&str, Setup); 7] = [
+            ("plain", |_| {}),
+            ("selection", |v| {
+                #[cfg(feature = "clipboard")]
+                assert_eq!(
+                    v.apply(Action::SelectAll, Instant::now()),
+                    Outcome::Selected
+                );
+                let _ = v;
+            }),
+            ("find", |v| {
+                #[cfg(feature = "find")]
+                {
+                    v.apply(Action::Find, Instant::now());
+                    v.find_type("e");
+                }
+                let _ = v;
+            }),
+            ("contents", |v| {
+                #[cfg(feature = "toc")]
+                v.set_toc(true);
+                let _ = v;
+            }),
+            ("scrollbar", |v| {
+                v.scroll_by(30.0, Instant::now());
+                v.fade.poke(Instant::now() + Duration::from_secs(3600));
+            }),
+            ("preview", |v| {
+                v.hover_note = Some("https://example.com/a/long/way/down")
+            }),
+            ("toolbar", |v| v.set_toolbar(true)),
+        ];
+        for (what, setup) in cases {
+            let (mut v, dir) = anim_view(600, 400, 560);
+            setup(&mut v);
+            paints_in_part_as_whole(&mut v, what);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // Its frames made at the GIF's size, enlarged a whole 100 times by the paint.
+        let (mut v, dir) = anim_view(700, 500, 600);
+        paints_in_part_as_whole(&mut v, "whole");
+        let _ = std::fs::remove_dir_all(&dir);
+        // The dropdown hangs over the image in a narrow window.
+        let (mut v, dir) = anim_view(200, 300, 190);
+        v.set_toolbar(true);
+        let more = toolbar::slots(&v.toolbar_ctx())
+            .items
+            .iter()
+            .find(|(i, _)| *i == toolbar::Item::More)
+            .unwrap()
+            .1;
+        let (mx, my) = (f64::from((more.x0 + more.x1) / 2.0), 16.0);
+        assert!(v.press(mx, my, now));
+        v.release_toolbar(mx, my);
+        paints_in_part_as_whole(&mut v, "dropdown");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

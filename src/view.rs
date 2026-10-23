@@ -18,7 +18,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::cli::Input;
 use crate::doc::{Doc, Heading};
 use crate::fonts::Fonts;
-use crate::image::{Images, Wake as ImageWake};
+use crate::image::{AnimState, Images, Wake as ImageWake};
 use crate::layout::{Anchor, BlockBox, ImageSize, Layout, Params};
 use crate::platform;
 use crate::render::{self, Clip, Frame, ScrollbarFade, Viewport};
@@ -69,6 +69,13 @@ pub const BLOCKED_NOTE: &str = "Remote image blocked · press I to load";
 pub const FORCE_NOTE: &str = "Over VOMD's image limits · click to load anyway";
 /// What hovering an SVG drawn without some of its embedded images says (a click draws them).
 pub const PARTIAL_NOTE: &str = "Some embedded images were skipped · click to load anyway";
+/// What hovering an animated image says, outside a link (a click plays or pauses it): paused,
+/// playing, waiting for the animations above it to scroll off, or over VOMD's limits.
+pub const PLAY_NOTE: &str = "Click to play";
+pub const PAUSE_NOTE: &str = "Click to pause";
+pub const WAITING_NOTE: &str = "Plays when the animations above it scroll off · click to play now";
+pub const ANIM_OVER_NOTE: &str = "Over VOMD's animation limits · click to play anyway";
+pub const ANIM_FAILED_NOTE: &str = "Couldn't load the animation · click to try again";
 /// Passes [`View::bottom`] makes: measuring the last screen changes the total height.
 const BOTTOM_PASSES: usize = 4;
 
@@ -131,6 +138,8 @@ pub enum Action {
     Copy,
     /// Load remote images for this document, or hide them again (`I`).
     ToggleRemote,
+    /// Animations on or off for the window (`A`), every image alike.
+    ToggleAnimations,
     /// Choose a file to open (`Ctrl+O`).
     Open,
     Quit,
@@ -275,6 +284,7 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
             #[cfg(feature = "toc")]
             "c" | "C" => Some(Action::ToggleToc),
             "i" | "I" if cfg!(feature = "remote-images") => Some(Action::ToggleRemote),
+            "a" | "A" if cfg!(feature = "images") => Some(Action::ToggleAnimations),
             _ => None,
         },
         _ => None,
@@ -312,6 +322,17 @@ pub fn hover_change(pointer: bool, hovered: bool, changed: bool) -> HoverChange 
         pointer: hovered,
         set_cursor: hovered != pointer,
         redraw: changed,
+    }
+}
+
+/// What hovering an animated image in `state` says: what a click on it does.
+fn anim_note(state: AnimState) -> &'static str {
+    match state {
+        AnimState::Playing => PAUSE_NOTE,
+        AnimState::Paused => PLAY_NOTE,
+        AnimState::Waiting => WAITING_NOTE,
+        AnimState::Over => ANIM_OVER_NOTE,
+        AnimState::Failed => ANIM_FAILED_NOTE,
     }
 }
 
@@ -488,14 +509,15 @@ pub struct View {
     hover: Option<u32>,
     /// What the image under the pointer says at the bottom: a blocked remote image's
     /// placeholder ([`BLOCKED_NOTE`]), one a click loads past the limits ([`FORCE_NOTE`],
-    /// [`PARTIAL_NOTE`]).
+    /// [`PARTIAL_NOTE`]), an animation a click plays or pauses ([`PLAY_NOTE`], ...).
     hover_note: Option<&'static str>,
-    /// The pointer is on an image a click loads past the limits (outside a link): the hand.
+    /// The pointer is on an image a click loads past the limits, or plays or pauses (outside a
+    /// link): the hand.
     hover_force: bool,
     /// The link the mouse button went down on; a click is a release on the same link.
     pressed: Option<u32>,
-    /// The image a click loads past the limits that the mouse button went down on (with Ctrl in a
-    /// link); a click is a release on it.
+    /// The image a click loads past the limits, or plays or pauses, that the mouse button went
+    /// down on (with Ctrl in a link); a click is a release on it.
     pressed_image: Option<u32>,
     /// Ctrl is held down (a click on an image in a link loads it, and doesn't follow the link).
     ctrl: bool,
@@ -506,6 +528,12 @@ pub struct View {
     images: Images,
     /// A frame was painted since the images near the viewport were last asked for.
     images_dirty: bool,
+    /// The window can't be seen (minimized, or covered whole): animations wait.
+    #[cfg(feature = "images")]
+    hidden: bool,
+    /// What the animations changed of the window since it was last painted ([`View::damage`]).
+    #[cfg(feature = "images")]
+    damage: Vec<Clip>,
     /// Remote images in the document (0 when they can't be loaded: the toolbar has no button).
     remote_count: u32,
     /// The first frame of the document was out and the remote images announced (or loaded,
@@ -600,6 +628,10 @@ impl View {
             kept: None,
             images: Images::default(),
             images_dirty: false,
+            #[cfg(feature = "images")]
+            hidden: false,
+            #[cfg(feature = "images")]
+            damage: Vec::new(),
             remote_count: 0,
             announced: false,
             pulse: None,
@@ -696,6 +728,22 @@ impl View {
 
     pub fn wide(&self) -> bool {
         self.wide
+    }
+
+    /// Whether animations play (the `animations` setting, `A`).
+    pub fn animations(&self) -> bool {
+        self.images.animations()
+    }
+
+    /// Whether the document has an animated image (found so far): the toolbar has the animations
+    /// button.
+    pub fn animated(&self) -> bool {
+        self.images.has_animated()
+    }
+
+    /// Animations on or off for every image: what a click chose for one is forgotten.
+    pub fn set_animations(&mut self, on: bool) {
+        self.images.set_animations(on);
     }
 
     /// Wide layout on or off (the `wide` setting); the reading position is kept.
@@ -801,6 +849,8 @@ impl View {
             remote_on: self.images.remote_on(),
             no_curl: self.images.no_curl(),
             pulse: self.pulse.is_some(),
+            animated: self.animated(),
+            animations: self.images.animations(),
         }
     }
 
@@ -1046,6 +1096,13 @@ impl View {
                 let on = !self.images.remote_on();
                 self.set_remote(on);
             }
+            Action::ToggleAnimations => {
+                if !cfg!(feature = "images") {
+                    return Outcome::Nothing;
+                }
+                let on = !self.images.animations();
+                self.images.set_animations(on);
+            }
             Action::Escape if self.close_menu() => {}
             #[cfg(feature = "find")]
             Action::Escape if self.find_escape() => {}
@@ -1153,9 +1210,9 @@ impl View {
         #[cfg(not(feature = "find"))]
         let blurred = false;
         self.pressed = if taken { None } else { self.link_at(x, y) };
-        // An image a click loads past the limits: outside a link, or with Ctrl in one (whose
-        // link isn't followed then).
-        if !taken && let Some(id) = self.forceable_at(x, y) {
+        // An image a click loads past the limits, or plays or pauses: outside a link, or with
+        // Ctrl in one (whose link isn't followed then).
+        if !taken && let Some(id) = self.forceable_at(x, y).or_else(|| self.playable_at(x, y)) {
             if self.pressed.is_none() {
                 self.pressed_image = Some(id);
             } else if self.ctrl {
@@ -1352,6 +1409,11 @@ impl View {
                 .image_at(x, y)
                 .is_some_and(|id| self.images.blocked(id));
         let force = if free { self.forceable_at(x, y) } else { None };
+        let play = if free && force.is_none() {
+            self.playable_at(x, y)
+        } else {
+            None
+        };
         let hover_note = if blocked {
             Some(BLOCKED_NOTE)
         } else if let Some(id) = force {
@@ -1361,9 +1423,10 @@ impl View {
                 FORCE_NOTE
             })
         } else {
-            None
+            play.and_then(|id| self.images.anim_state(id))
+                .map(anim_note)
         };
-        self.hover_force = force.is_some() && link.is_none();
+        self.hover_force = (force.is_some() || play.is_some()) && link.is_none();
         let note = std::mem::replace(&mut self.hover_note, hover_note) != hover_note;
         #[cfg(feature = "clipboard")]
         let note = note | self.copy_pointer(Some((x, y)));
@@ -1417,6 +1480,16 @@ impl View {
             self.ensure_content();
             if self.forceable_at(x, y) == Some(id) {
                 self.images.force(id, &self.doc, &mut self.layout);
+            } else if self.playable_at(x, y) == Some(id) {
+                if self.images.anim_state(id) == Some(AnimState::Playing) {
+                    self.images.pause(id);
+                } else {
+                    self.images.play(id);
+                }
+                // The note says what the next click does.
+                if self.hover_note.is_some() {
+                    self.hover_note = self.images.anim_state(id).map(anim_note);
+                }
             }
             return None;
         }
@@ -1507,9 +1580,33 @@ impl View {
     pub fn paint(&mut self, buf: &mut [u32], stride: usize, now: Instant) {
         let (w, h) = (self.width as usize, self.height as usize);
         let mut frame = Frame::new(buf, w, h, stride);
+        #[cfg(feature = "images")]
+        self.damage.clear();
+        self.paint_frame(&mut frame, now, true);
+    }
+
+    /// Paint only `rects` of the window into `buf`, which holds a frame painted before that
+    /// differs from this one only there ([`View::damage`]): each is painted as the whole paint
+    /// paints it. The frame is the one painted before (no image looks unpainted, and the images
+    /// near the viewport aren't asked for again).
+    #[cfg(feature = "images")]
+    pub fn paint_rects(&mut self, buf: &mut [u32], stride: usize, rects: &[Clip], now: Instant) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let mut frame = Frame::new(buf, w, h, stride);
+        self.damage.clear();
+        for &r in rects {
+            frame.set_limit(r);
+            self.paint_frame(&mut frame, now, false);
+        }
+    }
+
+    /// Paint the window, or what [`Frame::set_limit`] leaves of it; `whole` is a new frame
+    /// (else the frame painted last is painted again in part).
+    fn paint_frame(&mut self, frame: &mut Frame, now: Instant, whole: bool) {
+        let w = self.width as usize;
         let theme = self.palette();
         if let Some(text) = self.message.clone() {
-            self.paint_message(&mut frame, &text, theme);
+            self.paint_message(frame, &text, theme);
         } else {
             self.ensure();
             let vp = self.viewport();
@@ -1525,7 +1622,7 @@ impl View {
                     .then(|| (doc, found.marks(self.find.current)))
             };
             render::paint(
-                &mut frame,
+                frame,
                 vp,
                 &self.layout,
                 &self.fonts,
@@ -1537,9 +1634,11 @@ impl View {
                 finds,
             );
             if cfg!(feature = "images") {
-                self.images.begin_frame();
+                if whole {
+                    self.images.begin_frame();
+                }
                 render::paint_images(
-                    &mut frame,
+                    frame,
                     vp,
                     &self.layout,
                     &mut self.images,
@@ -1547,35 +1646,37 @@ impl View {
                     #[cfg(feature = "clipboard")]
                     sel,
                 );
-                self.images_dirty = true;
+                self.images_dirty |= whole;
+                // (The animations painted make their next frames.)
+                self.images.painted();
             }
             #[cfg(feature = "clipboard")]
-            self.paint_copy_button(&mut frame, vp.area, theme, now);
+            self.paint_copy_button(frame, vp.area, theme, now);
             if self.fade.visible(now) || self.bar_held() {
                 let total = self.layout.total_height();
-                render::paint_scrollbar(&mut frame, vp, total, self.scale(), theme);
+                render::paint_scrollbar(frame, vp, total, self.scale(), theme);
             }
             let note = self.hovered().or(self.hover_note);
             if let Some(text) = note.map(str::to_owned) {
-                self.paint_preview(&mut frame, &text, theme);
+                self.paint_preview(frame, &text, theme);
             }
             if let Some((_, text)) = self.toast.clone() {
-                self.paint_toast(&mut frame, &text, theme, false);
+                self.paint_toast(frame, &text, theme, false);
             }
             if let Some((until, text)) = self.notice.as_mut() {
                 let text = text.clone();
                 until.get_or_insert(now + NOTICE);
-                self.paint_toast(&mut frame, &text, theme, true);
+                self.paint_toast(frame, &text, theme, true);
             }
             #[cfg(feature = "toc")]
-            self.paint_toc(&mut frame, theme);
+            self.paint_toc(frame, theme);
         }
         // Under the toolbar's dropdown, which hangs over it.
         #[cfg(feature = "find")]
-        self.paint_find(&mut frame, theme);
+        self.paint_find(frame, theme);
         let ctx = self.toolbar_ctx();
         self.toolbar.paint(
-            &mut frame,
+            frame,
             &ctx,
             &self.fonts,
             &mut self.cache,
@@ -1837,6 +1938,8 @@ impl View {
             checked,
             tip,
             self.images.deadline(),
+            #[cfg(feature = "images")]
+            self.anim_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1870,12 +1973,70 @@ impl View {
         let scrolled = scrolled | self.find_expire(now);
         // An SVG that took too long shows its alt text.
         let images = self.images.expire(now) && self.poll_images(now);
+        // The animations whose next frames are due show them: their boxes are painted again.
+        #[cfg(feature = "images")]
+        let images =
+            images | (self.anim_deadline().is_some_and(|t| now >= t) && !self.anim_damage(now));
         fade | pulse
             | toast
             | notice
             | scrolled
             | images
             | self.toolbar.expire(&self.toolbar_ctx(), now)
+    }
+
+    // ---- Animations -----------------------------------------------------------------------
+
+    /// When the next frames of the animations in view are due: none while the window can't be
+    /// seen (hidden, of no size, or showing a message), so they wait where they are.
+    #[cfg(feature = "images")]
+    fn anim_deadline(&self) -> Option<Instant> {
+        let seen = !self.hidden && self.width > 0 && self.height > 0 && self.message.is_none();
+        seen.then(|| self.images.anim_deadline()).flatten()
+    }
+
+    /// Show the frames due by `now` ([`Images::advance`]), and add the boxes they show in to
+    /// [`View::damage`]. `false` if that can't say what changed (a box that wasn't painted in
+    /// the last frame): the whole window is painted again.
+    #[cfg(feature = "images")]
+    fn anim_damage(&mut self, now: Instant) -> bool {
+        let area = self.viewport().area;
+        let ids = self.images.advance(now);
+        let Some(boxes) = self.images.anim_boxes(&ids) else {
+            return false;
+        };
+        for (x0, y0, x1, y1) in boxes {
+            // (Images are painted inside the document's area.)
+            render::add_damage(&mut self.damage, Clip { x0, y0, x1, y1 }.intersect(area));
+        }
+        true
+    }
+
+    /// What the animations changed of the window since it was last painted: only these parts
+    /// of it need painting ([`View::paint_rects`]) if nothing else did.
+    #[cfg(feature = "images")]
+    pub fn damage(&self) -> &[Clip] {
+        &self.damage
+    }
+
+    /// A paint that can't be made drops [`View::damage`]: nothing is asking for it to be painted
+    /// any longer, and the next paint is whole.
+    #[cfg(feature = "images")]
+    pub fn discard_damage(&mut self) {
+        self.damage.clear();
+    }
+
+    /// Whether an animation in view plays: the window wants to know when it is shown.
+    #[cfg(feature = "images")]
+    pub fn animating(&self) -> bool {
+        !self.hidden && self.images.animating()
+    }
+
+    /// The window can't be seen (minimized, or covered whole), or can again. Returns true if it
+    /// needs a repaint: the animations in view go on from where they were.
+    #[cfg(feature = "images")]
+    pub fn set_hidden(&mut self, hidden: bool) -> bool {
+        std::mem::replace(&mut self.hidden, hidden) && !hidden && self.images.animating()
     }
 
     /// What the event loop does each time it runs out of events: hide the scrollbar if its
@@ -2110,7 +2271,19 @@ impl View {
         (refused || self.images.partial(id)).then_some(id)
     }
 
-    /// The pointer is on an image a click loads past VOMD's limits, outside a link: the hand.
+    /// The animated image at (`x`, `y`) that a click plays or pauses: one shown (not its
+    /// placeholder) that VOMD can play.
+    fn playable_at(&self, x: f64, y: f64) -> Option<u32> {
+        if !self.images.has_animated() {
+            return None;
+        }
+        let id = self.image_at(x, y)?;
+        let shown = !matches!(self.layout.image_size(id), Some(ImageSize::Refused(_)));
+        (shown && self.images.anim_state(id).is_some()).then_some(id)
+    }
+
+    /// The pointer is on an image a click loads past VOMD's limits, or plays or pauses, outside a
+    /// link: the hand.
     pub fn over_force(&self) -> bool {
         self.hover_force
     }

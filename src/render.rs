@@ -30,6 +30,8 @@ pub struct Frame<'a> {
     stride: usize,
     /// Drawing is limited to this rectangle (always inside the buffer).
     clip: Clip,
+    /// What is painted of the buffer (all of it, or a part that changed): no clip reaches past it.
+    limit: Clip,
 }
 
 /// A pixel rectangle, `x0..x1` × `y0..y1`.
@@ -42,7 +44,7 @@ pub struct Clip {
 }
 
 impl Clip {
-    fn intersect(self, o: Clip) -> Clip {
+    pub fn intersect(self, o: Clip) -> Clip {
         Clip {
             x0: self.x0.max(o.x0),
             y0: self.y0.max(o.y0),
@@ -51,8 +53,25 @@ impl Clip {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    /// The smallest rectangle holding both (`self` and `o` not empty).
+    #[cfg(feature = "images")]
+    fn union(self, o: Clip) -> Clip {
+        Clip {
+            x0: self.x0.min(o.x0),
+            y0: self.y0.min(o.y0),
+            x1: self.x1.max(o.x1),
+            y1: self.y1.max(o.y1),
+        }
+    }
+
+    #[cfg(feature = "images")]
+    fn area(&self) -> i64 {
+        (i64::from(self.x1) - i64::from(self.x0)).max(0)
+            * (i64::from(self.y1) - i64::from(self.y0)).max(0)
     }
 }
 
@@ -72,17 +91,19 @@ impl<'a> Frame<'a> {
         );
         // Sizes past i32 can't be addressed by the i32 drawing coordinates; clip to them.
         let (w, h) = (width.min(i32::MAX as usize), height.min(i32::MAX as usize));
+        let all = Clip {
+            x0: 0,
+            y0: 0,
+            x1: w as i32,
+            y1: h as i32,
+        };
         Frame {
             buf,
             width,
             height,
             stride,
-            clip: Clip {
-                x0: 0,
-                y0: 0,
-                x1: w as i32,
-                y1: h as i32,
-            },
+            clip: all,
+            limit: all,
         }
     }
 
@@ -94,17 +115,27 @@ impl<'a> Frame<'a> {
         self.height
     }
 
-    /// The whole buffer.
+    /// What is painted of the buffer ([`Frame::set_limit`]; all of it at first).
     fn bounds(&self) -> Clip {
-        Clip {
+        self.limit
+    }
+
+    /// Paint only `rect` of the buffer from now on (what changed of a frame painted before):
+    /// every clip set stays inside it, so a paint of the whole window paints just that part, as
+    /// the whole paint would.
+    #[cfg(feature = "images")]
+    pub fn set_limit(&mut self, rect: Clip) {
+        let all = Clip {
             x0: 0,
             y0: 0,
             x1: self.width.min(i32::MAX as usize) as i32,
             y1: self.height.min(i32::MAX as usize) as i32,
-        }
+        };
+        self.limit = rect.intersect(all);
+        self.clip = self.limit;
     }
 
-    /// Limit drawing to `clip` (within the buffer) and return the previous clip.
+    /// Limit drawing to `clip` (within what is painted) and return the previous clip.
     pub fn set_clip(&mut self, clip: Clip) -> Clip {
         let clip = clip.intersect(self.bounds());
         std::mem::replace(&mut self.clip, clip)
@@ -122,7 +153,7 @@ impl<'a> Frame<'a> {
             return;
         }
         for y in c.y0..c.y1 {
-            self.row(y)[c.x0 as usize..c.x1 as usize].fill(color);
+            fill(&mut self.row(y)[c.x0 as usize..c.x1 as usize], color);
         }
     }
 
@@ -575,6 +606,84 @@ pub trait Pixels {
     /// The bitmap to show in box `id`, `w` × `h` physical pixels: that size, another one
     /// while it's decoded again (scaled to fit), or none yet.
     fn pixels(&mut self, id: u32, w: u32, h: u32) -> Option<&Bitmap>;
+
+    /// Box `id` is painted at `rect` (left, top, right, bottom, frame pixels), before its
+    /// [`Pixels::pixels`] are asked for: what is on screen, for what plays.
+    #[cfg(feature = "images")]
+    fn placed(&mut self, id: u32, rect: (i32, i32, i32, i32)) {
+        let _ = (id, rect);
+    }
+
+    /// Box `id` is an animation that doesn't play: its pixels get the ▶ badge.
+    #[cfg(feature = "images")]
+    fn paused(&self, id: u32) -> bool {
+        let _ = id;
+        false
+    }
+}
+
+/// The ▶ badge's pill (width, height) and its margin to the box's lower left corner, and the
+/// smallest box side that gets one, in logical pixels (they scale with the document, as the box
+/// does).
+#[cfg(feature = "images")]
+const BADGE: (f32, f32) = (28.0, 20.0);
+#[cfg(feature = "images")]
+const BADGE_MARGIN: f32 = 6.0;
+#[cfg(feature = "images")]
+const BADGE_MIN: f32 = 48.0;
+#[cfg(feature = "images")]
+const BADGE_ALPHA: u8 = 150;
+
+/// A paused animation's badge: a white ▶ in a dark pill at the lower left of its box, on boxes
+/// of at least [`BADGE_MIN`] each way, so badges and emoji-sized images stay clean.
+#[cfg(feature = "images")]
+fn paint_badge(frame: &mut Frame, (x0, y0, x1, y1): (i32, i32, i32, i32), scale: f32) {
+    let s = scale.max(0.01);
+    let px = |v: f32| (v * s).round() as i32;
+    let min = px(BADGE_MIN);
+    if i64::from(x1) - i64::from(x0) < i64::from(min)
+        || i64::from(y1) - i64::from(y0) < i64::from(min)
+    {
+        return;
+    }
+    let bx0 = x0.saturating_add(px(BADGE_MARGIN));
+    let by1 = y1.saturating_sub(px(BADGE_MARGIN));
+    let (bx1, by0) = (
+        bx0.saturating_add(px(BADGE.0)),
+        by1.saturating_sub(px(BADGE.1)),
+    );
+    let r = (by1 - by0) as f32 / 2.0;
+    frame.rounded_rect((bx0, by0, bx1, by1), r, None, 0x000000, BADGE_ALPHA);
+    // The triangle's centroid (a third of its width from its left) at the pill's center.
+    let th = px(10.0).max(3) as u32;
+    let tw = (th as f32 * 0.87).round() as u32;
+    let mid = |a: i32, b: i32| ((i64::from(a) + i64::from(b)) / 2) as i32;
+    let tx = mid(bx0, bx1) - tw as i32 / 3;
+    let ty = mid(by0, by1) - th as i32 / 2;
+    frame.blit_mask(tx, ty, tw, th, &play_mask(tw, th), 0xffffff);
+}
+
+/// A right-pointing triangle filling `w` × `h`, as coverage from 4 × 4 samples a pixel.
+#[cfg(feature = "images")]
+fn play_mask(w: u32, h: u32) -> Vec<u8> {
+    let (wf, half) = (w as f32, h as f32 / 2.0);
+    let mut mask = Vec::with_capacity(w as usize * h as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let mut n = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let fx = x as f32 + (sx as f32 + 0.5) / 4.0;
+                    let fy = y as f32 + (sy as f32 + 0.5) / 4.0;
+                    // Inside while the distance from the middle row is within the half-height
+                    // left at this column.
+                    n += u32::from((fy - half).abs() <= half * (1.0 - fx / wf));
+                }
+            }
+            mask.push((n * 255 / 16) as u8);
+        }
+    }
+    mask
 }
 
 /// Paint the image boxes of the blocks in the viewport, after [`paint`]: their pixels, or a
@@ -608,8 +717,16 @@ pub fn paint_images(
                 continue;
             }
             let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+            #[cfg(feature = "images")]
+            pixels.placed(b.b.id, (x0, y0, x1, y1));
             match pixels.pixels(b.b.id, w, h) {
-                Some(bm) => frame.blit_bitmap(x0, y0, w, h, bm),
+                Some(bm) => {
+                    frame.blit_bitmap(x0, y0, w, h, bm);
+                    #[cfg(feature = "images")]
+                    if pixels.paused(b.b.id) {
+                        paint_badge(frame, (x0, y0, x1, y1), layout.params().scale);
+                    }
+                }
                 None => {
                     frame.fill_rect(x0, y0, x1, y1, theme.code_bg);
                     frame.rounded_rect((x0, y0, x1, y1), 0.0, Some(1.0), theme.border, 255);
@@ -733,6 +850,22 @@ impl ScrollbarFade {
     }
 }
 
+/// Set every pixel of `px` to `color`, four a step (as [`opaque`] does: the size-optimized
+/// build doesn't vectorize `fill`, and how fast its loop of one pixel a step runs depends on
+/// where it lands in the binary, 2 to 4 ms for a 4K window).
+fn fill(px: &mut [u32], color: Rgb) {
+    let c4 = u128::from(color) * 0x0000_0001_0000_0001_0000_0001_0000_0001;
+    // SAFETY: every bit pattern is a valid `u32` and `u128`, and `align_to_mut` keeps the
+    // middle slice aligned.
+    let (head, mid, tail) = unsafe { px.align_to_mut::<u128>() };
+    for p in mid {
+        *p = c4;
+    }
+    for p in head.iter_mut().chain(tail) {
+        *p = color;
+    }
+}
+
 /// Set the unused top byte of every pixel to 0xFF just before presenting. softbuffer labels
 /// frames XRGB8888, so that byte should be ignored, but some compositors read it as alpha:
 /// KWin 6.8 with NVIDIA 615 (Wayland) shows a `0x00RRGGBB` frame as black or see-through.
@@ -749,6 +882,55 @@ pub fn opaque(buf: &mut [u32]) {
     for p in head.iter_mut().chain(tail) {
         *p |= 0xff00_0000;
     }
+}
+
+/// [`opaque`] for the rectangles `rects` of a buffer `stride` pixels wide (each inside it).
+#[cfg(feature = "images")]
+pub fn opaque_rects(buf: &mut [u32], stride: usize, rects: &[Clip]) {
+    for r in rects {
+        for y in r.y0..r.y1 {
+            let start = y as usize * stride;
+            opaque(&mut buf[start + r.x0 as usize..start + r.x1 as usize]);
+        }
+    }
+}
+
+/// Add the rectangle `r` to `rects`, which it joins with any it is close to (when their union
+/// isn't half again as large as both: one paint for both is cheaper than two).
+#[cfg(feature = "images")]
+pub fn add_damage(rects: &mut Vec<Clip>, mut r: Clip) {
+    if r.is_empty() {
+        return;
+    }
+    while let Some(i) = rects
+        .iter()
+        .position(|o| 2 * o.union(r).area() <= 3 * (o.area() + r.area()))
+    {
+        r = r.union(rects.swap_remove(i));
+    }
+    rects.push(r);
+}
+
+/// What to paint again of a buffer that holds the frame presented `age` frames ago (softbuffer's
+/// `Buffer::age`: 0 is unknown), for the parts that changed since the last one, `changed`. The
+/// last one was painted in part (`last`: what changed then) or whole (`None`). `None`: all of it.
+#[cfg(feature = "images")]
+pub fn damage(changed: &[Clip], age: u8, last: Option<&[Clip]>) -> Option<Vec<Clip>> {
+    let mut rects = Vec::new();
+    match (age, last) {
+        (1, _) => {}
+        // (Wayland's two buffers: this one has missed what the last frame changed.)
+        (2, Some(last)) => {
+            for &r in last {
+                add_damage(&mut rects, r);
+            }
+        }
+        _ => return None,
+    }
+    for &r in changed {
+        add_damage(&mut rects, r);
+    }
+    (!changed.is_empty()).then_some(rects)
 }
 
 #[cfg(test)]

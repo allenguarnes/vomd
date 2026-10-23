@@ -1,4 +1,4 @@
-# Fuzz targets: `cargo +nightly fuzz run <doc|image|layout|settings|svg>`, or on
+# Fuzz targets: `cargo +nightly fuzz run <doc|image|anim|layout|settings|svg>`, or on
 # stable with `just fuzz <target> [seconds]`. Never shipped.
 [package]
 name = "vomd-fuzz"
@@ -35,6 +35,13 @@ bench = false
 [[bin]]
 name = "image"
 path = "fuzz_targets/image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anim"
+path = "fuzz_targets/anim.rs"
 test = false
 doc = false
 bench = false

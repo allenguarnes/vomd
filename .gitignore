@@ -4,3 +4,5 @@ target/
 /dist/
 /SPEC.md
 /PLAN.md
+/fixtures/anim.md
+/fixtures/anim/

@@ -574,6 +574,98 @@ mod doc {
         assert!(!c.contains(&LIGHT.bg));
     }
 
+    /// A paused animation's box gets the ▶ badge at its lower left (a white triangle in a dark
+    /// pill) when it is at least 48 logical pixels each way, at any scale; a smaller one, and
+    /// one that plays, show their pixels alone.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_paused_animation_gets_the_badge_on_a_box_big_enough() {
+        use crate::layout::ImageSize;
+        const PX: u32 = 0x336699;
+        struct Boxes {
+            bm: Option<Bitmap>,
+            placed: Vec<(u32, (i32, i32, i32, i32))>,
+        }
+        impl Pixels for Boxes {
+            fn pixels(&mut self, _: u32, w: u32, h: u32) -> Option<&Bitmap> {
+                self.bm = Some(Bitmap {
+                    width: w,
+                    height: h,
+                    data: vec![0xff00_0000 | PX; (w * h) as usize],
+                });
+                self.bm.as_ref()
+            }
+            fn placed(&mut self, id: u32, rect: (i32, i32, i32, i32)) {
+                self.placed.push((id, rect));
+            }
+            fn paused(&self, id: u32) -> bool {
+                id != 3
+            }
+        }
+        for scale in [1.0, 2.0] {
+            let fonts = Fonts::new().unwrap();
+            let doc = Doc::parse("![a](a.gif)\n\n![b](b.gif)\n\n![c](c.gif)");
+            let mut layout = Layout::new(
+                &doc,
+                Params {
+                    width: 600.0 * scale,
+                    scale,
+                    ..Params::default()
+                },
+            );
+            for (id, (w, h)) in [(1, (120, 80)), (2, (47, 60)), (3, (120, 80))] {
+                layout.set_image(&doc, id, ImageSize::Pixels(w, h));
+            }
+            let (w, h) = ((600.0 * scale) as usize, (400.0 * scale) as usize);
+            layout.ensure(&doc, &fonts, Anchor::TOP, h as f32);
+            let mut b = Buf::new(w, h, w);
+            let vp = Viewport {
+                area: Clip {
+                    x0: 0,
+                    y0: 0,
+                    x1: w as i32,
+                    y1: h as i32,
+                },
+                scroll: 0.0,
+            };
+            let mut boxes = Boxes {
+                bm: None,
+                placed: Vec::new(),
+            };
+            paint_images(
+                &mut b.frame(),
+                vp,
+                &layout,
+                &mut boxes,
+                &LIGHT,
+                #[cfg(feature = "clipboard")]
+                None,
+            );
+            assert_eq!(boxes.placed.len(), 3, "{scale}");
+            let s = |v: f32| (v * scale) as i32;
+            for &(id, (x0, y0, x1, y1)) in &boxes.placed {
+                let at = |x: i32, y: i32| b.at(x as usize, y as usize) & 0xff_ffff;
+                let plain = (y0..y1).all(|y| (x0..x1).all(|x| at(x, y) == PX));
+                if id == 1 {
+                    assert_eq!(
+                        at(x0 + s(20.0), y1 - s(16.0)),
+                        0xff_ffff,
+                        "triangle {scale}"
+                    );
+                    let pill = at(x0 + s(10.0), y1 - s(10.0));
+                    assert!(
+                        pill != PX && pill.to_be_bytes().iter().all(|&c| c < 0x40),
+                        "pill {pill:06x}"
+                    );
+                    assert_eq!(at(x0 + s(3.0), y1 - s(3.0)), PX, "margin {scale}");
+                    assert_eq!(at(x0 + s(60.0), y0 + s(20.0)), PX, "the rest {scale}");
+                } else {
+                    assert!(plain, "box {id} at {scale}: no badge");
+                }
+            }
+        }
+    }
+
     /// Identical blocks look identical however far down the document they are: block tops and
     /// the scroll position stay f64 until painting.
     #[test]
@@ -774,4 +866,98 @@ fn opaque_sets_only_the_top_byte() {
             }
         }
     }
+}
+
+#[cfg(feature = "images")]
+fn clip(x0: i32, y0: i32, x1: i32, y1: i32) -> Clip {
+    Clip { x0, y0, x1, y1 }
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn a_limit_keeps_every_clip_inside_it() {
+    let mut b = Buf::new(10, 6, 13);
+    let mut f = b.frame();
+    f.fill_rect(0, 0, 10, 6, BLUE);
+    f.set_limit(clip(2, 1, 5, 4));
+    f.fill_rect(0, 0, 10, 6, RED);
+    // A clip set later can't widen it, only narrow it.
+    let prev = f.set_clip(clip(0, 0, 10, 6));
+    assert_eq!(prev, clip(2, 1, 5, 4));
+    f.rounded_rect((0, 0, 10, 6), 0.0, None, RED, 255);
+    f.set_clip(clip(4, 0, 10, 6));
+    f.fill_rect(0, 0, 10, 6, 0x00ff00);
+    for y in 0..6 {
+        for x in 0..10 {
+            let want = match (x, y) {
+                (4, 1..4) => 0x00ff00,
+                (2..5, 1..4) => RED,
+                _ => BLUE,
+            };
+            assert_eq!(b.at(x, y), want, "({x}, {y})");
+        }
+    }
+    assert!(b.padding_untouched());
+    // Past the buffer, a limit is what of it is inside.
+    let mut f = b.frame();
+    f.set_limit(clip(8, -3, 30, 2));
+    f.fill_rect(-50, -50, 50, 50, 0);
+    assert_eq!(
+        (b.at(7, 0), b.at(8, 0), b.at(9, 1), b.at(9, 2)),
+        (BLUE, 0, 0, BLUE)
+    );
+    assert!(b.padding_untouched());
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn opaque_rects_sets_the_top_byte_in_them_only() {
+    let mut b = Buf::new(10, 6, 13);
+    b.frame().fill_rect(0, 0, 10, 6, BLUE);
+    opaque_rects(&mut b.px, 13, &[clip(1, 1, 3, 2), clip(7, 3, 10, 6)]);
+    for y in 0..6 {
+        for x in 0..10 {
+            let inside = matches!((x, y), (1..3, 1) | (7..10, 3..6));
+            assert_eq!(b.at(x, y) >> 24 == 0xff, inside, "({x}, {y})");
+        }
+    }
+    assert!(b.padding_untouched());
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn close_damage_is_painted_once() {
+    let mut rects = Vec::new();
+    add_damage(&mut rects, clip(0, 0, 10, 10));
+    // The same box again, and an empty one: nothing new.
+    add_damage(&mut rects, clip(0, 0, 10, 10));
+    add_damage(&mut rects, clip(5, 5, 5, 9));
+    assert_eq!(rects, [clip(0, 0, 10, 10)]);
+    // Far away: a rectangle of its own.
+    add_damage(&mut rects, clip(100, 100, 110, 110));
+    assert_eq!(rects.len(), 2);
+    // Beside the first: one with it (union 200, both 200).
+    add_damage(&mut rects, clip(10, 0, 20, 10));
+    assert!(rects.contains(&clip(0, 0, 20, 10)) && rects.len() == 2);
+    // A union that joins two: both go into one.
+    add_damage(&mut rects, clip(15, 5, 105, 105));
+    assert_eq!(rects, [clip(0, 0, 110, 110)]);
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn damage_is_painted_only_over_a_buffer_that_holds_a_known_frame() {
+    let (a, b) = (clip(0, 0, 10, 10), clip(100, 100, 110, 110));
+    // Nothing changed: nothing to paint in part.
+    assert_eq!(damage(&[], 1, None), None);
+    // The buffer holds the frame before (X11, Windows).
+    assert_eq!(damage(&[a], 1, None), Some(vec![a]));
+    assert_eq!(damage(&[a], 1, Some(&[b])), Some(vec![a]));
+    // Two frames before (Wayland): what the last one changed too, if it is known.
+    assert_eq!(damage(&[a], 2, Some(&[b])), Some(vec![b, a]));
+    assert_eq!(damage(&[a], 2, Some(&[a])), Some(vec![a]));
+    assert_eq!(damage(&[a], 2, None), None);
+    // A new buffer, or one older still: all of it.
+    assert_eq!(damage(&[a], 0, Some(&[b])), None);
+    assert_eq!(damage(&[a], 3, Some(&[b])), None);
 }
