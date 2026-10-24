@@ -1,6 +1,6 @@
 [package]
 name = "vomd"
-version = "1.6.1"
+version = "1.6.2"
 edition = "2024"
 rust-version = "1.89"
 description = "View-Only Markdown: a tiny, fast Markdown viewer"

@@ -3,6 +3,16 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.6.2] - 2026-10-24
+
+### Fixed
+- An SVG with an image, marker, filter, mask or pattern whose size or position is absurdly large
+  (a width of 1e38, say) no longer stops its drawing process, which left the image showing its
+  alt text: the SVG is drawn without that part instead.
+- An SVG with a shape, an image or a mask that has a point absurdly far outside the picture (a
+  corner 600 million pixels away, say), or a stroke that wide, no longer stops its drawing process
+  either: it is drawn as far as it shows.
+
 ## [1.6.1] - 2026-10-24
 
 ### Fixed
@@ -252,6 +262,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[1.6.2]: https://github.com/allenguarnes/vomd/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/allenguarnes/vomd/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/allenguarnes/vomd/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/allenguarnes/vomd/compare/v1.4.0...v1.5.0
