@@ -14,7 +14,7 @@ use std::{env, fs};
 mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
-const SIZE_BUDGET: [u64; 2] = [5_620_000, 3_000_000];
+const SIZE_BUDGET: [u64; 2] = [5_640_000, 3_000_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
 const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_500_000, 2_000_000];

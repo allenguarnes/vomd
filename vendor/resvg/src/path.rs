@@ -70,7 +70,17 @@ pub fn fill_path(
     paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
     paint.blend_mode = blend_mode;
 
-    pixmap.fill_path(path.data(), &paint, rule, transform, None);
+    // VOMD: a path too far for tiny-skia's scan is clipped to the pixmap (see `geom::fill`).
+    match crate::geom::fill(path.data(), transform, pixmap.width(), pixmap.height()) {
+        crate::geom::Drawing::Whole => {
+            pixmap.fill_path(path.data(), &paint, rule, transform, None);
+        }
+        crate::geom::Drawing::Device(path) => {
+            paint.shader.transform(transform);
+            pixmap.fill_path(&path, &paint, rule, tiny_skia::Transform::identity(), None);
+        }
+        crate::geom::Drawing::Nothing => return None,
+    }
     Some(())
 }
 
@@ -110,7 +120,31 @@ fn stroke_path(
     paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
     paint.blend_mode = blend_mode;
 
-    pixmap.stroke_path(path.data(), &paint, &stroke.to_tiny_skia(), transform, None);
+    // VOMD: as above, for the outline of the stroke (see `geom::stroke`).
+    let stroke = stroke.to_tiny_skia();
+    match crate::geom::stroke(
+        path.data(),
+        &stroke,
+        transform,
+        paint.anti_alias,
+        pixmap.width(),
+        pixmap.height(),
+    ) {
+        crate::geom::Drawing::Whole => {
+            pixmap.stroke_path(path.data(), &paint, &stroke, transform, None);
+        }
+        crate::geom::Drawing::Device(outline) => {
+            paint.shader.transform(transform);
+            pixmap.fill_path(
+                &outline,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        }
+        crate::geom::Drawing::Nothing => return None,
+    }
 
     Some(())
 }

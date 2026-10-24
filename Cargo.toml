@@ -29,7 +29,7 @@ zune-jpeg = { version = "0.5", optional = true }
 gif = { version = "0.14", default-features = false, features = ["std"], optional = true }
 image-webp = { version = "0.2", optional = true }
 # Exactly: the SVG memory and work charges (src/image/svg.rs) are measured against it, and it is
-# patched (vendor/resvg).
+# patched (vendor/resvg, and vendor/usvg, which it draws the tree of).
 resvg = { version = "=0.46.0", default-features = false, features = ["text"], optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"], optional = true } # svgz; usvg's
 # What usvg reads a style sheet with: the sheets' matching work is counted before usvg runs it.
@@ -84,6 +84,7 @@ incremental = false
 image-webp = { path = "vendor/image-webp" } # 0.2.4, its lossless decoder's Huffman codes bounded
 resvg = { path = "vendor/resvg" } # 0.46.0, raster images drawn by a hook, and a cancel flag
 simplecss = { path = "vendor/simplecss" } # 0.2.2, an error's position made in constant time
+usvg = { path = "vendor/usvg" } # 0.46.0, numbers too large for an f32 leave out what they would unwrap
 
 [dev-dependencies]
 insta = "1"

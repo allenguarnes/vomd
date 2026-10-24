@@ -242,8 +242,9 @@ fn from_linear_rgb(data: &mut [RGBA8]) {
 #[inline]
 fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
     debug_assert!(min.is_finite());
-    debug_assert!(val.is_finite());
-    debug_assert!(max.is_finite());
+    // VOMD: neither `val` nor `max` is asserted to be finite: a divisor, a kernel or a transfer
+    // function of extreme numbers makes them infinite or not a number, which this bounds (or a
+    // cast to `u8` makes 0) as in a release.
 
     if val > max {
         max
@@ -365,7 +366,7 @@ fn apply_inner(
     let region = filter
         .rect()
         .transform(ts)
-        .map(|r| r.to_int_rect())
+        .and_then(crate::geom::int_rect)
         .ok_or(Error::InvalidRegion)?;
 
     let mut results: Vec<FilterResult> = Vec::new();
@@ -378,7 +379,7 @@ fn apply_inner(
         let mut subregion = primitive
             .rect()
             .transform(ts)
-            .map(|r| r.to_int_rect())
+            .and_then(crate::geom::int_rect)
             .ok_or(Error::InvalidRegion)?;
 
         // `feOffset` inherits its region from the input.
@@ -623,8 +624,8 @@ fn apply_drop_shadow(
     }
 
     pixmap.draw_pixmap(
-        dx as i32,
-        dy as i32,
+        crate::geom::shift(dx),
+        crate::geom::shift(dy),
         shadow_pixmap.as_ref(),
         &tiny_skia::PixmapPaint::default(),
         tiny_skia::Transform::identity(),
@@ -683,8 +684,8 @@ fn apply_offset(
 
     let mut pixmap = tiny_skia::Pixmap::try_create(input.width(), input.height())?;
     pixmap.draw_pixmap(
-        dx as i32,
-        dy as i32,
+        crate::geom::shift(dx),
+        crate::geom::shift(dy),
         input.as_ref().as_ref(),
         &tiny_skia::PixmapPaint::default(),
         tiny_skia::Transform::identity(),

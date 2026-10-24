@@ -18,6 +18,7 @@ vomd = { path = "..", default-features = false, features = ["embed-fonts", "imag
 image-webp = { path = "../vendor/image-webp" }
 resvg = { path = "../vendor/resvg" }
 simplecss = { path = "../vendor/simplecss" }
+usvg = { path = "../vendor/usvg" }
 
 [workspace]
 members = ["."]

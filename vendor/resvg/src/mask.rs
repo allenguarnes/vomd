@@ -20,12 +20,22 @@ pub fn apply(
         // TODO: only when needed
         // Mask has to be clipped by mask.region
         let mut alpha_mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height()).unwrap();
-        alpha_mask.fill_path(
-            &tiny_skia::PathBuilder::from_rect(mask.rect().to_rect()),
-            tiny_skia::FillRule::Winding,
-            true,
-            transform,
-        );
+        // VOMD: a region too far for tiny-skia's scan is clipped to the pixmap (see `geom::fill`).
+        let region = tiny_skia::PathBuilder::from_rect(mask.rect().to_rect());
+        match crate::geom::fill(&region, transform, pixmap.width(), pixmap.height()) {
+            crate::geom::Drawing::Whole => {
+                alpha_mask.fill_path(&region, tiny_skia::FillRule::Winding, true, transform);
+            }
+            crate::geom::Drawing::Device(region) => {
+                alpha_mask.fill_path(
+                    &region,
+                    tiny_skia::FillRule::Winding,
+                    true,
+                    tiny_skia::Transform::identity(),
+                );
+            }
+            crate::geom::Drawing::Nothing => {}
+        }
 
         crate::render::render_nodes(mask.root(), ctx, transform, &mut mask_pixmap.as_mut());
 

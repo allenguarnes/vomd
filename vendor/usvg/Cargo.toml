@@ -1,0 +1,37 @@
+# usvg 0.46.0 from crates.io (git b8e58f5a), with VOMD's patch: see VOMD-PATCH.md. The library's
+# sources and licenses only: no binary (and with it no `pico-args`) and no dev-dependencies.
+[package]
+name = "usvg"
+version = "0.46.0"
+edition = "2024"
+rust-version = "1.87.0"
+license = "Apache-2.0 OR MIT"
+description = "An SVG simplification library."
+repository = "https://github.com/linebender/resvg"
+keywords = ["svg"]
+
+[features]
+default = ["text", "system-fonts", "memmap-fonts"]
+memmap-fonts = ["fontdb/memmap"]
+system-fonts = ["fontdb/fs", "fontdb/fontconfig"]
+text = ["fontdb", "rustybuzz", "unicode-bidi", "unicode-script", "unicode-vo"]
+
+[dependencies]
+base64 = "0.22"
+data-url = "0.3"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+fontdb = { version = "0.23.0", optional = true, default-features = false }
+imagesize = "0.14.0"
+kurbo = "0.13.0"
+log = "0.4"
+roxmltree = "0.21.1"
+rustybuzz = { version = "0.20.1", optional = true }
+simplecss = "0.2"
+siphasher = "1.0"
+strict-num = "0.1.1"
+svgtypes = "0.16.1"
+tiny-skia-path = "0.11.4"
+unicode-bidi = { version = "0.3", optional = true }
+unicode-script = { version = "0.5", optional = true }
+unicode-vo = { version = "0.1", optional = true }
+xmlwriter = "0.1"

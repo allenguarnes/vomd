@@ -130,9 +130,11 @@ notes are that version's section of `CHANGELOG.md`.
 
 ## Vendored crates
 
-`vendor/` holds three crates VOMD patches, used through `[patch.crates-io]` in `Cargo.toml`:
+`vendor/` holds four crates VOMD patches, used through `[patch.crates-io]` in `Cargo.toml`:
 
 - **resvg 0.46:** its raster images go through VOMD's decoders, and drawing can be cancelled.
+- **usvg 0.46:** numbers too large to draw (a huge size, position or transform) leave that part
+  out instead of panicking.
 - **image-webp 0.2.4:** a memory limit on a lossless image's Huffman codes.
 - **simplecss 0.2.2:** an error's position found in constant time (a style sheet with many rules
   used to take time quadratic in its length).

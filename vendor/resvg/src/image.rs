@@ -98,7 +98,25 @@ mod raster_images {
         let mut paint = tiny_skia::Paint::default();
         paint.shader = pattern;
 
-        pixmap.fill_rect(rect, &paint, transform, None);
+        // VOMD: a rectangle too far for tiny-skia's scan is clipped to the pixmap (see
+        // `geom::fill`); `fill_rect` with a transform fills the rectangle's path.
+        let path = tiny_skia::PathBuilder::from_rect(rect);
+        match crate::geom::fill(&path, transform, pixmap.width(), pixmap.height()) {
+            crate::geom::Drawing::Whole => {
+                pixmap.fill_rect(rect, &paint, transform, None);
+            }
+            crate::geom::Drawing::Device(path) => {
+                paint.shader.transform(transform);
+                pixmap.fill_path(
+                    &path,
+                    &paint,
+                    tiny_skia::FillRule::Winding,
+                    tiny_skia::Transform::identity(),
+                    None,
+                );
+            }
+            crate::geom::Drawing::Nothing => {}
+        }
 
         Some(())
     }

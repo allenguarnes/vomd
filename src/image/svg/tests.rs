@@ -1,4 +1,6 @@
-use super::super::{CACHE_BYTES, Limits, NO_CANCEL, decode, decode_cost, header_of, info_of};
+use super::super::{
+    CACHE_BYTES, Format, Limits, NO_CANCEL, decode, decode_cost, header_of, info_of,
+};
 use super::*;
 use std::time::{Duration, Instant};
 
@@ -1978,4 +1980,538 @@ fn a_style_sheet_is_read_in_linear_time() {
         sheet.rules[0].declarations.as_ptr(),
         sheet.rules[20_000].declarations.as_ptr()
     ));
+}
+
+/// What `decode` makes of `svg` at the sizes the `svg` fuzz target draws: no panic, and the size
+/// asked for when anything is drawn.
+fn drawn_at_the_fuzz_sizes(svg: &[u8]) {
+    let Some((Format::Svg, w, h)) = header_of(svg) else {
+        return;
+    };
+    assert!(w > 0 && h > 0);
+    for (bw, bh) in [(64, 64), (512, 512)] {
+        if let Some(b) = decode(svg, bw, bh) {
+            assert_eq!((b.width, b.height), (bw, bh));
+        }
+    }
+}
+
+/// Every input of a past fuzz finding (fuzz/seeds/svg/).
+#[test]
+fn the_svgs_of_past_fuzz_findings_are_drawn_or_refused() {
+    let dir = format!("{}/fuzz/seeds/svg", env!("CARGO_MANIFEST_DIR"));
+    let mut seeds = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        drawn_at_the_fuzz_sizes(&std::fs::read(entry.unwrap().path()).unwrap());
+        seeds += 1;
+    }
+    assert!(seeds > 0);
+}
+
+/// Numbers an `f32` can hardly hold, in the sizes, positions, transforms and radii of every kind
+/// of element that makes a rectangle or a size out of them: each of these panicked, in usvg's
+/// parser or in resvg's drawing, or in the walk that charges the drawing (where overflow is
+/// checked). The SVG is drawn or refused.
+#[test]
+fn extreme_numbers_in_shapes_are_drawn_or_refused() {
+    let png = format!("data:image/png;base64,{}", base64(&striped_png()));
+    let nested = format!(
+        "data:image/svg+xml;base64,{}",
+        base64(b"<svg xmlns='http://www.w3.org/2000/svg' width='24' height='16'><rect width='24' height='16'/></svg>")
+    );
+    let mut bodies = Vec::new();
+    // A miter limit past `f32::MAX` is infinite (usvg asserted it was finite).
+    for limit in ["1e39", "1e300"] {
+        bodies.push(format!(
+            "<path d='M0 0 L50 20 L0 30' stroke='red' stroke-miterlimit='{limit}'/>"
+        ));
+    }
+    for n in ["1e38", "1e30", "1e300", "1e-38", "4444444444444444402"] {
+        for href in [&png, &nested] {
+            // Far from zero, an image's size has no room beside its position (`f32`).
+            for (x, y, w, h) in [
+                ("0", "0", "24", n),
+                ("0", "0", n, "16"),
+                (n, n, n, n),
+                ("0", n, "24", "40"),
+            ] {
+                for aspect in ["", " preserveAspectRatio='xMidYMid slice'"] {
+                    bodies.push(format!(
+                        "<image x='{x}' y='{y}' width='{w}' height='{h}'{aspect} href='{href}'/>"
+                    ));
+                }
+            }
+            bodies.push(format!(
+                "<g transform='translate({n} {n}) rotate(90)'><image width='24' height='{n}' href='{href}'/></g>"
+            ));
+        }
+        let path = "<path d='M0 0 L10 10 L20 0'";
+        bodies.extend([
+            // A stroke too wide for the marker's size.
+            format!("<defs><marker id='m' markerWidth='5' markerHeight='5' viewBox='0 0 10 10'><circle r='5'/></marker></defs>{path} stroke-width='{n}' marker-mid='url(#m)'/>"),
+            // A region, mask or pattern in the shape's own units, of numbers too large.
+            format!("<defs><filter id='f' x='{n}' y='{n}' width='{n}' height='{n}'><feGaussianBlur stdDeviation='{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><mask id='k' x='{n}' y='{n}' width='{n}' height='{n}'><rect width='5' height='5'/></mask></defs><rect width='40' height='40' mask='url(#k)'/>"),
+            format!("<defs><pattern id='p' width='{n}' height='{n}' viewBox='0 0 {n} {n}'><rect width='5' height='5'/></pattern></defs><rect width='40' height='40' fill='url(#p)'/>"),
+            format!("<defs><pattern id='p' width='{n}' height='{n}' patternUnits='userSpaceOnUse'><rect width='5' height='5'/></pattern></defs><rect width='40' height='40' fill='url(#p)'/>"),
+            // Filter primitives: the numbers a drawing turns into pixels and offsets.
+            format!("<defs><filter id='f'><feMorphology radius='{n}'/><feDropShadow dx='{n}' dy='{n}' stdDeviation='{n}'/><feOffset dx='{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><filter id='f' filterUnits='userSpaceOnUse' x='0' y='0' width='{n}' height='{n}'><feConvolveMatrix order='3' divisor='{n}' kernelMatrix='1 1 1 1 1 1 1 1 1'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><filter id='f'><feConvolveMatrix order='3' divisor='{n}' kernelMatrix='1 1 1 1 1 1 1 1 1'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            // A stroke or a transform that carries the outline far from the canvas (`geom::stroke`
+            // of resvg), also with joins and curves of its own.
+            format!("<defs><marker id='m' markerWidth='5' markerHeight='5' viewBox='0 0 {n} {n}'><circle r='5'/></marker></defs>{path} stroke='red' stroke-width='{n}' marker-end='url(#m)'/>"),
+            format!("{path} stroke='red' stroke-width='{n}' stroke-linejoin='miter-clip'/>"),
+            format!("<path d='M0 0 C20 40 60 -40 10 30 S50 5 60 40' fill='red' stroke='blue' stroke-width='{n}' stroke-linecap='square'/>"),
+            format!("<g transform='scale({n})'><path d='M0 0 C20 40 60 -40 10 30 S50 5 60 40' fill='red' stroke='blue'/></g>"),
+            // A curve too large for the stroker's arithmetic, also after a transform that shrinks it.
+            format!("<path d='M0 0 Q{n} {n} {n} 0 C{n} 9 5 {n} 7 8' fill='red' stroke='blue'/>"),
+            format!("<g transform='scale(1e-30) rotate(30)'><path d='M0 0 Q{n} 5 {n} 0' stroke='blue' stroke-width='1e30'/></g>"),
+            format!("<g transform='translate(0 {n})'><rect width='60' height='{n}' fill='red'/></g>"),
+            // Numbers an overflow check or a finite-number assertion stops (the fuzz target runs both).
+            format!("<defs><filter id='f'><feTurbulence baseFrequency='{n}' numOctaves='3' seed='{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><filter id='f'><feTurbulence baseFrequency='{n} 0.1' seed='-{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><filter id='f'><feGaussianBlur stdDeviation='{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<rect width='40' height='40' filter='blur({n}px)'/>"),
+            format!("<defs><filter id='f' primitiveUnits='objectBoundingBox'><feGaussianBlur stdDeviation='{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><filter id='f'><feComponentTransfer><feFuncR type='gamma' amplitude='{n}' exponent='{n}' offset='{n}'/></feComponentTransfer><feComposite operator='arithmetic' k1='{n}' k2='{n}' k3='{n}' k4='{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<g opacity='.5' transform='matrix({n} 0 0 {n} {n} {n})'><rect width='5' height='5' stroke='red'/></g>"),
+            // A number bounded as an `f32` (infinite when it is too large), and orders whose
+            // product overflows a `u32` (usvg asserted and multiplied unchecked).
+            format!("<defs><filter id='f'><feColorMatrix type='saturate' values='{n}'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><linearGradient id='g'><stop offset='{n}' stop-color='red'/><stop offset='-{n}'/></linearGradient></defs><rect width='40' height='40' fill='url(#g)'/>"),
+            format!("<defs><filter id='f'><feConvolveMatrix order='{n}' kernelMatrix='1'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+            format!("<defs><filter id='f'><feConvolveMatrix order='{n} 65536'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"),
+        ]);
+    }
+    for order in [
+        "65536",
+        "65536 65536",
+        "65537 65537",
+        "1 4294967297",
+        "100000 100000",
+    ] {
+        bodies.push(format!(
+            "<defs><filter id='f'><feConvolveMatrix order='{order}' kernelMatrix='1'/></filter></defs><rect width='40' height='40' filter='url(#f)'/>"
+        ));
+    }
+    for body in bodies {
+        for root in [
+            "width='60' height='40'",
+            "width='60' height='40' viewBox='0 0 60 40'",
+        ] {
+            drawn_at_the_fuzz_sizes(
+                format!("<svg xmlns='http://www.w3.org/2000/svg' {root}>{body}</svg>").as_bytes(),
+            );
+        }
+    }
+}
+
+/// A path far from the canvas (`geom::fill` and `stroke` of resvg) is clipped to it and drawn:
+/// tiny-skia's anti-aliased scan panics on coordinates of about 2²⁴ pixels and more. The visible
+/// part is what the whole path draws there.
+#[test]
+fn a_path_far_from_the_canvas_is_clipped_and_drawn() {
+    let px = |svg: &str, w: u32, h: u32, x: u32, y: u32| {
+        let svg =
+            format!("<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}'>{svg}</svg>");
+        let b = decode(svg.as_bytes(), w, h).unwrap();
+        rgba(b.data[(y * w + x) as usize])
+    };
+    let (red, blue, none) = ([255, 0, 0, 255], [0, 0, 0xFF, 255], [0, 0, 0, 0]);
+    // Covering the canvas from far off: a wide curve stroke, a large scale, a position far above
+    // (the fuzz finding, a stroke of 2³¹, is a seed: its outline is too coarse an `f32` to say).
+    for far in [
+        "<path d='M0 0 C20 40 60 -40 10 30' fill='none' stroke='red' stroke-width='686107850000' stroke-linejoin='miter-clip'/>",
+        "<g transform='scale(1e9)'><rect x='-1' y='-1' width='2' height='2' fill='red'/></g>",
+        "<rect y='-2e9' width='60' height='4e9' fill='red'/>",
+    ] {
+        assert_eq!(px(far, 60, 40, 50, 30), red, "{far}");
+    }
+    // Where HEAD drew, it is drawn alike: a background of a million pixels, a large scale, a
+    // position far above, hairlines, wide strokes along a long path.
+    for near in [
+        "<rect width='1000000' height='1000000' fill='#00f'/>",
+        "<g transform='scale(100000)'><rect width='10' height='10' fill='#00f'/></g>",
+        "<rect y='-400000000' width='60' height='400000040' fill='#00f'/>",
+        "<path d='M0 -3e8 L60 -3e8 L60 3e8 L0 3e8Z' fill='#00f' stroke='#00f' stroke-width='1e6'/>",
+        "<line x1='30.5' y1='0' x2='30.5' y2='6e8' stroke='#00f'/>",
+        "<line x1='30.5' y1='-6e8' x2='30.5' y2='40' stroke='#00f'/>",
+        "<path d='M10 -50 L60 -50 L60 1.1e9 L10 1.1e9 Z' fill='#00f'/>",
+        "<path d='M10 -1.3e9 L60 -1.3e9 L60 3e8 L10 3e8 Z' fill='#00f'/>",
+        "<path d='M30 -50 L30 1.6e9' stroke='#00f' stroke-width='4'/>",
+    ] {
+        assert_eq!(px(near, 60, 40, 30, 20), blue, "{near}");
+    }
+    let frame = "<rect x='10.5' y='10.5' width='40' height='6e8' fill='none' stroke='#00f'/>";
+    assert_eq!(px(frame, 60, 40, 10, 20), blue, "{frame}");
+    // A subpath far above leaves the other subpath of its path alone (it once left the path out).
+    for far_part in [
+        "M0 -1073741696 L5 -1073741696 L5 -1073741440 Z",
+        "M-1e9 -1e9 L1e9 1e9 L1e9 -1e9 Z",
+    ] {
+        let square = "M10 200 L60 200 L60 250 L10 250 Z";
+        assert_eq!(
+            px(
+                &format!("<path d='{far_part} {square}' fill='red'/>"),
+                300,
+                300,
+                30,
+                220
+            ),
+            red,
+            "{far_part}"
+        );
+        assert_eq!(
+            px(
+                &format!(
+                    "<path d='{far_part} {square}' fill='red' stroke='red' stroke-width='4'/>"
+                ),
+                300,
+                300,
+                30,
+                220
+            ),
+            red,
+            "{far_part}"
+        );
+    }
+    // A single vertex far to the side makes a triangle with a sliver on the canvas, between the
+    // edges to the vertices (100, 110) and (200, 290): (50, 200) is inside, (250, 200) and
+    // (50, 50) aren't. Of random such triangles, a third panicked in tiny-skia.
+    for x in [
+        "-1e7", "-1.8e7", "-3e7", "-6e8", "-1e9", "-2e9", "-1e12", "-1e30",
+    ] {
+        let tri = format!("<path d='M{x} 80 L200 290 L100 110 Z' fill='red'/>");
+        assert_eq!(px(&tri, 300, 300, 50, 200), red, "{x}");
+        assert_eq!(px(&tri, 300, 300, 250, 200), none, "{x}");
+        assert_eq!(px(&tri, 300, 300, 50, 50), none, "{x}");
+    }
+    // Without anti-aliasing (`shape-rendering`) too: tiny-skia's cubic clipper unwraps on a path
+    // of cubics some millions of pixels out.
+    for x in ["-1e7", "-6e8"] {
+        let tri = format!(
+            "<path shape-rendering='crispEdges' d='M{x} 80 L200 290 L100 110 Z' fill='red'/>"
+        );
+        assert_eq!(px(&tri, 300, 300, 50, 200), red, "{x}");
+        assert_eq!(px(&tri, 300, 300, 250, 200), none, "{x}");
+    }
+    px(
+        "<path shape-rendering='crispEdges' d='M230.91464 0.17951131 C3520877 -3535824 -867679 -2707004 -1494787 1360698 Q-4238595 4001250 -2357208 1340155 C-8097520 -5181918 -2275875 7765701 -8330213 -7830216 Z' fill='red'/>",
+        300,
+        300,
+        0,
+        0,
+    );
+    // The same stroked: the sides of the triangle, not its inside.
+    let b = decode(
+        b"<svg xmlns='http://www.w3.org/2000/svg' width='300' height='300'><path d='M-6e8 80 L200 290 L100 110 Z' fill='none' stroke='red' stroke-width='6'/></svg>",
+        300,
+        300,
+    )
+    .unwrap();
+    assert_eq!(rgba(b.data[(200 * 300 + 50) as usize]), none);
+    assert_eq!(rgba(b.data[(290 * 300 + 50) as usize]), red);
+}
+
+/// The same on a canvas drawn in tiles (a side over 8,191 pixels), where tiny-skia moves the path
+/// by each tile's offset.
+#[test]
+fn a_path_far_from_a_canvas_in_tiles_is_clipped_and_drawn() {
+    let draw = |body: &str| {
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='9000'>{body}</svg>"
+        );
+        decode(svg.as_bytes(), 40, 9000).unwrap()
+    };
+    let at = |b: &crate::image::Bitmap, x: u32, y: u32| rgba(b.data[(y * 40 + x) as usize]);
+    for top in [
+        -536_870_912 + 5000,
+        -536_870_912,
+        -536_870_912 - 5000,
+        -1_073_741_824,
+    ] {
+        let b = draw(&format!(
+            "<path d='M10 {top} L30 {top} L30 9100 L10 9100Z' fill='#00f'/><rect x='35' y='8500' width='4' height='4' fill='#0c0'/>"
+        ));
+        assert_eq!(at(&b, 38, 8502), [0, 0xCC, 0, 255], "{top}");
+        assert_eq!(at(&b, 20, 8800), [0, 0, 0xFF, 255], "{top}");
+    }
+    let b = draw("<path d='M10 -50 L30 -50 L30 1.1e9 L10 1.1e9Z' fill='#00f'/>");
+    assert_eq!(at(&b, 20, 8800), [0, 0, 0xFF, 255]);
+    // A cubic far out, which the cubic clipper of tiny-skia unwraps on at about 2²¹.
+    draw("<path d='M20 4000 C-2e6 -1.7e6 -2e6 -1.7e6 1.7e6 9e5 L20 8000 Z' fill='#00f'/>");
+}
+
+/// A path that is clipped keeps its paint where it was: the shader of a gradient or a pattern
+/// goes through the path's transform as it does for a path that isn't (`geom::Drawing::Device`).
+/// A rectangle from far out covers the canvas as a near one does, pixel for pixel.
+#[test]
+fn a_clipped_path_keeps_its_gradient_and_pattern_in_place() {
+    let draw = |body: &str| {
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='60' height='40'><defs><linearGradient id='l' gradientUnits='userSpaceOnUse' x1='5' y1='0' x2='55' y2='40'><stop offset='0' stop-color='#f00'/><stop offset='1' stop-color='#00f'/></linearGradient><radialGradient id='r' gradientUnits='userSpaceOnUse' cx='30' cy='20' r='25'><stop offset='0' stop-color='#ff0'/><stop offset='1' stop-color='#060'/></radialGradient><pattern id='p' width='8' height='8' patternUnits='userSpaceOnUse'><rect width='4' height='4' fill='#0c0'/><rect x='4' y='4' width='4' height='4' fill='#c0c'/></pattern></defs>{body}</svg>"
+        );
+        decode(svg.as_bytes(), 60, 40).unwrap().data
+    };
+    for (paint, transform) in [
+        ("url(#l)", ""),
+        ("url(#r)", ""),
+        ("url(#p)", ""),
+        ("url(#l)", " transform='translate(3 2) scale(1.5)'"),
+        ("url(#p)", " transform='rotate(20 30 20)'"),
+    ] {
+        let near = draw(&format!(
+            "<rect x='-200' y='-200' width='500' height='500' fill='{paint}'{transform}/>"
+        ));
+        let far = draw(&format!(
+            "<rect x='-1e9' y='-1e9' width='2e9' height='2e9' fill='{paint}'{transform}/>"
+        ));
+        assert_eq!(near, far, "{paint}{transform}");
+        // The stroke of a far path: wide enough to cover the canvas, painted alike.
+        let near = draw(&format!(
+            "<path d='M-300 20 L300 20' stroke='{paint}' stroke-width='400'{transform}/>"
+        ));
+        let far = draw(&format!(
+            "<path d='M-1e9 20 L1e9 20' stroke='{paint}' stroke-width='400'{transform}/>"
+        ));
+        assert_eq!(near, far, "stroke {paint}{transform}");
+    }
+}
+
+/// A raster image or a mask region far from the canvas (`geom::fill` in resvg's `image.rs` and
+/// `mask.rs`) is clipped to it as a path is: each is a rectangle through a transform, which
+/// tiny-skia scans as it scans a path, and the scan panics on the far part of a rotated one.
+#[test]
+fn an_image_or_a_mask_far_from_the_canvas_is_clipped_and_drawn() {
+    let alpha = |body: &str, x: u32, y: u32| {
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>{body}</svg>"
+        );
+        rgba(decode(svg.as_bytes(), 100, 100).unwrap().data[(y * 100 + x) as usize])[3]
+    };
+    // A strip of image 1.86e9 wide (10 to 60 down), turned about (50, 50): (50, 50) is on it and
+    // (50, 95) is off it. The one of a fuzz-like finding that panicked in `alpha_runs.rs`.
+    let image = "<image x='10' y='10' width='1855850259.2205846' height='50' preserveAspectRatio='none' transform='rotate(-18.1705 50 50)' href='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAEklEQVR4nGP4z8DwHx9mGBkKAMLXf4EvceABAAAAAElFTkSuQmCC'/>";
+    assert_eq!(alpha(image, 50, 50), 255);
+    assert_eq!(alpha(image, 50, 95), 0);
+    // The same as the region of a mask on a rotated rectangle, and on a rotated group (a mask
+    // 4.4e8 tall, whose far edge was a panic, and one 1.86e9 wide).
+    for (mask, inside, outside, rotated) in [
+        (
+            "x='10' y='10' width='1855850259.2205846' height='50'",
+            (50, 50),
+            (50, 95),
+            "<rect width='100' height='100' fill='blue' mask='url(#m)' transform='rotate(-18.1705 50 50)'/>",
+        ),
+        (
+            "x='0' y='10' width='50' height='440548105.6754508'",
+            (30, 50),
+            (75, 50),
+            "<g transform='rotate(6.49897 50 50)'><rect x='-50' y='-50' width='300' height='300' fill='blue' mask='url(#m)'/></g>",
+        ),
+    ] {
+        let body = format!(
+            "<mask id='m' maskUnits='userSpaceOnUse' {mask}><rect x='-50' y='-50' width='300' height='300' fill='white'/></mask>{rotated}"
+        );
+        assert_eq!(alpha(&body, inside.0, inside.1), 255, "{mask}");
+        assert_eq!(alpha(&body, outside.0, outside.1), 0, "{mask}");
+    }
+}
+
+/// The clipper's crossings of a far edge with a side of the window are exact enough that a
+/// thin wedge with a vertex out on a diagonal covers what it covers wherever the vertex is: the
+/// crossing is worked out from the end of the edge nearer the side (from the far end, past 1e17
+/// px, it lost its last digits and the wedge came out a 30 px wide triangle). Wedge
+/// `M40 60 L(40+F) (60−1.7F) L44 61 Z` covers the same 285 pixels (278 without anti-aliasing)
+/// for any F; and a path of zero area, an even-odd fill with a vertex at −2.8e24 under a `matrix`, draws
+/// nothing (by exact arithmetic, none of its pixels is inside).
+#[test]
+fn a_thin_wedge_with_a_vertex_far_out_on_a_diagonal_is_clipped_exactly() {
+    let wedge = |far: f64, mode: &str| {
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><path d='M40 60 L{:e} {:e} L44 61 Z' fill='blue' shape-rendering='{mode}'/></svg>",
+            40.0 + far,
+            60.0 - 1.7 * far
+        );
+        covered(&svg, (100, 100)).iter().filter(|c| **c).count()
+    };
+    for (mode, count) in [("auto", 285), ("crispEdges", 278)] {
+        assert_eq!(wedge(1e12, mode), count, "{mode}");
+        for far in [1e17, 1e18, 1e19, 1e20, 1e30] {
+            let n = wedge(far, mode);
+            assert!(n.abs_diff(count) <= 2, "{mode} {far:e}: {n} of {count}");
+        }
+    }
+    let zero = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/seeds/svg/even-odd-vertex-far-left-under-a-matrix.svg"
+    ))
+    .unwrap();
+    assert!(
+        decode(&zero, 100, 100)
+            .unwrap()
+            .data
+            .iter()
+            .all(|p| *p == 0)
+    );
+}
+
+/// A subpath of a path that is clipped is drawn whatever else the path holds: the clipper's work
+/// on one subpath doesn't depend on another's. Four thousand loops of curves below the canvas,
+/// past its edge but inside the margin the clipper keeps, and a triangle far out (which makes the
+/// path too far for tiny-skia) once used up a budget the whole path shared, and the visible curves
+/// after them were cut to chords: the shape was gone. Now the loops (which don't reach the canvas)
+/// cost nothing, and the subpath is the one drawn without the rest of the path (to within what
+/// the clipper's finer flattening changes at its edge, which anti-aliasing or not is some pixels).
+#[test]
+fn a_visible_subpath_is_drawn_whatever_else_its_path_holds() {
+    let eyelet =
+        "M-1000 -2000 C-1000 -600 -3000 -600 -3000 -2000 C-3000 -3400 -1000 -3400 -1000 -2000 Z ";
+    let shape = "M20 50 C20 10 80 10 80 50 C80 90 20 90 20 50 Z ";
+    let far = "M300000 300000 L300010 300000 L300000 300010 Z";
+    for mode in ["auto", "crispEdges"] {
+        let drawn = |d: &str| {
+            let svg = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><path fill='blue' shape-rendering='{mode}' d='{d}'/></svg>"
+            );
+            covered(&svg, (100, 100)).iter().filter(|c| **c).count()
+        };
+        let alone = drawn(shape);
+        assert!((2800..3000).contains(&alone), "{mode}: {alone}");
+        for n in [1, 100, 4000] {
+            let d = format!("{}{shape}{far}", eyelet.repeat(n));
+            let count = drawn(&d);
+            assert!(
+                count.abs_diff(alone) <= 30,
+                "{mode} {n} loops: {count} of {alone}"
+            );
+        }
+        // A subpath of curves that crosses the canvas, with a far one in the path: the same.
+        let wide = "M-30 50 C-30 -200 130 -200 130 50 C130 300 -30 300 -30 50 Z ";
+        assert!(
+            drawn(&format!("{wide}{far}")).abs_diff(drawn(wide)) <= 40,
+            "{mode}"
+        );
+    }
+}
+
+/// An edge between two points far out on opposite sides of the canvas crosses a side of the
+/// clipper's window where the line is, though both its ends are 1e20 and more from it: the
+/// crossing is worked out without rounding (`geom::cross`: its terms are as large as the ends'
+/// distance from the side, and an `f64` rounds them far over the pixels). Triangles with two
+/// vertices on a line through the corner of the canvas (`-15 -17` and `15 17`, times powers of
+/// two, which an `f32` holds exactly) and a third far out cover the same pixels at any distance
+/// of the vertices: the half the canvas the line divides. At 1e20 the diagonal `y = x` came out as
+/// a canvas of one colour.
+#[test]
+fn an_edge_with_both_ends_far_out_is_cut_where_its_line_is() {
+    let covers = |d: &str, mode: &str| {
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><path d='{d}' fill='red' shape-rendering='{mode}'/></svg>"
+        );
+        covered(&svg, (64, 64))
+    };
+    for mode in ["auto", "crispEdges"] {
+        let diagonal = |far: &str| {
+            covers(
+                &format!("M-{far} -{far} L{far} {far} L{far} -{far} Z"),
+                mode,
+            )
+        };
+        let reference = diagonal("10000");
+        let half = reference.iter().filter(|c| **c).count();
+        assert!((1900..2200).contains(&half), "{mode}: {half}");
+        for far in ["1e12", "1e20", "1e25", "1e30", "1e35", "1e38"] {
+            assert!(diagonal(far) == reference, "{mode} {far}");
+        }
+        // Not on the diagonal: the line `17 x = 15 y`, the third vertex out at the same scale.
+        let at = |a: f64, b: f64, c: f64| {
+            let p = |e: f64, k: f64| format!("{:e} {:e}", 15.0 * k * e.exp2(), 17.0 * k * e.exp2());
+            covers(
+                &format!(
+                    "M{} L{} L{:e} {:e} Z",
+                    p(a, -1.0),
+                    p(b, 1.0),
+                    3.0 * c.exp2(),
+                    -5.0 * c.exp2()
+                ),
+                mode,
+            )
+        };
+        let reference = at(30.0, 31.0, 30.0);
+        assert!(
+            reference.iter().any(|c| *c) && !reference.iter().all(|c| *c),
+            "{mode}"
+        );
+        for (a, b, c) in [
+            (60.0, 78.0, 40.0),
+            (100.0, 90.0, 105.0),
+            (110.0, 120.0, 60.0),
+            (118.0, 100.0, 70.0),
+        ] {
+            assert!(at(a, b, c) == reference, "{mode} {a} {b} {c}");
+        }
+    }
+}
+
+/// A path is stroked as it was, less the subpaths that have a curve too big for tiny-skia's
+/// stroker (`usvg::without_big_curves`): one that spans over 1e18 on both axes panics it
+/// (`find_quad_max_curvature`), and none that is long on one axis only does.
+#[test]
+fn a_big_curve_costs_a_stroke_its_own_subpath_only() {
+    let draw = |body: &str| {
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>{body}</svg>"
+        );
+        decode(svg.as_bytes(), 100, 100).unwrap().data
+    };
+    let at = |d: &[u32], x: u32, y: u32| d[(y * 100 + x) as usize];
+    let line = "M20 50.5 L80.5 50.5 L80.5 70";
+    for (curve, long_on_both) in [
+        (
+            "M-2.81924 33.6695 Q2.24328e+32 2.84844e+31 -5.4753 1.17487e+32",
+            true,
+        ),
+        ("M10 10 C1e20 1e20 -1e20 3e20 90 90", true),
+        ("M10 10 C1e19 1e19 -1e19 3e19 90 90", true),
+        ("M10 10 Q50 -1.6e20 90 10", false),
+        ("M10 10 C1e20 5 -1e20 8 90 90", false),
+    ] {
+        for (width, extra) in [
+            ("3", ""),
+            ("3", " shape-rendering='crispEdges'"),
+            ("0.4", " shape-rendering='crispEdges'"),
+        ] {
+            let d = draw(&format!(
+                "<path d='{curve} {line}' fill='none' stroke='#345' stroke-width='{width}'{extra}/>"
+            ));
+            // Nothing is panicked at, and the polyline's corner is where it was.
+            assert_ne!(at(&d, 50, 50), 0, "{curve} {width}{extra}");
+            assert_ne!(at(&d, 80, 60), 0, "{curve} {width}{extra}");
+            let alone = draw(&format!(
+                "<path d='{curve}' fill='none' stroke='#345' stroke-width='{width}'{extra}/>"
+            ));
+            // The long curve itself: drawn when it is long on one axis only, as it ever was.
+            if long_on_both {
+                assert!(alone.iter().all(|p| *p == 0), "{curve} {width}{extra}");
+            } else if extra.is_empty() {
+                assert!(alone.iter().any(|p| *p != 0), "{curve} {width}{extra}");
+            }
+        }
+    }
+    // A curve far on one axis only is stroked wide across the canvas and covers it, as before:
+    // a 1.4e32 spike over a width of 440.
+    let spike = draw(
+        "<path d='M-19.8772 24.0887 Q87.6089 1.43972e+32 -14.3931 27.3979 C118.358 10.0395 12.2756 60.4416 97.1587 109.272 M88.5451 79.1311' fill='none' fill-rule='evenodd' stroke='#345' stroke-width='439.446' stroke-linejoin='miter-clip' stroke-linecap='square' transform='rotate(-66.8239)'/>",
+    );
+    assert_eq!(rgba(at(&spike, 50, 50)), [0x33, 0x44, 0x55, 255]);
+    // And a cubic subpath beside one long on one axis keeps its stroke (a 9000 by 40 canvas).
+    let svg = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/seeds/svg/stroke-quad-long-on-one-axis.svg"
+    ))
+    .unwrap();
+    let b = decode(&svg, 9000, 40).unwrap();
+    assert_eq!(b.data.iter().filter(|p| **p != 0).count(), 459);
 }

@@ -44,7 +44,9 @@ fn create_box_gauss(sigma: f32) -> [i32; STEPS] {
 
         // Ideal averaging filter width
         let w_ideal = (12.0 * sigma * sigma / n_float).sqrt() + 1.0;
-        let mut wl = w_ideal.floor() as i32;
+        // VOMD: a `sigma` of extreme size saturates the width at `i32::MAX`, and `wl + 2` overflows
+        // (a negative width in a release build): the width is kept two under it, odd as it is made.
+        let mut wl = (w_ideal.floor() as i32).min(i32::MAX - 2);
         if wl % 2 == 0 {
             wl -= 1;
         }

@@ -2716,7 +2716,7 @@ impl Peak {
 
 /// A pixmap of `w` × `h`.
 fn pixmap(w: u32, h: u32) -> Peak {
-    Peak(w as usize * h as usize * 4, 1)
+    Peak((w as usize).saturating_mul(h as usize).saturating_mul(4), 1)
 }
 
 /// The walk of a tree for [`Analysis`].
@@ -2868,13 +2868,13 @@ impl Walk {
         };
         let ibbox = if g.filters().is_empty() {
             tiny_skia::IntRect::from_xywh(
-                bbox.x().floor() as i32 - 2,
-                bbox.y().floor() as i32 - 2,
+                (bbox.x().floor() as i32).saturating_sub(2),
+                (bbox.y().floor() as i32).saturating_sub(2),
                 (bbox.width().ceil() as u32).saturating_add(4),
                 (bbox.height().ceil() as u32).saturating_add(4),
             )
         } else {
-            Some(bbox.to_int_rect())
+            int_rect(bbox)
         };
         let Some(ibbox) = ibbox.and_then(|r| fit_to_rect(r, self.max)) else {
             return Peak::default();
@@ -2889,7 +2889,9 @@ impl Walk {
             let Some(r) = f.rect().transform(inner) else {
                 continue;
             };
-            let r = r.to_int_rect();
+            let Some(r) = int_rect(r) else {
+                continue;
+            };
             let (sx, sy) = inner.get_scale();
             // What an `feImage` draws is drawn in a pixmap of the filter's region, scaled as the
             // layer is, each time the filter is applied.
@@ -3164,6 +3166,17 @@ fn filter_pixmaps(f: &usvg::filter::Filter) -> usize {
         most = most.max(kept + more);
     }
     most
+}
+
+/// `NonZeroRect::to_int_rect`, which unwraps the rectangle, as an option: a position or a size
+/// far out leaves none.
+fn int_rect(r: tiny_skia::NonZeroRect) -> Option<tiny_skia::IntRect> {
+    tiny_skia::IntRect::from_xywh(
+        r.x().floor() as i32,
+        r.y().floor() as i32,
+        (r.width().ceil() as u32).max(1),
+        (r.height().ceil() as u32).max(1),
+    )
 }
 
 /// resvg's `geom::fit_to_rect`: `r` cut to `max`.
