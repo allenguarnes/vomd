@@ -120,7 +120,13 @@ struct Queue {
     running: Option<Running>,
     /// The thread is there (it ends once the queue is empty).
     alive: bool,
+    /// Loads whose result is sent and not yet taken ([`Forced::taken`]): it isn't in `kept` until
+    /// it is, so without this a request in between would load the image again.
+    delivered: Vec<Delivered>,
 }
+
+/// A load whose result is on its way: what it was for (see [`Job`]) and its document.
+type Delivered = (Origin, Option<(u32, u32)>, u64);
 
 type Shared = Arc<(Mutex<Queue>, Condvar)>;
 
@@ -299,6 +305,14 @@ impl Forced {
                 }
                 q.jobs.retain(|j| j.origin != origin);
             }
+            // (Loaded for this document, and not taken yet: it is kept the moment it is. A load
+            // of it at another size, cancelled above, would only replace it.)
+            if q.delivered
+                .iter()
+                .any(|d| d.0 == origin && d.1 == size && d.2 == doc_gen)
+            {
+                continue;
+            }
             let body = match &origin {
                 Origin::Url(u) => self.bodies.iter().find(|b| b.0 == *u).map(|b| b.1.clone()),
                 Origin::File(_) => None,
@@ -373,6 +387,19 @@ impl Forced {
     pub(crate) fn busy(&self) -> bool {
         let q = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
         q.alive || !q.jobs.is_empty()
+    }
+
+    /// The result of a load of `origin` for the document of `doc_gen` is taken: what it made is
+    /// kept, or the image failed, from here on.
+    pub(crate) fn taken(&self, origin: &Origin, doc_gen: u64) {
+        let mut q = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = q
+            .delivered
+            .iter()
+            .position(|d| d.0 == *origin && d.2 == doc_gen)
+        {
+            q.delivered.remove(i);
+        }
     }
 
     /// A load of `origin` made `loaded`: kept, the least recently painted going first past the
@@ -489,6 +516,12 @@ fn work(shared: &Shared, tx: &Sender<Done>, wake: &Wake, env: &mut Env) {
         if job.cancel.load(Ordering::Relaxed) {
             continue;
         }
+        // Noted before it is sent, so that no request finds the load done and its result not
+        // there yet (and loads it again): [`Forced::taken`] ends it.
+        lock.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .delivered
+            .push((job.origin.clone(), job.size, job.doc_gen));
         let done = Done::Forced {
             doc_gen: job.doc_gen,
             origin: job.origin,

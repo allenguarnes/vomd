@@ -6342,6 +6342,7 @@ impl Images {
         result: Result<forced::Loaded, Refusal>,
         page: Option<(&Doc, &mut Layout)>,
     ) {
+        self.forced.taken(&origin, doc_gen);
         #[cfg(feature = "remote-images")]
         let mut page = page;
         let size = match result {

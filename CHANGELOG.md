@@ -12,6 +12,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - An SVG with a shape, an image or a mask that has a point absurdly far outside the picture (a
   corner 600 million pixels away, say), or a stroke that wide, no longer stops its drawing process
   either: it is drawn as far as it shows.
+- An image clicked to load past VOMD's limits is no longer now and then decoded twice (asked for
+  again in the moment between its load finishing and the window taking it).
 
 ## [1.6.1] - 2026-10-24
 

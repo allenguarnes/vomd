@@ -4491,6 +4491,78 @@ fn loads_past_the_limits_are_evicted_and_loaded_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A load past the limits that is done, its result sent and not yet taken (a frame between the
+/// end of the load and the window's poll), is not started again by a request for the same box:
+/// the image would be decoded twice.
+#[test]
+fn a_load_done_and_not_yet_taken_is_not_loaded_again() {
+    use crate::render::Pixels;
+    let dir = scratch("forced-delivered");
+    std::fs::write(dir.join("big.png"), big_png(9000, 8000)).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![big](big.png)");
+    assert!(images.force(1, &doc, &mut layout));
+    images.request(&[(1, 90, 80)], 1);
+    // The thread ends once its result is sent, which nothing polls for yet.
+    let t = Instant::now();
+    while images.forcing() {
+        assert!(t.elapsed() < Duration::from_secs(20), "never loaded");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let loads = images.forced_loads();
+    assert_eq!(loads, 1);
+    images.begin_frame();
+    images.request(&[(1, 90, 80)], 1);
+    assert_eq!(images.forced_loads(), loads, "not loaded again");
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).is_some()
+    });
+    assert_eq!(images.forced_loads(), loads);
+    // Taken, it is kept: the next request has nothing to load.
+    images.begin_frame();
+    images.request(&[(1, 90, 80)], 1);
+    assert_eq!(images.forced_loads(), loads);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A zoom there and back while a load is done and not yet taken: the load at the other size is
+/// cancelled by the way back, as it would only replace the pixels wanted again (and those would
+/// then be loaded a second time).
+#[test]
+fn a_zoom_back_to_a_load_not_yet_taken_cancels_the_other_size() {
+    use crate::render::Pixels;
+    let dir = scratch("forced-zoom-back");
+    std::fs::write(dir.join("big.png"), big_png(9000, 8000)).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![big](big.png)");
+    assert!(images.force(1, &doc, &mut layout));
+    images.request(&[(1, 90, 80)], 1);
+    let t = Instant::now();
+    while images.forcing() {
+        assert!(t.elapsed() < Duration::from_secs(20), "never loaded");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // (The other size is held unfinished, as if the way back came before its decode was done.)
+    images.forced.hold.store(true, Ordering::Relaxed);
+    images.begin_frame();
+    images.request(&[(1, 180, 160)], 1);
+    assert_eq!(images.forced_loads(), 2, "the other size is loaded");
+    images.begin_frame();
+    images.request(&[(1, 90, 80)], 1);
+    assert_eq!(images.forced_loads(), 2, "the size done isn't loaded again");
+    images.forced.hold.store(false, Ordering::Relaxed);
+    pump(&doc, &mut layout, &mut images, &[(1, 90, 80)], |i, _| {
+        i.pixels(1, 90, 80).is_some() && !i.forcing()
+    });
+    // (Shown a few more frames: nothing replaced it, so nothing is loaded again.)
+    for _ in 0..5 {
+        images.begin_frame();
+        assert!(images.pixels(1, 90, 80).is_some());
+        images.request(&[(1, 90, 80)], 1);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(images.forced_loads(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A remote image over the limits shows why once remote images are on; a click fetches it again
 /// (with the forced fetch) for its size, and then draws it at its box.
 #[cfg(feature = "remote-images")]
