@@ -618,7 +618,10 @@ wl_unset() { # options
 # headless sway has no keyboard, and a window is only told of the selections when it has one, so
 # a virtual keyboard is held (Shift down, for as long as the probe takes) while it runs.
 wl_read() {
-    wl wtype -M shift -s 20000 -m shift &
+    # (`env` directly, not through `wl`: a function in the background is a subshell, and killing
+    # it left wtype holding its virtual keyboard for the 20 s, which sway kept sending VOMD's
+    # window keymaps for, so the idle window used CPU.)
+    env XDG_RUNTIME_DIR=/run/sway WAYLAND_DISPLAY="$sway_display" wtype -M shift -s 20000 -m shift &
     local keyboard=$! status=0
     sleep 0.3
     wl timeout 30 "$probe" read "$@" || status=$?
@@ -739,6 +742,11 @@ wayland_suite() {
     ok "Wayland: types, Latin-1 STRING"
 
     echo "-- idle"
+    # No virtual keyboard may be left: sway sends the window its keymap again for each, and the
+    # window's work on those is no idleness of its own.
+    local stray
+    stray=$(ps -eo stat=,pid=,args= | awk '$1 !~ /^Z/ && $3 == "wtype"')
+    [ -z "$stray" ] || fail "Wayland: a wtype is still running: $stray"
     sleep 2
     local before after
     before=$(ticks "$pid")
