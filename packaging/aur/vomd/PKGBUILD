@@ -5,7 +5,7 @@
 # override the repository's opt-level="z", so the binary is larger (about 7.4 MB) and faster
 # than the release one, and runs on the build machine's CPU only. `vomd-bin` is the small one.
 pkgname=vomd
-pkgver=1.6.2
+pkgver=1.6.3
 pkgrel=1
 pkgdesc='View-Only Markdown: a tiny, fast Markdown viewer'
 arch=('x86_64' 'aarch64')
@@ -27,7 +27,7 @@ optdepends=('curl: remote images, loaded only after pressing I'
             'noto-fonts-emoji: color emoji')
 options=('!lto' '!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('63a56f24a8b33db077b5c1484bb9494c475f23b76585adc5bf05053b3b59fd53')
+sha256sums=('SKIP')
 
 prepare() {
   cd "$pkgname-$pkgver"

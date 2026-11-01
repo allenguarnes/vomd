@@ -3,6 +3,17 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.6.3] - 2026-11-02
+
+### Fixed
+- A PNG whose palette (`PLTE` chunk) has a length that isn't a multiple of 3 no longer closes
+  VOMD, which the PNG library crashed on: an image that needs the palette shows as a broken image,
+  like any other file that can't be read.
+- An SVG whose pattern paints with itself through what it inherits (a `stroke="url(#p)"` on the
+  `<svg>` that the pattern's own shapes take) no longer stops its drawing process by recursing
+  without end: the reference paints nothing (or its fallback color, if it has one), as one
+  written inside the pattern already did.
+
 ## [1.6.2] - 2026-10-24
 
 ### Fixed
@@ -264,6 +275,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[1.6.3]: https://github.com/allenguarnes/vomd/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/allenguarnes/vomd/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/allenguarnes/vomd/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/allenguarnes/vomd/compare/v1.5.0...v1.6.0
