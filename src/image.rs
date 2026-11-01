@@ -1422,6 +1422,15 @@ impl std::io::BufRead for PngChunks<'_> {
             let end = len.saturating_add(12).min(self.rest.len());
             let (chunk, rest) = self.rest.split_at(end);
             self.rest = rest;
+            // png 0.18.1 panics (an abort in a release build) on a palette whose length isn't
+            // a multiple of 3 when it makes the RGBA palette of an indexed image. Upstream
+            // rejects such a chunk since image-rs/image-png#682 (not released yet): it is left
+            // out here, as libpng ignores it, so an indexed image fails as one with no palette
+            // does (the decoder says one is required), and a truecolor one, which never uses
+            // its suggested palette, is drawn. Can go once a png release has the fix.
+            if &head[4..8] == b"PLTE" && !len.is_multiple_of(3) {
+                continue;
+            }
             // The type's first letter is upper case for a critical chunk.
             if head[4] & 0x20 == 0 || &head[4..8] == b"tRNS" {
                 self.chunk = chunk;

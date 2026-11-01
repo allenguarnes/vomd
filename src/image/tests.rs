@@ -764,6 +764,90 @@ fn every_fixture_decodes() {
     }
 }
 
+/// A PNG of 4 × 2 pixels, indexed (`indexed`) or RGB, with a `PLTE` chunk of `palette_len` bytes
+/// (its checksum made to fit): an indexed one's pixels use entries 0 and 1, red and blue, and an
+/// RGB one has the chunk as a suggested palette.
+fn png_with_palette_of(indexed: bool, palette_len: usize) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        !crc
+    }
+    let mut good = Vec::new();
+    let mut enc = png::Encoder::new(&mut good, 4, 2);
+    enc.set_depth(png::BitDepth::Eight);
+    let pixels: &[u8] = if indexed {
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_palette(vec![255, 0, 0, 0, 0, 255]);
+        &[0, 1, 0, 1, 1, 0, 1, 0]
+    } else {
+        enc.set_color(png::ColorType::Rgb);
+        &[9; 24]
+    };
+    enc.write_header()
+        .unwrap()
+        .write_image_data(pixels)
+        .unwrap();
+    // The signature and `IHDR` are 33 bytes; an indexed image's own `PLTE` (6 bytes) follows.
+    let after = if indexed {
+        assert_eq!(&good[37..41], b"PLTE");
+        33 + 12 + 6
+    } else {
+        33
+    };
+    let mut chunk = (palette_len as u32).to_be_bytes().to_vec();
+    chunk.extend_from_slice(b"PLTE");
+    chunk.extend((0..palette_len).map(|i| [255, 0, 0, 0, 0, 255][i % 6]));
+    let crc = crc32(&chunk[4..]);
+    chunk.extend(crc.to_be_bytes());
+    let mut out = good[..33].to_vec();
+    out.extend(chunk);
+    out.extend_from_slice(&good[after..]);
+    out
+}
+
+/// png 0.18.1 panics (an abort of the app, in a release build) on an indexed image whose palette
+/// has a length that isn't a multiple of 3: `PngChunks` leaves such a chunk out, so the image
+/// has no palette and is refused. A truecolor image never uses its suggested palette, and is
+/// drawn whatever the chunk is.
+#[test]
+fn a_png_palette_of_a_bad_length_is_left_out_not_a_panic() {
+    for len in [6, 768] {
+        let b = decode(&png_with_palette_of(true, len), 4, 2);
+        assert!(
+            b.is_some(),
+            "an indexed image with a palette of {len} bytes is drawn"
+        );
+    }
+    for len in [1, 2, 4, 5, 19, 767] {
+        let indexed = png_with_palette_of(true, len);
+        let rgb = png_with_palette_of(false, len);
+        for (w, h) in [(4, 2), (2, 1)] {
+            for rows in [true, false] {
+                let got = decode_png(&indexed, w, h, rows, Sampling::Area, &NO_CANCEL);
+                assert!(
+                    got.is_none(),
+                    "an indexed image with a palette of {len} bytes is refused"
+                );
+                let got = decode_png(&rgb, w, h, rows, Sampling::Area, &NO_CANCEL);
+                assert!(
+                    got.is_some(),
+                    "an RGB image with a palette of {len} bytes is drawn"
+                );
+            }
+        }
+    }
+    // A palette over 256 entries is png's own refusal.
+    assert!(decode(&png_with_palette_of(true, 771), 4, 2).is_none());
+    // A palette of a good length that isn't used is read as before.
+    assert!(decode(&png_with_palette_of(false, 6), 4, 2).is_some());
+}
+
 /// Every input of a past fuzz finding (fuzz/seeds/image/) goes through what the target does
 /// without a panic: a JPEG segment whose length is under 2 overflowed as it was read.
 #[test]
