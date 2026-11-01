@@ -3,11 +3,12 @@
 The library's sources (`src/`, without `main.rs`) and licenses of usvg 0.46.0 from crates.io
 (git b8e58f5a, `crates/usvg`), used through `[patch.crates-io]` in VOMD's `Cargo.toml` and
 `fuzz/Cargo.toml`. Its `Cargo.toml` drops the binary (and with it `pico-args`) and the
-dev-dependencies. The changes, marked `VOMD` in the code, are all one kind: numbers too large
-for an `f32` (a size, a position, a stroke width, a transform) made a rectangle or a size that
-upstream then unwraps, a panic in the process that draws the SVG (the `svg` fuzz target found
-the first). Each now leaves out what it can't make, as upstream does for the size it checks (the
-last one is an assertion on such a number).
+dev-dependencies. The changes, marked `VOMD` in the code, are of two kinds. All but the last
+are about numbers too large for an `f32` (a size, a position, a stroke width, a transform): they
+made a rectangle or a size that upstream then unwraps, a panic in the process that draws the SVG
+(the `svg` fuzz target found the first). Each now leaves out what it can't make, as upstream
+does for the size it checks (the last of them is an assertion on such a number). The final one
+is about a pattern that paints with itself, which recursed until the stack overflowed.
 
 - **An image far from zero** (`parser/image.rs`, `convert_inner`): an image much taller than it
   is wide, aligned inside a tall rectangle, sits at a position where an `f32` has no room for
@@ -49,6 +50,23 @@ last one is an assertion on such a number).
   an empty kernel for a match). It is a checked product: an order whose kernel size doesn't fit,
   or doesn't match the kernel's length, is a primitive that isn't made, as a mismatch is.
 
+- **A pattern that paints with itself through what it inherits** (`parser/paint_server.rs`,
+  `convert`; `parser/converter.rs`, `Cache::patterns_in_progress`): `fix_recursive_patterns`
+  only looks at the `fill` and `stroke` attributes of a pattern's own descendants (and of the
+  elements they link to), so `<svg stroke="url(#p)">` with a `<pattern id="p">` whose `<rect>`
+  takes that stroke made `convert_pattern` convert the rect, whose stroke converted the pattern
+  again, until the stack overflowed (a `use`, or two patterns painting with each other
+  through an ancestor's `fill`, did the same). The patterns being converted are kept in the
+  `Cache`, and a pattern asked for while it is being converted isn't made: the reference
+  becomes what a reference to nothing is (its fallback, or no paint), as the attribute-based
+  pass makes of the references it finds, so everything it already caught is converted as
+  before. A pattern converted with such a reference left out is part of a cycle, however
+  deep the cut: it is cached like any other (upstream's cache), so each pattern is converted
+  once, not once for each way round the cycle (a chain of patterns that each paint two shapes
+  with the next, the last with the first, would take twice as long for each link).
+
 To upgrade: copy the new version's `src/` (without `main.rs`) and licenses here, apply the same
 changes, and run VOMD's SVG tests (`cargo test --lib image::svg`), whose
-`extreme_numbers_in_shapes_are_drawn_or_refused` draws each of the cases above.
+`extreme_numbers_in_shapes_are_drawn_or_refused` draws each of the cases above except the last,
+which `a_pattern_that_paints_with_itself_by_inheritance_is_drawn_without_it` and
+`a_cycle_of_patterns_that_fans_out_is_converted_once_each` draw.

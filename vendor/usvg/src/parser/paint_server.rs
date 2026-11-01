@@ -27,6 +27,26 @@ pub(crate) fn convert(
         return Some(ServerOrColor::Server(paint.clone()));
     }
 
+    // VOMD: a pattern whose content paints with the pattern itself, directly, through what the
+    // content inherits (a `fill` or `stroke` of an ancestor of the pattern), through a
+    // `use`, or through other patterns, converted its content again without end (a stack
+    // overflow). `fix_recursive_patterns` only looks at attributes of the pattern's own
+    // descendants. The reference to a pattern that is being converted is left out, as that
+    // function leaves out the ones it finds: it paints nothing (or its fallback).
+    let is_pattern = node.tag_name() == Some(EId::Pattern);
+    if is_pattern {
+        if cache
+            .patterns_in_progress
+            .iter()
+            .any(|id| id == node.element_id())
+        {
+            return None;
+        }
+        cache
+            .patterns_in_progress
+            .push(node.element_id().to_string());
+    }
+
     // Unwrap is safe, because we already checked for is_paint_server().
     let paint = match node.tag_name().unwrap() {
         EId::LinearGradient => convert_linear(node, state),
@@ -35,6 +55,13 @@ pub(crate) fn convert(
         _ => unreachable!(),
     };
 
+    if is_pattern {
+        cache.patterns_in_progress.pop();
+    }
+
+    // A pattern converted with a reference to another one left out is part of a cycle, however
+    // deep the cut was: it is kept as it is, so each pattern is converted once (not once for
+    // each way round a chain of them, which doubles at each link of one that fans out).
     if let Some(ServerOrColor::Server(paint)) = &paint {
         cache
             .paint

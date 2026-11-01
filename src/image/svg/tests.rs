@@ -829,6 +829,14 @@ fn a_raster_image_drawn_whole_is_charged_the_same_at_any_box() {
 
 /// `svg` drawn at `size`, and what it covers: the pixels that are more than half opaque.
 fn covered(svg: &str, size: (u32, u32)) -> Vec<bool> {
+    drawn_pixels(svg, size)
+        .iter()
+        .map(|p| p >> 24 > 127)
+        .collect()
+}
+
+/// `svg` drawn at `size`: its pixels, as `0xAARRGGBB`.
+fn drawn_pixels(svg: &str, size: (u32, u32)) -> Vec<u32> {
     let header = info_of(svg.as_bytes()).unwrap();
     match render(
         svg.as_bytes(),
@@ -840,7 +848,7 @@ fn covered(svg: &str, size: (u32, u32)) -> Vec<bool> {
     ) {
         Rendered::Pixels(b, skipped) => {
             assert!(!skipped);
-            b.data.iter().map(|p| p >> 24 > 127).collect()
+            b.data
         }
         _ => panic!("not drawn"),
     }
@@ -1993,6 +2001,156 @@ fn drawn_at_the_fuzz_sizes(svg: &[u8]) {
         if let Some(b) = decode(svg, bw, bh) {
             assert_eq!((b.width, b.height), (bw, bh));
         }
+    }
+}
+
+/// A pattern whose content paints with the pattern itself through what it inherits (the `fill`
+/// or `stroke` of an ancestor of the pattern, which its shapes take as theirs), or through
+/// another pattern, was converted again without end (a stack overflow, in the process that
+/// draws it). The reference to the pattern being converted paints nothing; any other drawing is
+/// as it was.
+#[test]
+fn a_pattern_that_paints_with_itself_by_inheritance_is_drawn_without_it() {
+    let svg = |attrs: &str, body: &str| {
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' {attrs}>{body}</svg>"
+        )
+    };
+    let tile = "<rect width='4' height='8' fill='#e00'/>";
+    let pattern = |id: &str, content: &str| {
+        format!(
+            "<pattern id='{id}' width='8' height='8' patternUnits='userSpaceOnUse'>{content}</pattern>"
+        )
+    };
+    let target = |paint: &str| format!("<rect width='16' height='16' {paint}/>");
+    // The tile with and without the inherited reference to its own pattern: the same pixels,
+    // as the reference paints nothing.
+    let plain = covered(
+        &svg(
+            "",
+            &format!(
+                "<defs>{}</defs>{}",
+                pattern("p", tile),
+                target("fill='url(#p)'")
+            ),
+        ),
+        (16, 16),
+    );
+    assert!(plain.iter().any(|&c| c) && plain.iter().any(|&c| !c));
+    for attrs in ["stroke='url(#p)'", "stroke='url(#p)' stroke-width='3'"] {
+        let looped = covered(
+            &svg(
+                attrs,
+                &format!(
+                    "<defs>{}</defs>{}",
+                    pattern("p", tile),
+                    target("fill='url(#p)'")
+                ),
+            ),
+            (16, 16),
+        );
+        assert_eq!(looped, plain, "{attrs}");
+    }
+    // With a fallback, the cut reference paints that, as a link to nothing does.
+    let blue = svg(
+        "stroke='url(#p) blue'",
+        &format!(
+            "<defs>{}</defs>{}",
+            pattern("p", tile),
+            target("fill='url(#p)'")
+        ),
+    );
+    let bluish = |svg: &str| {
+        drawn_pixels(svg, (16, 16))
+            .iter()
+            .any(|p| p >> 24 > 127 && p & 0xff > 127 && (p >> 16) & 0xff < 64)
+    };
+    assert!(bluish(&blue));
+    assert!(!bluish(&blue.replace("url(#p) blue", "url(#p) none")));
+    // A fill of an ancestor of the pattern, here on a group; the target is the pattern's own
+    // content (no fill of its own), so the whole of it paints nothing.
+    let inherited = svg(
+        "",
+        &format!(
+            "<g fill='url(#p)' stroke='url(#p)'><defs>{}</defs>{}</g>",
+            pattern("p", "<rect width='4' height='8'/>"),
+            target("")
+        ),
+    );
+    assert!(covered(&inherited, (16, 16)).iter().all(|&c| !c));
+    // Two patterns that paint with each other, and cycles through a `use`: one whose shape takes
+    // the `<svg>`'s stroke, and a chain of three patterns whose first draws a `use`.
+    for body in [
+        format!(
+            "<g fill='url(#b)'><defs>{}{}</defs>{}</g>",
+            pattern("a", "<rect width='4' height='8'/>"),
+            pattern("b", "<rect width='4' height='8' fill='url(#a)'/>"),
+            target("fill='url(#a)'")
+        ),
+        format!(
+            "<defs>{}{}</defs>{}",
+            pattern(
+                "a",
+                "<g stroke='url(#b)'><rect width='4' height='8' fill='#e00'/></g>"
+            ),
+            pattern("b", "<g fill='url(#a)'><rect width='4' height='8'/></g>"),
+            target("fill='url(#a)' stroke='url(#b)'")
+        ),
+        format!(
+            "<defs><rect id='r' width='4' height='8'/>{}</defs>{}",
+            pattern("a", "<use href='#r'/>"),
+            target("fill='url(#a)'")
+        ),
+        format!(
+            "<defs><rect id='r' width='4' height='8' fill='url(#b)'/>{}{}{}</defs>{}",
+            pattern("a", "<use href='#r'/>"),
+            pattern("b", "<rect width='4' height='8' fill='url(#c)'/>"),
+            pattern("c", "<rect width='4' height='8' fill='url(#a)'/>"),
+            target("fill='url(#a)'")
+        ),
+    ] {
+        let _ = covered(&svg("stroke='url(#a)'", &body), (16, 16));
+    }
+}
+
+/// A chain of patterns that each paint two shapes with the next one, the last of them with the
+/// first (an inherited fill, or written out), is one cycle with many ways round it: a pattern
+/// converted with a reference cut out of it isn't converted again each time it is met (that
+/// took twice as long for each link: 20 links never finished). Parsed by usvg itself, as VOMD's
+/// own estimate refuses such a file before it gets to the parser.
+#[test]
+fn a_cycle_of_patterns_that_fans_out_is_converted_once_each() {
+    let chain = |n: usize, inherited: bool| {
+        let mut patterns = String::new();
+        for i in 0..n {
+            let content = if i + 1 < n {
+                format!(
+                    "<rect width='2' height='2' fill='url(#p{0})'/><rect x='2' width='2' height='2' fill='url(#p{0})'/>",
+                    i + 1
+                )
+            } else if inherited {
+                "<rect width='2' height='2'/>".to_string()
+            } else {
+                "<rect width='2' height='2' fill='url(#p0)'/>".to_string()
+            };
+            patterns += &format!(
+                "<pattern id='p{i}' width='4' height='4' patternUnits='userSpaceOnUse'>{content}</pattern>"
+            );
+        }
+        let root = if inherited { " fill='url(#p0)'" } else { "" };
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'{root}><defs>{patterns}</defs><rect width='64' height='64' fill='url(#p0)'/></svg>"
+        )
+    };
+    for inherited in [true, false] {
+        let start = Instant::now();
+        let tree = usvg::Tree::from_str(&chain(20, inherited), &usvg::Options::default()).unwrap();
+        assert!(tree.root().has_children());
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }
 

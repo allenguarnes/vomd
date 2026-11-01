@@ -63,6 +63,9 @@ pub struct Cache {
     pub filters: HashMap<String, Arc<filter::Filter>>,
     pub paint: HashMap<String, Paint>,
 
+    // VOMD: the patterns being converted (innermost last). See `paint_server::convert`.
+    pub(crate) patterns_in_progress: Vec<String>,
+
     // used for ID generation
     all_ids: HashSet<u64>,
     linear_gradient_index: usize,
@@ -110,6 +113,7 @@ impl Cache {
             masks: HashMap::new(),
             filters: HashMap::new(),
             paint: HashMap::new(),
+            patterns_in_progress: Vec::new(),
 
             all_ids: HashSet::new(),
             linear_gradient_index: 0,
