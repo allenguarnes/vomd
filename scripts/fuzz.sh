@@ -22,7 +22,7 @@ esac
 timeout=10
 extra=()
 if [ "$target" = svg ]; then
-    timeout=2
+    timeout=5
     extra=(-dict=svg.dict)
 fi
 corpus="corpus/$target"

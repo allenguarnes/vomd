@@ -1,5 +1,5 @@
 //! Bytes → SVG header, then parsing, the counts and the estimate, and drawing at 64 × 64 and
-//! 512 × 512 within the normal limits: never panics, never hangs (run with `-timeout=2`), and
+//! 512 × 512 within the normal limits: never panics, never hangs (run with `-timeout=5`), and
 //! the size drawn is the box asked for.
 #![no_main]
 

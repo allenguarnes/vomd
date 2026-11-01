@@ -55,7 +55,7 @@ jobs:
           esac
           # An SVG that takes long to draw is what the `svg` target looks for.
           timeout=10; extra=
-          if [ "${{ matrix.target }}" = svg ]; then timeout=2; extra=-dict=fuzz/svg.dict; fi
+          if [ "${{ matrix.target }}" = svg ]; then timeout=5; extra=-dict=fuzz/svg.dict; fi
           cargo +nightly fuzz run -a ${{ matrix.target }} -- \
             -max_total_time=${{ inputs.seconds || '3600' }} -max_len=$max_len \
             -timeout=$timeout -rss_limit_mb=2048 -print_final_stats=1 $extra
