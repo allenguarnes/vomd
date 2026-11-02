@@ -861,6 +861,7 @@ fn every_image_fuzz_seed_is_read_without_a_panic() {
             for (bw, bh) in [(1, 1), (7, 5), (w.min(64), h.min(64))] {
                 if let Some(b) = decode(&data, bw, bh) {
                     assert_eq!((b.width, b.height), (bw, bh));
+                    assert_eq!(b.data.len(), (bw * bh) as usize);
                 }
             }
         }
