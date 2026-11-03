@@ -61,8 +61,11 @@ package() {
   install -Dm644 assets/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/vomd.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
-    assets/fonts/LICENSE-Inter.txt assets/fonts/LICENSE-JetBrainsMono.txt assets/fonts/LICENSE-Lucide.txt
+    assets/fonts/LICENSE-Inter.txt assets/fonts/LICENSE-JetBrainsMono.txt assets/fonts/LICENSE-STIXTwoMath.txt \
+    assets/fonts/LICENSE-Lucide.txt
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
-  install -Dm644 assets/icon@2x.png "$pkgdir/usr/share/doc/$pkgname/assets/icon@2x.png"
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname/assets" \
+    assets/vomd-full-logo.svg assets/vomd-full-logo-light.svg \
+    assets/screenshot-dark.png assets/screenshot-light.png
   install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
 }

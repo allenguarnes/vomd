@@ -293,4 +293,5 @@ ships.
 ## License
 
 [MIT](LICENSE). The built-in fonts are Inter, JetBrains Mono and STIX Two Math (SIL OFL 1.1), and
-the icons are from Lucide (ISC); their licenses are in [`assets/fonts/`](assets/fonts/).
+the icons are from Lucide (ISC). Their licenses are in [`assets/fonts/`](assets/fonts/) in the
+source, next to the binary in the release archives, and with the packages' license files.

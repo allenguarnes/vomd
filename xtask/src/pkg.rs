@@ -157,6 +157,10 @@ fn copyright(stage: &Path) -> String {
             "LICENSE-JetBrainsMono.txt",
         ),
         (
+            "The binary embeds a subset of STIX Two Math (SIL Open Font License 1.1)",
+            "LICENSE-STIXTwoMath.txt",
+        ),
+        (
             "The binary embeds Lucide icons (ISC license)",
             "LICENSE-Lucide.txt",
         ),
@@ -368,6 +372,7 @@ pub fn appimage(stage: &Path, version: &str, dist: &Path) -> bool {
         "LICENSE",
         "LICENSE-Inter.txt",
         "LICENSE-JetBrainsMono.txt",
+        "LICENSE-STIXTwoMath.txt",
         "LICENSE-Lucide.txt",
     ] {
         put(

@@ -26,6 +26,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Changed
 - The default binary is 5.9 MB, up from 5.6 MB (the math engine and its font).
 
+### Fixed
+- The README in the release archives and packages shows its logo and screenshots: they are
+  shipped with it now, at the paths it names.
+
 ## [1.6.3] - 2026-11-02
 
 ### Fixed

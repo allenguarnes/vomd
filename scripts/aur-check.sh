@@ -22,7 +22,11 @@ check() { # name
     tar -C "$dir/root" -xf "$pkg"
     for f in usr/bin/vomd usr/share/applications/vomd.desktop \
              usr/share/icons/hicolor/scalable/apps/vomd.svg "usr/share/licenses/$1/LICENSE" \
-             "usr/share/doc/$1/README.md" "usr/share/doc/$1/assets/icon@2x.png"; do
+             "usr/share/licenses/$1/LICENSE-Inter.txt" "usr/share/licenses/$1/LICENSE-JetBrainsMono.txt" \
+             "usr/share/licenses/$1/LICENSE-Lucide.txt" "usr/share/licenses/$1/LICENSE-STIXTwoMath.txt" \
+             "usr/share/doc/$1/README.md" \
+             "usr/share/doc/$1/assets/vomd-full-logo.svg" "usr/share/doc/$1/assets/vomd-full-logo-light.svg" \
+             "usr/share/doc/$1/assets/screenshot-dark.png" "usr/share/doc/$1/assets/screenshot-light.png"; do
         test -e "$dir/root/$f" || { echo "missing $f in $pkg"; exit 1; }
     done
     desktop-file-validate "$dir/root/usr/share/applications/vomd.desktop"

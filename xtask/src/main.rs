@@ -913,17 +913,28 @@ fn dist(release: bool) -> bool {
 }
 
 /// The files that go with the binary in every release archive (source, name in the archive): the
-/// README and its image, at the path it names, the changelog and the licenses, ours and those of
-/// the fonts and icons built into the binary.
-const DIST_DOCS: [(&str, &str); 6] = [
+/// README and the images it shows, at the paths it names (not the 3.5 MB demo, whose alt text
+/// shows), the changelog and the licenses, ours and those of the fonts and icons built into the
+/// binary.
+const DIST_DOCS: [(&str, &str); 10] = [
     ("README.md", "README.md"),
-    ("assets/icon@2x.png", "assets/icon@2x.png"),
+    ("assets/vomd-full-logo.svg", "assets/vomd-full-logo.svg"),
+    (
+        "assets/vomd-full-logo-light.svg",
+        "assets/vomd-full-logo-light.svg",
+    ),
+    ("assets/screenshot-dark.png", "assets/screenshot-dark.png"),
+    ("assets/screenshot-light.png", "assets/screenshot-light.png"),
     ("CHANGELOG.md", "CHANGELOG.md"),
     ("LICENSE", "LICENSE"),
     ("assets/fonts/LICENSE-Inter.txt", "LICENSE-Inter.txt"),
     (
         "assets/fonts/LICENSE-JetBrainsMono.txt",
         "LICENSE-JetBrainsMono.txt",
+    ),
+    (
+        "assets/fonts/LICENSE-STIXTwoMath.txt",
+        "LICENSE-STIXTwoMath.txt",
     ),
 ];
 
