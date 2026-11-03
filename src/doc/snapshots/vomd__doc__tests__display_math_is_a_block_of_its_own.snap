@@ -1,0 +1,55 @@
+---
+source: src/doc/tests.rs
+expression: "parse_all(&[\"Text before $$x^2$$ and after.\",\n\"Text before\\n$$\\nx^2\\n$$\\nand after.\", \"$$a$$\\n$$b$$\", \"$$a$$ trailing\",\n\"- $$x$$\\n- item $$y$$ tail\\n\\n> quote $$z$$\", \"1. **bold $$x$$ still bold**\",\n\"[a $$x$$ b](u)\", \"# Heading $$x$$\\n\\n| a |\\n|---|\\n| $$y$$ |\",\n\"Empty: $$$$ and $$ $$.\", \"Hard break\\\\\\n$$x$$\\\\\\nafter\",\n\"a[^1]\\n\\n[^1]: Note $$y$$ end\",])"
+---
+== "Text before $$x^2$$ and after."
+P | "Text before"
+Math | [$=]"x^2"
+P | "and after."
+== "Text before\n$$\nx^2\n$$\nand after."
+P | "Text before"
+Math | [$=]"x^2"
+P | "and after."
+== "$$a$$\n$$b$$"
+Math | [$=]"a"
+Math | [$=]"b"
+== "$$a$$ trailing"
+Math | [$=]"a"
+P | "trailing"
+== "- $$x$$\n- item $$y$$ tail\n\n> quote $$z$$"
+Math list=1 Bullet | [$=]"x"
+P list=1 Bullet | "item"
+Math list=1 | [$=]"y"
+P list=1 | "tail"
+P quote=1 qstart=1 | "quote"
+Math quote=1 | [$=]"z"
+== "1. **bold $$x$$ still bold**"
+P list=1 Ordered(1) | [B]"bold"
+Math list=1 | [B$=]"x"
+P list=1 | [B]"still bold"
+== "[a $$x$$ b](u)"
+P | [L1]"a"
+Math | [L$=1]"x"
+P | [L1]"b"
+link 1: u
+== "# Heading $$x$$\n\n| a |\n|---|\n| $$y$$ |"
+H1 | "Heading " [$=]"x"
+Row(t0,head) | [ "a" ]
+Row(t0) | [ [$=]"y" ]
+anchor #heading-x -> 0
+== "Empty: $$$$ and $$ $$."
+P | "Empty:  and ."
+== "Hard break\\\n$$x$$\\\nafter"
+P | "Hard break"
+Math | [$=]"x"
+P | "after"
+== "a[^1]\n\n[^1]: Note $$y$$ end"
+P | "a" [LF1]"1"
+Rule |
+P Footnote(1) | "Note"
+Math | [$=]"y"
+P | "end" [L2]" ↩"
+link 1: #fn-1
+link 2: #fnref-1
+anchor #fnref-1 -> 0
+anchor #fn-1 -> 2

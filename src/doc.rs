@@ -16,6 +16,8 @@ use unicase::UniCase;
 use crate::image::MAX_SIDE;
 
 mod autolink;
+#[cfg(feature = "math")]
+mod math;
 mod pipeline;
 mod segment;
 
@@ -26,6 +28,8 @@ fn options() -> Options {
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_GFM;
     opts.remove(Options::ENABLE_SMART_PUNCTUATION);
+    #[cfg(feature = "math")]
+    opts.insert(Options::ENABLE_MATH);
     opts
 }
 
@@ -84,6 +88,17 @@ pub mod style {
     /// `<sup>` / `<sub>` text.
     pub const SUP: u16 = 1 << 7;
     pub const SUB: u16 = 1 << 8;
+    /// A formula: the span's text is its LaTeX source, without delimiters. A formula is always
+    /// a span of its own, never merged with the text around it.
+    #[cfg(feature = "math")]
+    pub const MATH: u16 = 1 << 9;
+    /// With `MATH`: display math (`$$…$$`, a ```` ```math ```` block), else inline.
+    #[cfg(feature = "math")]
+    pub const DISPLAY: u16 = 1 << 10;
+    /// With `CODE`: a formula too long to lay out ([`crate::math::MAX_SOURCE`]), shown as its
+    /// source with its delimiters. It isn't `MATH`, so a long block may be cut inside it.
+    #[cfg(feature = "math")]
+    pub const MATH_ERROR: u16 = 1 << 11;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +139,11 @@ pub enum BlockKind {
         first_cell: u32,
         cells: u32,
     },
+    /// A display formula (`$$…$$` on its own, or a ```` ```math ```` block): one span,
+    /// `style::MATH | style::DISPLAY`. It is never cut into chunks (a formula is at most
+    /// [`crate::math::MAX_SOURCE`] bytes).
+    #[cfg(feature = "math")]
+    Math,
 }
 
 /// Decoration drawn before the first line of a block.
@@ -566,6 +586,13 @@ struct Builder {
     slug_suffix: HashMap<String, u32>,
     /// Range of the last block's entry in `Doc::quote_lists`, for sharing.
     quote_pool: Range<u32>,
+    /// The text of the ```` ```math ```` block open now.
+    #[cfg(feature = "math")]
+    math_fence: Option<String>,
+    /// A display formula just ended a paragraph: the whitespace and breaks that follow it,
+    /// up to the next text, are dropped.
+    #[cfg(feature = "math")]
+    after_display: bool,
 }
 
 /// Inline HTML state of the open block (see `Builder::inline_tag`).
@@ -625,6 +652,10 @@ impl Builder {
             slugs: HashSet::new(),
             slug_suffix: HashMap::new(),
             quote_pool: 0..0,
+            #[cfg(feature = "math")]
+            math_fence: None,
+            #[cfg(feature = "math")]
+            after_display: false,
         }
     }
 
@@ -733,6 +764,11 @@ impl Builder {
         if let Some(image) = &mut self.image {
             match event {
                 Event::Text(s) | Event::Code(s) => image.alt.push_str(&s),
+                // Alt text is plain: a formula in it reads as it was written.
+                #[cfg(feature = "math")]
+                Event::InlineMath(s) => image.alt.push_str(&format!("${s}$")),
+                #[cfg(feature = "math")]
+                Event::DisplayMath(s) => image.alt.push_str(&format!("$${s}$$")),
                 Event::SoftBreak | Event::HardBreak => image.alt.push(' '),
                 Event::Start(Tag::Image { .. }) => image.depth += 1,
                 Event::End(TagEnd::Image) if image.depth > 0 => image.depth -= 1,
@@ -767,6 +803,8 @@ impl Builder {
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough)
                 if self.hidden_styles.pop() == Some(true) => {}
             Event::Start(tag) => self.start(tag),
+            #[cfg(feature = "math")]
+            Event::End(TagEnd::CodeBlock) if self.math_fence.is_some() => self.end_math_fence(),
             Event::End(tag) => {
                 let def = matches!(tag, TagEnd::FootnoteDefinition);
                 self.end(tag);
@@ -781,6 +819,12 @@ impl Builder {
                     self.fn_depth -= 1;
                 }
             }
+            #[cfg(feature = "math")]
+            Event::Text(s) if self.math_fence.is_some() => {
+                if let Some(fence) = &mut self.math_fence {
+                    fence.push_str(&s);
+                }
+            }
             Event::Text(s) if self.code_block() => self.text(&s, style::CODE, 0),
             Event::Text(s) if self.link() != 0 => self.text(&s, 0, 0),
             Event::Text(s) => {
@@ -791,7 +835,12 @@ impl Builder {
                 }
             }
             Event::Code(s) => self.text(&s, style::CODE, 0),
+            #[cfg(not(feature = "math"))]
             Event::InlineMath(s) | Event::DisplayMath(s) => self.text(&s, 0, 0),
+            #[cfg(feature = "math")]
+            Event::InlineMath(s) => self.formula(&s, false),
+            #[cfg(feature = "math")]
+            Event::DisplayMath(s) => self.display_math(&s),
             Event::Html(s) | Event::InlineHtml(s) => self.html(&s, false),
             Event::FootnoteReference(label) => self.footnote_ref(&label),
             Event::SoftBreak => self.text(" ", 0, 0),
@@ -809,6 +858,15 @@ impl Builder {
         match tag {
             Tag::Paragraph => self.open(BlockKind::Paragraph),
             Tag::Heading { level, .. } => self.open(BlockKind::Heading(level as u8)),
+            // GitHub's math blocks: the info string's first word is `math`, as it is written.
+            #[cfg(feature = "math")]
+            Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(info))
+                if info.split_whitespace().next() == Some("math") =>
+            {
+                self.close();
+                self.flush_marker();
+                self.math_fence = Some(String::new());
+            }
             Tag::CodeBlock(_) => {
                 self.close();
                 self.flush_marker();
@@ -1096,8 +1154,21 @@ impl Builder {
     /// Append text to the open block, opening an implicit paragraph if needed (tight list
     /// items and inline content after HTML have no explicit paragraph).
     fn text(&mut self, s: &str, extra_style: u16, image: u32) {
+        #[cfg(feature = "math")]
+        let s = if self.after_display
+            && self.open.is_none()
+            && extra_style & (style::MATH | style::MATH_ERROR) == 0
+        {
+            s.trim_start_matches([' ', '\t', '\n'])
+        } else {
+            s
+        };
         if s.is_empty() {
             return;
+        }
+        #[cfg(feature = "math")]
+        {
+            self.after_display = false;
         }
         if self.open.is_none() {
             // Nothing to close, and the inline HTML state stays: `- <b>bold</b> item` opened
@@ -1118,7 +1189,13 @@ impl Builder {
         }
         self.doc.text.push_str(s);
         let end = self.doc.text.len() as u32;
+        // A formula is a span of its own: it is laid out as one.
+        #[cfg(feature = "math")]
+        let merges = style & style::MATH == 0;
+        #[cfg(not(feature = "math"))]
+        let merges = true;
         if image == 0
+            && merges
             && self.doc.spans.len() > self.merge_floor
             && let Some(last) = self.doc.spans.last_mut()
             && last.end == start
@@ -1145,6 +1222,10 @@ impl Builder {
     }
 
     fn close(&mut self) {
+        #[cfg(feature = "math")]
+        {
+            self.after_display = false;
+        }
         self.end_inline_html();
         let Some(open) = self.open.take() else { return };
         let mut kind = open.kind;
@@ -1850,20 +1931,32 @@ fn boundary_after(event: &Event) -> char {
 /// decoded character reference (autolinks need to know, see `autolink::find`). Text from `src`
 /// borrows from it; a numeric reference is built (an owned string), a named one comes from the
 /// parser's table (a static string outside `src`).
+///
+/// With math, formulas are settled on the way (see `math::marked`).
 fn marked<'a>(
     src: &'a str,
     events: impl Iterator<Item = Event<'a>>,
 ) -> impl Iterator<Item = (Event<'a>, bool)> {
-    let start = src.as_ptr() as usize;
-    let source = start..start + src.len();
-    events.map(move |event| {
-        let decoded = match &event {
-            Event::Text(CowStr::Borrowed(s)) => !source.contains(&(s.as_ptr() as usize)),
-            Event::Text(_) => true,
-            _ => false,
-        };
-        (event, decoded)
-    })
+    #[cfg(feature = "math")]
+    return math::marked(src, events);
+    #[cfg(not(feature = "math"))]
+    {
+        let start = src.as_ptr() as usize;
+        let source = start..start + src.len();
+        events.map(move |event| {
+            let decoded = decoded(&source, &event);
+            (event, decoded)
+        })
+    }
+}
+
+/// Whether `event` is text that isn't a slice of the source (`source`: its addresses).
+fn decoded(source: &std::ops::Range<usize>, event: &Event) -> bool {
+    match event {
+        Event::Text(CowStr::Borrowed(s)) => !source.contains(&(s.as_ptr() as usize)),
+        Event::Text(_) => true,
+        _ => false,
+    }
 }
 
 /// The parser's broken-link callback, boxed. Every parser here has this one type (also without a
@@ -2180,6 +2273,23 @@ fn take_chunk(text: &str, cell: &mut CellRest, max: usize, out: &mut Vec<Span>) 
     while cell.next < spans.len() && spans[cell.next].end as usize <= at {
         cell.next += 1;
     }
+    // Never inside a formula: before it, or after it if the piece starts with it (a table cell's
+    // share of a row can be smaller than a formula).
+    #[cfg(feature = "math")]
+    let cut = {
+        let rest = &spans[cell.next..];
+        let i = rest.partition_point(|s| s.end as usize <= cut);
+        match rest.get(i) {
+            Some(s) if s.style & style::MATH != 0 && (s.start as usize) < cut => {
+                if s.start as usize > at {
+                    s.start as usize
+                } else {
+                    s.end as usize
+                }
+            }
+            _ => cut,
+        }
+    };
     for span in spans[cell.next..]
         .iter()
         .take_while(|s| (s.start as usize) < cut)

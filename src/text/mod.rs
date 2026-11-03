@@ -208,6 +208,19 @@ pub struct PGlyph {
     pub synth: u8,
 }
 
+/// The band glyph `glyph` (an index into its owner's glyphs) is drawn in: from `lo` to `hi`
+/// along y (`vertical`) or x, in the owner's coordinates. The pieces of a stretched
+/// delimiter overlap, and each is cut where the next takes over (see
+/// [`crate::math::layout::Cut`]).
+#[cfg(feature = "math")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PCut {
+    pub glyph: u32,
+    pub vertical: bool,
+    pub lo: f32,
+    pub hi: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RectKind {
     Fill,

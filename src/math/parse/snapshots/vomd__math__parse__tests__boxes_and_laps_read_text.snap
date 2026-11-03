@@ -1,0 +1,8 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"\\fbox{Note $x$} \\colorbox{yellow}{a b} \\fcolorbox{r}{g}{hi}\",\nr\"\\llap{a b} \\rlap{c} \\clap{d} \\mathllap{e f}\",], false)"
+---
+== \fbox{Note $x$} \colorbox{yellow}{a b} \fcolorbox{r}{g}{hi}
+(boxed (text "Note " (x))) (text "a b") (boxed (text "hi"))
+== \llap{a b} \rlap{c} \clap{d} \mathllap{e f}
+(lap left (text "a b")) (lap right (text "c")) (lap centre (text "d")) (lap left (e f))

@@ -1,0 +1,24 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"\\frac{a}{b} \\frac12 \\dfrac ab \\tfrac{1}{2}\",\nr\"\\cfrac[l]{1}{2+\\cfrac{1}{3}}\", r\"\\binom{n}{k} \\dbinom nk \\tbinom{a}{b}\",\nr\"a \\over b\", r\"{n \\choose k} {a \\atop b} {a \\brace b} {a \\brack b}\",\nr\"\\sqrt{2} \\sqrt[3]{x} \\sqrt[n+1]{\\frac{a}{b}}\",\nr\"\\left( x \\right) \\left. x \\right| \\left\\{ x \\middle| y \\right\\}\",\nr\"\\left\\langle x \\right\\rangle \\left\\lfloor x \\right\\rceil \\left< x \\right> \\left\\| x \\right\\Vert\",\nr\"\\big( \\Big[ \\bigg\\{ \\Bigg\\langle \\bigl( \\bigr) \\bigm| \\Biggr\\rbrace\",\nr\"\\left/ x \\right\\backslash \\left\\uparrow x \\right\\Downarrow\",], false)"
+---
+== \frac{a}{b} \frac12 \dfrac ab \tfrac{1}{2}
+(frac (a) (b)) (frac 1 2) (frac Display a b) (frac Text (1) (2))
+== \cfrac[l]{1}{2+\cfrac{1}{3}}
+(cfrac Display (1) (2 +:bin (cfrac Display (1) (3))))
+== \binom{n}{k} \dbinom nk \tbinom{a}{b}
+(frac nobar () (n) (k)) (frac nobar Display () n k) (frac nobar Text () (a) (b))
+== a \over b
+(frac (a) (b))
+== {n \choose k} {a \atop b} {a \brace b} {a \brack b}
+((frac nobar () (n) (k))) ((frac nobar (a) (b))) ((frac nobar {} (a) (b))) ((frac nobar [] (a) (b)))
+== \sqrt{2} \sqrt[3]{x} \sqrt[n+1]{\frac{a}{b}}
+(sqrt _ (2)) (sqrt (3) (x)) (sqrt (n +:bin 1) ((frac (a) (b))))
+== \left( x \right) \left. x \right| \left\{ x \middle| y \right\}
+(left( x right)) (left. x right|) (left{ x (middle|) y right})
+== \left\langle x \right\rangle \left\lfloor x \right\rceil \left< x \right> \left\| x \right\Vert
+(left⟨ x right⟩) (left⌊ x right⌉) (left⟨ x right⟩) (left‖ x right‖)
+== \big( \Big[ \bigg\{ \Bigg\langle \bigl( \bigr) \bigm| \Biggr\rbrace
+(big1:ord () (big2:ord [) (big3:ord {) (big4:ord ⟨) (big1:open () (big1:close )) (big1:rel |) (big4:close })
+== \left/ x \right\backslash \left\uparrow x \right\Downarrow
+(left/ x right\) (left↑ x right⇓)

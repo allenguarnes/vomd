@@ -16,6 +16,8 @@ use std::time::Instant;
 use crate::doc::{self, Alert, Block, BlockKind, Doc, ImageRef, Marker, Span, Want, style};
 use crate::fonts::Fonts;
 use crate::image::MAX_SIDE;
+#[cfg(feature = "math")]
+use crate::text::PCut;
 use crate::text::{
     Align, InlineBox, PBox, PGlyph, PHit, PLine, PRect, Para, ParaLayout, RectKind, TextCtx,
     TextStyle, deco,
@@ -198,6 +200,14 @@ pub struct BlockBox {
     pub glyphs: Vec<PGlyph>,
     pub styles: Vec<TextStyle>,
     pub rects: Vec<PRect>,
+    /// Formulas' rules (fraction bars, radicals' bars): drawn with the glyphs, over the
+    /// selection and find washes, so a selected bar stays visible.
+    #[cfg(feature = "math")]
+    pub ink: Vec<PRect>,
+    /// The bands some glyphs are drawn in (by glyph, ascending): the pieces of stretched
+    /// delimiters.
+    #[cfg(feature = "math")]
+    pub cuts: Vec<PCut>,
     pub lines: Vec<PLine>,
     pub hits: Vec<PHit>,
     pub boxes: Vec<PBox>,
@@ -381,6 +391,9 @@ enum Est {
     Code,
     Rule,
     Row,
+    /// A display formula: `code_lines` holds its count of `\\` (rows).
+    #[cfg(feature = "math")]
+    Math,
 }
 
 /// What the height estimate depends on besides the document: the layout's `em`, the column's
@@ -453,6 +466,9 @@ pub struct Layout {
     probe: Option<ImageProbe>,
     /// The block each image is in (by id − 1), found when first needed.
     image_blocks: Vec<u32>,
+    /// Formulas laid out, kept by the window across layouts (see [`Layout::set_math`]).
+    #[cfg(feature = "math")]
+    math: crate::math::Shared,
 }
 
 impl Layout {
@@ -481,6 +497,8 @@ impl Layout {
             images: vec![None; doc.images.len()],
             probe: None,
             image_blocks: Vec::new(),
+            #[cfg(feature = "math")]
+            math: crate::math::Cache::shared(),
         };
         layout.meta = layout.prepass(doc);
         layout.set_geometry();
@@ -587,6 +605,13 @@ impl Layout {
             g.unmeasure();
         }
         self.reset_measuring();
+    }
+
+    /// Lay formulas out through `cache`, the window's, which outlives this layout (a live
+    /// reload makes a new one): formulas it has are not laid out again.
+    #[cfg(feature = "math")]
+    pub fn set_math(&mut self, cache: crate::math::Shared) {
+        self.math = cache;
     }
 
     /// The faces text is set in changed (`font_sans` / `font_mono`): everything is remeasured.
@@ -843,6 +868,15 @@ impl Layout {
                 }
                 BlockKind::Rule => Est::Rule,
                 BlockKind::TableRow { .. } => Est::Row,
+                #[cfg(feature = "math")]
+                BlockKind::Math => {
+                    let rows: usize = spans
+                        .iter()
+                        .map(|s| doc.span_text(s).matches("\\\\").count())
+                        .sum();
+                    m.code_lines = rows.try_into().unwrap_or(u32::MAX);
+                    Est::Math
+                }
             };
         }
         meta
@@ -1092,40 +1126,80 @@ impl Layout {
         let mut missing = Vec::new();
         let body = self.body_style(block, meta);
 
+        // Paragraphs and headings; until formulas are laid out, a display formula is a paragraph
+        // of its source too.
+        let text = |this: &mut Self, out: &mut BlockBox, missing: &mut Vec<char>| {
+            let lh = if matches!(block.kind, BlockKind::Heading(_)) {
+                HEADING_LH
+            } else {
+                BODY_LH
+            };
+            this.resolve_images(doc, doc.block_spans(block));
+            let boxes = Boxes {
+                sizes: &this.images,
+                scale: this.params.scale,
+                em,
+                max_w: avail,
+            };
+            #[cfg(feature = "math")]
+            let mut formulas = Formulas::new(&this.math, fonts);
+            fill_para(
+                &mut this.para,
+                doc,
+                doc.block_spans(block),
+                body,
+                &boxes,
+                #[cfg(feature = "math")]
+                &mut formulas,
+            );
+            let pl = this.ctx.layout(fonts, &this.para, avail, Align::Start, lh);
+            missing.extend_from_slice(&pl.missing);
+            let first_baseline = pl.lines.first().map(|l| l.baseline + gap);
+            let mut h = pl.height;
+            let styles = std::mem::take(&mut this.para.styles);
+            #[cfg(feature = "math")]
+            let from = out.boxes.len();
+            out.append(pl, &styles, indent, gap);
+            #[cfg(feature = "math")]
+            formulas.place(out, from, missing);
+            this.para.styles = styles;
+            if let BlockKind::Heading(1 | 2) = block.kind
+                && last
+            {
+                h += 0.3 * em;
+                out.rect(indent, gap + h, avail, this.hairline(), Role::BorderMuted);
+                h += this.hairline();
+            }
+            if let Some(baseline) = first_baseline {
+                let gutter = this.gutter(doc, block, meta);
+                this.marker(fonts, block, meta, gutter, baseline, out, missing);
+            }
+            h
+        };
         let content_h = match block.kind {
-            BlockKind::Paragraph | BlockKind::Heading(_) => {
-                let lh = if matches!(block.kind, BlockKind::Heading(_)) {
-                    HEADING_LH
-                } else {
-                    BODY_LH
-                };
-                self.resolve_images(doc, doc.block_spans(block));
-                let boxes = Boxes {
-                    sizes: &self.images,
-                    scale: self.params.scale,
-                    em,
-                    max_w: avail,
-                };
-                fill_para(&mut self.para, doc, doc.block_spans(block), body, &boxes);
-                let pl = self.ctx.layout(fonts, &self.para, avail, Align::Start, lh);
-                missing.extend_from_slice(&pl.missing);
-                let first_baseline = pl.lines.first().map(|l| l.baseline + gap);
-                let mut h = pl.height;
-                let styles = std::mem::take(&mut self.para.styles);
-                out.append(pl, &styles, indent, gap);
-                self.para.styles = styles;
-                if let BlockKind::Heading(1 | 2) = block.kind
-                    && last
-                {
-                    h += 0.3 * em;
-                    out.rect(indent, gap + h, avail, self.hairline(), Role::BorderMuted);
-                    h += self.hairline();
+            BlockKind::Paragraph | BlockKind::Heading(_) => text(self, &mut out, &mut missing),
+            #[cfg(feature = "math")]
+            BlockKind::Math => {
+                match self.math_block(doc, fonts, block, body, (indent, avail, gap), &mut out) {
+                    Some((h, absent, baseline)) => {
+                        missing.extend(absent);
+                        // A list item that starts with the formula has its marker by it.
+                        if let Some(baseline) = baseline {
+                            let gutter = self.gutter(doc, block, meta);
+                            self.marker(
+                                fonts,
+                                block,
+                                meta,
+                                gutter,
+                                baseline,
+                                &mut out,
+                                &mut missing,
+                            );
+                        }
+                        h
+                    }
+                    None => text(self, &mut out, &mut missing),
                 }
-                if let Some(baseline) = first_baseline {
-                    let gutter = self.gutter(doc, block, meta);
-                    self.marker(fonts, block, meta, gutter, baseline, &mut out, &mut missing);
-                }
-                h
             }
             BlockKind::Code => self.code(
                 doc,
@@ -1554,6 +1628,8 @@ impl Layout {
         }
         let mut cells = Vec::new();
         let mut row_h: f32 = 0.0;
+        #[cfg(feature = "math")]
+        let math = self.math.clone();
         // A fragment of a split row only stores the cells that still have text.
         let stored = doc.row_cells(block).take_while(|&(c, _)| c < visible);
         for (c, spans) in stored {
@@ -1564,7 +1640,17 @@ impl Layout {
                 em,
                 max_w: (cols[c] - 2.0 * px).max(1.0),
             };
-            fill_para(&mut self.para, doc, spans, body, &boxes);
+            #[cfg(feature = "math")]
+            let mut formulas = Formulas::new(&math, fonts);
+            fill_para(
+                &mut self.para,
+                doc,
+                spans,
+                body,
+                &boxes,
+                #[cfg(feature = "math")]
+                &mut formulas,
+            );
             let align = match aligns.get(c) {
                 Some(doc::Align::Center) => Align::Center,
                 Some(doc::Align::Right) => Align::Right,
@@ -1583,7 +1669,13 @@ impl Layout {
             }
             missing.extend_from_slice(&pl.missing);
             row_h = row_h.max(pl.height);
-            cells.push((c, pl, std::mem::take(&mut self.para.styles)));
+            cells.push((
+                c,
+                pl,
+                std::mem::take(&mut self.para.styles),
+                #[cfg(feature = "math")]
+                formulas,
+            ));
         }
         if cells.is_empty() {
             self.para.clear();
@@ -1609,8 +1701,15 @@ impl Layout {
         let mut x = indent;
         let mut cells = cells.into_iter().peekable();
         for (c, w) in cols[..visible].iter().enumerate() {
+            #[cfg(not(feature = "math"))]
             if let Some((_, pl, styles)) = cells.next_if(|(col, ..)| *col == c) {
                 out.append(pl, &styles, x + px, gap + top);
+            }
+            #[cfg(feature = "math")]
+            if let Some((_, pl, styles, formulas)) = cells.next_if(|(col, ..)| *col == c) {
+                let from = out.boxes.len();
+                out.append(pl, &styles, x + px, gap + top);
+                formulas.place(out, from, missing);
             }
             x += w;
             // A rule on the far side of the visible width can't be seen.
@@ -1673,7 +1772,17 @@ impl Layout {
                     em,
                     max_w: ((self.col_w - indent) / n as f32 - 2.0 * px).max(em),
                 };
-                fill_para(&mut self.para, doc, spans, body, &boxes);
+                #[cfg(feature = "math")]
+                let mut formulas = Formulas::new(&self.math, fonts);
+                fill_para(
+                    &mut self.para,
+                    doc,
+                    spans,
+                    body,
+                    &boxes,
+                    #[cfg(feature = "math")]
+                    &mut formulas,
+                );
                 let (lo, hi, absent) = self.ctx.measure_missing(fonts, &self.para);
                 min[c] = min[c].max(lo);
                 max[c] = max[c].max(hi);
@@ -1804,6 +1913,8 @@ impl Layout {
                 Est::Rule => 0.25 * em,
                 // The cells share the width: a row is about as tall as its text set on one line.
                 Est::Row => lines(em) * BODY_LH * em + f32::from(meta.pads()) * CELL_PAD_Y * em,
+                #[cfg(feature = "math")]
+                Est::Math => (2.5 + 1.4 * meta.code_lines as f32) * em,
             }
     }
 }
@@ -1865,6 +1976,19 @@ fn span_style(span: &Span, body: TextStyle) -> TextStyle {
         s.size = body.size * CODE_SIZE;
         s.deco |= deco::CODE_BG;
     }
+    // A formula that isn't drawn (no math face) is its source in code style, muted; one too
+    // long to lay out is in the error color (see `Formulas::inline`).
+    #[cfg(feature = "math")]
+    if span.style & style::MATH != 0 {
+        s.mono = true;
+        s.bold = false;
+        s.italic = false;
+        s.size = body.size * CODE_SIZE;
+        s.deco |= deco::CODE_BG;
+        s.role = Role::Muted;
+    } else if span.style & style::MATH_ERROR != 0 {
+        s.role = Role::AlertCaution;
+    }
     if span.style & style::LINK != 0 {
         s.role = Role::Link;
         s.link = span.link;
@@ -1886,6 +2010,294 @@ fn span_style(span: &Span, body: TextStyle) -> TextStyle {
         s.shift = -body.size * 0.2;
     }
     s
+}
+
+/// The bit of an inline box's id that makes it a formula's (the rest indexes the
+/// paragraph's [`Formulas`]); image boxes have the image's id, far below it.
+#[cfg(feature = "math")]
+const MATH_BOX: u32 = 1 << 31;
+
+/// A paragraph's formulas while it is laid out: each is an inline box in the text, which
+/// [`Formulas::place`] then replaces with the formula's glyphs and rules.
+#[cfg(feature = "math")]
+struct Formulas<'a> {
+    cache: &'a std::cell::RefCell<crate::math::Cache>,
+    fonts: &'a Fonts,
+    placed: Vec<Placed>,
+    /// Characters of the formulas no face has.
+    missing: Vec<char>,
+}
+
+/// A formula in a box: as laid out, or broken into lines to fit; its size in pixels per em,
+/// and its color.
+#[cfg(feature = "math")]
+struct Placed {
+    laid: Arc<crate::math::Laid>,
+    broken: Option<Box<crate::math::layout::Formula>>,
+    em: f32,
+    role: Role,
+}
+
+#[cfg(feature = "math")]
+impl Placed {
+    fn formula(&self) -> Option<&crate::math::layout::Formula> {
+        self.broken.as_deref().or(self.laid.as_ref().as_ref().ok())
+    }
+}
+
+#[cfg(feature = "math")]
+impl<'a> Formulas<'a> {
+    fn new(cache: &'a std::cell::RefCell<crate::math::Cache>, fonts: &'a Fonts) -> Formulas<'a> {
+        Formulas {
+            cache,
+            fonts,
+            placed: Vec::new(),
+            missing: Vec::new(),
+        }
+    }
+
+    fn get(&self, src: &str, display: bool) -> Option<Arc<crate::math::Laid>> {
+        self.cache.borrow_mut().get(self.fonts, src, display)
+    }
+
+    /// Formula `span` in the paragraph: a box as big as it is at the text's size (`body`'s,
+    /// with `style` the span's own), shrunk to `max_w` if wider; or, if it can't be laid out,
+    /// its source in its delimiters, as code, in the error color (muted if there is no math
+    /// face at all).
+    fn inline(
+        &mut self,
+        para: &mut Para,
+        doc: &Doc,
+        span: &Span,
+        (style, body): (TextStyle, TextStyle),
+        max_w: f32,
+    ) {
+        let src = doc.span_text(span);
+        let display = span.style & style::DISPLAY != 0;
+        let role = if span.style & style::LINK != 0 {
+            Role::Link
+        } else {
+            body.role
+        };
+        let laid = self.get(src, display);
+        let Some(Ok(f)) = laid.as_deref() else {
+            let role = if laid.is_some() {
+                Role::AlertCaution
+            } else {
+                style.role
+            };
+            let delim = if display { "$$" } else { "$" };
+            source(para, span, src, (delim, delim), TextStyle { role, ..style });
+            return;
+        };
+        let em = body.size * crate::math::MATH_SCALE;
+        let w = f.width * em;
+        let s = if w > max_w && w > 0.0 {
+            crate::math::fit::quantize(max_w / w)
+        } else {
+            1.0
+        };
+        let em = em * s;
+        self.missing.extend_from_slice(&f.missing);
+        let b = InlineBox {
+            width: f.width * em,
+            ascent: f.height * em,
+            descent: f.depth * em,
+            id: MATH_BOX | self.placed.len() as u32,
+        };
+        para.push_box(b, span.start, math_style(body, role, style.link));
+        self.placed.push(Placed {
+            laid: laid.unwrap_or_else(|| Arc::new(Ok(Default::default()))),
+            broken: None,
+            em,
+            role,
+        });
+    }
+
+    /// Replace the formulas' boxes (those of `out.boxes` from `from` on) with their glyphs and
+    /// rules; note their missing characters.
+    fn place(self, out: &mut BlockBox, from: usize, missing: &mut Vec<char>) {
+        missing.extend_from_slice(&self.missing);
+        if self.placed.is_empty() {
+            return;
+        }
+        let boxes = out.boxes.split_off(from.min(out.boxes.len()));
+        for b in boxes {
+            let placed = (b.b.id & MATH_BOX != 0)
+                .then(|| self.placed.get((b.b.id & !MATH_BOX) as usize))
+                .flatten();
+            match placed.and_then(|p| Some((p, p.formula()?))) {
+                Some((p, f)) => out.formula(f, p.em, b.x, b.y + b.b.ascent, p.role),
+                None if b.b.id & MATH_BOX != 0 => {}
+                None => out.boxes.push(b),
+            }
+        }
+    }
+}
+
+/// The style of a formula's box (its cluster, for selecting and links) and its glyphs.
+#[cfg(feature = "math")]
+fn math_style(body: TextStyle, role: Role, link: u32) -> TextStyle {
+    TextStyle {
+        bold: false,
+        italic: false,
+        mono: false,
+        size: body.size,
+        role,
+        deco: 0,
+        shift: 0.0,
+        link,
+    }
+}
+
+/// A formula's source, in `delims`, for one that isn't drawn: code text that selects, copies
+/// and is found as the formula's (the delimiters aren't the document's: they stand at its
+/// first and last byte).
+#[cfg(feature = "math")]
+fn source(para: &mut Para, span: &Span, src: &str, delims: (&str, &str), style: TextStyle) {
+    let last = span.end.saturating_sub(1).max(span.start);
+    para.push_synthetic(delims.0, span.start, style);
+    para.push_text(src, span.start, style);
+    para.push_synthetic(delims.1, last, style);
+}
+
+#[cfg(feature = "math")]
+impl BlockBox {
+    /// Formula `f` at `em` pixels per em, its baseline's left end at (`x`, `y`).
+    fn formula(&mut self, f: &crate::math::layout::Formula, em: f32, x: f32, y: f32, role: Role) {
+        let mut e = crate::math::emit::Emitted::default();
+        crate::math::emit::emit(f, em, x, y, role, &mut e);
+        let (glyphs, styles) = (self.glyphs.len() as u32, self.styles.len() as u32);
+        self.styles.extend(e.styles);
+        self.cuts.extend(e.cuts.into_iter().map(|c| PCut {
+            glyph: c.glyph + glyphs,
+            ..c
+        }));
+        self.glyphs.extend(e.glyphs.into_iter().map(|g| PGlyph {
+            style: g.style + styles,
+            ..g
+        }));
+        self.ink.extend(e.ink);
+    }
+}
+
+#[cfg(feature = "math")]
+impl Layout {
+    /// A display formula (`block`, one `MATH | DISPLAY` span), centred in the column (`avail`
+    /// wide at `indent`, below `gap`), fitted to it, with its `\tag` flush right: its height,
+    /// the characters no face had, and its first line's baseline. A formula that can't be laid
+    /// out is its source, as code, in its delimiters on lines of their own. `None` if the
+    /// block isn't a formula.
+    fn math_block(
+        &mut self,
+        doc: &Doc,
+        fonts: &Fonts,
+        block: &Block,
+        body: TextStyle,
+        (indent, avail, gap): (f32, f32, f32),
+        out: &mut BlockBox,
+    ) -> Option<(f32, Vec<char>, Option<f32>)> {
+        let span = doc
+            .block_spans(block)
+            .first()
+            .filter(|s| s.style & style::MATH != 0)?;
+        let src = doc.span_text(span);
+        let laid = self.math.borrow_mut().get(fonts, src, true);
+        // In a link, it is link-coloured and clickable, as an inline formula is.
+        let (role, link) = if span.style & style::LINK != 0 {
+            (Role::Link, span.link)
+        } else {
+            (body.role, 0)
+        };
+        let style = math_style(body, role, link);
+        self.para.clear();
+        let Some(Ok(f)) = laid.as_deref() else {
+            let role = if laid.is_some() {
+                Role::AlertCaution
+            } else {
+                Role::Muted
+            };
+            let code = TextStyle {
+                mono: true,
+                size: body.size * CODE_SIZE,
+                role,
+                ..style
+            };
+            source(&mut self.para, span, src, ("$$\n", "\n$$"), code);
+            let pl = self
+                .ctx
+                .layout(fonts, &self.para, avail, Align::Start, CODE_LH);
+            let (h, absent) = (pl.height, pl.missing.clone());
+            let baseline = pl.lines.first().map(|l| l.baseline + gap);
+            let styles = std::mem::take(&mut self.para.styles);
+            out.append(pl, &styles, indent, gap);
+            self.para.styles = styles;
+            return Some((h, absent, baseline));
+        };
+        let em = body.size * crate::math::MATH_SCALE;
+        // The tag takes its width and a quad from the right; the formula stays centred in the
+        // column while it clears it, else it is centred in what is left. A tag wider than
+        // half the column, or one the formula can't clear without shrinking to less than half,
+        // is set on a line of its own below it, flush right, and the formula has the column.
+        let tag_w = f.tag.as_ref().map_or(0.0, |t| t.width * em + em);
+        let mut below = f.tag.is_some() && tag_w > avail / 2.0;
+        let mut room = if below || f.width * em <= avail - 2.0 * tag_w {
+            avail
+        } else {
+            (avail - tag_w).max(em)
+        };
+        let (mut fitted, mut s) = crate::math::fit::fit(f, room / em);
+        if f.tag.is_some() && !below && s < 0.5 {
+            (below, room) = (true, avail);
+            (fitted, s) = crate::math::fit::fit(f, room / em);
+        }
+        let g: &crate::math::layout::Formula = &fitted;
+        let em_f = em * s;
+        let b = InlineBox {
+            width: g.width * em_f,
+            ascent: g.height * em_f,
+            descent: g.depth * em_f,
+            id: MATH_BOX,
+        };
+        self.para.push_box(b, span.start, style);
+        let pl = self
+            .ctx
+            .layout(fonts, &self.para, room, Align::Center, BODY_LH);
+        let h = pl.height;
+        let mut absent = pl.missing.clone();
+        absent.extend_from_slice(&f.missing);
+        let placed = pl.boxes.first().map(|b| (b.x, b.y + b.b.ascent));
+        let styles = std::mem::take(&mut self.para.styles);
+        out.append(pl, &styles, indent, gap);
+        self.para.styles = styles;
+        out.boxes.retain(|b| b.b.id & MATH_BOX == 0);
+        let Some((x, baseline)) = placed else {
+            return Some((h, absent, None));
+        };
+        out.formula(g, em_f, indent + x, gap + baseline, role);
+        let mut h = h;
+        if let Some(t) = &f.tag {
+            if below {
+                // Its own line under the formula, shrunk to the column if it is wider.
+                let (t, ts) = crate::math::fit::fit(t, avail / em);
+                let em_t = em * ts;
+                let y = h + (t.height + 0.4) * em_t;
+                out.formula(&t, em_t, indent + avail - t.width * em_t, gap + y, role);
+                h += (t.height + t.depth + 0.4) * em_t;
+            } else {
+                // A one-line formula's tag is on its baseline; a taller one's is centred on it.
+                let tall = (g.height + g.depth) * em_f > 1.5 * em;
+                let y = if tall {
+                    let middle = baseline - (g.height - g.depth) / 2.0 * em_f;
+                    middle + f.axis * em
+                } else {
+                    baseline
+                };
+                out.formula(t, em, indent + avail - t.width * em, gap + y, role);
+            }
+        }
+        Some((h, absent, Some(gap + baseline)))
+    }
 }
 
 /// What [`fill_para`] needs to size image boxes: each image's size, the scale, and the line's
@@ -1946,10 +2358,22 @@ impl Boxes<'_> {
     }
 }
 
-fn fill_para(para: &mut Para, doc: &Doc, spans: &[Span], body: TextStyle, boxes: &Boxes) {
+fn fill_para(
+    para: &mut Para,
+    doc: &Doc,
+    spans: &[Span],
+    body: TextStyle,
+    boxes: &Boxes,
+    #[cfg(feature = "math")] formulas: &mut Formulas,
+) {
     para.clear();
     for (i, span) in spans.iter().enumerate() {
         let style = span_style(span, body);
+        #[cfg(feature = "math")]
+        if span.style & style::MATH != 0 {
+            formulas.inline(para, doc, span, (style, body), boxes.max_w);
+            continue;
+        }
         let img = doc.images.get((span.image as usize).wrapping_sub(1));
         let want = img.map_or([Want::Auto; 2], |img| img.want);
         if span.image != 0

@@ -11,6 +11,8 @@ pub mod find;
 pub mod fonts;
 pub mod image;
 pub mod layout;
+#[cfg(feature = "math")]
+pub mod math;
 pub mod nav;
 pub mod platform;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]

@@ -276,6 +276,27 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    /// The math face draws like any other: an operator, a math italic letter and a part of an
+    /// assembled delimiter, which has no character of its own.
+    #[cfg(feature = "math")]
+    #[test]
+    fn renders_math_glyphs() {
+        let mut fonts = Fonts::new().unwrap();
+        let face = fonts.load_math().expect("embedded math face");
+        let mut cache = GlyphCache::default();
+        let paren_part = 1309; // `(`'s extender (see `math::tests`)
+        for id in [
+            fonts.face(face).glyph('∑'),
+            fonts.face(face).glyph('\u{1D465}'),
+            paren_part,
+        ] {
+            assert_ne!(id, 0);
+            let k = GlyphKey::at(face, id, 24.0, 0.0, 0).0;
+            let img = cache.get(&fonts, k).expect("pixels");
+            assert!(img.width > 0 && img.data.iter().any(|&a| a > 128));
+        }
+    }
+
     #[test]
     fn subpixel_keys() {
         let (k0, x0) = GlyphKey::at(FaceId(0), 1, 16.0, 10.0, 0);

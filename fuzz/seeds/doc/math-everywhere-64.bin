@@ -1,0 +1,52 @@
+@# Heading $x^2$ and $$\frac{a}{b}$$
+
+Text $a$ and $$\sum_i i$$ in the middle, then $`x^2`$ and $5-$10 and $5 and $10, \$escaped$.
+$x$5 is a price; $x$ y is math. Unclosed $x and $$y.
+
+- item $\alpha$
+  $$\int_0^1 f$$
+- $$x = 1 \tag{2}$$
+  1. nested $$\begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}$$
+
+> quote $$\frac{1}{2}$$
+>
+> > nested $\vec{v}$
+
+| a | b |
+|---|---|
+| $x$ | $$y$$ |
+| $\vert x \vert$ | $|x|$ |
+
+[link $x^2$](https://example.com) ![alt $y$](missing.png) footnote[^m].
+
+[^m]: A note with $\frac{1}{2}$ and
+    $$\sum_{n=1}^\infty \frac{1}{n^2} = \frac{\pi^2}{6}$$
+
+```math
+\begin{aligned}
+a &= b \\
+c &= d
+\end{aligned}
+```
+
+``` math
+not math: the info string has a space
+```
+
+```Math
+not math either
+```
+
+$$
+\undefined{x} \frac{1}
+$$
+
+<div>$x$ in HTML</div>
+
+$$x$$
+$$y$$
+$$z$$
+
+$$
+a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + a + b
+$$

@@ -592,3 +592,18 @@ fn the_marks_of_a_late_chunk_are_found_without_looking_at_the_matches_before_it(
         .collect();
     assert_eq!(reached, [0, 1]);
 }
+
+/// A formula is found by its source: what the document holds of it.
+#[cfg(feature = "math")]
+#[test]
+fn formulas_are_found_by_their_source() {
+    let src = "Let $\\alpha + \\beta$ be, and\n\n$$\n\\sum \\alpha_i\n$$\n\n# The $\\alpha$ case\n";
+    assert_eq!(texts(src, "alpha"), ["alpha", "alpha", "alpha"]);
+    assert_eq!(texts(src, "\\alpha + \\b"), ["\\alpha + \\b"]);
+    // Across a formula and the text after it, as the source runs on.
+    assert_eq!(texts(src, "beta be"), ["beta be"]);
+    // The delimiters are not in the text.
+    assert!(texts(src, "$").is_empty());
+    assert!(texts("a $x$ b", "a $x").is_empty());
+    assert_eq!(texts("a $x$ b", "a x b"), ["a x b"]);
+}

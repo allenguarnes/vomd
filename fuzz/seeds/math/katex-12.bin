@@ -1,0 +1,1 @@
+a\begin{pmatrix} 1 & 0 \\ 0 & 1 \end{pmatrix} \begin{bmatrix} a & b \\ c & d \end{bmatrix} \begin{vmatrix} x & y \\ z & w \end{vmatrix}

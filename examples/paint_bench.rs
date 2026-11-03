@@ -153,7 +153,11 @@ fn main() {
     let line_width = args.get(1).map_or(Params::default().line_width, |w| {
         w.parse().expect("line_width")
     });
-    let fonts = Fonts::new().unwrap();
+    #[cfg_attr(not(feature = "math"), allow(unused_mut))]
+    let mut fonts = Fonts::new().unwrap();
+    // As the window does for a document with formulas.
+    #[cfg(feature = "math")]
+    fonts.load_math();
     let doc = Doc::parse(&src);
     #[cfg(feature = "clipboard")]
     let select = select_all.then(|| (Pos::start(0), Pos::end(doc.blocks.len() as u32 - 1)));

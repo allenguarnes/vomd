@@ -1,0 +1,20 @@
+---
+source: src/doc/tests.rs
+expression: "parse_all(&[\"```math\\n\\\\int_0^1 x\\\\,dx\\n```\",\n\"```math foo\\na\\n```\\n\\n~~~math\\nb\\n~~~\\n\\n```Math\\nc\\n```\\n\\n```mathematica\\nd\\n```\",\n\"```math\\n```\\n\\n```math\\n\\n\\n```\",\n\"- item\\n\\n  ```math\\n  x\\n  ```\\n- ```math\\n  y\\n  ```\\n\\n> ```math\\n> z\\n> ```\",\n\"```math\\na\\n\\nb\\n```\",])"
+---
+== "```math\n\\int_0^1 x\\,dx\n```"
+Math | [$=]"\\int_0^1 x\\,dx"
+== "```math foo\na\n```\n\n~~~math\nb\n~~~\n\n```Math\nc\n```\n\n```mathematica\nd\n```"
+Math | [$=]"a"
+Math | [$=]"b"
+Code | [C]"c"
+Code | [C]"d"
+== "```math\n```\n\n```math\n\n\n```"
+== "- item\n\n  ```math\n  x\n  ```\n- ```math\n  y\n  ```\n\n> ```math\n> z\n> ```"
+P list=1 Bullet | "item"
+Math list=1 | [$=]"x"
+P list=1 Bullet |
+Math list=1 | [$=]"y"
+Math quote=1 qstart=1 | [$=]"z"
+== "```math\na\n\nb\n```"
+Math | [$=]"a\n\nb"

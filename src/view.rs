@@ -505,6 +505,9 @@ pub struct View {
     doc: Shared,
     layout: Layout,
     fonts: Fonts,
+    /// Formulas laid out, kept across layouts (a resize, a reload) as long as the window.
+    #[cfg(feature = "math")]
+    math: crate::math::Shared,
     cache: GlyphCache,
     anchor: Anchor,
     /// Shown centered instead of the document (read errors, the empty window).
@@ -623,10 +626,17 @@ impl View {
         let d = Params::default();
         let text = (d.font_size, d.line_width);
         let params = params(width, hidpi, 100, text, false);
+        #[cfg(feature = "math")]
+        let (mut fonts, math) = (fonts, crate::math::Cache::shared());
         let mut view = View {
+            #[cfg(feature = "math")]
+            layout: layout_with_math(&doc, params, &mut fonts, &math),
+            #[cfg(not(feature = "math"))]
             layout: Layout::new(&doc, params),
             doc: share(doc),
             fonts,
+            #[cfg(feature = "math")]
+            math,
             cache: GlyphCache::default(),
             anchor: Anchor::TOP,
             message,
@@ -2345,10 +2355,19 @@ impl View {
         self.open_doc(doc, message);
     }
 
+    /// A layout of the document, with the window's formulas.
+    fn new_layout(&mut self) -> Layout {
+        let params = self.layout_params();
+        #[cfg(feature = "math")]
+        return layout_with_math(&self.doc, params, &mut self.fonts, &self.math);
+        #[cfg(not(feature = "math"))]
+        Layout::new(&self.doc, params)
+    }
+
     fn open_doc(&mut self, doc: Doc, message: Option<String>) {
         self.doc = share(doc);
         self.message = message;
-        self.layout = Layout::new(&self.doc, self.layout_params());
+        self.layout = self.new_layout();
         self.anchor = Anchor::TOP;
         self.drag = None;
         #[cfg(feature = "toc")]
@@ -2409,7 +2428,7 @@ impl View {
         }
         self.doc = share(doc);
         self.message = message;
-        self.layout = Layout::new(&self.doc, self.layout_params());
+        self.layout = self.new_layout();
         #[cfg(feature = "toc")]
         self.refresh_toc();
         // A reload keeps remote images on.
@@ -2577,6 +2596,27 @@ fn sane_scale(s: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+/// A layout of `doc` that lays its formulas out through `math`, with the math face loaded if
+/// the document has any (a document without formulas never touches it).
+#[cfg(feature = "math")]
+fn layout_with_math(
+    doc: &Doc,
+    params: Params,
+    fonts: &mut Fonts,
+    math: &crate::math::Shared,
+) -> Layout {
+    if doc
+        .spans
+        .iter()
+        .any(|s| s.style & crate::doc::style::MATH != 0)
+    {
+        fonts.load_math();
+    }
+    let mut layout = Layout::new(doc, params);
+    layout.set_math(math.clone());
+    layout
 }
 
 #[cfg(test)]

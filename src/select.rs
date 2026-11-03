@@ -148,6 +148,9 @@ pub fn block_unit(doc: &Doc, block: u32) -> (Pos, Pos) {
 /// The text of `block` that one word can't leave: the run of touching spans (or of table cells'
 /// spans) that holds `off`. An `off` at the end of a run counts as in it only if no run starts
 /// there.
+///
+/// A formula is a run of its own: it is selected whole (see [`formula_at`]), and the words
+/// beside it stop at it.
 fn extent(doc: &Doc, block: &Block, off: u32) -> Option<Range<u32>> {
     let around = |spans: &[Span], strict: bool| {
         let i = if strict {
@@ -156,11 +159,16 @@ fn extent(doc: &Doc, block: &Block, off: u32) -> Option<Range<u32>> {
             spans.iter().rposition(|s| s.end == off)?
         };
         let (mut a, mut b) = (i, i);
-        while a > 0 && spans[a - 1].end == spans[a].start {
-            a -= 1;
-        }
-        while b + 1 < spans.len() && spans[b].end == spans[b + 1].start {
-            b += 1;
+        if !is_formula(&spans[i]) {
+            while a > 0 && spans[a - 1].end == spans[a].start && !is_formula(&spans[a - 1]) {
+                a -= 1;
+            }
+            while b + 1 < spans.len()
+                && spans[b].end == spans[b + 1].start
+                && !is_formula(&spans[b + 1])
+            {
+                b += 1;
+            }
         }
         Some(spans[a].start..spans[b].end)
     };
@@ -171,6 +179,32 @@ fn extent(doc: &Doc, block: &Block, off: u32) -> Option<Range<u32>> {
         _ => around(doc.block_spans(block), strict),
     };
     find(true).or_else(|| find(false))
+}
+
+/// The span is a formula, which is selected whole.
+#[cfg(feature = "math")]
+fn is_formula(span: &Span) -> bool {
+    span.style & crate::doc::style::MATH != 0
+}
+
+#[cfg(not(feature = "math"))]
+fn is_formula(_: &Span) -> bool {
+    false
+}
+
+/// The formula of block `block` that byte `off` is in, if any.
+#[cfg(feature = "math")]
+fn formula_at(doc: &Doc, block: &Block, off: u32) -> Option<Range<u32>> {
+    let inside = |spans: &[Span]| {
+        spans
+            .iter()
+            .find(|s| s.start <= off && off < s.end && is_formula(s))
+            .map(|s| s.start..s.end)
+    };
+    match block.kind {
+        BlockKind::TableRow { .. } => doc.row_cells(block).find_map(|(_, spans)| inside(spans)),
+        _ => inside(doc.block_spans(block)),
+    }
 }
 
 /// What a character is, for deciding where a word ends.
@@ -265,6 +299,19 @@ pub fn word_unit(doc: &Doc, at: Pos) -> (Pos, Pos) {
     } else {
         at.off
     };
+    // A formula is one word: all of it.
+    #[cfg(feature = "math")]
+    if let Some(f) = formula_at(
+        doc,
+        block,
+        if at.off == END {
+            off.saturating_sub(1)
+        } else {
+            off
+        },
+    ) {
+        return (Pos::new(at.block, f.start), Pos::new(at.block, f.end));
+    }
     let Some(range) = extent(doc, block, off) else {
         return whole;
     };
@@ -289,6 +336,11 @@ fn snap(doc: &Doc, to: Pos, forward: bool) -> Pos {
     let Some(block) = doc.blocks.get(to.block as usize) else {
         return to;
     };
+    // Inside a formula: past its end going forward, before its start going back.
+    #[cfg(feature = "math")]
+    if let Some(f) = formula_at(doc, block, to.off).filter(|f| f.start < to.off) {
+        return Pos::new(to.block, if forward { f.end } else { f.start });
+    }
     let Some(range) = extent(doc, block, to.off).filter(|r| to.off < r.end) else {
         return to;
     };

@@ -516,12 +516,22 @@ impl BlockMarks<'_> {
     }
 
     /// Where the cluster that begins at `offs[k]` ends: where the next begins, or the span, but
-    /// no later than the first whitespace after its first character. The layout drops the
+    /// no later than the first whitespace after its first character; a formula's, at its end. The layout drops the
     /// whitespace at a break or the end of a line, and shaping never puts it in a cluster that
     /// is not its own (a space may have a combining mark with it).
     fn cluster_end(&self, offs: &[u32], k: usize) -> u32 {
         let at = offs[k];
         let span = self.spans[..self.spans.partition_point(|s| s.start <= at)].last();
+        // A drawn formula is one cluster, made from all of its source (one that isn't drawn is
+        // its text, cluster by cluster).
+        #[cfg(feature = "math")]
+        if let Some(s) = span.filter(|s| {
+            s.style & crate::doc::style::MATH != 0
+                && s.start == at
+                && offs.get(k + 1).is_none_or(|&next| next >= s.end)
+        }) {
+            return s.end;
+        }
         let limit = span
             .map_or(at, |s| s.end)
             .min(offs.get(k + 1).copied().unwrap_or(u32::MAX));

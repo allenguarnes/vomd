@@ -718,3 +718,26 @@ fn a_block_in_a_document_that_is_parsed_in_segments_copies_exactly() {
     );
     assert_eq!(buttons(&src), [long]);
 }
+
+#[cfg(feature = "math")]
+#[test]
+fn formulas_copy_with_their_delimiters() {
+    insta::assert_snapshot!(all_of(&[
+        "Inline $x^2$ and $`y`$ math\n",
+        "Before\n$$\n\\frac{a}{b}\n$$\nafter\n",
+        "> quoted $$z$$ math\n",
+        "- item\n\n  ```math\n  a + b\n  ```\n- next\n",
+        "## The $x$ case\n\n| $a$ | b $$c$$ |\n|---|---|\n",
+    ]));
+    // A formula is copied whole when its start is selected (it is one cluster, there), and
+    // not at all when it isn't, whatever offsets inside it the selection has.
+    assert_eq!(between("a $xyz$ b\n", "y", "z"), "");
+    assert_eq!(between("a $xyz$ b\n", "a", "y"), "a $xyz$");
+    assert_eq!(between("a $xyz$ b\n", "a", "b"), "a $xyz$ b");
+    assert_eq!(between("a $xyz$ b\n", "y", "b"), " b");
+    assert_eq!(
+        between("a\n\n$$\nxyz\n$$\n\nb\n", "a", "y"),
+        "a\n\n$$\nxyz\n$$"
+    );
+    assert_eq!(between("a\n\n$$\nxyz\n$$\n\nb\n", "y", "b"), "b");
+}

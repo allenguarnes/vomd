@@ -14,10 +14,12 @@ use std::{env, fs};
 mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
-const SIZE_BUDGET: [u64; 2] = [5_640_000, 3_000_000];
+// The default budget with math: 5,921,752 B measured, plus 20 KB, rounded up to 10 KB.
+const SIZE_BUDGET: [u64; 2] = [5_950_000, 3_000_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
-const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_500_000, 2_000_000];
+// The default budget with math: 4,661,248 B measured on Windows, plus 20 KB, rounded up to 10 KB.
+const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_690_000, 2_000_000];
 
 /// The size budgets of the system this runs on.
 fn size_budget() -> [u64; 2] {
@@ -49,7 +51,19 @@ const IMAGE_RSS_KB: u64 = 30_000 + IMAGE_CACHE_KB;
 
 /// The window the RSS budgets are specified for (logical pixels; the CI display is 1x).
 const BENCH_SIZE: &str = "1920x1080";
-const STARTUP_FIXTURES: &[&str] = &["tiny.md", "readme.md", "spec.md", "huge.md", "anim.md"];
+const STARTUP_FIXTURES: &[&str] = &[
+    "tiny.md",
+    "readme.md",
+    "spec.md",
+    "huge.md",
+    "anim.md",
+    "math.md",
+];
+/// `math_bench`: `math.md`'s 1,000 formulas laid out from an empty cache, and the slowest fuzz
+/// seed of the `math` target (parse, layout, fit and emit). Reported, not gated, until CI has
+/// measured them.
+const MATH_BENCH_MS: f64 = 30.0;
+const MATH_SEED_MS: f64 = 10.0;
 /// The warm start budget is for documents up to the CommonMark spec (200 KB): the 5 MB one is
 /// parsed whole before its first frame (≈ 37 ms of it), so it is held to the cold budget only
 /// and its warm start reported.
@@ -314,7 +328,13 @@ fn startup(bin: &Path, fixture: &Path) -> Option<(f64, f64, f64, u64)> {
 
 fn ensure_fixtures() {
     let dir = root().join("fixtures");
-    let made = ["huge.md", "medium.md", "anim.md", "anim/spin-20.gif"];
+    let made = [
+        "huge.md",
+        "medium.md",
+        "anim.md",
+        "anim/spin-20.gif",
+        "math.md",
+    ];
     if !made.iter().all(|f| dir.join(f).exists()) {
         fixtures();
     }
@@ -425,6 +445,27 @@ fn scroll_p95(fixture: &Path, args: &[&str], extra: &[&str], target_dir: &str) -
     print!("{text}");
     let line = text.lines().find(|l| l.starts_with("paint-bench "))?;
     field(line, "p95_ms")
+}
+
+/// `math_bench`'s cold time for `fixture`'s formulas and its slowest fuzz seed, in ms.
+fn math_bench(fixture: &Path) -> Option<(f64, f64)> {
+    let out = release_cargo()
+        .args([
+            "run",
+            "--release",
+            "--locked",
+            "--quiet",
+            "--target-dir",
+            "target",
+        ])
+        .args(["--example", "math_bench", "--"])
+        .arg(fixture)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    print!("{text}");
+    let line = text.lines().find(|l| l.starts_with("math-bench "))?;
+    Some((field(line, "cold_ms")?, field(line, "worst_seed_ms")?))
 }
 
 /// The peak RSS an RSS example reports in its `image-rss peak_rss_kb=N` line, in KB.
@@ -677,18 +718,29 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
         }
         let _ = fs::remove_dir_all(&config);
     }
-    // Both builds have a scroll budget; the default one's is held with animations playing too.
+    // Both builds have a scroll budget; the default one's is held with animations playing and
+    // through formulas too.
     let scrolls = BUILDS
         .into_iter()
         .map(|(label, extra, dir)| ("scroll frame, 4K", "readme.md", &[][..], label, extra, dir))
-        .chain([(
-            "scroll frame, 4K, animations playing",
-            "anim.md",
-            &["--view", "--animations"][..],
-            BUILDS[0].0,
-            BUILDS[0].1,
-            BUILDS[0].2,
-        )]);
+        .chain([
+            (
+                "scroll frame, 4K, animations playing",
+                "anim.md",
+                &["--view", "--animations"][..],
+                BUILDS[0].0,
+                BUILDS[0].1,
+                BUILDS[0].2,
+            ),
+            (
+                "scroll frame, 4K, math.md",
+                "math.md",
+                &[][..],
+                BUILDS[0].0,
+                BUILDS[0].1,
+                BUILDS[0].2,
+            ),
+        ]);
     for (metric, name, args, label, extra, dir) in scrolls {
         match scroll_p95(&fixture(name), args, extra, dir) {
             Some(p95) => gated_row(
@@ -708,6 +760,35 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
                 true,
             ),
         }
+    }
+    // 1,000 formulas, and the slowest formula there is.
+    match math_bench(&fixture("math.md")) {
+        Some((cold, worst)) => {
+            gated_row(
+                "1,000 formulas laid out, math.md".into(),
+                BUILDS[0].0,
+                format!("{cold:.1} ms"),
+                format!("≤ {MATH_BENCH_MS} ms (median of 10, cold)"),
+                cold <= MATH_BENCH_MS,
+                false,
+            );
+            gated_row(
+                "slowest math fuzz seed".into(),
+                BUILDS[0].0,
+                format!("{worst:.2} ms"),
+                format!("≤ {MATH_SEED_MS} ms"),
+                worst <= MATH_SEED_MS,
+                false,
+            );
+        }
+        None => gated_row(
+            "math_bench".into(),
+            BUILDS[0].0,
+            "no output".into(),
+            "a measurement".into(),
+            false,
+            true,
+        ),
     }
     // Memory with 50 images, from files and from a local server.
     let label = BUILDS[0].0;
@@ -1301,7 +1382,91 @@ fn fixtures() -> bool {
     fs::write(dir.join("medium.md"), &medium).expect("write medium.md");
     println!("wrote fixtures/medium.md ({} bytes)", medium.len());
     anim_fixtures(&dir);
+    math_fixture(&dir);
     true
+}
+
+/// `fixtures/math.md`: 1,000 formulas, each different (numbered), among text. Sections of a
+/// paragraph with three inline formulas and a display formula; every fifth section a matrix,
+/// every eighth a long `aligned` block (12 lines) and every twelfth a ```` ```math ```` fence.
+fn math_fixture(dir: &Path) {
+    const INLINE: [&str; 8] = [
+        r"x_{N}^2 + y_{N}^2",
+        r"\alpha_{N} \le \beta^{N}",
+        r"\frac{N}{N+1}",
+        r"\sqrt{N + x^2}",
+        r"\sum_{k=1}^{N} k",
+        r"e^{i \pi N}",
+        r"f(x) = \sin(N x)",
+        r"\binom{N}{2}",
+    ];
+    const DISPLAY: [&str; 6] = [
+        r"\int_0^{N} e^{-x^2}\,dx \approx \frac{\sqrt{\pi}}{2}",
+        r"\sum_{n=1}^{\infty} \frac{1}{n^{N}} = \zeta(N)",
+        r"f(x) = \frac{1}{\sigma\sqrt{2\pi}} \exp\left(-\frac{(x-N)^2}{2\sigma^2}\right)",
+        r"\lim_{n \to \infty} \left(1 + \frac{N}{n}\right)^n = e^{N}",
+        r"|x - N| = \begin{cases} x - N & \text{if } x \ge N \\ N - x & \text{otherwise} \end{cases}",
+        r"\nabla \times \vec{B}_{N} = \mu_0 \vec{J} + \mu_0 \varepsilon_0 \frac{\partial \vec{E}}{\partial t}",
+    ];
+    let mut out = String::from("# Math\n\n1,000 formulas, generated by `cargo xtask fixtures`.\n");
+    let mut n = 0;
+    let mut section = 0;
+    let next = |t: &str, n: &mut usize| {
+        *n += 1;
+        t.replace('N', &n.to_string())
+    };
+    while n + 4 <= 1000 {
+        section += 1;
+        out.push_str(&format!("\n## Section {section}\n\n"));
+        let a = next(INLINE[n % INLINE.len()], &mut n);
+        let b = next(INLINE[(n + 3) % INLINE.len()], &mut n);
+        let c = next(INLINE[(n + 5) % INLINE.len()], &mut n);
+        out.push_str(&format!(
+            "Some text with ${a}$ in it, then ${b}$, and a sentence long enough to wrap \
+             onto a second line before the third formula, ${c}$, ends it.\n\n"
+        ));
+        let d = next(DISPLAY[section % DISPLAY.len()], &mut n);
+        out.push_str(&format!("$$\n{d}\n$$\n"));
+        if section % 5 == 0 && n < 1000 {
+            n += 1;
+            let rows: Vec<String> = (0..4)
+                .map(|r| {
+                    (0..4)
+                        .map(|c| format!("a_{{{}{}}}^{{{n}}}", r + 1, c + 1))
+                        .collect::<Vec<_>>()
+                        .join(" & ")
+                })
+                .collect();
+            out.push_str(&format!(
+                "\n$$\nA_{{{n}}} = \\begin{{pmatrix}} {} \\end{{pmatrix}}\n$$\n",
+                rows.join(r" \\ ")
+            ));
+        }
+        if section % 8 == 0 && n < 1000 {
+            n += 1;
+            let lines: Vec<String> = (0..12)
+                .map(|k| {
+                    format!("&= \\frac{{{n} + {k}}}{{x^{{{k}}}}} + \\sum_{{i={k}}}^{{{n}}} i^2")
+                })
+                .collect();
+            out.push_str(&format!(
+                "\n$$\n\\begin{{aligned}}\nS_{{{n}}} {}\n\\end{{aligned}}\n$$\n",
+                lines.join(" \\\\\n")
+            ));
+        }
+        if section % 12 == 0 && n < 1000 {
+            let e = next(r"\mathbb{E}[X_{N}] = \sum_x x \, P(X_{N} = x)", &mut n);
+            out.push_str(&format!("\n```math\n{e}\n```\n"));
+        }
+    }
+    out.push('\n');
+    while n < 1000 {
+        let f = next(INLINE[n % INLINE.len()], &mut n);
+        out.push_str(&format!("And ${f}$. "));
+    }
+    out.push('\n');
+    fs::write(dir.join("math.md"), &out).expect("write math.md");
+    println!("wrote fixtures/math.md ({} bytes, {n} formulas)", out.len());
 }
 
 /// GIF-compress `px` (indices below `1 << min`): LZW of variable width, cleared when the table

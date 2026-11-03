@@ -161,6 +161,49 @@ const CASES: &[Case] = &[
         view: None,
         select: Some(("inline", "wrap onto")),
     },
+    // Math: inline in text, headings, lists, quotes and tables; display formulas, matrices,
+    // cases, aligned, a tag, wide formulas broken and one shrunk, errors.
+    #[cfg(feature = "math")]
+    Case {
+        name: "math-light",
+        fixture: "math-cases.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+        select: None,
+    },
+    #[cfg(feature = "math")]
+    Case {
+        name: "math-dark",
+        fixture: "math-cases.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &DARK,
+        view: None,
+        select: None,
+    },
+    #[cfg(feature = "math")]
+    Case {
+        name: "math-light-2x",
+        fixture: "math-cases.md",
+        width: 760.0,
+        scale: 2.0,
+        theme: &LIGHT,
+        view: None,
+        select: None,
+    },
+    // A selected formula: the fraction's bar is drawn over the wash.
+    #[cfg(all(feature = "math", feature = "clipboard"))]
+    Case {
+        name: "math-selected",
+        fixture: "math-cases.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+        select: Some(("the fraction", "end of selection")),
+    },
 ];
 
 /// `formats.md` with its images decoded by the viewer's own code: SVG drawn at the box (sharp
@@ -724,7 +767,10 @@ fn compare(expected: &[u8], actual: &[u8]) -> (usize, Vec<u8>) {
 
 #[test]
 fn goldens() {
-    let fonts = Fonts::new().unwrap();
+    #[allow(unused_mut)]
+    let mut fonts = Fonts::new().unwrap();
+    #[cfg(feature = "math")]
+    fonts.load_math();
     let bless = std::env::var_os("VOMD_BLESS").is_some_and(|v| v == "1");
     let out_dir = root().join("target/golden-out");
     let mut failures = Vec::new();

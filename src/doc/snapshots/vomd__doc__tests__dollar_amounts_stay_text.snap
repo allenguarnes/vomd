@@ -1,0 +1,17 @@
+---
+source: src/doc/tests.rs
+expression: "parse_all(&[\"It costs $5 and $10 today.\", \"From $5-$10 a day, or $20-$30.\",\n\"Escaped: \\\\$5 and \\\\$x$ and $x\\\\$ y\",\n\"A digit after the closer: $x$2, a letter: $x$y, a space: $x$ 2.\",\n\"$$5-$$10 is display math: the digit rule is for inline math.\",\n\"Lone $ sign, and a $ pair $.\",])"
+---
+== "It costs $5 and $10 today."
+P | "It costs $5 and $10 today."
+== "From $5-$10 a day, or $20-$30."
+P | "From $5-$10 a day, or $20-$30."
+== "Escaped: \\$5 and \\$x$ and $x\\$ y"
+P | "Escaped: $5 and $x$ and $x$ y"
+== "A digit after the closer: $x$2, a letter: $x$y, a space: $x$ 2."
+P | "A digit after the closer: $x$2, a letter: " [$]"x" "y, a space: " [$]"x" " 2."
+== "$$5-$$10 is display math: the digit rule is for inline math."
+Math | [$=]"5-"
+P | "10 is display math: the digit rule is for inline math."
+== "Lone $ sign, and a $ pair $."
+P | "Lone $ sign, and a $ pair $."

@@ -1,0 +1,8 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"a \\tag{1} \\tag{2}\", r\"\\text{$x$ \\\\ }\"], true)"
+---
+== a \tag{1} \tag{2}
+error: multiple \tag at 10..14 "\\tag"
+== \text{$x$ \\ }
+error: unknown command in text at 10..12 "\\\\"

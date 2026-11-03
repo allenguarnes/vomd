@@ -651,6 +651,28 @@ mod with_fonts {
         assert_eq!(buf[0], DARK.bg);
     }
 
+    /// The window loads the math face for a document with formulas, and keeps what it laid
+    /// out across a live reload and a resize: only a changed formula is laid out again.
+    #[cfg(feature = "math")]
+    #[test]
+    fn formulas_are_laid_out_once_per_window() {
+        let mut v = view("Plain text.\n", 600, 400);
+        assert_eq!(v.fonts.math(), None, "no formula, no math face");
+        let src = "A $x^2$ and\n\n$$\n\\frac{a}{b} \\tag{1}\n$$\n";
+        v.replace(Doc::parse(src), None);
+        settle(&mut v);
+        assert!(v.fonts.math().is_some());
+        let laid = v.math.borrow().laid;
+        assert_eq!(laid, 2);
+        v.replace(Doc::parse(src), None);
+        v.resize(300, 500);
+        settle(&mut v);
+        assert_eq!(v.math.borrow().laid, laid);
+        v.replace(Doc::parse(&src.replace("x^2", "x^3")), None);
+        settle(&mut v);
+        assert_eq!(v.math.borrow().laid, laid + 1);
+    }
+
     /// An edit above the heading being read doesn't move the text at the top of the window.
     #[test]
     fn reload_follows_the_heading() {

@@ -1,0 +1,32 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"\\begin{matrix} a & b \\\\ c & d \\end{matrix}\",\nr\"\\begin{pmatrix} 1 \\end{pmatrix} \\begin{bmatrix}1\\end{bmatrix} \\begin{Bmatrix}1\\end{Bmatrix}\",\nr\"\\begin{vmatrix}1\\end{vmatrix} \\begin{Vmatrix}1\\end{Vmatrix} \\begin{smallmatrix}a&b\\end{smallmatrix}\",\nr\"f(x) = \\begin{cases} 1 & x > 0 \\\\ 0 & \\text{otherwise} \\end{cases}\",\nr\"\\begin{dcases}a\\end{dcases} \\begin{rcases}a\\end{rcases}\",\nr\"\\begin{aligned} a &= b \\\\[2pt] &= c \\end{aligned}\",\nr\"\\begin{alignedat}{2} a &= b & c &= d \\end{alignedat}\",\nr\"\\begin{gathered} a \\\\ b \\end{gathered} \\begin{split} a &= b \\end{split}\",\nr\"\\begin{array}{l|c:r} \\hline a & b & c \\\\ \\hdashline d & e & f \\\\ \\hline \\end{array}\",\nr\"\\sum_{\\substack{0<i<m \\\\ 0<j<n}} P(i,j) \\begin{subarray}{l} a \\\\ b \\end{subarray}\",\nr\"\\begin{align} a &= b \\\\ c &= d \\end{align} \\begin{align*} x \\end{align*}\",\nr\"\\begin{gather} a \\end{gather} \\begin{equation*} E = mc^2 \\end{equation*}\",\nr\"a \\\\ b \\\\[1em] c \\tag{1.2}\", r\"x \\tag*{A}\",], true)"
+---
+== \begin{matrix} a & b \\ c & d \end{matrix}
+(matrix (cell a) (cell b) (row 0) (cell c) (cell d))
+== \begin{pmatrix} 1 \end{pmatrix} \begin{bmatrix}1\end{bmatrix} \begin{Bmatrix}1\end{Bmatrix}
+(pmatrix (cell 1)) (bmatrix (cell 1)) (bracematrix (cell 1))
+== \begin{vmatrix}1\end{vmatrix} \begin{Vmatrix}1\end{Vmatrix} \begin{smallmatrix}a&b\end{smallmatrix}
+(vmatrix (cell 1)) (doublevmatrix (cell 1)) (smallmatrix (cell a) (cell b))
+== f(x) = \begin{cases} 1 & x > 0 \\ 0 & \text{otherwise} \end{cases}
+f (:open x ):close =:rel (cases (cell 1) (cell x >:rel 0) (row 0) (cell 0) (cell (text "otherwise")))
+== \begin{dcases}a\end{dcases} \begin{rcases}a\end{rcases}
+(dcases (cell a)) (rcases (cell a))
+== \begin{aligned} a &= b \\[2pt] &= c \end{aligned}
+(aligned (cell a) (cell =:rel b) (row 0.2) (cell ) (cell =:rel c))
+== \begin{alignedat}{2} a &= b & c &= d \end{alignedat}
+(alignedat pairs=2 (cell a) (cell =:rel b) (cell c) (cell =:rel d))
+== \begin{gathered} a \\ b \end{gathered} \begin{split} a &= b \end{split}
+(gathered (cell a) (row 0) (cell b)) (split (cell a) (cell =:rel b))
+== \begin{array}{l|c:r} \hline a & b & c \\ \hdashline d & e & f \\ \hline \end{array}
+(array [Left, Rule { dashed: false }, Center, Rule { dashed: true }, Right] (hline) (cell a) (cell b) (cell c) (row 0) (hdashline) (cell d) (cell e) (cell f) (row 0) (hline))
+== \sum_{\substack{0<i<m \\ 0<j<n}} P(i,j) \begin{subarray}{l} a \\ b \end{subarray}
+(scripts (op:display ∑:op) ^_ _((substack (cell 0 <:rel i <:rel m) (row 0) (cell 0 <:rel j <:rel n)))) P (:open i ,:punct j ):close (subarray [Left] (cell a) (row 0) (cell b))
+== \begin{align} a &= b \\ c &= d \end{align} \begin{align*} x \end{align*}
+(align (cell a) (cell =:rel b) (row 0) (cell c) (cell =:rel d)) (align (cell x))
+== \begin{gather} a \end{gather} \begin{equation*} E = mc^2 \end{equation*}
+(gather (cell a)) (equation (cell E =:rel m (scripts c ^2 __)))
+== a \\ b \\[1em] c \tag{1.2}
+a (newline) b (newline) c (tag (text "1.2"))
+== x \tag*{A}
+x (tag* (text "A"))

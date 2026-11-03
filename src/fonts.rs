@@ -165,11 +165,19 @@ pub struct Fonts {
     icons: FaceId,
     /// Fallback faces in the order they were added.
     fallbacks: Vec<FaceId>,
+    /// The math face: not looked for yet (`None`), or what was found (see [`Fonts::load_math`]).
+    #[cfg(feature = "math")]
+    math: Option<Option<FaceId>>,
 }
 
 /// Toolbar and button icons (`scripts/subset-icons.sh`): 13 Lucide glyphs, 4 KB, so they are
 /// embedded even without `embed-fonts` (no system font has them).
 static ICONS: &[u8] = include_bytes!("../assets/fonts/icons.ttf");
+
+/// The math face (`scripts/subset-math-font.sh`): STIX Two Math, with the MATH table that
+/// formulas are laid out by. It is added to the faces at the first formula, not at startup.
+#[cfg(all(feature = "math", feature = "embed-fonts"))]
+static MATH: &[u8] = include_bytes!("../assets/fonts/STIXTwoMath-Regular.otf");
 
 #[cfg(feature = "embed-fonts")]
 static EMBEDDED: [(Slot, &[u8]); 6] = [
@@ -215,6 +223,8 @@ impl Fonts {
             slots,
             defaults: slots,
             fallbacks: Vec::new(),
+            #[cfg(feature = "math")]
+            math: None,
         })
     }
 
@@ -269,6 +279,8 @@ impl Fonts {
             defaults: [FaceId(0); 6],
             icons: FaceId(0),
             fallbacks: Vec::new(),
+            #[cfg(feature = "math")]
+            math: None,
         };
         let mut loaded: [Option<FaceId>; 6] = [None; 6];
         for (i, names) in NAMES.iter().enumerate() {
@@ -300,6 +312,69 @@ impl Fonts {
     /// The toolbar's icon face.
     pub fn icons(&self) -> FaceId {
         self.icons
+    }
+
+    /// The math face, adding it the first time: the embedded STIX Two Math, or without
+    /// `embed-fonts` an installed math font, found by file name. `None` if there is none (or
+    /// the file has no MATH table): formulas are then shown as their source.
+    #[cfg(feature = "math")]
+    pub fn load_math(&mut self) -> Option<FaceId> {
+        if let Some(found) = self.math {
+            return found;
+        }
+        let found = self.find_math();
+        self.math = Some(found);
+        found
+    }
+
+    /// How many faces there are: more once fallbacks are added (a formula with characters no
+    /// face had is laid out again then, see [`crate::math::Cache`]).
+    #[cfg(feature = "math")]
+    pub fn faces_len(&self) -> usize {
+        self.faces.len()
+    }
+
+    /// The math face, if [`Fonts::load_math`] has added it.
+    #[cfg(feature = "math")]
+    pub fn math(&self) -> Option<FaceId> {
+        self.math.flatten()
+    }
+
+    #[cfg(all(feature = "math", feature = "embed-fonts"))]
+    fn find_math(&mut self) -> Option<FaceId> {
+        if self.faces.len() >= u16::MAX as usize {
+            return None;
+        }
+        self.faces
+            .push(Face::new(Data::Static(MATH), 0, None).expect("embedded math font"));
+        Some(FaceId(self.faces.len() as u16 - 1))
+    }
+
+    /// The first of the well-known math fonts that is installed, if it has a MATH table.
+    #[cfg(all(feature = "math", not(feature = "embed-fonts")))]
+    fn find_math(&mut self) -> Option<FaceId> {
+        const NAMES: &[&str] = &[
+            "STIXTwoMath-Regular.otf",
+            "STIXTwoMath.otf", // macOS
+            "latinmodern-math.otf",
+            "NewCMMath-Regular.otf",
+            "NewCMMath-Book.otf",
+            "texgyretermes-math.otf",
+            "texgyrepagella-math.otf",
+            "texgyreschola-math.otf",
+            "texgyrebonum-math.otf",
+            "texgyredejavu-math.otf",
+            "DejaVuMathTeXGyre.ttf",
+            "NotoSansMath-Regular.ttf",
+            "cambria.ttc", // Windows: Cambria Math is its second face
+        ];
+        let path = crate::text::fallback::find_file(NAMES)?;
+        let cambria = path
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("cambria.ttc"));
+        let id = self.face_for(&path, cambria as u32)?;
+        let math = self.face(id).font().table(swash::tag_from_bytes(b"MATH"));
+        math.is_some().then_some(id)
     }
 
     pub fn face(&self, id: FaceId) -> &Face {
@@ -604,6 +679,24 @@ mod tests {
         assert_eq!(fonts.slots, defaults);
     }
 
+    #[cfg(feature = "math")]
+    #[test]
+    fn the_math_face_loads_once_when_asked() {
+        let mut fonts = Fonts::new().unwrap();
+        let n = fonts.faces.len();
+        assert_eq!(fonts.math(), None, "not at startup");
+        let id = fonts.load_math().expect("embedded");
+        assert_eq!(fonts.faces.len(), n + 1);
+        assert_eq!(fonts.load_math(), Some(id));
+        assert_eq!((fonts.math(), fonts.faces.len()), (Some(id), n + 1));
+        let face = fonts.face(id);
+        assert!(face.font().table(swash::tag_from_bytes(b"MATH")).is_some());
+        assert_ne!(face.glyph('∫'), 0);
+        assert_ne!(face.glyph('\u{1D53C}'), 0, "double-struck E");
+        // Not a face text falls back to: math has its own glyphs and metrics.
+        assert!(fonts.sources().is_empty() && !fonts.fallbacks.contains(&id));
+    }
+
     const BOX: char = '\u{2500}';
 
     #[test]
@@ -674,5 +767,25 @@ mod tests {
         assert!(!face.covers_sequence('q', &['\u{0301}']));
         assert!(!face.covers_sequence('中', &[]));
         assert!(face.covers_sequence('q', &[]));
+    }
+}
+
+#[cfg(all(test, feature = "math", not(feature = "embed-fonts")))]
+mod system_math_tests {
+    use super::*;
+
+    /// Whatever is installed: a math face that is found has a MATH table, and is looked for
+    /// once.
+    #[test]
+    fn an_installed_math_face_has_a_math_table() {
+        let Ok(mut fonts) = Fonts::new() else { return };
+        let found = fonts.load_math();
+        let n = fonts.faces.len();
+        assert_eq!(fonts.load_math(), found);
+        assert_eq!(fonts.faces.len(), n);
+        if let Some(id) = found {
+            let font = fonts.face(id).font();
+            assert!(font.table(swash::tag_from_bytes(b"MATH")).is_some());
+        }
     }
 }

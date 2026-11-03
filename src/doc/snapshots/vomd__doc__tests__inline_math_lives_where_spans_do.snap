@@ -1,0 +1,31 @@
+---
+source: src/doc/tests.rs
+expression: "parse_all(&[\"## The $x^2$ case\\n\\n## The $x^2$ case\",\n\"| $a$ | $b$ $c$ |\\n|---|---|\\n| $\\\\vert x\\\\vert$ | **$d$** |\",\n\"- $a$\\n  - $b$\\n\\n> $c$\\n>\\n> > $d$\",\n\"Ref[^n] and [a $x$ link](u) and ![alt $y$](i.png)\\n\\n[^n]: $z$ in a note\",\n\"$a$$b$ and $a$ $b$\", \"*emphasis $x$* and <b>html $y$</b> and `code $z$`\",])"
+---
+== "## The $x^2$ case\n\n## The $x^2$ case"
+H2 | "The " [$]"x^2" " case"
+H2 | "The " [$]"x^2" " case"
+anchor #the-x2-case -> 0
+anchor #the-x2-case-1 -> 1
+== "| $a$ | $b$ $c$ |\n|---|---|\n| $\\vert x\\vert$ | **$d$** |"
+Row(t0,head) | [ [$]"a" ] [ [$]"b" " " [$]"c" ]
+Row(t0) | [ [$]"\\vert x\\vert" ] [ [B$]"d" ]
+== "- $a$\n  - $b$\n\n> $c$\n>\n> > $d$"
+P list=1 Bullet | [$]"a"
+P list=2 Bullet | [$]"b"
+P quote=1 qstart=1 | [$]"c"
+P quote=2 qstart=2 | [$]"d"
+== "Ref[^n] and [a $x$ link](u) and ![alt $y$](i.png)\n\n[^n]: $z$ in a note"
+P | "Ref" [LF1]"1" " and " [L2]"a " [L$2]"x" [L2]" link" " and " [Mm1]"alt $y$"
+Rule |
+P Footnote(1) | [$]"z" " in a note" [L3]" ↩"
+link 1: #fn-n
+link 2: u
+link 3: #fnref-n
+image 1: i.png remote=false
+anchor #fnref-n -> 0
+anchor #fn-n -> 2
+== "$a$$b$ and $a$ $b$"
+P | [$]"a" [$]"b" " and " [$]"a" " " [$]"b"
+== "*emphasis $x$* and <b>html $y$</b> and `code $z$`"
+P | [I]"emphasis " [I$]"x" " and " [B]"html " [B$]"y" " and " [C]"code $z$"

@@ -270,6 +270,17 @@ impl TextCursor {
         match block.kind {
             BlockKind::Rule => return false,
             BlockKind::AlertTitle(alert) => body.push_str(alert_label(alert)),
+            // A whole display formula pastes back as one, on lines of its own.
+            #[cfg(feature = "math")]
+            BlockKind::Math
+                if spans
+                    .first()
+                    .is_some_and(|s| from <= s.start && s.start < to) =>
+            {
+                body.push_str("$$\n");
+                body.push_str(&doc.text[spans[0].start as usize..spans[0].end as usize]);
+                body.push_str("\n$$");
+            }
             _ => text_of(
                 doc,
                 spans,
@@ -509,10 +520,26 @@ fn alert_label(alert: Alert) -> &'static str {
 }
 
 /// The text of `spans` (the ones from `doc.spans[base..]`) that starts in `from..to`, as it is
-/// read: no markup, a footnote's number in brackets (so it doesn't glue onto the word), and
-/// no "↩" back to the reference.
+/// read: no markup, a footnote's number in brackets (so it doesn't glue onto the word), a
+/// whole formula in its delimiters (so it pastes back as one), and no "↩" back to the
+/// reference.
 fn text_of(doc: &Doc, spans: &[Span], base: usize, (from, to): (u32, u32), out: &mut String) {
     for (i, s) in spans.iter().enumerate() {
+        // A formula is one cluster, at its start: all of it is selected, or none.
+        #[cfg(feature = "math")]
+        if s.style & style::MATH != 0 {
+            if from <= s.start && s.start < to {
+                let d = if s.style & style::DISPLAY != 0 {
+                    "$$"
+                } else {
+                    "$"
+                };
+                out.push_str(d);
+                out.push_str(&doc.text[s.start as usize..s.end as usize]);
+                out.push_str(d);
+            }
+            continue;
+        }
         let (mut a, mut z) = (s.start.max(from), s.end.min(to));
         if a >= z || is_backlink(doc, base + i) {
             continue;

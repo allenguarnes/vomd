@@ -1,0 +1,22 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"\\href{x}{y}\", r\"\\ce{H2O}\", r\"\\verb|x|\", r\"\\cancel{x}\",\nr\"\\newcommand{\\x}{y}\", r\"\\begin{CD} A \\end{CD}\", r\"\\genfrac{x}{)}{}{}{a}{b}\",\nr\"\\begin{matrix*}[x] a \\end{matrix*}\", r\"\\begin{multline} a \\end{multline}\",],\nfalse)"
+---
+== \href{x}{y}
+error: unknown command at 0..5 "\\href"
+== \ce{H2O}
+error: unknown command at 0..3 "\\ce"
+== \verb|x|
+error: unknown command at 0..5 "\\verb"
+== \cancel{x}
+error: unknown command at 0..7 "\\cancel"
+== \newcommand{\x}{y}
+error: unknown command at 0..11 "\\newcommand"
+== \begin{CD} A \end{CD}
+error: unknown environment at 0..6 "\\begin"
+== \genfrac{x}{)}{}{}{a}{b}
+error: not a delimiter at 0..8 "\\genfrac"
+== \begin{matrix*}[x] a \end{matrix*}
+error: bad column spec at 0..6 "\\begin"
+== \begin{multline} a \end{multline}
+error: environment only allowed in display math at 0..6 "\\begin"

@@ -1,0 +1,34 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"a \\bmod b\", r\"a \\equiv b \\pmod{n}\", r\"a \\mod n\",\nr\"{\\rm d}x {\\bf x}\\it y\", r\"\\tiny x \\Huge y\",\nr\"\\mathllap{a} \\mathrlap{b} \\clap{c}\",\nr\"\\fbox{a} \\colorbox{red}{b} \\fcolorbox{a}{b}{c} \\strut \\mathstrut\",\nr\"\\Bbb R \\bold{x} \\pmb{y}\",\nr\"\\genfrac(){0pt}{}{a}{b} \\genfrac{[}{]}{1pt}{0}{a}{b} {a \\above 1pt b}\",\nr\"\\llbracket \\rrbracket \\iddots \\lang \\rang\",\nr\"\\varliminf \\varlimsup \\xlongequal{a} \\utilde{x}\",\nr\"\\eqref{e} \\ref{r} \\argmax \\injlim \\sh\",\nr\"\\begin{matrix*}[r] a \\end{matrix*} \\begin{pmatrix*}b\\end{pmatrix*}\",\nr\"\\begin{multline} a \\\\ b \\end{multline}\",\nr\"\\begin{eqnarray} a & = & b \\end{eqnarray}\",], true)"
+---
+== a \bmod b
+a (class:bin "mod") b
+== a \equiv b \pmod{n}
+a ≡:rel b ((space 18mu) (:open "mod" (space 6mu) (n) ):close)
+== a \mod n
+a ((space 18mu) "mod" (space 6mu) n)
+== {\rm d}x {\bf x}\it y
+((switch roman) d) x ((switch bold) x) (switch italic) y
+== \tiny x \Huge y
+x y
+== \mathllap{a} \mathrlap{b} \clap{c}
+(lap left (a)) (lap right (b)) (lap centre (text "c"))
+== \fbox{a} \colorbox{red}{b} \fcolorbox{a}{b}{c} \strut \mathstrut
+(boxed (text "a")) (text "b") (boxed (text "c")) (rule 0 1.2 -0.36) (rule 0 1 -0.25)
+== \Bbb R \bold{x} \pmb{y}
+(doublestruck R) (bold (x)) (bold (y))
+== \genfrac(){0pt}{}{a}{b} \genfrac{[}{]}{1pt}{0}{a}{b} {a \above 1pt b}
+(frac nobar () (a) (b)) (frac rule=0.1 Display [] (a) (b)) ((frac rule=0.1 (a) (b)))
+== \llbracket \rrbracket \iddots \lang \rang
+⟦:open ⟧:close ⋰:inner ⟨:open ⟩:close
+== \varliminf \varlimsup \xlongequal{a} \utilde{x}
+(op:display (underline "lim")) (op:display (overline "lim")) (xarrow = ^(a) __) (accent:underarrow u+0303 (x))
+== \eqref{e} \ref{r} \argmax \injlim \sh
+"(e)" "r" (op:display "arg max") (op:display "inj lim") (op:never "sh")
+== \begin{matrix*}[r] a \end{matrix*} \begin{pmatrix*}b\end{pmatrix*}
+(matrix [Right] (cell a)) (pmatrix (cell b))
+== \begin{multline} a \\ b \end{multline}
+(gather (cell a) (row 0) (cell b))
+== \begin{eqnarray} a & = & b \end{eqnarray}
+(eqnarray (cell a) (cell =:rel) (cell b))

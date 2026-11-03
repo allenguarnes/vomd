@@ -53,8 +53,13 @@ required-features = ["clipboard"]
 name = "find_bench"
 required-features = ["find"]
 
+# 1,000 formulas laid out, cold and warm (fixtures/math.md).
+[[example]]
+name = "math_bench"
+required-features = ["math", "embed-fonts"]
+
 [features]
-default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find"]
+default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find", "math"]
 # Text selection and copy, and paste into the find bar. The X11 and Wayland clipboards use crates
 # that winit already brings in; the minimal build leaves all of it out.
 clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayland-protocols"]
@@ -62,6 +67,9 @@ clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayl
 toc = []
 # Find in page (Ctrl+F). No crates, and little code: the minimal build leaves it out.
 find = []
+# LaTeX math ($…$, $$…$$, $`…`$, ```math): VOMD's own layout engine, no crates. With embed-fonts,
+# the STIX Two Math subset (143 KB) is embedded; without it, an installed math font is used.
+math = []
 images = ["dep:png", "dep:zune-jpeg", "dep:gif", "dep:image-webp"]
 # SVG and svgz images, with resvg (vendored, see [patch.crates-io]).
 svg = ["images", "dep:resvg", "dep:flate2", "dep:simplecss"]

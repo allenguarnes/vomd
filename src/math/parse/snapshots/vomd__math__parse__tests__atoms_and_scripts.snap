@@ -1,0 +1,37 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[\"x+1=y\", \"a-b\", r\"\\alpha\\leq\\beta, x\\in A\", \"x^2_i\", \"x_i^2\",\n\"x^{y^z}\", \"^2 x\", \"{}_1^2\", \"f'(x) + f''\", \"x'^2_i\",\nr\"\\sum_{i=0}^n \\sum\\limits_i \\int\\nolimits_0 \\prod\",\nr\"\\sin x \\lim_{n\\to\\infty} \\operatorname{tr} A \\operatorname*{argmax}_x\",\nr\"\\mathop{x}_1 \\mathbin{\\star} \\mathrel{R}\", r\"\\not= \\not\\in\",\n\"x % comment\\n + y\", \"中 → ≤\",], false)"
+---
+== x+1=y
+x +:bin 1 =:rel y
+== a-b
+a −:bin b
+== \alpha\leq\beta, x\in A
+α ≤:rel β ,:punct x ∈:rel A
+== x^2_i
+(scripts x ^2 _i)
+== x_i^2
+(scripts x ^2 _i)
+== x^{y^z}
+(scripts x ^((scripts y ^z __)) __)
+== ^2 x
+(scripts _ ^2 __) x
+== {}_1^2
+(scripts () ^2 _1)
+== f'(x) + f''
+(scripts f ^_ __ '1) (:open x ):close +:bin (scripts f ^_ __ '2)
+== x'^2_i
+(scripts x ^2 _i '1)
+== \sum_{i=0}^n \sum\limits_i \int\nolimits_0 \prod
+(scripts (op:display ∑:op) ^n _(i =:rel 0)) (scripts (op:always ∑:op) ^_ _i) (scripts (op:never ∫:op) ^_ _0) (op:display ∏:op)
+== \sin x \lim_{n\to\infty} \operatorname{tr} A \operatorname*{argmax}_x
+(op:never "sin") x (scripts (op:display "lim") ^_ _(n →:rel ∞)) (op:never (roman (t r))) A (scripts (op:display (roman (a r g m a x))) ^_ _x)
+== \mathop{x}_1 \mathbin{\star} \mathrel{R}
+(scripts (op:display (x)) ^_ _1) (class:bin (⋆:bin)) (class:rel (R))
+== \not= \not\in
+(not =:rel) (not ∈:rel)
+== x % comment
+ + y
+x +:bin y
+== 中 → ≤
+中 →:rel ≤:rel

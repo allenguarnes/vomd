@@ -1,0 +1,1 @@
+\begin{array}{l|c} a & b \\ \hline c & d \end{array} \begin{cases} 1 & x \\ 0 \end{cases} \begin{aligned} a &= b \\[2pt] &= c \end{aligned}

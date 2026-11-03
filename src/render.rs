@@ -561,12 +561,53 @@ fn paint_block_marked(
             frame.fill_rect(x0, px(oy + y0), x1, px(oy + y1), color);
         });
     }
+    #[cfg(feature = "math")]
+    for r in &content.ink {
+        let (x0, x1) = span(ox + r.x, r.w);
+        let (y0, y1) = span(oy + r.y, r.h);
+        if y1 > clip.y0 && y0 < clip.y1 {
+            frame.fill_rect(x0, y0, x1, y1, theme.color(r.role));
+        }
+    }
+    #[cfg(feature = "math")]
+    let (mut cuts, mut cut_on, mut i) = (content.cuts.iter().peekable(), false, 0usize);
     for g in &content.glyphs {
+        // A piece of a stretched delimiter is drawn only in its band.
+        #[cfg(feature = "math")]
+        {
+            if std::mem::take(&mut cut_on) {
+                frame.set_clip(clip);
+            }
+            while cuts.next_if(|c| (c.glyph as usize) < i).is_some() {}
+            if let Some(c) = cuts.next_if(|c| c.glyph as usize == i) {
+                let band = if c.vertical {
+                    Clip {
+                        y0: px(oy + c.lo),
+                        y1: px(oy + c.hi),
+                        ..clip
+                    }
+                } else {
+                    Clip {
+                        x0: px(ox + c.lo),
+                        x1: px(ox + c.hi),
+                        ..clip
+                    }
+                };
+                frame.set_clip(clip.intersect(band));
+                cut_on = true;
+            }
+            i += 1;
+        }
         let style = &content.styles[g.style as usize];
         let baseline = px(oy + g.y);
-        // Glyphs reach at most about one size above and below their baseline.
+        // Glyphs reach at most about one size above and below their baseline; the biggest
+        // size variants of a math font's radicals and brackets, 2.6 em.
         // (Capped, with `baseline` within i32/2: the sums below can't overflow.)
-        let reach = style.size.min(1e6) as i32 * 2 + 2;
+        #[cfg(feature = "math")]
+        const REACH: i32 = 3;
+        #[cfg(not(feature = "math"))]
+        const REACH: i32 = 2;
+        let reach = style.size.min(1e6) as i32 * REACH + 2;
         if baseline + reach < clip.y0 || baseline - reach >= clip.y1 {
             continue;
         }
@@ -594,6 +635,10 @@ fn paint_block_marked(
                 theme.color(style.role),
             );
         }
+    }
+    #[cfg(feature = "math")]
+    if cut_on {
+        frame.set_clip(clip);
     }
 }
 

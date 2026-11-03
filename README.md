@@ -36,7 +36,7 @@
 ## Why VOMD
 
 - **Fast.** Opens in milliseconds; a 5 MB document opens in under 100 ms.
-- **Small.** One file with its fonts built in: 5.6 MB on Linux, 4.3 MB on Windows. No web
+- **Small.** One file with its fonts built in: 5.9 MB on Linux, 4.7 MB on Windows. No web
   engine, no GUI toolkit, nothing else to install.
 - **Private.** Never touches the network unless you ask it to, and never runs a document's HTML.
 - **Just a viewer.** No editor, no workspace, no accounts. Open a file, read it, close it.
@@ -47,6 +47,9 @@
   (`> [!NOTE]`), autolinks and hidden YAML front matter.
 - **Light and dark themes** that follow your system, zoom from 50% to 300%, and sharp text on
   HiDPI screens.
+- **Math:** LaTeX formulas, written as on GitHub: `$…$` and `` $`…`$ `` in the text, `$$…$$`
+  and ```` ```math ```` blocks centred on a line of their own. VOMD lays them out itself, with a
+  built-in math font.
 - **Images:** PNG, JPEG, GIF, WebP and SVG, local or remote. Animated GIFs and WebPs can play
   (off by default, press `A`).
 - **Links:** `#anchors` scroll, links to other `.md` files open in the same window (with Back),
@@ -256,7 +259,14 @@ VOMD makes no network requests of its own.
 
 - macOS isn't supported yet. The code compiles there, but it's untested.
 - No screen reader support.
-- Math and Mermaid diagrams show as plain text and code.
+- Mermaid diagrams show as code.
+- Math: formulas use a common subset of LaTeX math, about what KaTeX reads. Anything else shows
+  its source in red: macros (`\newcommand`, `\def`), `\href`, `\url`, `\ce`, `\verb`,
+  `\cancel` and the `CD` environment, for example. `\color` and the colors of `\colorbox` are
+  ignored, the size switches (`\tiny` to `\Huge`) do nothing, and `multline` is set as `gather`.
+  A `|` in a formula in a table cell ends the cell, as on GitHub; write `\vert` instead. A `$…$`
+  whose closing `$` is followed right away by a digit stays text, so a price range like
+  `$5-$10` isn't read as math.
 - AVIF, HEIC, BMP, TIFF and ICO images show their alt text.
 - Drag and drop doesn't work on Wayland; use `Ctrl+O` there.
 - Text can't be selected with the keyboard (`Shift` + arrows).
@@ -282,5 +292,5 @@ ships.
 
 ## License
 
-[MIT](LICENSE). The built-in fonts are Inter and JetBrains Mono (SIL OFL 1.1), and the icons are
-from Lucide (ISC); their licenses are in [`assets/fonts/`](assets/fonts/).
+[MIT](LICENSE). The built-in fonts are Inter, JetBrains Mono and STIX Two Math (SIL OFL 1.1), and
+the icons are from Lucide (ISC); their licenses are in [`assets/fonts/`](assets/fonts/).

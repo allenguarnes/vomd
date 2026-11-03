@@ -1,0 +1,34 @@
+---
+source: src/copy/tests.rs
+expression: "all_of(&[\"Inline $x^2$ and $`y`$ math\\n\",\n\"Before\\n$$\\n\\\\frac{a}{b}\\n$$\\nafter\\n\", \"> quoted $$z$$ math\\n\",\n\"- item\\n\\n  ```math\\n  a + b\\n  ```\\n- next\\n\",\n\"## The $x$ case\\n\\n| $a$ | b $$c$$ |\\n|---|---|\\n\",])"
+---
+source: "Inline $x^2$ and $`y`$ math\n"
+│ Inline $x^2$ and $y$ math
+source: "Before\n$$\n\\frac{a}{b}\n$$\nafter\n"
+│ Before
+│ 
+│ $$
+│ \frac{a}{b}
+│ $$
+│ 
+│ after
+source: "> quoted $$z$$ math\n"
+│ > quoted
+│ >
+│ > $$
+│ > z
+│ > $$
+│ >
+│ > math
+source: "- item\n\n  ```math\n  a + b\n  ```\n- next\n"
+│ - item
+│ 
+│   $$
+│   a + b
+│   $$
+│ 
+│ - next
+source: "## The $x$ case\n\n| $a$ | b $$c$$ |\n|---|---|\n"
+│ The $x$ case
+│ 
+│ $a$→b $$c$$

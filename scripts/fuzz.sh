@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Run a fuzz target (fuzz/fuzz_targets/) on the stable toolchain: libFuzzer with the same
 # coverage instrumentation cargo-fuzz uses, without a sanitizer (cargo-fuzz needs nightly for
-# ASan; CI's nightly job uses it). Usage: scripts/fuzz.sh <doc|image|anim|layout|settings|svg> [seconds]
+# ASan; CI's nightly job uses it). Usage: scripts/fuzz.sh <doc|image|anim|layout|math|settings|svg> [seconds]
 set -euo pipefail
-target=${1:?usage: scripts/fuzz.sh <doc|image|anim|layout|settings|svg> [seconds]}
+target=${1:?usage: scripts/fuzz.sh <doc|image|anim|layout|math|settings|svg> [seconds]}
 secs=${2:-60}
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root/fuzz"
@@ -16,6 +16,7 @@ RUSTFLAGS="--cfg fuzzing -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-
 case $target in
     doc | image | anim | svg) max_len=65536 ;;
     layout) max_len=16384 ;;
+    math) max_len=8200 ;; # a formula is at most 8 KiB (math::MAX_SOURCE), plus the mode byte
     *) max_len=4096 ;;
 esac
 # An SVG that takes long to draw is what the `svg` target looks for.
@@ -24,21 +25,23 @@ extra=()
 if [ "$target" = svg ]; then
     timeout=5
     extra=(-dict=svg.dict)
+elif [ "$target" = math ]; then
+    extra=(-dict=math.dict)
 fi
 corpus="corpus/$target"
 mkdir -p "$corpus" "artifacts/$target"
 # Seeds: the fixtures for the Markdown targets, the images for `image` (the SVGs for `svg`, the
-# GIFs and WebPs for `anim`), and
-# seeds/<target>/: the sample files of the
-# settings, and the inputs of past findings (also run as tests). The seeds go in every run, so
-# a finding is run also from a corpus that was seeded before it.
+# GIFs and WebPs for `anim`), and seeds/<target>/: the sample files of the settings, sample
+# formulas for `math`, Markdown with math for `doc` and `layout`, and the inputs of past
+# findings (also run as tests). The seeds go in
+# every run, so a finding is run also from a corpus that was seeded before it.
 if [ "$target" = image ] && [ -z "$(ls -A "$corpus")" ]; then
     cp "$root"/fixtures/images/* "$corpus/"
 elif [ "$target" = svg ] && [ -z "$(ls -A "$corpus")" ]; then
     cp "$root"/fixtures/images/*.svg* "$corpus/"
 elif [ "$target" = anim ] && [ -z "$(ls -A "$corpus")" ]; then
     cp "$root"/fixtures/images/*.gif "$root"/fixtures/images/*.webp "$corpus/"
-elif [ "$target" != settings ] && [ -z "$(ls -A "$corpus")" ]; then
+elif [ "$target" != settings ] && [ "$target" != math ] && [ -z "$(ls -A "$corpus")" ]; then
     for f in "$root"/fixtures/*.md; do
         if [ "$(stat -c %s "$f")" -le "$max_len" ]; then cp "$f" "$corpus/"; fi
     done

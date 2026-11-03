@@ -626,3 +626,17 @@ fn keys_and_the_aimed_mark_reach_headings_without_a_slug() {
     assert_eq!(v.toc.aimed, Some((block, v.anchor())));
     assert_eq!(v.toc_current(), Some(1));
 }
+
+/// A formula in a heading is its source in the panel, without its dollars, as the slug is.
+#[cfg(feature = "math")]
+#[test]
+fn a_heading_with_math_shows_its_source() {
+    let doc = Doc::parse("## The $x^2$ case\n\n## $$\\frac{a}{b}$$ and $`c`$\n");
+    assert_eq!(heading_text(&doc, doc.headings[0].block), "The x^2 case");
+    assert_eq!(
+        heading_text(&doc, doc.headings[1].block),
+        "\\frac{a}{b} and c"
+    );
+    assert_eq!(doc.headings[0].slug, "the-x2-case");
+    assert_eq!(doc.headings[1].slug, "fracab-and-c");
+}

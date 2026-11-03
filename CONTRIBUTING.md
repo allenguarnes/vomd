@@ -9,6 +9,7 @@ Thanks for your interest in VOMD! Bug reports, ideas and pull requests are all w
 - [Performance budgets](#performance-budgets)
 - [Fuzzing](#fuzzing)
 - [Cargo features](#cargo-features)
+- [Fonts](#fonts)
 - [Packaging](#packaging)
 - [Vendored crates](#vendored-crates)
 - [Pull requests](#pull-requests)
@@ -91,8 +92,8 @@ If your change makes VOMD bigger or slower, say so in the pull request, with num
 ## Fuzzing
 
 `just fuzz <target> [seconds]` runs a fuzz target from `fuzz/fuzz_targets/` on the stable
-toolchain. The targets are `doc`, `image`, `anim`, `layout`, `settings` and `svg`. A nightly CI job
-also fuzzes every target with AddressSanitizer. A crash leaves its input in `fuzz/artifacts/`;
+toolchain. The targets are `doc`, `image`, `anim`, `layout`, `math`, `settings` and `svg`. A
+nightly CI job also fuzzes every target with AddressSanitizer. A crash leaves its input in `fuzz/artifacts/`;
 add it to `fuzz/seeds/<target>/` with the fix, and add a test for it.
 
 ## Cargo features
@@ -108,13 +109,25 @@ All features are on by default. Turning some off makes a smaller binary:
 | `clipboard` | Selecting and copying text |
 | `toc` | The contents panel |
 | `find` | Find in page |
+| `math` | LaTeX math, with the STIX Two Math font when `embed-fonts` is on (an installed math font otherwise) |
 
 ```sh
-# Without SVG (SVGs show their alt text), about 4.1 MB on Linux:
-cargo build --release --no-default-features --features images,remote-images,embed-fonts,clipboard,toc,find
+# Without SVG (SVGs show their alt text), about 4.5 MB on Linux:
+cargo build --release --no-default-features --features images,remote-images,embed-fonts,clipboard,toc,find,math
+# Without math (formulas show as their source), about 5.6 MB on Linux:
+cargo build --release --no-default-features --features images,remote-images,svg,embed-fonts,clipboard,toc,find
 # The smallest build: no images and system fonts only, about 3.0 MB on Linux and 1.9 MB on Windows:
 cargo build --release --no-default-features
 ```
+
+## Fonts
+
+The built-in fonts in `assets/fonts/` are subsets, made once and committed; nothing is
+downloaded or subset at build time. `just fonts <dir>` (`scripts/subset-fonts.sh`) makes the
+Inter and JetBrains Mono ones, and `scripts/subset-math-font.sh <dir>` makes STIX Two Math's from
+the code points in `assets/fonts/math-codepoints.txt`. That list comes from the math symbol table:
+after changing the table, run `VOMD_BLESS=1 cargo test the_codepoint_list` to write it again, then
+the script (a test checks that the font has every character of the table).
 
 ## Packaging
 

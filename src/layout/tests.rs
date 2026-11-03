@@ -2268,3 +2268,349 @@ fn runs_join_neighbours_with_one_key_and_split_on_another_or_none() {
     // No hits, no runs.
     runs(&[], |_| Some(()), |_, _, ()| panic!("a run from nothing"));
 }
+
+/// Without a math face, each formula shows as its source in the code face, muted (a link's
+/// stays a link), and a display formula is a block of that; one too long is in the error color.
+#[cfg(feature = "math")]
+#[test]
+fn formulas_show_as_their_source_without_a_math_face() {
+    let fonts = Fonts::new().unwrap();
+    let over = "a".repeat(crate::math::MAX_SOURCE + 1);
+    let src = format!("Text $x^2$ and [$y$](u).\n\n$$\n\\frac{{a}}{{b}}\n$$\n\n${over}$\n");
+    let doc = Doc::parse(&src);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    let content = |i: usize| l.geoms()[i].content.as_ref().unwrap();
+    let styles = |i: usize| -> Vec<(bool, Role)> {
+        content(i).styles.iter().map(|s| (s.mono, s.role)).collect()
+    };
+    // (One style each, in the order they first come.)
+    assert_eq!(
+        styles(0),
+        [(false, Role::Text), (true, Role::Muted), (true, Role::Link)]
+    );
+    assert_eq!(doc.blocks[1].kind, BlockKind::Math);
+    assert_eq!(styles(1), [(true, Role::Muted)]);
+    assert!(!content(1).glyphs.is_empty());
+    assert_eq!(styles(2), [(true, Role::AlertCaution)]);
+}
+
+/// The embedded faces with the math face, and a document laid out with them, every block
+/// measured and the first screens' content kept.
+#[cfg(feature = "math")]
+fn with_math(src: &str, width: f32) -> (Fonts, Doc, Layout) {
+    let mut fonts = Fonts::new().unwrap();
+    fonts.load_math().expect("math face");
+    let doc = Doc::parse(src);
+    let mut l = complete(&doc, &fonts, params(width, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 4000.0);
+    (fonts, doc, l)
+}
+
+#[cfg(feature = "math")]
+fn math_glyphs(fonts: &Fonts, c: &BlockBox) -> usize {
+    let math = fonts.math().unwrap();
+    c.glyphs.iter().filter(|g| g.face == math).count()
+}
+
+/// An inline formula is one box in the line, drawn as the math face's glyphs and its rules
+/// as ink, and one cluster for selecting (its source's start); the box isn't an image's.
+#[cfg(feature = "math")]
+#[test]
+fn an_inline_formula_is_glyphs_in_one_cluster() {
+    let src = "Let $\\frac{a}{b}$ be.\n";
+    let (fonts, doc, l) = with_math(src, 900.0);
+    let c = l.geoms()[0].content.as_deref().unwrap();
+    assert!(c.boxes.is_empty(), "no box is left to paint as an image");
+    assert_eq!(math_glyphs(&fonts, c), 2, "a and b");
+    assert_eq!(c.ink.len(), 1, "the bar");
+    let span = doc
+        .spans
+        .iter()
+        .find(|s| s.style & style::MATH != 0)
+        .unwrap();
+    let hits: Vec<_> = c.hits.iter().filter(|h| h.doc == span.start).collect();
+    assert_eq!(hits.len(), 1);
+    // Nothing else starts inside the formula's source.
+    assert!(
+        !c.hits
+            .iter()
+            .any(|h| h.doc > span.start && h.doc < span.end)
+    );
+    // The bar and the glyphs are inside the cluster.
+    let (x0, x1) = (hits[0].x0, hits[0].x1);
+    let bar = c.ink[0];
+    assert!(
+        bar.x >= x0 - 0.5 && bar.x + bar.w <= x1 + 0.5,
+        "{bar:?} in {x0}..{x1}"
+    );
+    // At 1.15 times the text's size.
+    let math = fonts.math().unwrap();
+    let sizes: Vec<f32> = c
+        .glyphs
+        .iter()
+        .filter(|g| g.face == math)
+        .map(|g| c.styles[g.style as usize].size)
+        .collect();
+    assert!(
+        sizes.iter().all(|&s| s < 16.0 * 1.15),
+        "text style: smaller parts"
+    );
+}
+
+/// A display formula is centred in its column (indented in a list), its tag flush right;
+/// a formula too wide is broken into lines at its full size, or shrunk if it has nowhere to
+/// break, inside the column; one that can't be laid out is its source in its delimiters, in
+/// the error color.
+#[cfg(feature = "math")]
+#[test]
+fn display_formulas_are_centred_fitted_and_tagged() {
+    let wide = (0..60)
+        .map(|i| format!("x_{{{i}}}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let src = format!(
+        "$$\nx = y\n$$\n\n- item\n\n  $$\nx = y\n$$\n\n$$\na = b \\tag{{7}}\n$$\n\n$$\n{wide} = 0\n$$\n\n$$\n\\nope\n$$\n\n$$\n\\left({wide}\\right)\n$$\n"
+    );
+    let (fonts, doc, l) = with_math(&src, 700.0);
+    let (_, col_w) = l.column();
+    let math = fonts.math().unwrap();
+    let extent = |i: usize| {
+        let c = l.geoms()[i].content.as_deref().unwrap();
+        let xs = c.glyphs.iter().filter(|g| g.face == math).map(|g| g.x);
+        let lo = xs.clone().fold(f32::INFINITY, f32::min);
+        let hi = c
+            .glyphs
+            .iter()
+            .filter(|g| g.face == math)
+            .map(|g| g.x + c.styles[g.style as usize].size * 0.5)
+            .fold(f32::NEG_INFINITY, f32::max);
+        (lo, hi)
+    };
+    let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind).collect();
+    let maths: Vec<usize> = (0..kinds.len())
+        .filter(|&i| kinds[i] == BlockKind::Math)
+        .collect();
+    assert_eq!(maths.len(), 6, "{kinds:?}");
+    // Centred.
+    let (lo, hi) = extent(maths[0]);
+    assert!(
+        ((lo + hi) / 2.0 - col_w / 2.0).abs() < 10.0,
+        "{lo}..{hi} in {col_w}"
+    );
+    // In a list: centred in the indented column.
+    let (lo2, hi2) = extent(maths[1]);
+    assert!((lo2 + hi2) / 2.0 > (lo + hi) / 2.0 + 5.0, "indented");
+    // The tag at the right edge.
+    let c = l.geoms()[maths[2]].content.as_deref().unwrap();
+    let right = c.glyphs.iter().map(|g| g.x).fold(0.0, f32::max);
+    assert!(right > col_w - 30.0, "{right} near {col_w}");
+    // Too wide: within the column, broken into lines at its own size.
+    let (lo, hi) = extent(maths[3]);
+    assert!(lo >= 0.0 && hi <= col_w + 1.0, "{lo}..{hi} within {col_w}");
+    let c = l.geoms()[maths[3]].content.as_deref().unwrap();
+    let full = |g: &PGlyph| c.styles[g.style as usize].size == 16.0 * 1.15;
+    let x = c.glyphs.iter().find(|g| full(g)).unwrap();
+    let below = c.glyphs.iter().filter(|g| full(g) && g.y > x.y + 16.0);
+    assert!(below.count() > 10, "lines under the first");
+    // With nowhere to break (one `\left…\right`): shrunk to the column.
+    let (lo, hi) = extent(maths[5]);
+    assert!(lo >= 0.0 && hi <= col_w + 1.0, "{lo}..{hi} within {col_w}");
+    let c = l.geoms()[maths[5]].content.as_deref().unwrap();
+    assert!(
+        c.glyphs
+            .iter()
+            .all(|g| c.styles[g.style as usize].size < 16.0 * 1.15 * 0.75)
+    );
+    // The error: its source in its delimiters, mono, red.
+    let c = l.geoms()[maths[4]].content.as_deref().unwrap();
+    assert_eq!(math_glyphs(&fonts, c), 0);
+    assert!(
+        c.styles
+            .iter()
+            .all(|s| s.mono && s.role == Role::AlertCaution)
+    );
+    assert!(c.lines.len() >= 3, "$$, the source, $$");
+}
+
+/// A display formula in a link takes the link's color and is clickable, like an inline one.
+#[cfg(feature = "math")]
+#[test]
+fn a_display_formula_in_a_link_is_a_link() {
+    let (fonts, doc, l) = with_math("[some $$d$$ text](https://example.com)\n", 700.0);
+    let math = fonts.math().unwrap();
+    let i = doc
+        .blocks
+        .iter()
+        .position(|b| b.kind == BlockKind::Math)
+        .expect("a formula block");
+    let c = l.geoms()[i].content.as_deref().unwrap();
+    assert!(math_glyphs(&fonts, c) > 0);
+    for g in c.glyphs.iter().filter(|g| g.face == math) {
+        assert_eq!(c.styles[g.style as usize].role, Role::Link);
+    }
+    // Clicking the formula follows the link.
+    let hit = c.hits.first().expect("a hit box for the formula");
+    let (col_x, _) = l.column();
+    let top: f32 = l.geoms()[..i].iter().map(|g| g.h).sum();
+    let line = &c.lines[0];
+    let (x, y) = (
+        col_x + (hit.x0 + hit.x1) / 2.0,
+        top + (line.top + line.bottom) / 2.0,
+    );
+    assert_eq!(l.hit(x, y).map(|h| h.link), Some(1));
+}
+
+/// A tag that doesn't fit beside its formula (wider than half the column, or one the formula
+/// can't clear without shrinking to less than half) goes on a line of its own below it, flush
+/// right and inside the column; the formula has the whole column. Nothing is left of it.
+#[cfg(feature = "math")]
+#[test]
+fn a_long_tag_goes_below_its_formula() {
+    let src = "$$\na+b=c \\tag{a rather long equation label}\n$$\n\n$$\na+b=c \\tag{7}\n$$\n\n$$\na+b=c \\tag{a label a good deal wider than this window}\n$$\n";
+    let (fonts, doc, l) = with_math(src, 240.0);
+    let (_, col_w) = l.column();
+    let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind).collect();
+    let maths: Vec<usize> = (0..kinds.len())
+        .filter(|&i| kinds[i] == BlockKind::Math)
+        .collect();
+    assert_eq!(maths.len(), 3, "{kinds:?}");
+    let full = 16.0 * 1.15;
+    for &i in &[maths[0], maths[2]] {
+        let c = l.geoms()[i].content.as_deref().unwrap();
+        let left = c.glyphs.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
+        let right = c
+            .glyphs
+            .iter()
+            .map(|g| g.x + c.styles[g.style as usize].size * 0.3)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            left >= 0.0 && right <= col_w + 1.0,
+            "{left}..{right} in {col_w}"
+        );
+        // The formula at full size (its 5 glyphs), the tag's glyphs lower, at the right.
+        let formula: Vec<&PGlyph> = c
+            .glyphs
+            .iter()
+            .filter(|g| c.styles[g.style as usize].size == full)
+            .collect();
+        let top = formula.iter().map(|g| g.y).fold(f32::INFINITY, f32::min);
+        assert!(formula.len() >= 5, "the formula is not a speck");
+        let tag: Vec<&PGlyph> = c.glyphs.iter().filter(|g| g.y > top + 8.0).collect();
+        assert!(tag.len() >= 10, "the tag is below");
+        let first = formula.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
+        assert!(
+            first > 40.0,
+            "the formula is centred in the column: {first}"
+        );
+    }
+    // A short one stays beside its formula, on its baseline.
+    let c = l.geoms()[maths[1]].content.as_deref().unwrap();
+    let ys: Vec<f32> = c.glyphs.iter().map(|g| g.y).collect();
+    assert!(ys.iter().all(|&y| (y - ys[0]).abs() < 1.0), "{ys:?}");
+    let _ = fonts;
+}
+
+/// Formulas are laid out once, by the window's cache: a resize, new fonts or a live reload
+/// (a new layout of a new document) don't lay unchanged ones out again.
+#[cfg(feature = "math")]
+#[test]
+fn formulas_survive_resize_reload_and_new_fonts() {
+    let mut fonts = Fonts::new().unwrap();
+    fonts.load_math().unwrap();
+    let cache = crate::math::Cache::shared();
+    let src = "A $x^2$ and $\\frac{1}{2}$.\n\n$$\n\\sum_{i=1}^n i\n$$\n";
+    let doc = Doc::parse(src);
+    let mut l = Layout::new(&doc, params(800.0, 1.0));
+    l.set_math(cache.clone());
+    while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
+    let laid = cache.borrow().laid;
+    assert_eq!(laid, 3);
+    // Resize and zoom.
+    l.set_params(params(500.0, 2.0));
+    while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
+    l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+    l.invalidate_all();
+    while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
+    assert_eq!(cache.borrow().laid, laid);
+    // A reload with one formula changed: only that one is laid out.
+    let doc = Doc::parse("A $x^3$ and $\\frac{1}{2}$.\n\n$$\n\\sum_{i=1}^n i\n$$\n");
+    let mut l = Layout::new(&doc, params(800.0, 1.0));
+    l.set_math(cache.clone());
+    while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
+    assert_eq!(cache.borrow().laid, laid + 1);
+    assert_eq!(cache.borrow().len(), 4);
+}
+
+/// A click in a formula's left half puts the caret before it, in its right half after it;
+/// a selection that has its start has all of it, washed.
+#[cfg(all(feature = "math", feature = "clipboard"))]
+#[test]
+fn a_formula_is_selected_whole() {
+    use crate::select::{BlockSel, Pos};
+    let (_, doc, l) = with_math("Let $\\frac{a+b}{c}$ be.\n", 900.0);
+    let span = doc
+        .spans
+        .iter()
+        .find(|s| s.style & style::MATH != 0)
+        .unwrap();
+    let c = l.geoms()[0].content.as_deref().unwrap();
+    let h = *c.hits.iter().find(|h| h.doc == span.start).unwrap();
+    let line = c.lines[0].clone();
+    let y = l.y(0) + (line.top + line.bottom) / 2.0;
+    let (col_x, _) = l.column();
+    let at = |x: f32| l.locate(col_x + x, y).off;
+    assert_eq!(at(h.x0 + (h.x1 - h.x0) * 0.3), span.start);
+    assert_eq!(at(h.x0 + (h.x1 - h.x0) * 0.7), span.end);
+    // From before the text to the formula's start: all of it is washed.
+    let sel = BlockSel::of(0, (Pos::new(0, 0), Pos::new(0, span.start + 1))).unwrap();
+    let mut washed = Vec::new();
+    sel.rects(c, |x0, _, x1, _| washed.push((x0, x1)));
+    assert!(
+        washed.iter().any(|&(x0, x1)| x0 <= h.x0 && x1 >= h.x1),
+        "{washed:?}"
+    );
+    // A double click on it selects it, its source and nothing else.
+    let word = crate::select::Selection::word(&doc, Pos::new(0, span.start)).range();
+    assert_eq!(
+        word,
+        (Pos::new(0, span.start), Pos::new(0, span.end)),
+        "the formula"
+    );
+}
+
+/// Finding text of a formula's source marks all of the formula.
+#[cfg(all(feature = "math", feature = "find"))]
+#[test]
+fn a_match_in_a_formula_marks_all_of_it() {
+    let (_, doc, l) = with_math("Let $\\alpha + \\beta$ be.\n", 900.0);
+    let span = doc
+        .spans
+        .iter()
+        .find(|s| s.style & style::MATH != 0)
+        .unwrap();
+    let c = l.geoms()[0].content.as_deref().unwrap();
+    let h = *c.hits.iter().find(|h| h.doc == span.start).unwrap();
+    for query in ["alpha", "beta", "+"] {
+        let found = crate::find::search(&doc, query);
+        assert_eq!(found.matches.len(), 1, "{query}");
+        let marks = found.marks(Some(0));
+        let mut rects = Vec::new();
+        marks
+            .of_block(&doc, 0)
+            .unwrap()
+            .rects(c, |x0, _, x1, _, _| rects.push((x0, x1)));
+        assert_eq!(rects, [(h.x0, h.x1)], "{query}");
+    }
+}
+
+/// A list item that starts with a display formula keeps its bullet.
+#[cfg(feature = "math")]
+#[test]
+fn a_formula_that_starts_an_item_has_its_marker() {
+    let (fonts, doc, l) = with_math("- $$x = 1$$\n- text\n", 700.0);
+    assert_eq!(doc.blocks[0].kind, BlockKind::Math);
+    let c = l.geoms()[0].content.as_deref().unwrap();
+    let math = fonts.math().unwrap();
+    assert!(c.glyphs.iter().any(|g| g.face != math), "the bullet");
+}

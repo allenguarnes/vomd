@@ -1,0 +1,14 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"\\text{a \\rm b \\bf c \\it d \\sf e \\tt f}\",\nr\"\\text{\\bf Note: $x$ {\\it y} z}\", r\"\\fbox{\\bf hi}\", r\"x \\tag{\\rm (a)}\",\nr\"\\text{\\cal a}\",], true)"
+---
+== \text{a \rm b \bf c \it d \sf e \tt f}
+(text "a " "b " "c ":bold "d ":italic "e ":sans "f":mono)
+== \text{\bf Note: $x$ {\it y} z}
+(text "Note: ":bold (x) " ":bold "y":italic " z":bold)
+== \fbox{\bf hi}
+(boxed (text "hi":bold))
+== x \tag{\rm (a)}
+x (tag (text "(a)"))
+== \text{\cal a}
+error: unknown command in text at 6..10 "\\cal"

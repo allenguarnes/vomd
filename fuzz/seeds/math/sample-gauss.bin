@@ -1,0 +1,1 @@
+\oint_{\partial\Omega} \mathbf{E}\cdot d\mathbf{A} = \frac{1}{\varepsilon_0}\iiint_\Omega \rho\, dV

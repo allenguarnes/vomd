@@ -1,0 +1,32 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"\\hat a \\vec{v} \\widehat{xyz} \\overrightarrow{AB} \\underleftarrow{x}\",\nr\"\\overline{x} \\underline{y} \\overbrace{a+b}^{2} \\underbrace{c}_{d}\",\nr\"\\overset{!}{=} \\underset{x}{\\lim} \\stackrel{def}{=} \\overset{a}{b}\",\nr\"\\xrightarrow{f} \\xleftarrow[g]{h} \\xmapsto{}\",\nr\"\\text{if  $x>0$, {and} \\textbf{bold}~\\$5 \\% \\{\\} \\ldots}\",\nr\"\\textit{it} \\textsf{sf} \\texttt{tt} \\mbox{m} \\text a\",\nr\"\\mathrm{d}x \\mathbf{v} \\mathbb{R} \\mathcal{L} \\mathscr{H} \\mathfrak{g} \\mathsf{s} \\mathtt{t} \\boldsymbol\\alpha \\bm{x}\",\nr\"\\displaystyle x \\textstyle y \\scriptstyle z \\scriptscriptstyle w\",\nr\"a\\,b\\:c\\;d\\!e\\ f~g\\quad h\\qquad i\\enspace j\",\nr\"\\hspace{1em} \\hspace*{2pt} \\kern-1.5em \\mkern18mu \\mskip 9mu \\kern 1in \\hspace{1,5cm}\",\nr\"\\phantom{x} \\hphantom{y} \\vphantom{z} \\smash{a} \\smash[t]{b} \\smash[b]{c}\",\nr\"\\boxed{x} \\rule{1em}{2em} \\rule[-1ex]{2pt}{1pt}\",\nr\"\\color{red} x \\textcolor{blue}{y} \\label{eq} \\nonumber \\notag\",\nr\"\\kern1000em \\rule{9999em}{-9999em}\",], false)"
+---
+== \hat a \vec{v} \widehat{xyz} \overrightarrow{AB} \underleftarrow{x}
+(accent:plain u+0302 a) (accent:plain u+20d7 (v)) (accent:wide u+0302 (x y z)) (accent:arrow u+2192 (A B)) (accent:underarrow u+2190 (x))
+== \overline{x} \underline{y} \overbrace{a+b}^{2} \underbrace{c}_{d}
+(overline (x)) (underline (y)) (scripts (op:always (overbrace (a +:bin b))) ^(2) __) (scripts (op:always (underbrace (c))) ^_ _(d))
+== \overset{!}{=} \underset{x}{\lim} \stackrel{def}{=} \overset{a}{b}
+(stack:rel (=:rel) ^(!:close) __) (stack:ord ((op:display "lim")) ^_ _(x)) (stack:rel (=:rel) ^(d e f) __) (stack:ord (b) ^(a) __)
+== \xrightarrow{f} \xleftarrow[g]{h} \xmapsto{}
+(xarrow → ^(f) __) (xarrow ← ^(h) _(g)) (xarrow ↦ ^() __)
+== \text{if  $x>0$, {and} \textbf{bold}~\$5 \% \{\} \ldots}
+(text "if " (x >:rel 0) ", and " (text "bold":bold) "\u{a0}$5 % {} …")
+== \textit{it} \textsf{sf} \texttt{tt} \mbox{m} \text a
+(text "it":italic) (text "sf":sans) (text "tt":mono) (text "m") (text "a")
+== \mathrm{d}x \mathbf{v} \mathbb{R} \mathcal{L} \mathscr{H} \mathfrak{g} \mathsf{s} \mathtt{t} \boldsymbol\alpha \bm{x}
+(roman (d)) x (bold (v)) (doublestruck (R)) (script (L)) (script (H)) (fraktur (g)) (sans (s)) (mono (t)) (bolditalic α) (bolditalic (x))
+== \displaystyle x \textstyle y \scriptstyle z \scriptscriptstyle w
+(style display) x (style text) y (style script) z (style scriptscript) w
+== a\,b\:c\;d\!e\ f~g\quad h\qquad i\enspace j
+a (space 3mu) b (space 4mu) c (space 5mu) d (space -3mu) e (space 0.25em) f (space 0.25em) g (space 1em) h (space 2em) i (space 0.5em) j
+== \hspace{1em} \hspace*{2pt} \kern-1.5em \mkern18mu \mskip 9mu \kern 1in \hspace{1,5cm}
+(space 1em) (space 0.2em) (space -1.5em) (space 18mu) (space 9mu) (space 7.227em) (space 4.2679133em)
+== \phantom{x} \hphantom{y} \vphantom{z} \smash{a} \smash[t]{b} \smash[b]{c}
+(phantomwh (x)) (phantomw (y)) (phantomh (z)) (smashtb (a)) (smasht (b)) (smashb (c))
+== \boxed{x} \rule{1em}{2em} \rule[-1ex]{2pt}{1pt}
+(boxed (x)) (rule 1 2 0) (rule 0.2 0.1 -0.431)
+== \color{red} x \textcolor{blue}{y} \label{eq} \nonumber \notag
+x (y)
+== \kern1000em \rule{9999em}{-9999em}
+(space 100em) (rule 100 -100 0)

@@ -1,0 +1,10 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"{\\rm a \\over b}\", r\"{x \\bf a \\choose b} c\", r\"{a \\over b \\it c}\",],\nfalse)"
+---
+== {\rm a \over b}
+((frac ((switch roman) a) ((switch roman) b)))
+== {x \bf a \choose b} c
+((frac nobar () (x (switch bold) a) ((switch bold) b))) c
+== {a \over b \it c}
+((frac (a) (b (switch italic) c)))

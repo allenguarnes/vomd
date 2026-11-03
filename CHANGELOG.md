@@ -3,6 +3,29 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Math: LaTeX formulas, written as on GitHub. `$…$` and `` $`…`$ `` are formulas in the text;
+  `$$…$$` and ```` ```math ```` blocks are centred on a line of their own, with a `\tag{…}` at
+  the right. VOMD lays them out itself, on the built-in STIX Two Math font (SIL OFL 1.1):
+  fractions, roots, scripts, big operators and limits, stretchy delimiters, accents, matrices,
+  `cases`, `aligned` and the other environments, `\text`, the math alphabets and about 500
+  symbols.
+  - A formula is selected, copied and found whole. Copying gives its source back with its
+    delimiters, so it pastes as Markdown.
+  - A display formula too wide for the window is broken into lines before its relations and
+    operators; one that can't be broken is made smaller. Nothing is cut off. A `\tag` too long to
+    fit beside its formula goes on a line of its own below it.
+  - A formula VOMD can't read (an unknown command, a macro, a mistake) shows its source in red.
+  - A `$…$` whose closing `$` is followed right away by a digit stays text, so a price range like
+    `$5-$10` isn't read as math. `\$` is a dollar sign.
+  - The `math` Cargo feature (on by default) builds it in. Without the built-in fonts, VOMD uses
+    an installed math font (STIX Two Math, Latin Modern Math, Cambria Math and others).
+
+### Changed
+- The default binary is 5.9 MB, up from 5.6 MB (the math engine and its font).
+
 ## [1.6.3] - 2026-11-02
 
 ### Fixed

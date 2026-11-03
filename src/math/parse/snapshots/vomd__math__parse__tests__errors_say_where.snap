@@ -1,0 +1,76 @@
+---
+source: src/math/parse/tests.rs
+expression: "dumps(&[r\"\\foo\", r\"x \\frac{a}\", \"{x\", \"x}\", \"x^\", \"x^1^2\", \"x_1_2\", \"x'^1^2\",\nr\"\\left( x\", r\"x \\right)\", r\"\\middle|\", r\"\\left\\alpha x \\right)\",\nr\"\\begin{foo} \\end{foo}\", r\"\\begin{matrix} a \\end{pmatrix}\",\nr\"\\begin{matrix} a\", r\"\\end{matrix}\", \"a & b\", r\"{a \\\\ b}\",\nr\"a \\over b \\over c\", r\"\\limits\", r\"x\\limits\", r\"\\sqrt[3\", r\"\\text{abc\",\nr\"\\text{\\alpha}\", r\"\\kern 3\", r\"\\kern 3mu\", r\"\\mkern 3em\", r\"\\hspace{x}\",\nr\"\\begin{array}{lq} a \\end{array}\", r\"\\begin{align} a \\end{align}\",\nr\"\\tag{1}\", r\"\\newcommand{\\x}{y}\", r\"\\def\\x{y}\", r\"\\cancel{x}\", \"\\\\\",\nr\"x \\smash[q]{y}\",], false)"
+---
+== \foo
+error: unknown command at 0..4 "\\foo"
+== x \frac{a}
+error: missing argument at 10..10 ""
+== {x
+error: missing } at 2..2 ""
+== x}
+error: unmatched } at 1..2 "}"
+== x^
+error: missing argument at 2..2 ""
+== x^1^2
+error: double superscript at 3..4 "^"
+== x_1_2
+error: double subscript at 3..4 "_"
+== x'^1^2
+error: double superscript at 4..5 "^"
+== \left( x
+error: \left without \right at 0..5 "\\left"
+== x \right)
+error: \right without \left at 2..8 "\\right"
+== \middle|
+error: \middle without \left at 0..7 "\\middle"
+== \left\alpha x \right)
+error: not a delimiter at 5..11 "\\alpha"
+== \begin{foo} \end{foo}
+error: unknown environment at 0..6 "\\begin"
+== \begin{matrix} a \end{pmatrix}
+error: \end doesn't match \begin at 17..21 "\\end"
+== \begin{matrix} a
+error: \begin without \end at 0..6 "\\begin"
+== \end{matrix}
+error: \end without \begin at 0..4 "\\end"
+== a & b
+error: & outside an environment at 2..3 "&"
+== {a \\ b}
+error: \\ outside an environment at 3..5 "\\\\"
+== a \over b \over c
+error: ambiguous fraction: use \frac at 10..15 "\\over"
+== \limits
+error: unknown command at 0..7 "\\limits"
+== x\limits
+error: \limits must follow an operator at 1..8 "\\limits"
+== \sqrt[3
+error: missing ] at 7..7 ""
+== \text{abc
+error: missing } at 5..6 "{"
+== \text{\alpha}
+error: unknown command in text at 6..12 "\\alpha"
+== \kern 3
+error: bad dimension at 6..7 "3"
+== \kern 3mu
+error: wrong unit at 0..5 "\\kern"
+== \mkern 3em
+error: wrong unit at 0..6 "\\mkern"
+== \hspace{x}
+error: bad dimension at 8..8 ""
+== \begin{array}{lq} a \end{array}
+error: bad column spec at 0..6 "\\begin"
+== \begin{align} a \end{align}
+error: environment only allowed in display math at 0..6 "\\begin"
+== \tag{1}
+error: \tag outside display math at 0..4 "\\tag"
+== \newcommand{\x}{y}
+error: unknown command at 0..11 "\\newcommand"
+== \def\x{y}
+error: unknown command at 0..4 "\\def"
+== \cancel{x}
+error: unknown command at 0..7 "\\cancel"
+== \
+error: lone backslash at 0..1 "\\"
+== x \smash[q]{y}
+error: \smash takes [t] or [b] at 2..8 "\\smash"

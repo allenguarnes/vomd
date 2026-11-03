@@ -1,0 +1,18 @@
+---
+source: src/doc/tests.rs
+expression: "parse_all(&[\"Inline $`\\\\sqrt{x^2}`$ math.\",\n\"$`a`$$`b`$ and $``a`b``$ and $` c `$\",\n\"Not math: \\\\$`x`$, $ `x`$, $`x` $, `x`$ and $`x`.\",\n\"[link $`x`$ text](u) and *$`y`$*\",\n\"| a | b |\\n|---|---|\\n| $`x|y`$ | $`z`$ |\", \"Before$`x`$after, and $`x`$5\",])"
+---
+== "Inline $`\\sqrt{x^2}`$ math."
+P | "Inline " [$]"\\sqrt{x^2}" " math."
+== "$`a`$$`b`$ and $``a`b``$ and $` c `$"
+P | [$]"a" [$]"b" " and " [$]"a`b" " and " [$]"c"
+== "Not math: \\$`x`$, $ `x`$, $`x` $, `x`$ and $`x`."
+P | "Not math: $" [C]"x" "$, $ " [C]"x" "$, $" [C]"x" " " [$]", `x`" " and $" [C]"x" "."
+== "[link $`x`$ text](u) and *$`y`$*"
+P | [L1]"link " [L$1]"x" [L1]" text" " and " [I$]"y"
+link 1: u
+== "| a | b |\n|---|---|\n| $`x|y`$ | $`z`$ |"
+Row(t0,head) | [ "a" ] [ "b" ]
+Row(t0) | [ "$`x" ] [ "y`$" ]
+== "Before$`x`$after, and $`x`$5"
+P | "Before" [$]"x" "after, and " [$]"x" "5"

@@ -14,6 +14,8 @@ fn dump(doc: &Doc) -> String {
             BlockKind::TableRow { table, header, .. } => {
                 format!("Row(t{table}{})", if header { ",head" } else { "" })
             }
+            #[cfg(feature = "math")]
+            BlockKind::Math => "Math".to_owned(),
         };
         out.push_str(&kind);
         if block.list > 0 {
@@ -88,6 +90,16 @@ fn span_dump(doc: &Doc, span: &Span) -> String {
         (style::FOOTREF, 'F'),
         (style::SUP, 'U'),
         (style::SUB, 'D'),
+    ] {
+        if span.style & bit != 0 {
+            tags.push(c);
+        }
+    }
+    #[cfg(feature = "math")]
+    for (bit, c) in [
+        (style::MATH, '$'),
+        (style::DISPLAY, '='),
+        (style::MATH_ERROR, '!'),
     ] {
         if span.style & bit != 0 {
             tags.push(c);
@@ -4279,4 +4291,264 @@ fn a_large_document_keeps_a_footnote_whose_label_is_at_the_length_limit() {
     let doc = Doc::parse(&src);
     assert!(has_the_note(&doc));
     assert!(doc == Doc::parse_whole(&src));
+}
+
+/// The input of each example of pulldown-cmark's math spec (`specs/math.txt`, 0.13.4).
+#[cfg(feature = "math")]
+const MATH_SPEC: [&str; 48] = [
+    "This sentence uses `$` delimiters to show math inline: $\\sqrt{3x-1}+(1+x)^2$\n$\\sum_{k=1}^n a_k b_k$: Mathematical expression at head of line\n\n`\\` may follow just after the first `$`: $\\{1, 2, 3\\}$",
+    "**The Cauchy-Schwarz Inequality**\n\n$$\\left( \\sum_{k=1}^n a_k b_k \\right)^2 \\leq \\left( \\sum_{k=1}^n a_k^2 \\right) \\left( \\sum_{k=1}^n b_k^2 \\right)$$",
+    "Oops empty $$ expression.\n\n$$$$",
+    "$x$$$$$$$y$$\n\n$x$$$$$$y$$\n\n$$x$$$$$$y$$",
+    "$a<b>c</b>$\n\n$${a*b*c} _c_ d$$\n\n$not `code`$\n\n$![not an](/image)$\n\n$<https://not.a.link/>$\n\n$&alpha;$",
+    "Hello $world.\n\nDollar at end of line$",
+    "$5x + 2 =\n17$\n\n$$\\left( \\sum_{k=1}^n a_k b_k \\right)^2 \\leq \\left( \\sum_{k=1}^n a_k^2 \\right)\n\\left( \\sum_{k=1}^n b_k^2 \\right)$$",
+    "$not a\\\nhard break  \neither$",
+    "$\\$$\n\n$$y = \\$ x$$",
+    "$x $ x$\n\n$$ $ $$",
+    "alpha$$beta$gamma$$delta",
+    "these are not math texts: $ y=x$, $y=x $, $\ny=x$ and $y=x\n$\n\n>The start of a line counts as whitespace $2 +\n>$\n\nWhile displays can start with whitespace, {${\nthey should not allow inlines to do that $$2 +\n$*$",
+    "these are math texts: foo$y=x$bar and $y=x$bar and foo$y=x$ bar",
+    "math texts: $x=y$! and $x=y$? and $x=y$: and $x=y$. and $x=y$\"\n\nalso math texts: !$x=y$! and ?$x=y$? and :$x=y$: and .$x=y$. and \"$x=y$\"\n\nbraces: ($x=y$) [$x=y$] {$x=y$}",
+    "$x=y$",
+    "$a$$b$\n\n$a$$$b$$\n\n$$a$$$b$\n\n$$a$$$$b$$",
+    "$Inline `first$ then` code\n\n`Code $first` then$ inline\n\n$$ Display `first $$ then` code\n\n`Code $$ first` then $$ display",
+    "$x + y - z$\n\n$x + y\n- z$\n\n$$ x + y\n> z $$",
+    "$not\n\nmath$\n\n$$\nnot\n\nmath\n$$",
+    "- $not\n    - *\n  math$",
+    "This is display math:\n$$\n\\text{Hello $x^2$}\n$$\nAnd this is inline math:\n$\\text{Hello $x$ there!}$",
+    "This is not valid math: $}{$\n\nNeither is this: { $}{$ }\n\nThis is: $\\}\\{$\n\nThis is: $\\}$\n\nMath environment contains 2+2: $}$2+2$\n\nMath environment contains y: $x {$ $ } $y$",
+    "This is not display math. It is inline math:\n\n$$\\text{first $$ second}$\n\n$$$\\text{first $$ second}$\n\nThis is display math:\n\n$$\\text{first $$ second}$$\n\n$$$\\text{first $$ second}$$\n\nThis is also display math, but (counterintuitively) it's allowed to be empty\nand expected to be as short as possible:\n\n$$$$\\text{first $$ second}$$",
+    "$\\text{\\$}$\n\n$$x$x$$\n\n${$^$$\n\n$}$$$$\n\n$}$] $$",
+    "$1$2$3\n\n$1$2$3$\n\n$1{$2$}3$\n\n$$1$$2$$3\n\n$$1$$2$$3$$\n\n$$1{$$2$$}3$$",
+    "$x$ $`y`$",
+    "- $a$\n\n  ```math\n  a\n  ```\n\n  $$\n  a\n  $$\n\n- ```math\n  b\n  ```\n\n  $$\n  b\n  $$",
+    "- ![node logo](https://nodejs.org/static/images/logo.svg)\n- $x$",
+    "<details>\n\n$A = 5$\n\n$$\nA = 5\n$$\n\n</details>",
+    "$a<b$\n\n$$a<b$$",
+    "[^a]\n\n[^a]: Lorem $a$",
+    "[$a$](x)",
+    "a$x$\n\n-$x$\n\n1$x$",
+    "_$a$ equals $b$_\n\n_$a$ equals $b$_\n\n**$a$ equals $b$**",
+    "$$\na\n$$\n\n- $$\n  \\text{$b$}\n  $$",
+    "$\\{a\\,b\\}$",
+    "$a <b > c$\n\n$[(a+b)c](d+e)$\n\n${a}_b c_{d}$",
+    "When $a \\ne 0$, there are two solutions to $(ax^2 + bx + c = 0)$ and they are\n$$ x = {-b \\pm \\sqrt{b^2-4ac} \\over 2a} $$",
+    "$x = \\$$",
+    "_Equation $\\Omega(69)$ in italic text_",
+    "$\\pi$\n'$\\pi$\n\"$\\pi$\n($\\pi$\n[$\\pi$\n{$\\pi$\n/$\\pi$",
+    "| first $|$ second |\n|--------|---------|\n| a ${   | }$ b    |",
+    "| first $\\|$ second |\n|-------------------|\n| a ${   \\| }$ b    |",
+    "| Description | Test case |\n|-------------|-----------|\n| Single      | $\\$       |\n| Double      | $\\\\$      |\n| Basic test  | $\\|$      |\n| Basic test 2| $\\|\\|\\$   |\n| Basic test 3| $x\\|y\\|z\\$|\n| Not pipe    | $\\.$      |\n| Combo       | $\\.\\|$    |\n| Combo 2     | $\\.\\|\\$   |\n| Extra       | $\\\\\\.$    |\n| Wait, what? | $\\\\|$     |\n| Wait, what? | $\\\\\\|$    |\n| Wait, what? | $\\\\\\\\|$   |\n| Wait, what? | $\\\\\\\\\\|$  |",
+    "This is not an inline math environment: $}{$\nBut, because it's nested too deeply, this is parsed as an inline math environment:\n{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{\nimproperly $}{$ nested\n}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}\nBut this still isn't, because the braces are still counted: $}{$",
+    "This is also deeply nested, but, unlike the first example,\nthey don't have an equal number of close braces and open braces,\nso aren't detected as math.\n{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{\nimproperly $}$ nested ${$ example\n}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}\nThis, however, is detected ${}$\n\n${{{{{{{{{{{{{{{{{{{{{{{{{{{{{{\nanother improperly nested example\n}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}$",
+    "${}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}  20 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}  40 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}  60 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}  80 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 100 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 120 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 140 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 160 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 180 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 200 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 220 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{} 240 brace pairs\n{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{$ 255 brace pairs and one unclosed brace",
+    "${{{{{{{{{{{{{{{{{{{{ 20 open braces\n{{{{{{{{{{{{{{{{{{{{  40 open braces\n{{{{{{{{{{{{{{{{{{{{  60 open braces\n{{{{{{{{{{{{{{{{{{{{  80 open braces\n{{{{{{{{{{{{{{{{{{{{ 100 open braces\n{{{{{{{{{{{{{{{{{{{{ 110 open braces\n{{{{{{{{{{{{{{{{{{{{ 120 open braces\n{{{{{{{{{{{{{{{{{{{{ 140 open braces\n{{{{{{{{{{{{{{{{{{{{ 160 open braces\n{{{{{{{{{{{{{{{{{{{{ 180 open braces\n{{{{{{{{{{{{{{{{{{{{ 200 open braces\n{{{{{{{{{{{{{{{{{{{{ 220 open braces\n{{{{{{{{{{{{{{{{{{{{ 240 open braces\n{{{{{{{{{{{{{{{ 255 open braces\n}}}}}}}}}}}}}}}}}}}}  20 close braces\n}}}}}}}}}}}}}}}}}}}}  40 close braces\n}}}}}}}}}}}}}}}}}}}}  60 close braces\n}}}}}}}}}}}}}}}}}}}}  80 close braces\n}}}}}}}}}}}}}}}}}}}} 100 close braces\n}}}}}}}}}}}}}}}}}}}} 120 close braces\n}}}}}}}}}}}}}}}}}}}} 140 close braces\n}}}}}}}}}}}}}}}}}}}} 160 close braces\n}}}}}}}}}}}}}}}}}}}} 180 close braces\n}}}}}}}}}}}}}}}}}}}} 200 close braces\n}}}}}}}}}}}}}}}}}}}} 220 close braces\n}}}}}}}}}}}}}}}}}}}} 240 close braces\n}}}}}}}}}}}}}}}{$ 255 close braces and one open brace",
+];
+
+#[cfg(feature = "math")]
+#[test]
+fn math_spec_examples() {
+    let out: String = MATH_SPEC
+        .iter()
+        .enumerate()
+        .map(|(i, src)| format!("== {}: {src:?}\n{}", i + 1, parse(src)))
+        .collect();
+    insta::assert_snapshot!(out);
+}
+
+/// Parse each source and dump it, under the source.
+#[cfg(feature = "math")]
+fn parse_all(sources: &[&str]) -> String {
+    sources
+        .iter()
+        .map(|src| format!("== {src:?}\n{}", parse(src)))
+        .collect()
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn dollar_amounts_stay_text() {
+    insta::assert_snapshot!(parse_all(&[
+        "It costs $5 and $10 today.",
+        "From $5-$10 a day, or $20-$30.",
+        "Escaped: \\$5 and \\$x$ and $x\\$ y",
+        "A digit after the closer: $x$2, a letter: $x$y, a space: $x$ 2.",
+        "$$5-$$10 is display math: the digit rule is for inline math.",
+        "Lone $ sign, and a $ pair $.",
+    ]));
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn backtick_math() {
+    insta::assert_snapshot!(parse_all(&[
+        "Inline $`\\sqrt{x^2}`$ math.",
+        "$`a`$$`b`$ and $``a`b``$ and $` c `$",
+        "Not math: \\$`x`$, $ `x`$, $`x` $, `x`$ and $`x`.",
+        "[link $`x`$ text](u) and *$`y`$*",
+        "| a | b |\n|---|---|\n| $`x|y`$ | $`z`$ |",
+        "Before$`x`$after, and $`x`$5",
+    ]));
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn math_fences() {
+    insta::assert_snapshot!(parse_all(&[
+        "```math\n\\int_0^1 x\\,dx\n```",
+        "```math foo\na\n```\n\n~~~math\nb\n~~~\n\n```Math\nc\n```\n\n```mathematica\nd\n```",
+        "```math\n```\n\n```math\n\n\n```",
+        "- item\n\n  ```math\n  x\n  ```\n- ```math\n  y\n  ```\n\n> ```math\n> z\n> ```",
+        "```math\na\n\nb\n```",
+    ]));
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn display_math_is_a_block_of_its_own() {
+    insta::assert_snapshot!(parse_all(&[
+        "Text before $$x^2$$ and after.",
+        "Text before\n$$\nx^2\n$$\nand after.",
+        "$$a$$\n$$b$$",
+        "$$a$$ trailing",
+        "- $$x$$\n- item $$y$$ tail\n\n> quote $$z$$",
+        "1. **bold $$x$$ still bold**",
+        "[a $$x$$ b](u)",
+        "# Heading $$x$$\n\n| a |\n|---|\n| $$y$$ |",
+        "Empty: $$$$ and $$ $$.",
+        "Hard break\\\n$$x$$\\\nafter",
+        "a[^1]\n\n[^1]: Note $$y$$ end",
+    ]));
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn inline_math_lives_where_spans_do() {
+    insta::assert_snapshot!(parse_all(&[
+        "## The $x^2$ case\n\n## The $x^2$ case",
+        "| $a$ | $b$ $c$ |\n|---|---|\n| $\\vert x\\vert$ | **$d$** |",
+        "- $a$\n  - $b$\n\n> $c$\n>\n> > $d$",
+        "Ref[^n] and [a $x$ link](u) and ![alt $y$](i.png)\n\n[^n]: $z$ in a note",
+        "$a$$b$ and $a$ $b$",
+        "*emphasis $x$* and <b>html $y$</b> and `code $z$`",
+    ]));
+}
+
+/// Every formula of `doc` whole: its text is `want`'s, in order, and no block has a piece of
+/// one.
+#[cfg(feature = "math")]
+fn assert_formulas(doc: &Doc, want: &[&str]) {
+    let mut got = Vec::new();
+    let all = doc.blocks.iter().flat_map(|b| {
+        let own = (!matches!(b.kind, BlockKind::TableRow { .. })).then(|| doc.block_spans(b));
+        own.into_iter()
+            .chain(doc.row_cells(b).map(|(_, s)| s))
+            .flatten()
+    });
+    for span in all {
+        if span.style & style::MATH != 0 {
+            got.push(doc.span_text(span));
+        }
+    }
+    got.sort_unstable();
+    let mut want = want.to_vec();
+    want.sort_unstable();
+    assert_eq!(got.len(), want.len(), "formulas");
+    assert!(got == want, "a formula was cut");
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn chunks_never_cut_a_formula() {
+    // A paragraph of formulas of every length up to the limit, no space between some, so a cut
+    // has to move off the end of the window.
+    let formulas: Vec<String> = (0..60)
+        .map(|i| format!("x_{{{i}}}{}", "+a".repeat(i * 67 % 4000)))
+        .collect();
+    let mut src = String::new();
+    for (i, f) in formulas.iter().enumerate() {
+        src.push_str(&format!("${f}$"));
+        src.push_str(if i % 3 == 0 { "" } else { " text " });
+    }
+    let doc = Doc::parse(&src);
+    check_invariants(&doc);
+    assert!(doc.blocks.len() > 3, "cut into chunks");
+    let want: Vec<&str> = formulas.iter().map(String::as_str).collect();
+    assert_formulas(&doc, &want);
+    for b in &doc.blocks {
+        assert!(block_bytes(&doc, b) <= MAX_BLOCK_BYTES + crate::math::MAX_SOURCE);
+    }
+    // A table row of many cells, each with a share of the row smaller than its formula.
+    let big = format!("x{}", "+b".repeat(3000));
+    let row: String = (0..40).map(|_| format!("| ${big}$ t ")).collect();
+    let src = format!("{row}|\n{}|\n{row}|\n", "|---".repeat(40));
+    let doc = Doc::parse(&src);
+    check_invariants(&doc);
+    assert_formulas(&doc, &vec![big.as_str(); 80]);
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn formulas_over_the_limit_are_error_text() {
+    let max = crate::math::MAX_SOURCE;
+    let at = "a".repeat(max);
+    let over = "a".repeat(max + 1);
+    // (Over 16 KiB: two chunks, cut after the first formula.)
+    let doc = Doc::parse(&format!("${at}$ and ${over}$"));
+    let spans = &doc.spans;
+    assert_eq!(spans[0].style, style::MATH);
+    assert_eq!(doc.span_text(&spans[0]), at);
+    assert_eq!(spans[1].style, 0);
+    assert_eq!(spans[2].style, style::CODE | style::MATH_ERROR);
+    assert_eq!(doc.span_text(&spans[2]), format!("${over}$"));
+    // A display formula: a paragraph of error text, cut into chunks like any.
+    let huge = "b".repeat(3 * MAX_BLOCK_BYTES);
+    let doc = Doc::parse(&format!("text $${huge}$$ more"));
+    check_invariants(&doc);
+    let kinds: Vec<_> = doc.blocks.iter().map(|b| (b.kind, b.joined)).collect();
+    assert_eq!(kinds[0], (BlockKind::Paragraph, false));
+    assert_eq!(kinds[1], (BlockKind::Paragraph, false));
+    assert!(
+        kinds[2..kinds.len() - 1]
+            .iter()
+            .all(|k| *k == (BlockKind::Paragraph, true))
+    );
+    let error: String = doc.blocks[1..doc.blocks.len() - 1]
+        .iter()
+        .flat_map(|b| doc.block_spans(b))
+        .inspect(|s| assert_eq!(s.style, style::CODE | style::MATH_ERROR))
+        .map(|s| doc.span_text(s))
+        .collect();
+    assert_eq!(error, format!("$${huge}$$"));
+    // A math block: a code block.
+    let doc = Doc::parse(&format!("```math\n{over}\n```\n\n```math\n{at}\n```"));
+    assert_eq!(doc.blocks[0].kind, BlockKind::Code);
+    assert_eq!(doc.blocks[0].spans.len(), 1);
+    assert_eq!(doc.spans[0].style, style::CODE | style::MATH_ERROR);
+    assert_eq!(
+        (doc.blocks[1].kind, doc.span_text(&doc.spans[1])),
+        (BlockKind::Math, at.as_str())
+    );
+}
+
+#[cfg(feature = "math")]
+#[test]
+fn segmented_parse_matches_with_math() {
+    let mut src = MATH_SPEC.join("\n\nA paragraph between examples.\n\n");
+    let blocks = [
+        "Text $x^2$ and $$\\frac{a}{b}$$ more $`c`$ and $5-$10.",
+        "```math\n\\begin{aligned}\na &= b \\\\\nc &= d\n\\end{aligned}\n```",
+        "- $a$\n- $$b$$\n\n> $$\n> c\n> $$",
+        "| $x$ | $$y$$ |\n|---|---|\n| $`z`$ | w |",
+        "## The $x^2$ case",
+    ];
+    for i in 0..40 {
+        src.push_str("\n\n");
+        src.push_str(blocks[i % blocks.len()]);
+    }
+    for budget in [1, 200, 1024] {
+        let n = assert_same("math", &src, budget);
+        assert!(n > 3, "@ {budget}: {n} segments");
+    }
 }
