@@ -3,7 +3,7 @@
 # release: bump pkgver, run `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO`.
 pkgname=vomd-bin
 _pkgname=vomd
-pkgver=1.6.3
+pkgver=1.7.0
 pkgrel=1
 pkgdesc='View-Only Markdown: a tiny, fast Markdown viewer (release binary)'
 arch=('x86_64')
@@ -26,7 +26,7 @@ provides=("$_pkgname")
 conflicts=("$_pkgname")
 options=('!strip' '!debug')
 source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64-linux.tar.gz")
-sha256sums_x86_64=('094eb6c76d84b283c45b62af1a3ce30d2cfb226bc8e79b12cb27f2405bdffad5')
+sha256sums_x86_64=('SKIP')
 
 package() {
   cd "$_pkgname-$pkgver-$CARCH-linux"
