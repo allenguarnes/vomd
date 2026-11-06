@@ -126,7 +126,7 @@ pub enum Alert {
 pub enum BlockKind {
     Paragraph,
     Heading(u8),
-    Code,
+    Code(Hl),
     Rule,
     /// First line of a GitHub alert blockquote (`> [!NOTE]`); has no spans.
     AlertTitle(Alert),
@@ -144,6 +144,17 @@ pub enum BlockKind {
     /// [`crate::math::MAX_SOURCE`] bytes).
     #[cfg(feature = "math")]
     Math,
+}
+
+/// How a code block is highlighted: its language (a 1-based index into the highlighter's tables,
+/// 0 for none) and the lexer's state where the block starts, which is not 0 only for a chunk after
+/// the first of an oversized block. Nothing without the `highlight` feature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hl {
+    #[cfg(feature = "highlight")]
+    pub lang: u8,
+    #[cfg(feature = "highlight")]
+    pub state: u32,
 }
 
 /// Decoration drawn before the first line of a block.
@@ -867,10 +878,10 @@ impl Builder {
                 self.flush_marker();
                 self.math_fence = Some(String::new());
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(ref kind) => {
                 self.close();
                 self.flush_marker();
-                self.open(BlockKind::Code);
+                self.open(BlockKind::Code(code_hl(kind)));
             }
             Tag::HtmlBlock => {
                 self.close();
@@ -1078,7 +1089,7 @@ impl Builder {
         matches!(
             self.open,
             Some(Open {
-                kind: BlockKind::Code,
+                kind: BlockKind::Code(_),
                 ..
             })
         )
@@ -1229,7 +1240,7 @@ impl Builder {
         self.end_inline_html();
         let Some(open) = self.open.take() else { return };
         let mut kind = open.kind;
-        if kind == BlockKind::Code {
+        if matches!(kind, BlockKind::Code(_)) {
             self.trim_trailing_newline(open.span_start as usize);
         }
         if let BlockKind::TableRow {
@@ -1281,7 +1292,7 @@ impl Builder {
             _ => 0,
         };
         match kind {
-            BlockKind::Paragraph | BlockKind::Heading(_) | BlockKind::Code
+            BlockKind::Paragraph | BlockKind::Heading(_) | BlockKind::Code(_)
                 if bytes > MAX_BLOCK_BYTES =>
             {
                 self.push_chunks(kind, spans.start as usize);
@@ -1296,14 +1307,33 @@ impl Builder {
 
     /// Split the open block's spans (everything from `first` on) into chunk blocks. The marker
     /// and quote start go to the first chunk; the rest are `joined` to it.
-    fn push_chunks(&mut self, kind: BlockKind, first: usize) {
+    fn push_chunks(&mut self, mut kind: BlockKind, first: usize) {
         let tail = self.doc.spans.split_off(first);
         let (spans, chunks) = split_spans(&self.doc.text, &tail, MAX_BLOCK_BYTES);
         self.doc.spans.extend(spans);
         for (i, chunk) in chunks.into_iter().enumerate() {
             let range = (first as u32 + chunk.start)..(first as u32 + chunk.end);
-            self.push_joined(kind, range, i > 0);
+            self.push_joined(kind, range.clone(), i > 0);
+            kind = self.after_chunk(kind, range);
         }
+    }
+
+    /// The kind of the chunk after one of `kind` (with `spans`): for a highlighted code block,
+    /// the state the lexer is in at the end of this one, so a comment or a string open across
+    /// the cut is coloured as one.
+    fn after_chunk(&self, kind: BlockKind, spans: Range<u32>) -> BlockKind {
+        #[cfg(feature = "highlight")]
+        if let BlockKind::Code(Hl { lang, state }) = kind
+            && lang != 0
+            && let Some(spans) = self.doc.spans.get(spans.start as usize..spans.end as usize)
+            && let (Some(a), Some(b)) = (spans.first(), spans.last())
+        {
+            let text = &self.doc.text[a.start as usize..b.end as usize];
+            let state = crate::highlight::lex(lang, text, state, &mut |_, _, _| {});
+            return BlockKind::Code(Hl { lang, state });
+        }
+        let _ = spans;
+        kind
     }
 
     /// Split an oversized table row (spans from `first_span`, cells from `first_cell`) into
@@ -2332,6 +2362,17 @@ fn split_spans(text: &str, spans: &[Span], max: usize) -> (Vec<Span>, Vec<Range<
             return (out, chunks);
         }
     }
+}
+
+/// How a code block starts out highlighted: in the language a fenced block's info string names.
+fn code_hl(kind: &pulldown_cmark::CodeBlockKind) -> Hl {
+    #[cfg(feature = "highlight")]
+    if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind {
+        let lang = crate::highlight::find(info).unwrap_or(0);
+        return Hl { lang, state: 0 };
+    }
+    let _ = kind;
+    Hl::default()
 }
 
 /// Where to cut the chunk starting at `from` (at most `max` bytes): the next chunk's start.

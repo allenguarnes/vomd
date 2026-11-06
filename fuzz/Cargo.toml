@@ -1,4 +1,4 @@
-# Fuzz targets: `cargo +nightly fuzz run <doc|image|anim|layout|math|settings|svg>`, or on
+# Fuzz targets: `cargo +nightly fuzz run <doc|image|anim|layout|math|settings|svg|highlight>`, or on
 # stable with `just fuzz <target> [seconds]`. Never shipped.
 [package]
 name = "vomd-fuzz"
@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-vomd = { path = "..", default-features = false, features = ["embed-fonts", "images", "svg", "math"] }
+vomd = { path = "..", default-features = false, features = ["embed-fonts", "images", "svg", "math", "highlight"] }
 
 # As in ../Cargo.toml.
 [patch.crates-io]
@@ -71,6 +71,13 @@ bench = false
 [[bin]]
 name = "math"
 path = "fuzz_targets/math.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "highlight"
+path = "fuzz_targets/highlight.rs"
 test = false
 doc = false
 bench = false

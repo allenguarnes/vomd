@@ -1,0 +1,18 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Comment	"// c"
+Plain	"\n$"
+Tag	"size"
+Plain	": "
+Constant	"4px"
+Plain	";\n"
+Entity	".nav"
+Plain	" { "
+Tag	"ul"
+Plain	" { "
+Constant	"margin"
+Plain	": $"
+Constant	"size"
+Plain	"; } }"

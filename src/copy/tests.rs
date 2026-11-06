@@ -543,7 +543,7 @@ fn pieces_never_split_a_character() {
 fn code_blocks(d: &Doc) -> Vec<(u32, u32)> {
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for (i, b) in d.blocks.iter().enumerate() {
-        if b.kind != BlockKind::Code {
+        if !matches!(b.kind, BlockKind::Code(_)) {
             continue;
         }
         match runs.last_mut() {

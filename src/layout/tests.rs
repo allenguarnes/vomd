@@ -887,7 +887,7 @@ fn chunk_estimates_match_measured_heights() {
     for (i, (e, g)) in est.iter().zip(l.geoms()).enumerate() {
         match doc.blocks[i].kind {
             // Code lines are exact, so are the pads on the run's outer edges.
-            BlockKind::Code => assert!(
+            BlockKind::Code(_) => assert!(
                 (e - g.h).abs() < 1.0 + g.h * 1e-3,
                 "block {i}: {e} vs {}",
                 g.h
@@ -2613,4 +2613,117 @@ fn a_formula_that_starts_an_item_has_its_marker() {
     let c = l.geoms()[0].content.as_deref().unwrap();
     let math = fonts.math().unwrap();
     assert!(c.glyphs.iter().any(|g| g.face != math), "the bullet");
+}
+
+/// The first block's glyphs laid out (by id and position), and the role of each.
+fn glyph_roles(md: &str) -> (Vec<(u16, i32, i32)>, Vec<Role>) {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(md);
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, l.anchor_at(0.0), 1000.0);
+    let c = l.geoms()[0].content.as_deref().unwrap();
+    let at = |v: f32| (v * 64.0).round() as i32;
+    let glyphs = c.glyphs.iter().map(|g| (g.id, at(g.x), at(g.y))).collect();
+    let roles = c
+        .glyphs
+        .iter()
+        .map(|g| c.styles[g.style as usize].role)
+        .collect();
+    (glyphs, roles)
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn a_highlighted_block_is_coloured_by_token() {
+    use crate::highlight::Tok;
+    let (_, roles) = glyph_roles("```rust\nfn main() { let s = \"x\"; } // c\n```\n");
+    let syntax = |t| Role::Syntax(t);
+    // One glyph per character (no ligature in this line but `//`'s, at its end).
+    assert_eq!(&roles[..2], [syntax(Tok::Keyword); 2]);
+    assert_eq!(roles[2], Role::Text);
+    assert_eq!(&roles[3..7], [syntax(Tok::Entity); 4]);
+    assert_eq!(&roles[12..15], [syntax(Tok::Keyword); 3]);
+    assert_eq!(&roles[20..23], [syntax(Tok::Str); 3]);
+    assert_eq!(roles.last(), Some(&syntax(Tok::Comment)));
+    assert!(!roles.contains(&syntax(Tok::Plain)));
+}
+
+/// A selection washes highlighted code as it does any text: from its first glyph to its last,
+/// whatever the colours of the glyphs between.
+#[cfg(all(feature = "highlight", feature = "clipboard"))]
+#[test]
+fn a_selection_washes_highlighted_code_whole() {
+    use crate::select::{BlockSel, Pos};
+    let code = "fn main() { let s = \"x\"; } // c";
+    let doc = Doc::parse(&format!("```rust\n{code}\n```\n"));
+    let fonts = Fonts::new().unwrap();
+    let mut l = complete(&doc, &fonts, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 4000.0);
+    let c = l.geoms()[0].content.as_deref().unwrap();
+    let roles: std::collections::HashSet<_> = c
+        .glyphs
+        .iter()
+        .map(|g| c.styles[g.style as usize].role)
+        .collect();
+    assert!(roles.len() >= 4, "{roles:?}");
+    let sel = BlockSel::of(0, (Pos::new(0, 0), Pos::new(0, code.len() as u32))).unwrap();
+    let mut washed = Vec::new();
+    sel.rects(c, |x0, _, x1, _| washed.push((x0, x1)));
+    let (first, last) = (
+        c.glyphs.iter().map(|g| g.x).fold(f32::MAX, f32::min),
+        c.glyphs.iter().map(|g| g.x).fold(f32::MIN, f32::max),
+    );
+    assert!(
+        washed.iter().any(|&(x0, x1)| x0 <= first && x1 >= last),
+        "{washed:?} over {first}..{last}"
+    );
+}
+
+#[test]
+fn highlighting_only_colours() {
+    // The same glyphs in the same places as an unhighlighted block, and a `text` block (and,
+    // without the feature, a `rust` one) all in the text colour.
+    let code = "fn main() {\n\tlet s = \"x\"; /* c\n*/ }";
+    let rust = glyph_roles(&format!("```rust\n{code}\n```\n"));
+    let text = glyph_roles(&format!("```text\n{code}\n```\n"));
+    assert_eq!(rust.0, text.0);
+    assert!(text.1.iter().all(|&r| r == Role::Text));
+    assert_eq!(
+        rust.1.iter().all(|&r| r == Role::Text),
+        !cfg!(feature = "highlight")
+    );
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn a_long_highlighted_line_is_pushed_token_by_token() {
+    // 16 KB on one line, a token every two bytes: one item per token, and the text whole (the
+    // column is only looked for where there is a tab).
+    let line = "a(".repeat(8 * 1024);
+    let doc = Doc::parse(&format!("```rust\n{line}\n```\n"));
+    let block = &doc.blocks[0];
+    let mut runs = 0;
+    let lang = crate::highlight::find("rust").unwrap();
+    crate::highlight::lex(lang, &line, 0, &mut |_, _, _| runs += 1);
+    let mut para = Para::default();
+    let style = TextStyle {
+        bold: false,
+        italic: false,
+        mono: true,
+        size: 14.0,
+        role: Role::Text,
+        deco: 0,
+        shift: 0.0,
+        link: 0,
+    };
+    assert!(push_highlighted(&mut para, &doc, block, style));
+    assert_eq!(runs, 16 * 1024);
+    assert_eq!(para.items.len(), runs);
+    assert_eq!(para.text, line);
+    assert!(para.items.iter().all(|it| !it.fixed_doc));
+    // With tabs, they are expanded to the column, mapped to the tab.
+    let doc = Doc::parse("```rust\nab\tc(\t)\n```\n");
+    para.clear();
+    assert!(push_highlighted(&mut para, &doc, &doc.blocks[0], style));
+    assert_eq!(para.text, "ab  c(  )");
 }

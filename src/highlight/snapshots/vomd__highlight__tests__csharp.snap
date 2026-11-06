@@ -1,0 +1,22 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Keyword	"#region"
+Plain	" x\n"
+Keyword	"namespace"
+Plain	" "
+Entity	"App"
+Plain	" { "
+Keyword	"class"
+Plain	" "
+Entity	"Foo"
+Plain	" { "
+Keyword	"string"
+Plain	" p = "
+Str	"@\"C:\\x\""
+Plain	"; "
+Keyword	"var"
+Plain	" s = "
+Str	"$\"{p}\""
+Plain	"; } }"

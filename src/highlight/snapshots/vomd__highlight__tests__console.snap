@@ -1,0 +1,16 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Comment	"$ "
+Constant	"cargo"
+Plain	" build --release\n   Compiling vomd v1.7.0\n"
+Comment	"user@host:~$ "
+Constant	"echo"
+Plain	" "
+Str	"\"hi\""
+Plain	" \\\n  && "
+Constant	"ls"
+Plain	"\nhi\n"
+Comment	"PS C:\\> "
+Plain	"Get-Item x"

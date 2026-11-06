@@ -1,0 +1,21 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Keyword	"data"
+Plain	" "
+Keyword	"class"
+Plain	" "
+Entity	"User"
+Plain	"("
+Keyword	"val"
+Plain	" name: String)\n"
+Keyword	"fun"
+Plain	" "
+Entity	"greet"
+Plain	"(u: User) = "
+Constant	"println"
+Plain	"("
+Str	"\"hi ${u.name} $x\""
+Plain	") "
+Comment	"/* a /* b */ c */"

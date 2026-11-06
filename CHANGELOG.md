@@ -3,6 +3,14 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Code blocks are coloured by language, as on GitHub (Rust, Python, JavaScript/TypeScript, JSON,
+  YAML, TOML, shell and console, C/C++, Go, Java, Kotlin, C#, Swift, HTML/XML, CSS, SQL, diff,
+  Markdown, Dockerfile, Makefile, Ruby, PHP, Lua, PowerShell). The `highlight` Cargo feature (on
+  by default) builds it in.
+
 ## [1.7.0] - 2026-11-03
 
 ### Added

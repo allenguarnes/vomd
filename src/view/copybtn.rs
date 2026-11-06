@@ -92,7 +92,7 @@ impl View {
         let doc_y = self.doc_y(y);
         let i = self.layout.range_exact(doc_y, doc_y + 0.001).start;
         let block = self.doc.blocks.get(i)?;
-        if block.kind != BlockKind::Code {
+        if !matches!(block.kind, BlockKind::Code(_)) {
             return None;
         }
         let content = self.layout.geoms()[i].content.as_deref()?;

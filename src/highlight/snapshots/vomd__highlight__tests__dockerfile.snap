@@ -1,0 +1,20 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Keyword	"FROM"
+Plain	" rust:"
+Constant	"1.89"
+Plain	" "
+Keyword	"AS"
+Plain	" build\n"
+Keyword	"RUN"
+Plain	" cargo build --release "
+Comment	"# build"
+Plain	"\n"
+Keyword	"COPY"
+Plain	" --from=build /app/target/release/vomd /usr/local/bin/\n"
+Keyword	"ENV"
+Plain	" PATH="
+Var	"$HOME"
+Plain	"/bin"

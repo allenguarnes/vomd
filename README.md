@@ -36,7 +36,7 @@
 ## Why VOMD
 
 - **Fast.** Opens in milliseconds; a 5 MB document opens in under 100 ms.
-- **Small.** One file with its fonts built in: 5.9 MB on Linux, 4.7 MB on Windows. No web
+- **Small.** One file with its fonts built in: under 6 MB on Linux, 4.7 MB on Windows. No web
   engine, no GUI toolkit, nothing else to install.
 - **Private.** Never touches the network unless you ask it to, and never runs a document's HTML.
 - **Just a viewer.** No editor, no workspace, no accounts. Open a file, read it, close it.
@@ -50,6 +50,8 @@
 - **Math:** LaTeX formulas, written as on GitHub: `$…$` and `` $`…`$ `` in the text, `$$…$$`
   and ```` ```math ```` blocks centred on a line of their own. VOMD lays them out itself, with a
   built-in math font.
+- **Syntax highlighting** in code blocks, in GitHub's colours, for 26 languages and their usual
+  aliases.
 - **Images:** PNG, JPEG, GIF, WebP and SVG, local or remote. Animated GIFs and WebPs can play
   (off by default, press `A`).
 - **Links:** `#anchors` scroll, links to other `.md` files open in the same window (with Back),

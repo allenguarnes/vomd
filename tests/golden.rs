@@ -204,6 +204,37 @@ const CASES: &[Case] = &[
         view: None,
         select: Some(("the fraction", "end of selection")),
     },
+    // Syntax highlighting: a block for each language table, and a `text` block left plain.
+    #[cfg(feature = "highlight")]
+    Case {
+        name: "highlight-light",
+        fixture: "highlight.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+        select: None,
+    },
+    #[cfg(feature = "highlight")]
+    Case {
+        name: "highlight-dark",
+        fixture: "highlight.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &DARK,
+        view: None,
+        select: None,
+    },
+    #[cfg(feature = "highlight")]
+    Case {
+        name: "highlight-2x",
+        fixture: "highlight.md",
+        width: 760.0,
+        scale: 2.0,
+        theme: &LIGHT,
+        view: None,
+        select: None,
+    },
 ];
 
 /// `formats.md` with its images decoded by the viewer's own code: SVG drawn at the box (sharp
@@ -592,7 +623,7 @@ fn render_button(case: &ButtonCase) -> Rendered {
         .doc()
         .blocks
         .iter()
-        .position(|b| b.kind == vomd::doc::BlockKind::Code)
+        .position(|b| matches!(b.kind, vomd::doc::BlockKind::Code(_)))
         .expect("the fixture has a code block");
     // The middle of the block's background, and the button at its corner.
     let content = view.layout().geoms()[first].content.as_deref().unwrap();

@@ -487,7 +487,7 @@ fn is_backlink(doc: &Doc, i: usize) -> bool {
 /// that isn't part of what reads as a line when it is pasted.
 fn ends_code(doc: &Doc, b: u32, to: u32) -> bool {
     let block = &doc.blocks[b as usize];
-    block.kind == BlockKind::Code
+    matches!(block.kind, BlockKind::Code(_))
         && !joined_next(doc, b)
         && doc.block_spans(block).last().is_some_and(|s| to >= s.end)
 }

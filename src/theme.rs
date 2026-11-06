@@ -26,6 +26,9 @@ pub enum Role {
     FindMatch,
     #[cfg(feature = "find")]
     FindCurrent,
+    /// A token in a highlighted code block (`Tok::Plain` is `Text`).
+    #[cfg(feature = "highlight")]
+    Syntax(crate::highlight::Tok),
 }
 
 /// `0x00RRGGBB`, the softbuffer pixel format.
@@ -52,6 +55,11 @@ pub struct Theme {
     pub find_match: Rgb,
     #[cfg(feature = "find")]
     pub find_current: Rgb,
+    /// Code tokens, by `Tok` from `Comment` to `Meta`: Primer's "prettylights" colours, except
+    /// a diff's inserted and deleted lines, which take the success and danger colours (Primer's
+    /// own are made for a tinted background).
+    #[cfg(feature = "highlight")]
+    pub syntax: [Rgb; 10],
 }
 
 pub const LIGHT: Theme = Theme {
@@ -72,6 +80,11 @@ pub const LIGHT: Theme = Theme {
     find_match: 0xffe98f,
     #[cfg(feature = "find")]
     find_current: 0xffb25c,
+    #[cfg(feature = "highlight")]
+    syntax: [
+        0x59636e, 0xcf222e, 0x0a3069, 0x0550ae, 0x6639ba, 0x0550ae, 0x953800, 0x1a7f37, 0xcf222e,
+        0x8250df,
+    ],
 };
 
 pub const DARK: Theme = Theme {
@@ -92,6 +105,11 @@ pub const DARK: Theme = Theme {
     find_match: 0x5c4a14,
     #[cfg(feature = "find")]
     find_current: 0x9c5a14,
+    #[cfg(feature = "highlight")]
+    syntax: [
+        0x9198a1, 0xff7b72, 0xa5d6ff, 0x79c0ff, 0xd2a8ff, 0x7ee787, 0xffa657, 0x3fb950, 0xf85149,
+        0xd2a8ff,
+    ],
 };
 
 impl Theme {
@@ -117,6 +135,10 @@ impl Theme {
             Role::FindMatch => self.find_match,
             #[cfg(feature = "find")]
             Role::FindCurrent => self.find_current,
+            #[cfg(feature = "highlight")]
+            Role::Syntax(crate::highlight::Tok::Plain) => self.text,
+            #[cfg(feature = "highlight")]
+            Role::Syntax(t) => self.syntax[t as usize - 1],
         }
     }
 }

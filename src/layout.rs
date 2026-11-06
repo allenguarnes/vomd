@@ -853,7 +853,7 @@ impl Layout {
             m.shape = match b.kind {
                 BlockKind::Paragraph | BlockKind::AlertTitle(_) => Est::Text,
                 BlockKind::Heading(level) => Est::Heading(level.clamp(1, 6)),
-                BlockKind::Code => {
+                BlockKind::Code(_) => {
                     let newlines: usize = spans
                         .iter()
                         .map(|s| doc.span_text(s).matches('\n').count())
@@ -1201,7 +1201,7 @@ impl Layout {
                     None => text(self, &mut out, &mut missing),
                 }
             }
-            BlockKind::Code => self.code(
+            BlockKind::Code(_) => self.code(
                 doc,
                 fonts,
                 (block, last),
@@ -1536,8 +1536,10 @@ impl Layout {
             link: 0,
         };
         self.para.clear();
-        for span in doc.block_spans(block) {
-            push_expanding_tabs(&mut self.para, doc.span_text(span), span.start, style);
+        if !push_highlighted(&mut self.para, doc, block, style) {
+            for span in doc.block_spans(block) {
+                push_expanding_tabs(&mut self.para, doc.span_text(span), span.start, style);
+            }
         }
         if self.para.styles.is_empty() {
             self.para.styles.push(style);
@@ -2419,8 +2421,45 @@ fn fill_para(
     }
 }
 
+/// Copy a highlighted code block's text (with tabs expanded) in its tokens' colours, lexed from
+/// the state the block starts in; false for a block that isn't one.
+fn push_highlighted(para: &mut Para, doc: &Doc, block: &Block, style: TextStyle) -> bool {
+    #[cfg(feature = "highlight")]
+    if let BlockKind::Code(hl) = block.kind
+        && hl.lang != 0
+        && let spans = doc.block_spans(block)
+        && let (Some(a), Some(b)) = (spans.first(), spans.last())
+    {
+        use crate::highlight::Tok;
+        // A block's spans are one run of the document's text.
+        let at = a.start;
+        let text = &doc.text[at as usize..b.end as usize];
+        crate::highlight::lex(hl.lang, text, hl.state, &mut |s, e, tok| {
+            let role = match tok {
+                Tok::Plain => Role::Text,
+                t => Role::Syntax(t),
+            };
+            push_expanding_tabs(
+                para,
+                &text[s..e],
+                at + s as u32,
+                TextStyle { role, ..style },
+            );
+        });
+        return true;
+    }
+    let _ = (para, doc, block, style);
+    false
+}
+
 /// Copy code text with tabs expanded to the next multiple-of-4 column.
 fn push_expanding_tabs(para: &mut Para, text: &str, doc: u32, style: TextStyle) {
+    // Only text with a tab needs the column, found from the line so far: a highlighted line of
+    // many tokens would otherwise take time in its length times theirs.
+    if !text.contains('\t') {
+        para.push_text(text, doc, style);
+        return;
+    }
     let mut col = para
         .text
         .rsplit('\n')

@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{CowStr, Event};
 
-use super::{BlockKind, Builder, style};
+use super::{BlockKind, Builder, Hl, style};
 use crate::math::MAX_SOURCE;
 
 impl Builder {
@@ -106,7 +106,7 @@ impl Builder {
             return;
         }
         if src.len() > MAX_SOURCE {
-            self.open(BlockKind::Code);
+            self.open(BlockKind::Code(Hl::default()));
             self.text(&src, style::CODE | style::MATH_ERROR, 0);
             self.close();
         } else {

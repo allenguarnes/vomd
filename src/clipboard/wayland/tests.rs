@@ -118,7 +118,7 @@ fn pasted_code(src: &str) -> Vec<u8> {
     let first = doc
         .blocks
         .iter()
-        .position(|b| b.kind == BlockKind::Code)
+        .position(|b| matches!(b.kind, BlockKind::Code(_)))
         .expect("a code block") as u32;
     let last = crate::select::block_unit(&doc, first).1.block;
     pasted(&Content::code(&doc, first, last), false)

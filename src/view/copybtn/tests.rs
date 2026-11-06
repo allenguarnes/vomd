@@ -25,7 +25,7 @@ fn code_block(v: &View) -> usize {
     v.doc()
         .blocks
         .iter()
-        .position(|b| b.kind == BlockKind::Code)
+        .position(|b| matches!(b.kind, BlockKind::Code(_)))
         .expect("a code block")
 }
 
@@ -194,7 +194,7 @@ fn a_block_in_a_list_or_quote_has_its_button_at_its_own_corner() {
     let mut v = view(src, 700, 900);
     settle(&mut v);
     let blocks: Vec<usize> = (0..v.doc().blocks.len())
-        .filter(|&i| v.doc().blocks[i].kind == BlockKind::Code)
+        .filter(|&i| matches!(v.doc().blocks[i].kind, BlockKind::Code(_)))
         .collect();
     assert_eq!(blocks.len(), 4);
     let mut lefts = Vec::new();
@@ -496,7 +496,7 @@ fn a_huge_block_has_one_button_at_the_top_of_its_first_chunk() {
     let mut v = view(&src, 640, 400);
     settle(&mut v);
     let chunks: Vec<usize> = (0..v.doc().blocks.len())
-        .filter(|&i| v.doc().blocks[i].kind == BlockKind::Code)
+        .filter(|&i| matches!(v.doc().blocks[i].kind, BlockKind::Code(_)))
         .collect();
     assert!(chunks.len() > 20, "{} chunks", chunks.len());
     let first = chunks[0];
@@ -596,7 +596,7 @@ fn the_check_mark_belongs_to_the_block_that_was_copied() {
     let mut v = view(src, 640, 480);
     settle(&mut v);
     let blocks: Vec<usize> = (0..v.doc().blocks.len())
-        .filter(|&i| v.doc().blocks[i].kind == BlockKind::Code)
+        .filter(|&i| matches!(v.doc().blocks[i].kind, BlockKind::Code(_)))
         .collect();
     v.code_copied(blocks[0] as u32, now);
     let checked = |v: &mut View, b: usize| {

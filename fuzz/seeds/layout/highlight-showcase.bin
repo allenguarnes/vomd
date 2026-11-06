@@ -1,0 +1,123 @@
+pÈ# Highlighting
+
+````rust
+/// Doc /* nested */ comment
+#[derive(Debug)]
+pub fn parse<'a>(s: &'a str) -> Option<u32> {
+    let c = '\n'; let d = 'x'; let r = r#"raw "q" "#;
+    println!("{} {}", 0x1F, 1.5e-3);
+    if s.len() > 2 { Some(42) } else { None }
+}
+````
+
+````python
+@dataclass
+class Foo(Base):
+    """Doc
+    string"""
+    def bar(self, x=1.5):  # comment
+        return f"hi {x}" + r'\d' if x else None
+````
+
+````bash
+#!/bin/bash
+for f in *.md; do echo "file: $f ${HOME}" | grep -v '#x'; done # c
+apt-get install -y --no-install-recommends curl
+````
+
+````console
+$ cargo build --release
+   Compiling vomd v1.7.0
+user@host:~$ echo "hi" \
+  && ls
+hi
+````
+
+````yaml
+# config
+name: vomd
+version: 1.7
+on: [push, "pull_request"]
+jobs:
+  build:
+    - run: cargo test # c
+      env: &e
+        X: true
+    script: |
+      echo hi
+      echo there
+    after: *e
+````
+
+````json
+{"name": "x", "n": [1, 2.5, -3e2], "ok": true, "z": null}
+````
+
+````toml
+[package]
+name = "vomd" # c
+deps = [
+  "a", 1, true,
+]
+[[bin]]
+````
+
+````diff
+diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -1,2 +1,2 @@
+-old
++new
+ same
+````
+
+````html
+<!-- c -->
+<a href="x.html" class='b'>Hi &amp; bye</a>
+<br/>
+````
+
+````css
+/* c */
+a:hover, .btn #id { color: #fff; margin: 0 1.5em !important; }
+@media (max-width: 600px) { body { font: 12px "Inter"; } }
+````
+
+````sql
+SELECT id, COUNT(*) FROM users WHERE name = 'it''s' -- c
+````
+
+````markdown
+# Title
+- item `code` [link](http://x)
+```rust
+let x = 1;
+```
+1. two
+````
+
+```ts
+interface User { name: string; age?: number }
+export async function load(id: number): Promise<User> {
+  const res = await fetch(`/api/${id}`); // fetch
+  return res.json() as User;
+}
+```
+
+```go
+package main
+import "fmt"
+func main() { fmt.Println("hi", 42, nil) }
+```
+
+```c
+#include <stdio.h>
+int main(void) { printf("%d\n", 0xff); return 0; } /* done */
+```
+
+```dockerfile
+FROM rust:1.89 AS build
+RUN cargo build --release # build
+COPY --from=build /app/target/release/vomd /usr/local/bin/
+```

@@ -4168,7 +4168,7 @@ mod with_fonts {
                     .doc()
                     .blocks
                     .iter()
-                    .position(|b| b.kind == BlockKind::Code)
+                    .position(|b| matches!(b.kind, BlockKind::Code(_)))
                     .unwrap();
                 let c = v.layout().geoms()[b].content.as_deref().unwrap();
                 let r = c.rects.iter().find(|r| r.role == Role::CodeBg).unwrap();

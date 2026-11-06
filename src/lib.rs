@@ -9,6 +9,8 @@ pub mod doc;
 #[cfg(feature = "find")]
 pub mod find;
 pub mod fonts;
+#[cfg(feature = "highlight")]
+pub mod highlight;
 pub mod image;
 pub mod layout;
 #[cfg(feature = "math")]

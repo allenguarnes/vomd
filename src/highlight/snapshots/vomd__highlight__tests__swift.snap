@@ -1,0 +1,21 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Keyword	"struct"
+Plain	" "
+Entity	"Point"
+Plain	" { "
+Keyword	"var"
+Plain	" x = "
+Constant	"0"
+Plain	" }\n"
+Keyword	"func"
+Plain	" "
+Entity	"area"
+Plain	"(_ p: Point) -> Int { "
+Keyword	"return"
+Plain	" p.x * "
+Constant	"2"
+Plain	" } "
+Comment	"// c"

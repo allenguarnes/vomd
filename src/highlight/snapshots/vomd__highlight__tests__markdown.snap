@@ -1,0 +1,21 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Constant	"# Title"
+Plain	"\n"
+Var	"-"
+Plain	" item "
+Str	"`code`"
+Plain	" [link]"
+Str	"(http://x)"
+Plain	"\n"
+Str	"```rust"
+Plain	"\n"
+Str	"let x = 1;"
+Plain	"\n"
+Str	"```"
+Plain	"\n"
+Var	"1."
+Plain	" two "
+Comment	"<!-- c -->"

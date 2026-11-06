@@ -1,0 +1,21 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Comment	"--[==[ long\ncomment ]==]"
+Plain	"\n"
+Keyword	"local"
+Plain	" "
+Keyword	"function"
+Plain	" "
+Entity	"f"
+Plain	"(t) "
+Keyword	"return"
+Plain	" t["
+Constant	"1"
+Plain	"] .. "
+Str	"[[long\nstring]]"
+Plain	" "
+Keyword	"end"
+Plain	" "
+Comment	"-- c"

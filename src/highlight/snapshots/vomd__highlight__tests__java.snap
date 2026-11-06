@@ -1,0 +1,18 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Entity	"@Override"
+Plain	"\n"
+Keyword	"public"
+Plain	" "
+Keyword	"class"
+Plain	" "
+Entity	"Foo"
+Plain	" "
+Keyword	"extends"
+Plain	" Bar {\n    String s = "
+Str	"\"\"\"\n        text\"\"\""
+Plain	"; "
+Comment	"// c"
+Plain	"\n}"

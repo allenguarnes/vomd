@@ -13,6 +13,7 @@ clippy:
     cargo clippy --all-targets --no-default-features --features svg -- -D warnings
     cargo clippy --all-targets --no-default-features --features math -- -D warnings
     cargo clippy --all-targets --no-default-features --features math,embed-fonts -- -D warnings
+    cargo clippy --all-targets --no-default-features --features highlight -- -D warnings
 
 test:
     cargo test --workspace
@@ -20,6 +21,7 @@ test:
     cargo test --lib --no-default-features --features images,embed-fonts
     cargo test --lib --no-default-features --features math
     cargo test --lib --no-default-features --features math,embed-fonts
+    cargo test --lib --no-default-features --features highlight
 
 # Portability guard: needs `rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin`.
 check-other:
@@ -37,7 +39,7 @@ budgets:
 images *args:
     cargo xtask images {{args}}
 
-# Fuzz a target (doc, image, anim, layout, math, settings, svg) on stable for SECONDS.
+# Fuzz a target (doc, image, anim, layout, math, settings, svg, highlight) on stable for SECONDS.
 fuzz target seconds="60":
     scripts/fuzz.sh {{target}} {{seconds}}
 

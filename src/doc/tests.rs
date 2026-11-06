@@ -8,7 +8,7 @@ fn dump(doc: &Doc) -> String {
         let kind = match block.kind {
             BlockKind::Paragraph => "P".to_owned(),
             BlockKind::Heading(n) => format!("H{n}"),
-            BlockKind::Code => "Code".to_owned(),
+            BlockKind::Code(_) => "Code".to_owned(),
             BlockKind::Rule => "Rule".to_owned(),
             BlockKind::AlertTitle(a) => format!("Alert({a:?})"),
             BlockKind::TableRow { table, header, .. } => {
@@ -708,7 +708,7 @@ fn oversized_code_block_is_chunked() {
     check_invariants(&doc);
     assert!(doc.blocks.len() > 2);
     for (i, b) in doc.blocks.iter().enumerate() {
-        assert_eq!(b.kind, BlockKind::Code);
+        assert!(matches!(b.kind, BlockKind::Code(_)));
         assert_eq!(b.joined, i > 0);
         let bytes: usize = doc
             .block_spans(b)
@@ -4523,7 +4523,7 @@ fn formulas_over_the_limit_are_error_text() {
     assert_eq!(error, format!("$${huge}$$"));
     // A math block: a code block.
     let doc = Doc::parse(&format!("```math\n{over}\n```\n\n```math\n{at}\n```"));
-    assert_eq!(doc.blocks[0].kind, BlockKind::Code);
+    assert_eq!(doc.blocks[0].kind, BlockKind::Code(Hl::default()));
     assert_eq!(doc.blocks[0].spans.len(), 1);
     assert_eq!(doc.spans[0].style, style::CODE | style::MATH_ERROR);
     assert_eq!(
@@ -4551,4 +4551,91 @@ fn segmented_parse_matches_with_math() {
         let n = assert_same("math", &src, budget);
         assert!(n > 3, "@ {budget}: {n} segments");
     }
+}
+
+#[test]
+fn a_code_block_costs_no_more_than_a_table_row() {
+    assert_eq!(std::mem::size_of::<BlockKind>(), 16);
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn a_fence_names_its_language() {
+    use crate::highlight::find;
+    let doc = Doc::parse(
+        "```rust\nfn x() {}\n```\n\n~~~Python title=\"a\"\nx\n~~~\n\n```\nx\n```\n\n\
+         ```nonesuch\nx\n```\n\n    indented\n\n```math\nx\n```\n",
+    );
+    let langs: Vec<_> = doc
+        .blocks
+        .iter()
+        .map(|b| match b.kind {
+            BlockKind::Code(hl) => Some(hl),
+            _ => None,
+        })
+        .collect();
+    let code = |lang| Some(Hl { lang, state: 0 });
+    let math = if cfg!(feature = "math") {
+        None
+    } else {
+        code(0)
+    };
+    assert_eq!(
+        langs,
+        [
+            code(find("rust").unwrap()),
+            code(find("python").unwrap()),
+            code(0),
+            code(0),
+            code(0),
+            math,
+        ]
+    );
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn a_highlighted_blocks_chunks_start_where_the_lexer_is() {
+    use crate::highlight::{find, lex};
+    let lang = find("rust").unwrap();
+    // A block comment open across the first cut, and a string across the second.
+    let lines = |n: usize| {
+        (0..n)
+            .map(|i| format!("let x{i} = {i};\n"))
+            .collect::<String>()
+    };
+    let code = format!(
+        "{}/* open\n{}*/\nlet s = \"\n{}\";\n{}",
+        lines(1000),
+        lines(1000),
+        lines(1000),
+        lines(500)
+    );
+    let doc = Doc::parse(&format!("```rust\n{code}```\n"));
+    check_invariants(&doc);
+    assert!(doc.blocks.len() >= 3, "{} chunks", doc.blocks.len());
+    let text = |b: &Block| {
+        let spans = doc.block_spans(b);
+        &doc.text[spans[0].start as usize..spans[spans.len() - 1].end as usize]
+    };
+    let mut state = 0;
+    let mut states = Vec::new();
+    for b in &doc.blocks {
+        assert_eq!(b.kind, BlockKind::Code(Hl { lang, state }));
+        states.push(state);
+        state = lex(lang, text(b), state, &mut |_, _, _| {});
+    }
+    // The chunks are the whole text, and the states are those of lexing it whole.
+    let all: String = doc.blocks.iter().map(text).collect();
+    assert_eq!(all, code.trim_end_matches('\n'));
+    let mut at = 0;
+    for (b, &want) in doc.blocks.iter().zip(&states) {
+        let got = lex(lang, &all[..at], 0, &mut |_, _, _| {});
+        assert_eq!(got, want, "at {at}");
+        at += text(b).len();
+    }
+    assert!(
+        states.iter().filter(|&&s| s != 0).count() >= 2,
+        "{states:?}"
+    );
 }

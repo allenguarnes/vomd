@@ -1,0 +1,22 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Keyword	"package"
+Plain	" main\n"
+Keyword	"import"
+Plain	" "
+Str	"\"fmt\""
+Plain	"\n"
+Keyword	"func"
+Plain	" "
+Entity	"main"
+Plain	"() { fmt."
+Entity	"Println"
+Plain	"("
+Str	"`raw`"
+Plain	", "
+Constant	"42"
+Plain	", "
+Constant	"nil"
+Plain	") }"

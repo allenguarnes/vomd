@@ -1,0 +1,22 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Comment	"<!-- c -->"
+Plain	"\n<"
+Tag	"a"
+Plain	" "
+Entity	"href"
+Plain	"="
+Str	"\"x.html\""
+Plain	" "
+Entity	"class"
+Plain	"="
+Str	"'b'"
+Plain	">Hi "
+Constant	"&amp;"
+Plain	" bye</"
+Tag	"a"
+Plain	">\n<"
+Tag	"br"
+Plain	"/>"

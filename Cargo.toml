@@ -59,7 +59,7 @@ name = "math_bench"
 required-features = ["math", "embed-fonts"]
 
 [features]
-default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find", "math"]
+default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find", "math", "highlight"]
 # Text selection and copy, and paste into the find bar. The X11 and Wayland clipboards use crates
 # that winit already brings in; the minimal build leaves all of it out.
 clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayland-protocols"]
@@ -70,6 +70,8 @@ find = []
 # LaTeX math ($…$, $$…$$, $`…`$, ```math): VOMD's own layout engine, no crates. With embed-fonts,
 # the STIX Two Math subset (143 KB) is embedded; without it, an installed math font is used.
 math = []
+# Syntax highlighting of fenced code blocks, in GitHub's colours: one small lexer, no crates.
+highlight = []
 images = ["dep:png", "dep:zune-jpeg", "dep:gif", "dep:image-webp"]
 # SVG and svgz images, with resvg (vendored, see [patch.crates-io]).
 svg = ["images", "dep:resvg", "dep:flate2", "dep:simplecss"]

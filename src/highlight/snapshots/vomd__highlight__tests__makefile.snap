@@ -1,0 +1,18 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Plain	"CC := gcc\n"
+Entity	"all"
+Plain	": build "
+Comment	"# c"
+Plain	"\n"
+Entity	"build"
+Plain	":\n\t"
+Var	"$(CC)"
+Plain	" -o app main.c\n"
+Keyword	"ifeq"
+Plain	" ("
+Var	"$(OS)"
+Plain	",Windows_NT)\n"
+Keyword	"endif"

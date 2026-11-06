@@ -1,0 +1,16 @@
+---
+source: src/highlight/tests.rs
+expression: "tokens(lang(name), text)"
+---
+Constant	"diff --git a/x b/x"
+Plain	"\n"
+Constant	"--- a/x"
+Plain	"\n"
+Constant	"+++ b/x"
+Plain	"\n"
+Meta	"@@ -1,2 +1,2 @@"
+Plain	"\n"
+Deleted	"-old"
+Plain	"\n"
+Inserted	"+new"
+Plain	"\n same"
