@@ -353,12 +353,63 @@ impl View {
         self.toc.list.as_ref().map_or(0, |l| l.entries.len())
     }
 
-    /// The row at window point (`x`, `y`), if it is on one.
+    /// The row at window point (`x`, `y`), if it is on one (and not on the scrollbar).
     pub(super) fn toc_row_at(&self, x: f64, y: f64) -> Option<usize> {
-        if !self.toc_covers(x, y) {
+        if !self.toc_covers(x, y) || self.toc_bar_column(x, y).is_some() {
             return None;
         }
         self.toc_geom().row_at(y, self.toc.scroll, self.toc_rows())
+    }
+
+    /// The panel's scrollbar thumb with the panel scrolled by `scroll`: `None` when its rows
+    /// all fit, or there are none (no scrollbar is painted then, only "No headings").
+    fn toc_thumb(&self, scroll: f64) -> Option<render::Thumb> {
+        if self.toc_rows() == 0 {
+            return None;
+        }
+        let g = self.toc_geom();
+        let area = Clip {
+            x0: 0,
+            y0: g.y0 as i32,
+            x1: g.width as i32,
+            y1: g.y1 as i32,
+        };
+        let vp = Viewport { area, scroll };
+        render::thumb(vp, g.content(self.toc_rows()) as f32, self.hidpi as f32)
+    }
+
+    /// The panel's scrollbar thumb if (`x`, `y`) is in its column on the panel: the thumb and
+    /// its margin to the panel's edge, a thumb's width wider to the left so it is easy to hit,
+    /// as the document's.
+    fn toc_bar_column(&self, x: f64, y: f64) -> Option<render::Thumb> {
+        if !self.toc_covers(x, y) {
+            return None;
+        }
+        let t = self.toc_thumb(self.toc.scroll)?;
+        let slack = f64::from(t.x1 - t.x0);
+        (x >= f64::from(t.x0) - slack).then_some(t)
+    }
+
+    /// The pointer moved to `y` while dragging the panel's thumb, grabbed `grab` pixels below
+    /// its top. Returns true if the panel scrolled.
+    pub(super) fn toc_drag_to(&mut self, y: f64, grab: f64) -> bool {
+        // Closed mid-drag (`C`, or a message in the document's place): nothing to scroll.
+        if !self.toc_showing() {
+            return false;
+        }
+        let max = self.toc_geom().max_scroll(self.toc_rows());
+        let (Some(first), Some(last)) = (self.toc_thumb(0.0), self.toc_thumb(max)) else {
+            return false;
+        };
+        let travel = f64::from(last.y0 - first.y0);
+        let frac = if travel > 0.0 {
+            (y - grab - f64::from(first.y0)) / travel
+        } else {
+            0.0
+        };
+        let before = self.toc.scroll;
+        self.toc.scroll = frac.clamp(0.0, 1.0) * max;
+        self.toc.scroll != before
     }
 
     /// Look at the row under the pointer again. Returns true if the picture changed.
@@ -382,9 +433,10 @@ impl View {
         self.toc.hover.is_some()
     }
 
-    /// A press at (`x`, `y`): true if the panel takes it. On the panel it is the start of a
-    /// click on a row (and never of a selection); on the document, with the panel covering it,
-    /// it closes the panel and does nothing else.
+    /// A press at (`x`, `y`): true if the panel takes it. On the panel's scrollbar it starts a
+    /// drag of its thumb; elsewhere on the panel it is the start of a click on a row (and never
+    /// of a selection); on the document, with the panel covering it, it closes the panel and
+    /// does nothing else.
     pub(super) fn press_toc(&mut self, x: f64, y: f64) -> bool {
         self.toc.pressed = None;
         if !self.toc_showing() {
@@ -392,6 +444,19 @@ impl View {
         }
         if self.toc_covers(x, y) {
             self.toc_ready();
+            // The scrollbar's: a press on the thumb drags it from where it was grabbed, one on
+            // the rest of its track centers the thumb there first.
+            if let Some(t) = self.toc_bar_column(x, y) {
+                let (y0, y1) = (f64::from(t.y0), f64::from(t.y1));
+                let grab = if (y0..y1).contains(&y) {
+                    y - y0
+                } else {
+                    (y1 - y0) / 2.0
+                };
+                self.drag = Some(super::Drag { grab, panel: true });
+                self.toc_drag_to(y, grab);
+                return true;
+            }
             self.toc.pressed = self.toc_row_at(x, y);
             return true;
         }

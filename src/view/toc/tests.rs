@@ -640,3 +640,86 @@ fn a_heading_with_math_shows_its_source() {
     assert_eq!(doc.headings[0].slug, "the-x2-case");
     assert_eq!(doc.headings[1].slug, "fracab-and-c");
 }
+
+#[test]
+fn the_panel_scrollbar_is_dragged_not_clicked_through() {
+    let mut v = view(&sections(100), 1200, 400);
+    v.set_toc(true);
+    settle(&mut v);
+    let now = Instant::now();
+    let t = v.toc_thumb(0.0).expect("a hundred rows overflow the panel");
+    let x = f64::from(t.x0 + t.x1) / 2.0;
+    let y = f64::from(t.y0 + t.y1) / 2.0;
+    // Over the thumb there is no row (no hand cursor, no click), though a row is under it.
+    assert_eq!(v.toc_row_at(x, y), None);
+    assert!(v.toc_geom().row_at(y, 0.0, v.toc_rows()).is_some());
+    // A press on the thumb grabs it, and a drag scrolls the panel, not the document.
+    let before = v.scroll();
+    assert!(v.press(x, y, now));
+    assert!(v.dragging());
+    assert_eq!(v.toc.pressed, None);
+    assert!(v.drag_to(y + 100.0, now));
+    assert!(v.toc.scroll > 0.0);
+    assert_eq!(v.scroll(), before);
+    // Dragged past the end, it stops there.
+    v.drag_to(1.0e6, now);
+    assert_eq!(v.toc.scroll, v.toc_geom().max_scroll(v.toc_rows()));
+    assert!(v.release(now));
+    assert!(!v.dragging());
+    assert!(
+        !v.fade.visible(now),
+        "the document's scrollbar doesn't show: it didn't move"
+    );
+    assert_eq!(v.click(x, 1.0e6), None);
+    assert_eq!(v.take_jump(), None, "the release jumps to no heading");
+    assert!(v.toc_open());
+    // A press on the track above the thumb centers the thumb there.
+    let t = v.toc_thumb(v.toc.scroll).unwrap();
+    let at = f64::from(t.y0) - 40.0;
+    assert!(v.press(x, at, now));
+    let t2 = v.toc_thumb(v.toc.scroll).unwrap();
+    assert!(
+        (f64::from(t2.y0 + t2.y1) / 2.0 - at).abs() <= 1.0,
+        "{t2:?} at {at}"
+    );
+    v.release(now);
+    // Left of the scrollbar's column, a press is still a click on the row.
+    let row_x = f64::from(t.x0) - 3.0 * f64::from(t.x1 - t.x0);
+    let row_y = v.toc_geom().top(
+        v.toc_geom().visible(v.toc.scroll, 100).start + 1,
+        v.toc.scroll,
+    ) + 5.0;
+    assert!(v.toc_row_at(row_x, row_y).is_some());
+    assert!(v.press(row_x, row_y, now));
+    assert!(!v.dragging());
+    v.release(now);
+    v.click(row_x, row_y);
+    assert!(v.take_jump().is_some());
+}
+
+#[test]
+fn a_panel_closed_mid_drag_scrolls_no_more() {
+    let mut v = view(&sections(100), 1200, 400);
+    v.set_toc(true);
+    settle(&mut v);
+    let now = Instant::now();
+    let t = v.toc_thumb(0.0).unwrap();
+    let (x, y) = (f64::from(t.x0 + t.x1) / 2.0, f64::from(t.y0 + 2));
+    assert!(v.press(x, y, now));
+    v.set_toc(false);
+    assert!(!v.drag_to(y + 100.0, now));
+    assert_eq!(v.toc.scroll, 0.0);
+    assert!(v.release(now));
+    assert!(!v.dragging());
+}
+
+#[test]
+fn a_panel_without_headings_has_no_scrollbar_to_grab() {
+    // So short that even the empty panel's padding overflows it.
+    let mut v = view("Just a paragraph.\n", 600, 40);
+    v.set_toc(true);
+    settle(&mut v);
+    assert_eq!(v.toc_rows(), 0);
+    assert!(v.toc_thumb(0.0).is_none());
+    assert!(!v.dragging());
+}

@@ -495,10 +495,13 @@ pub fn title(input: &Input) -> String {
     }
 }
 
-/// A scrollbar drag in progress: where on the thumb it was grabbed.
+/// A scrollbar drag in progress: where on the thumb it was grabbed, and whether it is the
+/// contents panel's scrollbar rather than the document's.
 #[derive(Clone, Copy, Debug)]
 struct Drag {
     grab: f64,
+    #[cfg(feature = "toc")]
+    panel: bool,
 }
 
 pub struct View {
@@ -1289,7 +1292,11 @@ impl View {
 
     /// The scrollbar is held on screen: dragged, or under the pointer.
     fn bar_held(&self) -> bool {
-        self.drag.is_some() || self.over_bar
+        #[cfg(feature = "toc")]
+        let doc = self.drag.is_some_and(|d| !d.panel);
+        #[cfg(not(feature = "toc"))]
+        let doc = self.drag.is_some();
+        doc || self.over_bar
     }
 
     fn press_scrollbar(&mut self, x: f64, y: f64, now: Instant) -> bool {
@@ -1302,7 +1309,11 @@ impl View {
             return false;
         }
         let grab = if on_thumb { y - y0 } else { (y1 - y0) / 2.0 };
-        self.drag = Some(Drag { grab });
+        self.drag = Some(Drag {
+            grab,
+            #[cfg(feature = "toc")]
+            panel: false,
+        });
         self.drag_to(y, now);
         true
     }
@@ -1312,6 +1323,10 @@ impl View {
         let Some(drag) = self.drag else {
             return false;
         };
+        #[cfg(feature = "toc")]
+        if drag.panel {
+            return self.toc_drag_to(y, drag.grab);
+        }
         let max = self.max_scroll();
         let (Some(first), Some(last)) = (self.thumb_at(0.0), self.thumb_at(max)) else {
             return false;
@@ -1335,6 +1350,11 @@ impl View {
         let row = self.toc.pressed.is_some();
         #[cfg(not(feature = "toc"))]
         let row = false;
+        // The document's scrollbar lingers after its own drag, not after the panel's.
+        #[cfg(feature = "toc")]
+        if self.drag.take_if(|d| d.panel).is_some() {
+            return true;
+        }
         if self.drag.take().is_some() {
             self.fade.poke(now);
             return true;
