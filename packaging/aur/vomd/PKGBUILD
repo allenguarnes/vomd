@@ -27,7 +27,7 @@ optdepends=('curl: remote images, loaded only after pressing I'
             'noto-fonts-emoji: color emoji')
 options=('!lto' '!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('52cc4085bdff844034d329e8d7859f2b84c24d11b9dd2b0cb4fed406d32e8414')
 
 prepare() {
   cd "$pkgname-$pkgver"
