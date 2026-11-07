@@ -1354,6 +1354,59 @@ fn segmented_parse_cuts_giant_tables_between_rows() {
     assert_eq!(doc.blocks.len(), 1 + (1 + 3000) + 1 + (1 + 40));
 }
 
+/// pulldown-cmark counts math braces from a table's first `$` across all of its rows, so a
+/// segment starting mid-table could read the rows after it differently: a table is cut only
+/// where the brace state is the same either way (`Scan::math_cut`).
+#[cfg(feature = "math")]
+#[test]
+fn segmented_parse_cuts_tables_only_where_math_braces_agree() {
+    // Found by the fuzzer: the open braces of one row decide whether `$}{$` in the next is math.
+    let src = "|\0\n|-\n|${{{{{{{{{{{{{{{{{{{{{{{\n|{{$}{$";
+    for budget in [1, 8, 16, 24] {
+        assert_same("braces", src, budget);
+    }
+    // Rows before the first `$` with a brace after it are still cut; none after it.
+    let rows = big_table(400);
+    let rows = rows.splitn(3, '\n').nth(2).unwrap();
+    let src = format!("{}| ${{x}}$ | 1 | 2 |\n{rows}", big_table(400));
+    let dollar = src.find('$').unwrap();
+    let cuts = |src: &str| -> Vec<usize> {
+        segment::plan(src, 700).map_or(vec![], |p| {
+            p.segments.iter().skip(1).map(|s| s.range.start).collect()
+        })
+    };
+    let c = cuts(&src);
+    assert!(c.len() > 5, "{} cuts", c.len());
+    assert!(
+        c.iter().all(|&c| c <= dollar),
+        "a cut after the $ at {dollar}"
+    );
+    assert_same("dollar", &src, 700);
+    // Prices: a `$` in every row and no braces, cut anywhere.
+    let price = |i: usize, esc: &str| format!("| item {i} | {esc}$ {i}.99 | x |\n");
+    let head = "| Item | Price | Notes |\n|---|---:|---|\n";
+    let src: String = std::iter::once(head.to_string())
+        .chain((0..400).map(|i| price(i, "")))
+        .collect();
+    let c = cuts(&src);
+    assert!(c.len() > 5 && c.iter().any(|&c| c > 1000), "{c:?}");
+    assert_same("prices", &src, 700);
+    // An escaped `$` is no `$` to pulldown-cmark: the brace state after it is not the root's.
+    // The padding moves the escaped row onto a cut.
+    for (n, pad) in (6..14).flat_map(|n| (0..7).map(move |pad| (n, pad))) {
+        let src = format!(
+            "| h |\n|-|\n{}|${}\n|\\$ {}\n|{{{{$}}{{$\n",
+            "| a |\n".repeat(n),
+            " ".repeat(pad),
+            "{".repeat(23)
+        );
+        assert_same("escaped", &src, 1);
+    }
+    // A brace in the header with a `$` there: the table is never cut.
+    let src = big_table(400).replacen("Notes", "Notes ${}$", 1);
+    assert!(cuts(&src).is_empty(), "{:?}", cuts(&src));
+}
+
 /// Bytes the parsers read for `src` cut at `budget`: every segment with the header it repeats.
 fn parser_input_bytes(src: &str, budget: usize) -> usize {
     segment::plan(src, budget).map_or(src.len(), |p| {

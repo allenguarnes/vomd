@@ -11,6 +11,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
   Markdown, Dockerfile, Makefile, Ruby, PHP, Lua, PowerShell). The `highlight` Cargo feature (on
   by default) builds it in.
 
+### Changed
+- The default binary is 35 KB larger for syntax highlighting, still under 6 MB.
+
+### Fixed
+- The contents panel's scrollbar can be dragged. A press on it clicked the heading under it.
+- In a document over 1 MB, a long table with math in it could show a formula as text, or text
+  as a formula, unlike the same table in a smaller document (found by fuzzing).
+
 ## [1.7.0] - 2026-11-03
 
 ### Added

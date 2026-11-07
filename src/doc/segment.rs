@@ -31,8 +31,10 @@
 //! starts with the table's header and delimiter rows again ([`Segment::head`]), which the builder
 //! drops (see `Builder::continue_table`). The header is checked once with pulldown-cmark itself.
 //! A table whose short rows would make pulldown-cmark end it partway (it only fills in so many
-//! empty cells) is not cut: segments would count afresh and go on. Nor is a table cut before
-//! the segment is [`TABLE_HEAD_RATIO`] times its header, so repeating a huge header stays linear.
+//! empty cells) is not cut: segments would count afresh and go on. With math on, a table is not
+//! cut where pulldown-cmark's math brace state, kept across all of its rows, could differ from
+//! a fresh one (see `Scan::math_cut`). Nor is a table cut before the segment is
+//! [`TABLE_HEAD_RATIO`] times its header, so repeating a huge header stays linear.
 //!
 //! **Lists.** A list has no blank line to cut at when it is tight, and a giant one (a generated
 //! file index) must not be one parser's tree. So a segment may also end between two items of a
@@ -283,6 +285,40 @@ struct TableScan {
     /// The table's rows don't leave so many cells empty that pulldown-cmark gives up on it
     /// partway (see [`MAX_AUTOCOMPLETED_CELLS`]), which segments would do at other rows.
     cuttable: bool,
+    /// The first `$`, and the first `{` or `}`, at or after the header, maybe past the table
+    /// (`usize::MAX` if none): see [`Scan::math_cut`].
+    #[cfg(feature = "math")]
+    dollar: usize,
+    #[cfg(feature = "math")]
+    brace: usize,
+}
+
+/// A forward search that remembers its last answer: from where (`usize::MAX` before the first),
+/// and what it found (`usize::MAX` if nothing). Asked from offsets that only grow, it reads each
+/// byte once.
+#[cfg(feature = "math")]
+#[derive(Clone, Copy)]
+struct Next {
+    from: usize,
+    found: usize,
+}
+
+#[cfg(feature = "math")]
+impl Next {
+    const NEW: Next = Next {
+        from: usize::MAX,
+        found: usize::MAX,
+    };
+
+    /// The first match at or after `from`; `find` gives it as an offset into `src[from..]`.
+    fn at(&mut self, src: &str, from: usize, find: fn(&str) -> Option<usize>) -> usize {
+        // Nothing matches in `self.from..self.found`, so `found` answers every `from` in there.
+        if from < self.from || from > self.found {
+            let found = find(&src[from..]).map_or(usize::MAX, |i| from + i);
+            *self = Next { from, found };
+        }
+        self.found
+    }
 }
 
 /// A list item that starts in column 0.
@@ -437,6 +473,9 @@ struct Scan<'a> {
     stopped: bool,
     /// Whether the header at this start offset is a table for pulldown-cmark (checked lazily).
     valid_head: Option<(usize, bool)>,
+    /// Searches for a `$`, a `$` not after a backslash, and a `{` or `}` (see [`Scan::math_cut`]).
+    #[cfg(feature = "math")]
+    seek: [Next; 3],
 }
 
 impl<'a> Scan<'a> {
@@ -464,6 +503,8 @@ impl<'a> Scan<'a> {
             scratch: Vec::new(),
             stopped: false,
             valid_head: None,
+            #[cfg(feature = "math")]
+            seek: [Next::NEW; 3],
         }
     }
 
@@ -711,6 +752,10 @@ impl<'a> Scan<'a> {
         if pos <= table.body || !table.cuttable {
             return None;
         }
+        #[cfg(feature = "math")]
+        if !self.math_cut(table, pos) {
+            return None;
+        }
         let valid = match self.valid_head {
             Some((start, valid)) if start == table.head.start => valid,
             _ => {
@@ -745,8 +790,55 @@ impl<'a> Scan<'a> {
                 head: line.pos..body,
                 body,
                 cuttable: sparse_rows_fit(src, delim.as_bytes(), body),
+                #[cfg(feature = "math")]
+                dollar: self.next_dollar(line.pos),
+                #[cfg(feature = "math")]
+                brace: self.next_brace(line.pos),
             });
         }
+    }
+
+    /// Whether a segment may start at the row at `pos` of `table` as far as math goes.
+    /// pulldown-cmark keeps one math brace state for a whole table, across its rows, where a
+    /// segment starts afresh. The state stays fresh until the first `$` (a `{` or `}` before one
+    /// stores nothing), so a cut before any `$` is exact. After a `$` with no `{` or `}` yet, the
+    /// state is the root context alone, and a segment gets the same at its first `$`: the cut is
+    /// exact if that `$` comes before any brace (or no `$` comes at all). A `$` after a backslash
+    /// may be escaped, which pulldown-cmark skips, so it doesn't count as that first `$`.
+    #[cfg(feature = "math")]
+    fn math_cut(&mut self, table: &TableScan, pos: usize) -> bool {
+        if table.dollar >= pos {
+            return true;
+        }
+        if table.brace < pos {
+            return false;
+        }
+        self.next_dollar(pos) == usize::MAX || self.next_live_dollar(pos) < self.next_brace(pos)
+    }
+
+    #[cfg(feature = "math")]
+    fn next_dollar(&mut self, from: usize) -> usize {
+        self.seek[0].at(self.src, from, |s| s.find('$'))
+    }
+
+    /// The first `$` at or after `from` that doesn't follow a backslash (`from` starts a line).
+    #[cfg(feature = "math")]
+    fn next_live_dollar(&mut self, from: usize) -> usize {
+        self.seek[1].at(self.src, from, |s| {
+            let mut i = 0;
+            while let Some(j) = s[i..].find('$') {
+                if i + j == 0 || s.as_bytes()[i + j - 1] != b'\\' {
+                    return Some(i + j);
+                }
+                i += j + 1;
+            }
+            None
+        })
+    }
+
+    #[cfg(feature = "math")]
+    fn next_brace(&mut self, from: usize) -> usize {
+        self.seek[2].at(self.src, from, |s| s.find(['{', '}']))
     }
 
     fn finish(mut self) -> Option<Plan> {
