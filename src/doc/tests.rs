@@ -1118,6 +1118,155 @@ fn html_attributes_are_parsed_by_boundaries() {
     );
 }
 
+/// A `<picture>`'s `<source>`s give its `<img>` the light and the dark theme's images, as a
+/// browser picks them: the first source that fits a theme wins, one without `media` fits both,
+/// any other media query none; the `<img>` is the fallback and gives the alt text and size.
+#[test]
+fn picture_sources_give_each_theme_its_image() {
+    // The light image (the one shown after parsing), and the dark one if it differs.
+    let themed = |html: &str| -> (String, Option<String>) {
+        let doc = Doc::parse(html);
+        let img = doc.images.first().expect("an image");
+        let dark = img.theme.as_ref().map(|t| {
+            assert_eq!(t[0], img.src, "the light image is shown after parsing");
+            t[1].to_string()
+        });
+        (img.src.to_string(), dark)
+    };
+    let pair = |light: &str, dark: Option<&str>| (light.to_owned(), dark.map(str::to_owned));
+    let dark = "<source media=\"(prefers-color-scheme: dark)\" srcset=\"d.png\">";
+    let light = "<source media=\"(prefers-color-scheme: light)\" srcset=\"l.png\">";
+    let img = "<img src=\"f.png\" alt=\"Logo\" width=\"320\">";
+    let picture = |sources: &str| format!("<picture>\n{sources}\n{img}\n</picture>\n");
+    // Dark and light.
+    assert_eq!(
+        themed(&picture(&format!("{dark}\n{light}"))),
+        pair("l.png", Some("d.png"))
+    );
+    assert_eq!(
+        themed(&picture(&format!("{light}{dark}"))),
+        pair("l.png", Some("d.png"))
+    );
+    // Only one theme's: the other has the `<img>`'s.
+    assert_eq!(themed(&picture(dark)), pair("f.png", Some("d.png")));
+    assert_eq!(themed(&picture(light)), pair("l.png", Some("f.png")));
+    // Case and spaces don't matter, and the first source that fits wins.
+    assert_eq!(
+        themed(&picture(
+            "<SOURCE MEDIA=' ( Prefers-Color-Scheme :DARK ) ' SRCSET=d.png>\
+             <source media=\"(prefers-color-scheme: dark)\" srcset=\"x.png\">"
+        )),
+        pair("f.png", Some("d.png"))
+    );
+    // No media fits both themes: before a themed source it wins, after one it fills the rest.
+    let any = "<source srcset=\"a.png\">";
+    assert_eq!(
+        themed(&picture(&format!("{any}{dark}"))),
+        pair("a.png", None)
+    );
+    assert_eq!(
+        themed(&picture(&format!("{dark}{any}"))),
+        pair("a.png", Some("d.png"))
+    );
+    // Other media queries fit neither; nor does a source without a srcset, or one of a type
+    // VOMD can't show.
+    assert_eq!(
+        themed(&picture(
+            "<source media=\"(min-width: 600px)\" srcset=\"w.png\">\
+             <source media=\"(prefers-color-scheme: dark)\">\
+             <source type=\"image/avif\" srcset=\"x.avif\">\
+             <source type=\"image/webp\" media=\"(prefers-color-scheme: dark)\" srcset=\"d.webp\">"
+        )),
+        pair("f.png", Some("d.webp"))
+    );
+    // `image/jpg` (not a MIME type, but common) and `image/apng` are formats VOMD reads.
+    assert_eq!(
+        themed(&picture(
+            "<source type=\"image/jpg\" media=\"(prefers-color-scheme: dark)\" srcset=\"d.jpg\">\
+             <source type=\"image/apng\" srcset=\"l.apng\">"
+        )),
+        pair("l.apng", Some("d.jpg"))
+    );
+    // An SVG source is shown only by a build that draws SVGs; others keep the `<img>`'s.
+    let svg = themed(&picture(
+        "<source type=\"image/svg+xml\" media=\"(prefers-color-scheme: dark)\" srcset=\"d.svg\">",
+    ));
+    let want = if cfg!(feature = "svg") {
+        "d.svg"
+    } else {
+        "f.png"
+    };
+    assert_eq!(svg.1.as_deref().unwrap_or(&svg.0), want);
+    // A srcset's first candidate, without its descriptor or the commas around it.
+    assert_eq!(
+        themed(&picture(
+            "<source media=\"(prefers-color-scheme: dark)\" srcset=\" ,d.png 2x, e.png 3x\">\
+             <source srcset=\"l.png, m.png 2x\">"
+        )),
+        pair("l.png", Some("d.png"))
+    );
+    assert_eq!(
+        themed(&picture(
+            "<source media=\"(prefers-color-scheme: dark)\" srcset=\"d&amp;1.png 100w\">"
+        )),
+        pair("f.png", Some("d&1.png"))
+    );
+    // Remote images are remote in either theme.
+    let doc = Doc::parse(&picture(
+        "<source media=\"(prefers-color-scheme: dark)\" srcset=\"https://x.y/d.png\">",
+    ));
+    assert!(!doc.images[0].remote);
+    let mut doc = doc;
+    doc.set_dark(true);
+    assert_eq!(
+        (&*doc.images[0].src, doc.images[0].remote),
+        ("https://x.y/d.png", true)
+    );
+    // The `<img>` gives the alt text and size, in either theme.
+    assert_eq!(doc.images[0].want[0], Want::Px(32000));
+    assert_eq!(doc.text, "Logo");
+    // Without a `<picture>`, sources are not an image's (`<video>`, `<audio>`); after its end,
+    // nor are they. Its sources don't last past its block either (as a link doesn't).
+    for html in [
+        format!("{dark}{img}"),
+        format!("<video>{dark}</video>{img}"),
+        format!("<picture>{dark}</picture>{img}"),
+        format!("<picture>\n{dark}\n\n{img}\n</picture>"),
+        format!("<picture>{dark}{img}{img}</picture>"),
+    ] {
+        let doc = Doc::parse(&html);
+        assert_eq!(&*doc.images.last().unwrap().src, "f.png", "{html}");
+        assert!(doc.images.last().unwrap().theme.is_none(), "{html}");
+    }
+    // Inline in a paragraph, and in a link.
+    let doc = Doc::parse(&format!(
+        "See <a href=\"u\"><picture>{dark}{img}</picture></a> here.\n"
+    ));
+    assert_eq!(doc.text, "See Logo here.");
+    assert!(doc.images[0].theme.is_some());
+    assert!(doc.spans.iter().any(|s| s.image == 1 && s.link == 1));
+    // A theme that changes nothing changes nothing.
+    let mut doc = Doc::parse(&picture(&format!("{light}<source srcset=l.png>")));
+    assert!(doc.images[0].theme.is_none() && !doc.set_dark(true));
+    assert_eq!(&*doc.images[0].src, "l.png");
+}
+
+/// VOMD's own README shows its light logo in the light theme and its dark one in the dark.
+#[test]
+fn readme_logo_follows_the_theme() {
+    let readme = include_str!("../../README.md");
+    let mut doc = Doc::parse(readme);
+    let logo = &doc.images[0];
+    assert_eq!(&*logo.src, "assets/vomd-full-logo-light.svg");
+    assert_eq!(logo.want[0], Want::Px(32000));
+    assert!(doc.text.starts_with("VOMD"));
+    assert!(doc.set_dark(true), "changed");
+    assert_eq!(&*doc.images[0].src, "assets/vomd-full-logo.svg");
+    assert!(!doc.set_dark(true), "unchanged");
+    assert!(doc.set_dark(false));
+    assert_eq!(doc, Doc::parse(readme));
+}
+
 #[test]
 fn heading_slugs_never_collide() {
     let anchors = |src: &str| -> Vec<String> {
@@ -1193,8 +1342,8 @@ fn assert_same(name: &str, src: &str, budget: usize) -> usize {
 }
 
 /// Inline HTML and autolinks at the cuts: tight items and cells that open tags, paragraphs that
-/// begin with an address (whether it may start a link depends on what came before), and URLs
-/// that end a block.
+/// begin with an address (whether it may start a link depends on what came before), URLs
+/// that end a block, and `<picture>`s.
 #[test]
 fn segmented_parse_keeps_inline_html_and_autolinks_at_the_cuts() {
     let blocks = [
@@ -1206,6 +1355,11 @@ fn segmented_parse_keeps_inline_html_and_autolinks_at_the_cuts() {
         "1. <kbd>k</kbd> a\n   - <sup>2</sup> b\n2. http://localhost:3000",
         "[a <a href=x>b](y) c</a> d\n\n<a href=x>foo [bar</a>](y)",
         "https://github.com/a/__init__.py",
+        // A `<picture>` cut between its sources and its image, one in a list, one inline.
+        "<p>\n<picture>\n<source media=\"(prefers-color-scheme: dark)\" srcset=\"d.png\">\n\n\
+         <source srcset=a.png>\n<img src=l.png alt=L>\n</picture>\n</p>",
+        "- <picture><source srcset=\"d.png 2x\" media=\"(prefers-color-scheme:dark)\">\n\
+         - <img src=l.png></picture>\n- x <picture><source srcset=e.png><img src=m.png>",
     ];
     let src: String = (0..12)
         .flat_map(|i| (0..blocks.len()).map(move |j| (i + j) % blocks.len()))

@@ -3,6 +3,22 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Images in a `<picture>` follow the theme: the dark or light version a README offers is the one
+  shown, and it changes with the theme. VOMD's own logo was dark grey on the dark theme.
+
+### Changed
+- When the font set in `font_sans` or `font_mono` isn't installed, or can't be used, VOMD says
+  so once instead of quietly keeping its built-in font.
+
+### Fixed
+- Alt text outlines of images that aren't shown, such as a README's row of badges, and code
+  spans with a space between them no longer run into each other.
+- The scrollbar shown when a window opens under the pointer, with the pointer at its right edge,
+  fades on its own like after a scroll. It stayed until the pointer moved.
+
 ## [1.8.0] - 2026-11-08
 
 ### Added

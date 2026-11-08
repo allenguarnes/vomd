@@ -2727,3 +2727,60 @@ fn a_long_highlighted_line_is_pushed_token_by_token() {
     assert!(push_highlighted(&mut para, &doc, &doc.blocks[0], style));
     assert_eq!(para.text, "ab  c(  )");
 }
+
+/// HTML images on lines of their own (a badge row) are one space apart, as in a browser: their
+/// alt texts' outlines don't meet across it, and loaded images keep the space between them.
+/// Code backgrounds facing each other across a space stay apart the same way, while an outline
+/// next to plain text keeps its whole padding.
+#[test]
+fn outlines_and_images_across_a_space_stay_apart() {
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(
+        "<p>\n  <a href=\"x\"><img src=\"a.png\" alt=\"Latest release\"></a>\n  \
+         <a href=\"y\"><img src=\"b.png\" alt=\"CI\"></a>\n  <img src=\"c.png\" alt=\"MIT\">\n</p>\n\n\
+         <p>\n  <img src=\"d.png\" alt=\"A\">\n  <img src=\"e.png\" alt=\"B\">\n</p>\n\n\
+         `one` `two`\n\nsee <img src=\"f.png\" alt=\"F\"> here\n",
+    );
+    for scale in [1.0, 2.0] {
+        let mut l = Layout::new(&doc, params(900.0, scale));
+        let probe: ImageProbe = Box::new(|img: &ImageRef| match &*img.src {
+            "d.png" | "e.png" => ImageSize::Pixels(40, 20),
+            _ => ImageSize::Alt,
+        });
+        l.set_image_probe(&doc, Some(probe));
+        l.ensure(&doc, &fonts, Anchor::TOP, 2000.0);
+        let space = |b: usize, role: Role| {
+            let c = l.geoms()[b].content.as_ref().unwrap();
+            let r: Vec<&PRect> = c.rects.iter().filter(|r| r.role == role).collect();
+            r.windows(2)
+                .map(|w| w[1].x - (w[0].x + w[0].w))
+                .collect::<Vec<f32>>()
+        };
+        // A space is about a quarter em: at least half of it stays clear.
+        let clear = 16.0 * scale * 0.1;
+        let gaps = space(0, Role::Border);
+        assert_eq!(gaps.len(), 2, "scale {scale}");
+        assert!(gaps.iter().all(|&g| g >= clear), "scale {scale}: {gaps:?}");
+        let b = boxes(&l, 1);
+        assert_eq!(b.len(), 2);
+        let gap = b[1].x - (b[0].x + b[0].b.width);
+        assert!(gap >= 2.0 * clear, "scale {scale}: {gap}");
+        let gaps = space(2, Role::CodeBg);
+        assert_eq!(gaps.len(), 1, "scale {scale}");
+        assert!(gaps[0] >= clear, "scale {scale}: {gaps:?}");
+        // Beside plain text, the outline keeps its padding.
+        let c = l.geoms()[3].content.as_ref().unwrap();
+        let outline = c.rects.iter().find(|r| r.role == Role::Border).unwrap();
+        let first = c
+            .glyphs
+            .iter()
+            .filter(|g| c.styles[g.style as usize].deco & deco::IMAGE_BOX != 0)
+            .map(|g| g.x)
+            .fold(f32::INFINITY, f32::min);
+        let pad = first - outline.x;
+        assert!(
+            (pad - 16.0 * scale * 0.15).abs() < 0.01,
+            "scale {scale}: {pad}"
+        );
+    }
+}

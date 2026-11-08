@@ -242,6 +242,8 @@ every option listed and commented out. Changes apply as soon as you switch back 
 | `font_sans`, `font_mono` | `default` (built in), or an installed font such as `Noto Sans` |
 | `window_width`, `window_height` | `900`, `1000` |
 
+If a font isn't found, VOMD says so and uses its built-in font.
+
 The theme, zoom, toolbar, contents panel, wide layout, animations and window size are saved
 automatically when you change them.
 
@@ -253,7 +255,7 @@ VOMD makes no network requests of its own.
   that document. They're then fetched with your system's `curl`, at most 12 MiB each, and kept in
   memory only. `remote_images = always` loads them for every document; `never` turns them off.
 - **HTML** in a document is never run. Tags are removed and their text kept; a few, such as
-  `<b>`, `<img>` and `<a>`, are shown the way GitHub shows them.
+  `<b>`, `<img>`, `<picture>` and `<a>`, are shown the way GitHub shows them.
 - **SVGs** never load other files or URLs. Each one is drawn in a separate, short-lived process
   that is stopped if it takes too long.
 

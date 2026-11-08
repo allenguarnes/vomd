@@ -255,6 +255,10 @@ pub struct ImageRef {
     pub start: u32,
     /// The width and height an HTML `<img>` asks for (Markdown has no syntax for them).
     pub want: [Want; 2],
+    /// An `<img>` in a `<picture>` that offers another image for one theme: the light and the
+    /// dark theme's images, and `src` is the one [`Doc::set_dark`] chose (the light one when
+    /// parsed).
+    pub theme: Option<Box<[Arc<str>; 2]>>,
 }
 
 /// A side of an image's box as an `<img>`'s `width` or `height` gives it.
@@ -458,6 +462,22 @@ impl Doc {
     pub fn remote_image_count(&self) -> usize {
         self.images.iter().filter(|i| i.remote).count()
     }
+
+    /// Show each `<picture>`'s image for the `dark` (or light) theme. Returns true if any image
+    /// changed.
+    pub fn set_dark(&mut self, dark: bool) -> bool {
+        let mut changed = false;
+        for img in &mut self.images {
+            let Some(t) = &img.theme else { continue };
+            let src = &t[dark as usize];
+            if *src != img.src {
+                img.src = src.clone();
+                img.remote = has_http_scheme(src);
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 /// Block being filled with spans.
@@ -617,6 +637,9 @@ struct HtmlInline {
     sub: u32,
     /// Inside `<script>` or `<style>` (the tag name): content is dropped.
     skip: Option<&'static str>,
+    /// Inside a `<picture>`: the image of the first `<source>` that fits the light and the dark
+    /// theme, for its `<img>`.
+    picture: Option<[Option<String>; 2]>,
     /// A space owed to the next content of a block of HTML, as its style and link: whitespace
     /// that ended the text before a tag. It is written with what follows, so none is left at the
     /// end of a block, and it is in the style of where it was, not of the tag after it.
@@ -1013,7 +1036,8 @@ impl Builder {
                 self.links.push(id);
             }
             Tag::Image { dest_url, .. } => {
-                let id = self.push_image(dest_url.into_string(), [Want::Auto; 2]);
+                let id =
+                    self.push_image(dest_url.into_string(), [Want::Auto; 2], Default::default());
                 self.image = Some(ImageAlt {
                     id,
                     alt: String::new(),
@@ -1552,15 +1576,24 @@ impl Builder {
         }
     }
 
-    fn push_image(&mut self, src: String, want: [Want; 2]) -> u32 {
-        let remote = has_http_scheme(&src);
+    /// An image whose source is `src`, or in a `<picture>`, the `themed` light and dark ones
+    /// where a `<source>` gives them.
+    fn push_image(&mut self, src: String, want: [Want; 2], themed: [Option<String>; 2]) -> u32 {
         let start = self.doc.text.len() as u32;
-        let src = src.into();
+        let [light, dark] = themed;
+        let (light, dark) = (
+            light.as_deref().unwrap_or(&src),
+            dark.as_deref().unwrap_or(&src),
+        );
+        let theme = (light != dark).then_some(dark);
+        let src: Arc<str> = light.into();
+        let theme = theme.map(|dark| Box::new([src.clone(), dark.into()]));
         let img = ImageRef {
+            remote: has_http_scheme(&src),
             src,
-            remote,
             start,
             want,
+            theme,
         };
         push_id(&mut self.doc.images, img)
     }
@@ -1710,11 +1743,21 @@ impl Builder {
                         attr(tag, name)
                             .map_or(Want::Auto, |v| Want::parse(&decode_entities(&v), width))
                     };
-                    let id = self.push_image(src, [want("width", true), want("height", false)]);
+                    // The first `<img>` of a `<picture>` takes its sources.
+                    let themed = (self.html_inline.picture.as_mut())
+                        .map_or_else(Default::default, std::mem::take);
+                    let want = [want("width", true), want("height", false)];
+                    let id = self.push_image(src, want, themed);
                     let alt = alt
                         .filter(|a| !a.trim().is_empty())
                         .unwrap_or("image".into());
                     self.text(&alt, style::IMAGE, id);
+                }
+                "picture" => self.html_inline.picture = (!closing).then(Default::default),
+                "source" if !closing => {
+                    if let Some(themed) = &mut self.html_inline.picture {
+                        source(themed, tag);
+                    }
                 }
                 "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "tr" | "table"
                 | "details" | "summary" | "ul" | "ol" | "blockquote" | "pre" | "hr"
@@ -2454,6 +2497,55 @@ fn decode_entities(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// A `<picture>`'s `<source>`: the first image of its `srcset` is the light or dark theme's (in
+/// `themed`) if no source before it is, and its `media` fits the theme as a browser's would: none
+/// (or `all`, `screen`) fits both, `(prefers-color-scheme: dark)` or `light` one, any other none.
+/// A source whose `type` is no image format VOMD reads is skipped (SVG only with the `svg`
+/// feature), as a browser skips one it can't show.
+fn source(themed: &mut [Option<String>; 2], tag: &str) {
+    let read = |name| attr(tag, name).map(|v| decode_entities(&v));
+    let shown = |t: String| {
+        let t = t
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let t = t.strip_prefix("image/").unwrap_or("");
+        ["png", "apng", "jpeg", "jpg", "gif", "webp"].contains(&t)
+            || (cfg!(feature = "svg") && t == "svg+xml")
+    };
+    if !read("type").is_none_or(shown) {
+        return;
+    }
+    let srcset = read("srcset").unwrap_or_default();
+    // Its first candidate's URL: up to whitespace (before a `2x` or `100w`), without the commas
+    // that separate candidates.
+    let url = (srcset.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ','))
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(',');
+    if url.is_empty() {
+        return;
+    }
+    let media: String = (read("media").unwrap_or_default().chars())
+        .filter(|c| !c.is_ascii_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let fits = match media.as_str() {
+        "" | "all" | "screen" => [true; 2],
+        "(prefers-color-scheme:light)" => [true, false],
+        "(prefers-color-scheme:dark)" => [false, true],
+        _ => return,
+    };
+    for (slot, fits) in themed.iter_mut().zip(fits) {
+        if fits && slot.is_none() {
+            *slot = Some(url.to_owned());
+        }
+    }
 }
 
 /// Whether `s` begins with `http://` or `https://`, in any case (schemes are case-insensitive).

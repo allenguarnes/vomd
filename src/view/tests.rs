@@ -651,6 +651,128 @@ mod with_fonts {
         assert_eq!(buf[0], DARK.bg);
     }
 
+    /// A directory with the two images of a `<picture>` test: `l.png` (30 by 10) and `d.png`
+    /// (20 by 40).
+    fn picture_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vomd-view-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, w, h) in [("l.png", 30, 10), ("d.png", 20, 40)] {
+            let mut out = Vec::new();
+            let mut enc = ::png::Encoder::new(&mut out, w, h);
+            enc.set_color(::png::ColorType::Grayscale);
+            enc.write_header()
+                .unwrap()
+                .write_image_data(&vec![0u8; (w * h) as usize])
+                .unwrap();
+            std::fs::write(dir.join(name), out).unwrap();
+        }
+        dir
+    }
+
+    const PICTURE: &str = "<picture>\n<source media=\"(prefers-color-scheme: dark)\" \
+                           srcset=\"d.png\">\n<img src=\"l.png\" alt=\"Logo\">\n</picture>\n";
+
+    /// A `<picture>` shows the image for the theme on screen, and the other one when the theme
+    /// changes (the T key, the system's, the setting, a reload, another document): the layout
+    /// sizes it from its own file.
+    #[test]
+    fn a_picture_follows_the_theme() {
+        let now = Instant::now();
+        let dir = picture_dir("picture");
+        let src = PICTURE;
+        let mut v = View::with_base(
+            Fonts::new().unwrap(),
+            Doc::parse(src),
+            None,
+            (400, 300),
+            1.0,
+            Some(dir.clone()),
+        );
+        v.ensure();
+        let shown = |v: &View| (v.doc().images[0].src.to_string(), v.layout().image_size(1));
+        #[cfg(feature = "images")]
+        let size = |w, h| Some(ImageSize::Pixels(w, h));
+        #[cfg(not(feature = "images"))]
+        let size = |_, _| Some(ImageSize::Alt);
+        let light = ("l.png".to_owned(), size(30, 10));
+        let dark = ("d.png".to_owned(), size(20, 40));
+        assert_eq!(shown(&v), light);
+        assert!(v.set_system_dark(true));
+        assert_eq!(shown(&v), dark, "the system's dark theme");
+        v.apply(Action::CycleTheme, now);
+        assert_eq!(shown(&v), light, "T: light");
+        v.apply(Action::CycleTheme, now);
+        assert_eq!(shown(&v), dark, "T: dark");
+        v.set_theme_mode(ThemeMode::Light);
+        assert_eq!(shown(&v), light, "the setting");
+        v.set_theme_mode(ThemeMode::System);
+        assert_eq!(shown(&v), dark);
+        v.replace(Doc::parse(src), None);
+        v.ensure();
+        assert_eq!(shown(&v), dark, "a reload in the dark theme");
+        assert_eq!(v.doc().text, "Logo");
+        // Another document (a link, Back, the Open dialog) in the dark theme.
+        v.open_in(Doc::parse(src), None, Some(dir.clone()));
+        v.ensure();
+        assert_eq!(shown(&v), dark, "open_in");
+        v.set_theme_mode(ThemeMode::Light);
+        assert_eq!(shown(&v), light);
+        v.set_theme_mode(ThemeMode::Dark);
+        v.set_theme_mode(ThemeMode::Light);
+        v.open(Doc::parse(src), None);
+        v.ensure();
+        assert_eq!(shown(&v), light, "open: light");
+        v.set_theme_mode(ThemeMode::Dark);
+        v.open(Doc::parse(src), None);
+        v.ensure();
+        assert_eq!(shown(&v), dark, "open: dark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While the clipboard holds a large lazy copy of the document, a theme change can't swap
+    /// the picture's image: it does when the copy is let go, without another theme change.
+    #[cfg(all(feature = "clipboard", feature = "images"))]
+    #[test]
+    fn a_picture_waits_for_a_held_copy() {
+        use crate::copy::Content;
+        use crate::select::Pos;
+        let now = Instant::now();
+        let dir = picture_dir("held");
+        let src = format!("{PICTURE}\n{}", "Line of text.\n\n".repeat(25_000));
+        let mut v = View::with_base(
+            Fonts::new().unwrap(),
+            Doc::parse(&src),
+            None,
+            (400, 300),
+            1.0,
+            Some(dir.clone()),
+        );
+        v.ensure();
+        let last = v.doc().blocks.len() as u32 - 1;
+        let held = Content::of(&v.doc, (Pos::start(0), Pos::end(last)));
+        assert!(matches!(held, Content::Lazy { .. }), "a large copy is lazy");
+        let shown = |v: &View| (v.doc().images[0].src.to_string(), v.layout().image_size(1));
+        let (light, dark) = (
+            ("l.png".to_owned(), Some(ImageSize::Pixels(30, 10))),
+            ("d.png".to_owned(), Some(ImageSize::Pixels(20, 40))),
+        );
+        v.set_theme_mode(ThemeMode::Dark);
+        assert_eq!(shown(&v), light, "held: the old image stays");
+        assert!(!v.tick(now, None).redraw);
+        assert_eq!(shown(&v), light, "still held");
+        drop(held);
+        assert!(v.tick(now, None).redraw, "the image changed");
+        assert_eq!(
+            shown(&v),
+            dark,
+            "let go: the dark image, with no new theme change"
+        );
+        assert!(!v.theme_wait);
+        // Nothing left to wait for.
+        assert!(!v.tick(now, None).redraw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The window loads the math face for a document with formulas, and keeps what it laid
     /// out across a live reload and a resize: only a changed formula is laid out again.
     #[cfg(feature = "math")]
@@ -966,6 +1088,75 @@ mod with_fonts {
         settle(&mut short);
         assert!(!short.hover_at(595.0, 200.0, t0));
         assert_eq!(short.deadline(), None);
+    }
+
+    /// A window that opens under the pointer, with the pointer in the scrollbar's column, shows
+    /// the scrollbar as a scroll does: it fades on its own after the same delay, once, however
+    /// often the pointer is looked at again without moving. Moving the pointer holds it.
+    #[test]
+    fn scrollbar_under_a_resting_pointer_fades_on_its_own() {
+        let t0 = Instant::now();
+        let mut v = view(&paras(200), 600, 400);
+        settle(&mut v);
+        let x = f64::from(v.thumb_at(0.0).unwrap().x1 - 1);
+        let mut buf = vec![0; 600 * 400];
+        let thumb_px = |buf: &[u32]| (0..400).any(|y| buf[y * 600 + 595] != LIGHT.bg);
+        // The first position seen (the window opened there): shown, with a deadline.
+        assert!(v.hover_at(x, 300.0, t0), "appears");
+        let deadline = v.deadline().expect("fades like after a scroll");
+        v.apply(Action::Lines(0), t0);
+        assert_eq!(v.deadline(), Some(deadline), "the same delay as a scroll");
+        // Events that look at the pointer again, where it is, don't push the deadline back.
+        assert!(!v.hover_at(x, 300.0, t0 + Duration::from_millis(100)));
+        assert_eq!(v.deadline(), Some(deadline));
+        v.paint(&mut buf, 600, t0);
+        assert!(thumb_px(&buf));
+        // The loop wakes at the deadline, hides it, and then has nothing to wake for.
+        let tick = v.tick(t0, None);
+        assert!(matches!(tick.wake, Wake::At(t) if t == deadline));
+        assert!(v.expire(deadline));
+        v.paint(&mut buf, 600, deadline);
+        assert!(!thumb_px(&buf), "hidden without pointer input");
+        assert!(!v.hover_at(x, 300.0, deadline));
+        assert_eq!(
+            v.deadline(),
+            None,
+            "not shown again while the pointer rests"
+        );
+        assert!(matches!(v.tick(deadline, None).wake, Wake::Event));
+        // Moving the pointer in the column shows it and holds it.
+        assert!(v.hover_at(x, 310.0, deadline), "appears");
+        assert_eq!(v.deadline(), None, "held, no timer");
+    }
+
+    /// A pointer that comes back into the window somewhere else has moved: the bar holds. One that
+    /// comes back at the same pixel (the window was covered and uncovered) is at rest: it fades.
+    #[test]
+    fn scrollbar_after_the_pointer_leaves_and_comes_back() {
+        let t0 = Instant::now();
+        let mut v = view(&paras(200), 600, 400);
+        settle(&mut v);
+        let x = f64::from(v.thumb_at(0.0).unwrap().x1 - 1);
+        assert!(v.hover_at(x, 300.0, t0));
+        assert!(v.deadline().is_some(), "the window opened under it: fades");
+        v.hover_end();
+        v.hover_at(x, 300.0, t0);
+        assert!(
+            v.deadline().is_some(),
+            "back at the same pixel: at rest, fades"
+        );
+        v.hover_end();
+        v.hover_at(x, 320.0, t0);
+        assert_eq!(v.deadline(), None, "back somewhere else: moved, held");
+        // A view that never saw the pointer: its first sight is at rest.
+        let mut v = view(&paras(200), 600, 400);
+        settle(&mut v);
+        v.hover_end();
+        assert!(v.hover_at(x, 300.0, t0));
+        assert!(
+            v.deadline().is_some(),
+            "first sight after hover_end: at rest"
+        );
     }
 
     /// A one-pixel scroll moves exactly one pixel far down a tall document (f64 anchors).
@@ -3646,6 +3837,34 @@ mod with_fonts {
             assert!(v.toast.is_none());
             frame(&mut v, now + TOAST);
             assert!(v.toast.is_none());
+        }
+
+        /// A remote image that only a theme change brings (a `<picture>`'s dark image) is
+        /// loaded by `always`, and announced under `ask`, though the document had none to
+        /// announce at its first frame.
+        #[test]
+        fn a_remote_image_a_theme_brings_is_announced() {
+            const SRC: &str = "<picture>\n<source media=\"(prefers-color-scheme: dark)\" \
+                               srcset=\"https://127.0.0.1:9/d.png\">\n\
+                               <img src=\"l.png\" alt=\"L\">\n</picture>\n";
+            let now = Instant::now();
+            let mut v = view(SRC, 600, 400);
+            v.set_remote_policy(RemoteImages::Always);
+            v.tick(now, Some(now));
+            assert!(!v.remote_on() && v.remote_count == 0);
+            v.set_theme_mode(ThemeMode::Dark);
+            assert_eq!(v.remote_count, 1);
+            v.tick(now, Some(now));
+            assert!(v.remote_on(), "always: loaded");
+            // ask, no toolbar: the toast.
+            let mut v = view(SRC, 600, 400);
+            v.tick(now, Some(now));
+            assert!(v.toast.is_none());
+            v.set_theme_mode(ThemeMode::Dark);
+            v.tick(now, Some(now));
+            let (_, text) = v.toast.clone().expect("announced");
+            assert_eq!(text, "1 remote image blocked · press I to load");
+            assert!(!v.remote_on());
         }
     }
 

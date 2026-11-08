@@ -274,6 +274,8 @@ struct App {
     /// Families (by `mono`) waiting for a lookup of their files.
     unresolved: Vec<bool>,
     resolving: bool,
+    /// Families a lookup didn't find, already said so (once per process each).
+    fonts_missed: Vec<String>,
     /// Open's dialog is up (one at a time).
     choosing: bool,
     /// The window system is Wayland (known once the window exists).
@@ -1159,20 +1161,35 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Families(results) => {
                 self.resolving = false;
                 let now = Instant::now();
+                let mut missed = Vec::new();
                 for (mono, family, faces) in results {
                     // Skip lookups the settings have moved on from.
                     if !same_family(Some(&family), self.families[mono as usize].as_deref()) {
                         continue;
                     }
-                    let (Some(view), Some(faces)) = (self.view.as_mut(), faces) else {
+                    let Some(view) = self.view.as_mut() else {
+                        continue;
+                    };
+                    // Not installed, or no face of it usable: the built-in one stays.
+                    let Some(faces) = faces else {
+                        missed.push(family);
                         continue;
                     };
                     let faces = faces.map(|f| f.map(|f| (f.path, f.index)));
                     if view.set_family(mono, Some(&faces)) {
                         self.store
                             .record_fonts(mono, &FontPaths { family, faces }, now);
+                    } else {
+                        missed.push(family);
                     }
                     self.redraw();
+                }
+                // Not over a toast showing (the blocked remote images'): the names stay unsaid.
+                if self.bench.is_none()
+                    && !self.view.as_ref().is_some_and(View::toasting)
+                    && let Some(text) = font_notice(&mut self.fonts_missed, missed)
+                {
+                    self.toast(text);
                 }
                 self.resolve_families();
             }
@@ -1596,6 +1613,7 @@ fn main() {
         families: [None, None],
         unresolved: Vec::new(),
         resolving: false,
+        fonts_missed: Vec::new(),
         choosing: false,
         wayland: false,
         mods: ModifiersState::empty(),
@@ -1662,6 +1680,28 @@ fn open_in_editor(path: &std::path::Path) -> Option<String> {
         .map(|e| format!("Can't open {name}: {e}"))
 }
 
+/// What to say when `font_sans` / `font_mono` families weren't found (or none of their faces
+/// could be used): those not said before in this process (`said`, which they join), as one
+/// toast. `None`: nothing new to say.
+fn font_notice(said: &mut Vec<String>, missed: Vec<String>) -> Option<String> {
+    let mut names = Vec::new();
+    for name in missed {
+        let name = name.trim().to_owned();
+        if !said.iter().any(|s| same_family(Some(s), Some(&name))) {
+            said.push(name.clone());
+            names.push(name);
+        }
+    }
+    Some(match names.as_slice() {
+        [] => return None,
+        [one] => format!("Font not found: {one}. Using the built-in font."),
+        _ => format!(
+            "Fonts not found: {}. Using the built-in fonts.",
+            names.join(", ")
+        ),
+    })
+}
+
 fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -1672,7 +1712,9 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_message, is_wayland, leave, parent_name, pop, same_family, system_dark};
+    use super::{
+        empty_message, font_notice, is_wayland, leave, parent_name, pop, same_family, system_dark,
+    };
     use std::ptr::NonNull;
     use std::time::Instant;
     use vomd::cli::Input;
@@ -1686,6 +1728,35 @@ mod tests {
         XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
     };
     use winit::window::Theme;
+
+    /// A family a lookup didn't find is said once per process, whatever its case or spaces;
+    /// two new ones at once are one toast.
+    #[test]
+    fn missing_fonts_are_said_once_each() {
+        let mut said = Vec::new();
+        let s = |v: &[&str]| v.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            font_notice(&mut said, s(&["Inter"])).as_deref(),
+            Some("Font not found: Inter. Using the built-in font.")
+        );
+        assert_eq!(
+            font_notice(&mut said, s(&[" inter "])),
+            None,
+            "said already"
+        );
+        assert_eq!(font_notice(&mut said, Vec::new()), None);
+        assert_eq!(
+            font_notice(&mut said, s(&["Iosevka", "INTER", "Fira Sans"])).as_deref(),
+            Some("Fonts not found: Iosevka, Fira Sans. Using the built-in fonts.")
+        );
+        assert_eq!(font_notice(&mut said, s(&["Iosevka", "Fira Sans"])), None);
+        // The same family in both settings is one name.
+        let mut said = Vec::new();
+        assert_eq!(
+            font_notice(&mut said, s(&["Mono X", "mono x"])).as_deref(),
+            Some("Font not found: Mono X. Using the built-in font.")
+        );
+    }
 
     #[test]
     fn the_empty_window_offers_a_drop_where_winit_takes_one() {

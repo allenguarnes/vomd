@@ -325,28 +325,55 @@ fn cluster_hits(para: &Para, shaped: &Shaped, c: &Cluster, x0: f32, x1: f32, hit
 
 /// Rects for decorated runs: consecutive clusters sharing a decorated style.
 fn decorations(fonts: &Fonts, para: &Para, hits: &[PHit], baseline: f32, rects: &mut Vec<PRect>) {
+    let run_end = |i: usize| {
+        (i..hits.len())
+            .find(|&j| hits[j].style_index() != hits[i].style_index())
+            .unwrap_or(hits.len())
+    };
+    // Hits are in visual order: a run's extent is from its first hit to its last.
+    let extent = |i: usize, j: usize| {
+        (
+            hits[i].x0.min(hits[j - 1].x0),
+            hits[i].x1.max(hits[j - 1].x1),
+        )
+    };
+    let padded =
+        |i: usize| para.styles[hits[i].style_index()].deco & (deco::CODE_BG | deco::IMAGE_BOX) != 0;
+    // Right edge of the last padded run on the line.
+    let mut before = f32::NEG_INFINITY;
     let mut i = 0;
     while i < hits.len() {
         let style = &para.styles[hits[i].style_index()];
-        let j = (i..hits.len())
-            .find(|&j| hits[j].style_index() != hits[i].style_index())
-            .unwrap_or(hits.len());
+        let j = run_end(i);
         if style.deco != 0 {
-            let (x0, x1) = (
-                hits[i].x0.min(hits[j - 1].x0),
-                hits[i].x1.max(hits[j - 1].x1),
-            );
+            let (x0, x1) = extent(i, j);
             let m = fonts
                 .face(fonts.primary(style.bold, style.italic, style.mono))
                 .metrics()
                 .scale(style.size);
             let base = baseline - style.shift;
             let pad = style.size * 0.15;
+            // Backgrounds and outlines reach out by `pad`; two that face each other across a
+            // space (a row of alt texts, `` `a` `b` ``) take at most a quarter of the gap each,
+            // so half of it stays clear and they read as two.
+            let (mut left, mut right) = (pad, pad);
+            if padded(i) {
+                left = pad.min(((x0 - before) / 4.0).max(0.0));
+                let mut k = j;
+                while k < hits.len() && !padded(k) {
+                    k = run_end(k);
+                }
+                if k < hits.len() {
+                    let (next, _) = extent(k, run_end(k));
+                    right = pad.min(((next - x1) / 4.0).max(0.0));
+                }
+                before = x1;
+            }
             if style.deco & deco::CODE_BG != 0 {
                 rects.push(PRect {
-                    x: x0 - pad,
+                    x: x0 - left,
                     y: base - m.ascent - pad * 0.5,
-                    w: x1 - x0 + 2.0 * pad,
+                    w: x1 - x0 + left + right,
                     h: m.ascent + m.descent.abs() + pad,
                     role: Role::CodeBg,
                     radius: style.size * 0.25,
@@ -355,9 +382,9 @@ fn decorations(fonts: &Fonts, para: &Para, hits: &[PHit], baseline: f32, rects: 
             }
             if style.deco & deco::IMAGE_BOX != 0 {
                 rects.push(PRect {
-                    x: x0 - pad,
+                    x: x0 - left,
                     y: base - m.ascent - pad * 0.5,
-                    w: x1 - x0 + 2.0 * pad,
+                    w: x1 - x0 + left + right,
                     h: m.ascent + m.descent.abs() + pad,
                     role: Role::Border,
                     radius: style.size * 0.2,

@@ -540,8 +540,14 @@ pub struct View {
     system_dark: bool,
     fade: ScrollbarFade,
     drag: Option<Drag>,
-    /// The pointer is over the scrollbar's column: it shows, and stays until the pointer leaves.
+    /// The pointer is over the scrollbar's column.
     over_bar: bool,
+    /// The pointer moved into the scrollbar's column: it shows, and stays until the pointer
+    /// leaves. (A column that comes under a pointer at rest, as a window opens under it, shows
+    /// the scrollbar as a scroll does: it fades.)
+    bar_hold: bool,
+    /// Where the pointer was last seen in the window (`None`: never; NaN: it left since).
+    pointer: Option<(f64, f64)>,
     /// Characters already handed to a fallback scan, over all documents shown (the
     /// system fonts are scanned once per character, not once per reload).
     tried: HashSet<char>,
@@ -583,6 +589,9 @@ pub struct View {
     /// The first frame of the document was out and the remote images announced (or loaded,
     /// with the `always` policy).
     announced: bool,
+    /// A `<picture>` still shows the other theme's image: the clipboard holds the document, so it
+    /// can't be changed yet ([`View::follow_theme`] runs again from [`View::tick`]).
+    theme_wait: bool,
     /// Until when the toolbar's remote-images button pulses, and the toast shows.
     pulse: Option<Instant>,
     toast: Option<(Instant, String)>,
@@ -667,6 +676,8 @@ impl View {
             fade: ScrollbarFade::default(),
             drag: None,
             over_bar: false,
+            bar_hold: false,
+            pointer: None,
             tried: HashSet::new(),
             msg_missing: BTreeSet::new(),
             zoom_pixels: 0.0,
@@ -685,6 +696,7 @@ impl View {
             damage: Vec::new(),
             remote_count: 0,
             announced: false,
+            theme_wait: false,
             pulse: None,
             toast: None,
             notice: None,
@@ -749,11 +761,39 @@ impl View {
     pub fn set_system_dark(&mut self, dark: bool) -> bool {
         let before = self.dark();
         self.system_dark = dark;
+        self.follow_theme();
         self.dark() != before
     }
 
     pub fn set_theme_mode(&mut self, mode: ThemeMode) {
         self.theme = mode;
+        self.follow_theme();
+    }
+
+    /// A `<picture>` shows its image for the theme on screen: when the theme changes it, the
+    /// images are attached again (the position is kept). The other image loads only when shown.
+    /// While the clipboard holds the document (a large lazy copy) it can't be changed: this
+    /// waits and runs again from `tick`. Returns true if an image changed.
+    fn follow_theme(&mut self) -> bool {
+        let dark = self.dark();
+        #[cfg(feature = "clipboard")]
+        let Some(doc) = Arc::get_mut(&mut self.doc) else {
+            self.theme_wait = true;
+            return false;
+        };
+        #[cfg(not(feature = "clipboard"))]
+        let doc = &mut self.doc;
+        self.theme_wait = false;
+        if !doc.set_dark(dark) {
+            return false;
+        }
+        // Remote images that weren't there to announce may be now.
+        let none = self.remote_count == 0;
+        self.attach_images();
+        self.announced &= !none;
+        self.images_dirty = true;
+        self.ensure();
+        true
     }
 
     pub fn set_zoom(&mut self, zoom: u16) {
@@ -1121,7 +1161,7 @@ impl View {
             Action::ZoomIn => self.set_zoom(self.zoom.saturating_add(ZOOM_STEP)),
             Action::ZoomOut => self.set_zoom(self.zoom.saturating_sub(ZOOM_STEP)),
             Action::ZoomReset => self.set_zoom(100),
-            Action::CycleTheme => self.theme = self.theme.next(),
+            Action::CycleTheme => self.set_theme_mode(self.theme.next()),
             Action::PrevHeading => {
                 self.heading(-1, now);
             }
@@ -1296,7 +1336,7 @@ impl View {
         let doc = self.drag.is_some_and(|d| !d.panel);
         #[cfg(not(feature = "toc"))]
         let doc = self.drag.is_some();
-        doc || self.over_bar
+        doc || self.bar_hold
     }
 
     fn press_scrollbar(&mut self, x: f64, y: f64, now: Instant) -> bool {
@@ -1305,7 +1345,7 @@ impl View {
         };
         let (y0, y1) = (f64::from(t.y0), f64::from(t.y1));
         let on_thumb = (y0..y1).contains(&y);
-        if !on_thumb && !self.fade.visible(now) && !self.over_bar {
+        if !on_thumb && !self.fade.visible(now) && !self.bar_hold {
             return false;
         }
         let grab = if on_thumb { y - y0 } else { (y1 - y0) / 2.0 };
@@ -1470,7 +1510,8 @@ impl View {
         #[cfg(feature = "toc")]
         let free = free && !self.toc_covers(x, y);
         let link = if free { self.link_at(x, y) } else { None };
-        let bar = bar | self.set_over_bar(free && self.bar_column(x, y).is_some(), now);
+        let moved = self.pointer.replace((x, y)).is_some_and(|p| p != (x, y));
+        let bar = bar | self.set_over_bar(free && self.bar_column(x, y).is_some(), moved, now);
         let blocked = cfg!(feature = "remote-images")
             && free
             && self
@@ -1506,7 +1547,9 @@ impl View {
     pub fn hover_end(&mut self) -> bool {
         let note = std::mem::take(&mut self.hover_note).is_some();
         self.hover_force = false;
-        let bar = self.set_over_bar(false, Instant::now());
+        // The last position is kept: coming back somewhere else is a move (the bar holds), coming
+        // back at the same pixel (the window was covered and uncovered) is a pointer at rest.
+        let bar = self.set_over_bar(false, false, Instant::now());
         #[cfg(feature = "find")]
         let bar = bar | self.find_pointer(None, Instant::now());
         #[cfg(feature = "toc")]
@@ -1516,13 +1559,18 @@ impl View {
         self.hover.take().is_some() | self.toolbar.leave() | note | bar
     }
 
-    /// The pointer went over the scrollbar's column (`over`) or left it. Entering shows the
-    /// scrollbar, held while the pointer stays; leaving lets it linger and fade as after a
-    /// scroll. Returns true if the scrollbar appeared (repaint).
-    fn set_over_bar(&mut self, over: bool, now: Instant) -> bool {
-        if std::mem::replace(&mut self.over_bar, over) == over {
+    /// The pointer is over the scrollbar's column (`over`) or not, and `moved` since it was last
+    /// seen. Moving into the column shows the scrollbar, held while the pointer stays; leaving
+    /// lets it linger and fade as after a scroll. A column that comes under a pointer at rest (a
+    /// window opening under it, a resize) shows it as a scroll does, once: it fades on its own.
+    /// Returns true if the scrollbar appeared (repaint).
+    fn set_over_bar(&mut self, over: bool, moved: bool, now: Instant) -> bool {
+        let entered = !std::mem::replace(&mut self.over_bar, over) && over;
+        let hold = over && (self.bar_hold || moved);
+        if !entered && std::mem::replace(&mut self.bar_hold, hold) == hold {
             return false;
         }
+        self.bar_hold = hold;
         let shown = self.fade.visible(now) || self.drag.is_some();
         self.fade.poke(now);
         over && !shown
@@ -2113,6 +2161,9 @@ impl View {
     /// screen is repainted when measuring moves its thumb.
     pub fn tick(&mut self, now: Instant, measure_until: Option<Instant>) -> Tick {
         let mut redraw = self.expire(now);
+        if self.theme_wait {
+            redraw |= self.follow_theme();
+        }
         // Images wait for the first frame (`measure_until` is set once it's out).
         if measure_until.is_some() && self.message.is_none() {
             redraw |= self.announce(now);
@@ -2231,6 +2282,11 @@ impl View {
     /// expires replaces it). The caller repaints.
     pub fn show_toast(&mut self, text: String, now: Instant) {
         self.toast = Some((now + TOAST, text));
+    }
+
+    /// A toast is showing.
+    pub fn toasting(&self) -> bool {
+        self.toast.is_some()
     }
 
     /// After the document's first frame: point out its blocked remote images once (the
@@ -2384,8 +2440,14 @@ impl View {
         Layout::new(&self.doc, params)
     }
 
+    /// The document as the view holds it, its `<picture>`s showing the theme on screen.
+    fn themed(&self, mut doc: Doc) -> Shared {
+        doc.set_dark(self.dark());
+        share(doc)
+    }
+
     fn open_doc(&mut self, doc: Doc, message: Option<String>) {
-        self.doc = share(doc);
+        self.doc = self.themed(doc);
         self.message = message;
         self.layout = self.new_layout();
         self.anchor = Anchor::TOP;
@@ -2446,7 +2508,7 @@ impl View {
             self.clear_selection();
             self.forget_copy();
         }
-        self.doc = share(doc);
+        self.doc = self.themed(doc);
         self.message = message;
         self.layout = self.new_layout();
         #[cfg(feature = "toc")]
