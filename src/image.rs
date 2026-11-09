@@ -1821,6 +1821,9 @@ fn reduce_row(row: &[u8], channels: usize, xs: &Spans, out: &mut [f32]) {
 // | the paths worked out for `srcs`, the       | `admit_tables`, after the results nobody   | nothing decodes (`Later`): the tables are   |
 // | layout probe's closure (the directory is   | has taken are taken (`drain_results`)      | made by the poll that takes the decode's    |
 // | an `Arc`, shared)                          |                                            | result (`build_pending`)                    |
+// | `attach`: local pixels kept for the next   | nothing is made: keys change (`carry`);    | - (what is kept stays charged, evictable)   |
+// | document (`carry`, `carried`), its files'  | the paths, one at a time, in the room      |                                             |
+// | stamps compared                            | `admit_tables` made for the tables' paths  |                                             |
 // | the layout's probe: a path and a header    | not the images': layout calls it. One at a | -                                           |
 // | (`probe`, `probe_file`)                    | time, at most 2 x `MAX_SRC` + the directory| (FREE)                                      |
 // |                                            | + 4 KiB                                    |                                             |
@@ -1934,7 +1937,15 @@ struct Slot {
     /// A body let in by the poll in progress ([`Cache::admitted`]): kept from the room that
     /// the next body's admission makes ([`Cache::guard_admitted`]), and from no other.
     admitted: bool,
+    /// The stamp of the file a local image's pixels were decoded from, taken before it was read:
+    /// a reload (or a theme's other `<picture>`) that finds the same file keeps them
+    /// ([`Images::carry`]). `None`: never kept.
+    file: Option<crate::view::Stamp>,
 }
+
+/// Marks the key of local pixels kept for the next document ([`Images::carry`]) while the last
+/// one's go: its ids and the old ones overlap.
+const CARRIED: u32 = 1 << 31;
 
 /// What a slot costs besides its buffer and its URL's string: the `Arc` and `Vec` headers of a
 /// body and the allocator's rounding of the buffer, at most. (Its place in the list of slots, and
@@ -2226,6 +2237,7 @@ impl Cache {
             painted: 0,
             protect: false,
             admitted: false,
+            file: None,
         };
         // Room is made before the slot is in, so it can't be the one evicted.
         self.evict_to(slot.cost());
@@ -2611,6 +2623,9 @@ pub(crate) enum Done {
         /// The pixels are an animation's first frame ([`anim::detect`]).
         #[cfg(feature = "images")]
         anim: Option<AnimInfo>,
+        /// A local file's stamp before it was read ([`Slot::file`]).
+        #[cfg(feature = "images")]
+        stamp: Option<crate::view::Stamp>,
         /// The job was told to stop and made nothing: its image is given up already.
         cancelled: bool,
         /// The worker that made it, which waits until the result is taken ([`Worker::taken`]).
@@ -2716,6 +2731,12 @@ impl Worker {
                 state.fonts.set(q.fonts.clone());
                 job
             };
+            // (Before the file is read: a write meanwhile makes it another stamp, never the same.)
+            #[cfg(feature = "images")]
+            let stamp = match &job.source {
+                Source::File(path) => crate::view::stamp(path),
+                Source::Bytes(_) => None,
+            };
             let mut made = decode_job(&job, &mut state);
             made.cancelled = made.bitmap.is_none()
                 && made.need.is_none()
@@ -2742,6 +2763,8 @@ impl Worker {
                 skipped: made.skipped,
                 #[cfg(feature = "images")]
                 anim: made.anim,
+                #[cfg(feature = "images")]
+                stamp,
                 cancelled: made.cancelled,
                 worker: theirs.clone(),
             };
@@ -3170,6 +3193,11 @@ pub struct Images {
     pub(crate) remote: crate::remote::Remote,
 }
 
+/// A key of the document that is going: local, and not carried ([`CARRIED`]).
+fn old_local(key: &Key) -> bool {
+    matches!(key, Key::Local(id) if id & CARRIED == 0)
+}
+
 /// The URL of a remote key (the empty string for a local one).
 #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
 fn key_url(key: &Key) -> &str {
@@ -3584,11 +3612,19 @@ impl Images {
     }
 
     pub fn set_base(&mut self, base: Option<PathBuf>) {
-        self.base = base.map(Arc::from);
+        let base = base.map(Arc::from);
+        // The same `src` is another file in another directory: nothing decoded is kept for it.
+        if base != self.base {
+            for s in &mut self.cache.slots {
+                s.file = None;
+            }
+        }
+        self.base = base;
     }
 
     /// Start on a document (opened or reloaded) and its new layout: local images are decoded
-    /// again (the files may have changed); remote ones stay cached by URL.
+    /// again, but for those whose files are the same as when they were (a reload, a theme's other
+    /// `<picture>`: [`Images::carry`]); remote ones stay cached by URL.
     ///
     /// What the document's images cost to keep is worked out from the numbers of its images
     /// ([`Images::tables_bytes`]): one [`Src`] each and, for a remote one, its place in the set of
@@ -3626,6 +3662,7 @@ impl Images {
         // when they are in view.
         #[cfg(feature = "images")]
         {
+            self.carry(doc);
             self.detach_anims();
             self.forced.abandon();
             self.forced.stale();
@@ -3644,7 +3681,7 @@ impl Images {
         // What the old document had painted is not painted any more: room is made from it first.
         self.cache.frame += 1;
         self.cache.floor = 0;
-        self.cache.retain(|s| matches!(s.key, Key::Remote(_)));
+        self.cache.retain(|s| !old_local(&s.key));
         // The last document's tables go before the new one's are made: they are never both held.
         self.srcs = Vec::new();
         self.costs = std::collections::HashMap::new();
@@ -3663,6 +3700,142 @@ impl Images {
                 self.build_tables(doc, layout, false);
             }
             Tables::Never => self.build_tables(doc, layout, false),
+        }
+    }
+
+    /// The pixels of the local images that `doc` (the next document) has too, by the same `src`
+    /// (and the same directory: [`Images::set_base`]), are kept for it under its ids, marked
+    /// [`CARRIED`] while the old ones go, and so is what says an image is animated (its animation
+    /// starts again). An image shown many times is as many: the k-th place of a `src` gets what
+    /// the k-th had (the ones in view keep theirs, unless the edit added or took away one above
+    /// them). The files are compared once the new tables are made ([`Images::carried`]). Only
+    /// keys change: no pixels are allocated or freed, and they stay charged as they were
+    /// (evictable: nothing painted them since).
+    #[cfg(feature = "images")]
+    fn carry(&mut self, doc: &Doc) {
+        let local = |k: &Key| match k {
+            Key::Local(id) if id & CARRIED == 0 => *id,
+            _ => 0,
+        };
+        // The images with pixels: what is worked out here is as many as the cache's slots, never
+        // as many as the documents' images.
+        let mut olds: Vec<u32> = (self.cache.slots.iter())
+            .filter(|s| s.file.is_some() && local(&s.key) != 0)
+            .map(|s| local(&s.key))
+            .collect();
+        if olds.is_empty() {
+            return;
+        }
+        olds.sort_unstable();
+        olds.dedup();
+        let file = |id: u32| match self.src(id) {
+            Src::File(src) => Some(&**src),
+            _ => None,
+        };
+        // Their `src`s, by a hash of each (FNV-1a): (hash, an image with it). A `src` is told by
+        // the first of them that it equals.
+        let hash = |s: &str| {
+            (s.bytes()).fold(0x811c_9dc5_u32, |h, b| {
+                (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+            })
+        };
+        let mut srcs: Vec<(u32, u32)> = (olds.iter())
+            .filter_map(|&id| Some((hash(file(id)?), id)))
+            .collect();
+        srcs.sort_unstable();
+        let which = |s: &str| {
+            let h = hash(s);
+            let from = srcs.partition_point(|e| e.0 < h);
+            (srcs[from..].iter())
+                .take_while(|e| e.0 == h)
+                .position(|e| file(e.1) == Some(s))
+                .map(|i| from + i)
+        };
+        // Which place of its `src` each is in the old document (the k-th), and the ones of each
+        // `src` in order: (src, id).
+        let mut count = vec![0u32; srcs.len()];
+        let mut place = vec![0u32; olds.len()];
+        let mut want = Vec::with_capacity(olds.len());
+        for (id, src) in (1..).zip(&self.srcs) {
+            if let Src::File(src) = src
+                && let Some(i) = which(src)
+            {
+                if let Ok(p) = olds.binary_search(&id) {
+                    want.push((i as u32, id));
+                    place[p] = count[i];
+                }
+                count[i] += 1;
+            }
+        }
+        want.sort_unstable();
+        // The image at the same place in the new one: one pass, each `src` going through its
+        // own in order. (old, new) ids, by old.
+        let mut next: Vec<usize> = (0..srcs.len() as u32)
+            .map(|i| want.partition_point(|w| w.0 < i))
+            .collect();
+        count.fill(0);
+        let mut to = Vec::with_capacity(want.len());
+        for (id, img) in (1..).zip(&doc.images) {
+            if !img.remote
+                && let Some(i) = which(&img.src)
+            {
+                if let Some(&(j, old)) = want.get(next[i])
+                    && j == i as u32
+                    && olds.binary_search(&old).is_ok_and(|p| place[p] == count[i])
+                {
+                    to.push((old, id | CARRIED));
+                    next[i] += 1;
+                }
+                count[i] += 1;
+            }
+        }
+        to.sort_unstable();
+        let new = |old: u32| {
+            let i = to.binary_search_by_key(&old, |t| t.0).ok()?;
+            Some(Key::Local(to[i].1))
+        };
+        // (Every size of it.)
+        for t in &mut self.cache.slots {
+            if let Some(k) = new(local(&t.key)).filter(|_| t.file.is_some()) {
+                t.key = k;
+            }
+        }
+        for (k, _) in &mut self.animated {
+            if let Some(n) = new(local(k)) {
+                *k = n;
+            }
+        }
+    }
+
+    /// The pixels carried to the document ([`Images::carry`]) are its own if their files are as
+    /// they were when decoded (a changed one is decoded again); the others go, and all of them if
+    /// the document's tables aren't made. (A path is worked out for each, one at a time, in the
+    /// room `admit_tables` made for that.)
+    #[cfg(feature = "images")]
+    fn carried(&mut self) {
+        let carried = |k: &Key| match k {
+            Key::Local(id) if id & CARRIED != 0 => Some(id & !CARRIED),
+            _ => None,
+        };
+        let (srcs, base) = (&self.srcs, self.base.as_deref());
+        self.cache.retain(|s| {
+            carried(&s.key).is_none_or(|id| {
+                matches!(srcs.get(id as usize - 1), Some(Src::File(src))
+                    if local_path(src, base).is_some_and(|p| crate::view::stamp(&p) == s.file))
+            })
+        });
+        let slots = &self.cache.slots;
+        self.animated
+            .retain(|(k, _)| carried(k).is_none() || slots.iter().any(|s| s.key == *k));
+        for s in &mut self.cache.slots {
+            if let Some(id) = carried(&s.key) {
+                s.key = Key::Local(id);
+            }
+        }
+        for (k, _) in &mut self.animated {
+            if let Some(id) = carried(k) {
+                *k = Key::Local(id);
+            }
         }
     }
 
@@ -3755,6 +3928,8 @@ impl Images {
                 })
                 .collect();
         }
+        #[cfg(feature = "images")]
+        self.carried();
         if cfg!(feature = "images") {
             let base = self.base.clone();
             // What loads past the limits, or failed to, is sized by that.
@@ -4912,6 +5087,8 @@ impl Images {
                 skipped,
                 #[cfg(feature = "images")]
                 anim,
+                #[cfg(feature = "images")]
+                stamp,
                 cancelled,
                 worker,
             } => {
@@ -4965,6 +5142,12 @@ impl Images {
                         let current = doc_gen == self.doc_gen;
                         let key_kept = key.clone();
                         if self.store(key, Data::Pixels(b), current).is_ok() {
+                            // (The slot is the last: [`Cache::insert_as`]. An SVG drawn without
+                            // its embedded images is drawn again, which a click can draw whole.)
+                            #[cfg(feature = "images")]
+                            if !skipped && let Some(s) = self.cache.slots.last_mut() {
+                                s.file = stamp;
+                            }
                             if page.is_some() {
                                 // (Kept to the end of the poll that took it: the window paints
                                 // it next, and what the rest of the poll does, the bodies it
@@ -5214,11 +5397,14 @@ impl Images {
             // What is known of a remote animation lives as long as its still or animation is
             // cached, or the document has it: back at it, nothing is decoded again to find it
             // out. Past that it is forgotten ([`Images::forget_evicted`] does so for a slot
-            // evicted later).
+            // evicted later). (A local one is the document's, or carried to the next: that is
+            // for `attach` to say, [`Images::detach_anims`].)
             #[cfg(feature = "images")]
             {
-                let owned =
-                    |k: &Key| matches!(k, Key::Remote(u) if urls.contains(u) || cached.contains(u));
+                let owned = |k: &Key| match k {
+                    Key::Remote(u) => urls.contains(u) || cached.contains(u),
+                    Key::Local(_) => true,
+                };
                 keep_anims(&mut self.animated, &mut self.anims, &owned);
             }
         }
@@ -7550,10 +7736,9 @@ impl Images {
             }
         }
         self.anims.choices = Vec::new();
-        // (The remote ones are pruned to the new document's URLs with the other records.)
-        keep_anims(&mut self.animated, &mut self.anims, &|k| {
-            matches!(k, Key::Remote(_))
-        });
+        // (The remote ones are pruned to the new document's URLs with the other records. A carried
+        // image's record stays: its animation starts again.)
+        keep_anims(&mut self.animated, &mut self.anims, &|k| !old_local(k));
         self.anims.reads = Vec::new();
         self.anims.alloc = anim::Alloc::default();
         self.anims.fetched = Vec::new();

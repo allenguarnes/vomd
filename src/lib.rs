@@ -29,3 +29,4 @@ pub mod text;
 pub mod theme;
 pub mod toolbar;
 pub mod view;
+pub mod watch;

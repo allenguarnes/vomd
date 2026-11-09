@@ -58,8 +58,8 @@
   and web links open in your browser.
 - **Find in page** (`Ctrl+F`), a **contents panel** (`C`), and **text selection** with copy, plus a
   copy button on code blocks.
-- **Live reload:** a file that changed on disk is shown again, at the same place, when you come
-  back to the window.
+- **Live reload:** when the file changes on disk, VOMD shows the new version at the same place,
+  so it works as a live preview beside your editor.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
@@ -237,6 +237,7 @@ every option listed and commented out. Changes apply as soon as you switch back 
 | `toolbar` | `true`, `false` |
 | `toc` | `false`, `true` (contents panel) |
 | `animations` | `off`, `on` |
+| `live_reload` | `on`, `off` (show changes to the file as soon as it's saved) |
 | `remote_images` | `ask`, `never`, `always` |
 | `primary_selection` | `on`, `off` (Linux: middle-click paste of selected text) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed font such as `Noto Sans` |
@@ -273,6 +274,8 @@ VOMD makes no network requests of its own.
   `$5-$10` isn't read as math.
 - AVIF, HEIC, BMP, TIFF and ICO images show their alt text.
 - Drag and drop doesn't work on Wayland; use `Ctrl+O` there.
+- On network drives and some FUSE file systems, changes show when you come back to the window
+  rather than right away.
 - Text can't be selected with the keyboard (`Shift` + arrows).
 - On Windows, flag emoji show as two letters, as in other Windows apps.
 

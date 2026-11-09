@@ -6,12 +6,19 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Live reload: a document open in VOMD is shown again as soon as its file is saved, at the same
+  place, from any editor. Before, it was only reloaded when you came back to the window.
+  `live_reload = off` in the settings turns it off. If the file is deleted or moved away, VOMD
+  keeps showing the last version and says so.
 - Images in a `<picture>` follow the theme: the dark or light version a README offers is the one
   shown, and it changes with the theme. VOMD's own logo was dark grey on the dark theme.
 
 ### Changed
 - When the font set in `font_sans` or `font_mono` isn't installed, or can't be used, VOMD says
   so once instead of quietly keeping its built-in font.
+- Reloading a document no longer makes its images blink: images whose files didn't change stay
+  on screen, and only the changed ones load again. The same goes for the other images of a page
+  when the theme switches a `<picture>`.
 
 ### Fixed
 - Alt text outlines of images that aren't shown, such as a README's row of badges, and code

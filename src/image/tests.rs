@@ -1364,6 +1364,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
         painted: 0,
         protect: false,
         admitted: false,
+        file: None,
     };
     assert_eq!(
         slot(Data::Bytes(Arc::new(loose))).cost(),
@@ -1384,6 +1385,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
             painted: 0,
             protect: false,
             admitted: false,
+            file: None,
         }
         .cost(),
         400 + SLOT_OVERHEAD
@@ -1530,9 +1532,202 @@ fn a_documents_local_images_load() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(images.pixels(3, 5, 5).is_none() && images.pixels(4, 5, 5).is_none());
-    // Another document drops the local images; its results are told apart from late ones.
+    // The same document again (a reload) keeps the pixels of a file that is the same; one in
+    // another directory drops them.
+    images.attach(&doc, &mut layout);
+    assert!(images.pixels(1, 30, 20).is_some());
+    images.set_base(Some(dir.join("elsewhere")));
     images.attach(&doc, &mut layout);
     assert!(images.pixels(1, 30, 20).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Set `path`'s modification time (seconds since the epoch): a stamp that differs, or is the
+/// same, whatever the clock's granularity.
+fn set_mtime(path: &Path, secs: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// A reload keeps the pixels of the local images whose files are as they were, under the new
+/// document's ids (moved, shown twice), and decodes nothing again for them: no image blinks. A
+/// changed file is decoded again, a deleted one shows its placeholder, and another directory's
+/// file of the same name and stamp isn't taken for it. What is kept stays charged as it was.
+#[test]
+fn a_reload_keeps_the_pixels_of_unchanged_files() {
+    let dir = scratch("carry");
+    let (a, b) = (dir.join("a.png"), dir.join("b.png"));
+    std::fs::write(&a, png_bytes(30, 20, |_, _| [0, 0, 255, 255])).unwrap();
+    std::fs::write(&b, png_bytes(10, 10, |_, _| [255, 0, 0, 255])).unwrap();
+    set_mtime(&a, 1_000_000_000);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    let load = |images: &mut Images, src: &str| {
+        let doc = Doc::parse(src);
+        let mut layout = Layout::new(&doc, crate::layout::Params::default());
+        images.attach(&doc, &mut layout);
+        layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 600.0);
+        (doc, layout)
+    };
+    let charged = |i: &Images| {
+        assert_eq!(
+            i.cache.bytes,
+            i.cache.slots.iter().map(Slot::cost).sum::<usize>()
+        );
+    };
+    let (doc, mut layout) = load(&mut images, "![a](a.png) ![b](b.png)");
+    images.request(&[(1, 30, 20), (2, 10, 10)], 2);
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.pixels(1, 30, 20).is_some() && i.pixels(2, 10, 10).is_some()
+    });
+    assert_eq!(images.stats().decodes, 2);
+    let held = images.cache.bytes;
+
+    // Edited: a paragraph above, the two swapped, and b shown twice.
+    let (doc, mut layout) = load(&mut images, "Text.\n\n![b](b.png) ![a](a.png) ![b](b.png)");
+    assert!(images.pixels(1, 10, 10).is_some(), "b, at once");
+    assert!(images.pixels(2, 30, 20).is_some(), "a, at once");
+    assert!(
+        images.pixels(3, 10, 10).is_none(),
+        "b's second place is its own"
+    );
+    assert_eq!(images.cache.bytes, held, "the same pixels, the same charge");
+    charged(&images);
+    images.request(&[(1, 10, 10), (2, 30, 20), (3, 10, 10)], 3);
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.pixels(3, 10, 10).is_some()
+    });
+    assert_eq!(images.stats().decodes, 3, "only b's second place");
+    assert_eq!(images.pixels(2, 30, 20).unwrap().data[0], 0xFF00_00FF);
+
+    // a changed (another color, another stamp), b deleted.
+    std::fs::write(&a, png_bytes(30, 20, |_, _| [0, 255, 0, 255])).unwrap();
+    set_mtime(&a, 1_000_000_001);
+    std::fs::remove_file(&b).unwrap();
+    let (doc, mut layout) = load(&mut images, "![a](a.png) ![b](b.png)");
+    assert!(images.pixels(1, 30, 20).is_none(), "a changed");
+    assert!(images.pixels(2, 10, 10).is_none(), "b deleted");
+    assert_eq!(
+        layout.image_size(2),
+        Some(ImageSize::Alt),
+        "its placeholder"
+    );
+    charged(&images);
+    images.request(&[(1, 30, 20)], 1);
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.pixels(1, 30, 20).is_some()
+    });
+    assert_eq!(images.stats().decodes, 4);
+    assert_eq!(
+        images.pixels(1, 30, 20).unwrap().data[0],
+        0xFF00_FF00,
+        "the new one"
+    );
+
+    // A copy with the same name and stamp in another directory is another file.
+    std::fs::create_dir(dir.join("other")).unwrap();
+    std::fs::copy(&a, dir.join("other/a.png")).unwrap();
+    set_mtime(&dir.join("other/a.png"), 1_000_000_001);
+    assert_eq!(
+        crate::view::stamp(&a),
+        crate::view::stamp(&dir.join("other/a.png"))
+    );
+    images.set_base(Some(dir.join("other")));
+    load(&mut images, "![a](a.png)");
+    assert!(images.pixels(1, 30, 20).is_none());
+    charged(&images);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An icon shown many times (on every row of a table): a reload gives each place what that
+/// place had, so the ones in view keep their pixels, and costs one pass over the images however
+/// many are cached (this was cubic in the copies: seconds for a few thousand, on every save).
+#[test]
+fn a_reload_carries_each_copy_of_an_image_to_its_own_place() {
+    let dir = scratch("carry-many");
+    std::fs::write(dir.join("i.png"), png_bytes(8, 8, |_, _| [0, 0, 255, 255])).unwrap();
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    let decoded = |images: &mut Images, n: u32, ids: std::ops::Range<u32>| {
+        *images = Images::default();
+        images.set_base(Some(dir.clone()));
+        let doc = Doc::parse(&"![i](i.png)\n\n".repeat(n as usize));
+        let mut layout = Layout::new(&doc, crate::layout::Params::default());
+        images.attach(&doc, &mut layout);
+        layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 1e6);
+        let boxes: Vec<_> = ids.clone().map(|id| (id, 8, 8)).collect();
+        images.request(&boxes, boxes.len());
+        wait(images, &doc, &mut layout, |i| {
+            ids.clone().all(|id| i.pixels(id, 8, 8).is_some())
+        });
+        doc
+    };
+    let with_pixels = |images: &mut Images, n: u32| -> Vec<u32> {
+        (1..=n)
+            .filter(|&id| images.pixels(id, 8, 8).is_some())
+            .collect()
+    };
+
+    // Scrolled to the middle: the same places after the reload, and no others.
+    let mut images = Images::default();
+    let doc = decoded(&mut images, 100, 50..60);
+    images.attach(
+        &doc,
+        &mut Layout::new(&doc, crate::layout::Params::default()),
+    );
+    assert_eq!(with_pixels(&mut images, 100), (50..60).collect::<Vec<_>>());
+
+    // Thousands, all cached: one pass, every one kept. (A generous bound for a debug build on a
+    // busy machine; the old way took seconds in a release build.)
+    let n = 3200;
+    let doc = decoded(&mut images, n, 1..n + 1);
+    let t = Instant::now();
+    images.attach(
+        &doc,
+        &mut Layout::new(&doc, crate::layout::Params::default()),
+    );
+    let took = t.elapsed();
+    assert_eq!(with_pixels(&mut images, n).len(), n as usize);
+    assert!(took < Duration::from_millis(500), "{took:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other image of a `<picture>` after a theme change is attached as a new document is: the
+/// document's other images keep their pixels.
+#[test]
+fn a_theme_change_keeps_the_other_images() {
+    let dir = scratch("carry-theme");
+    for (name, rgba) in [
+        ("l.png", [0, 0, 0, 255]),
+        ("d.png", [255; 4]),
+        ("a.png", [0, 0, 255, 255]),
+    ] {
+        std::fs::write(dir.join(name), png_bytes(10, 10, move |_, _| rgba)).unwrap();
+    }
+    let mut doc = Doc::parse(
+        "<picture>\n<source media=\"(prefers-color-scheme: dark)\" srcset=\"d.png\">\n\
+         <img src=\"l.png\" alt=\"Logo\">\n</picture>\n\n![a](a.png)\n",
+    );
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    images.attach(&doc, &mut layout);
+    images.request(&[(1, 10, 10), (2, 10, 10)], 2);
+    wait(&mut images, &doc, &mut layout, |i| {
+        i.pixels(1, 10, 10).is_some() && i.pixels(2, 10, 10).is_some()
+    });
+    assert!(doc.set_dark(true));
+    images.attach(&doc, &mut layout);
+    assert!(
+        images.pixels(1, 10, 10).is_none(),
+        "the dark one is another file"
+    );
+    assert!(images.pixels(2, 10, 10).is_some(), "a, kept");
+    assert_eq!(images.stats().decodes, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2773,6 +2968,7 @@ fn a_decoded_result_evicts_a_body_let_in_earlier_in_the_poll() {
             refused: None,
             skipped: false,
             anim: None,
+            stamp: None,
             cancelled: false,
             worker: shared.clone(),
         })
@@ -4905,7 +5101,14 @@ fn decodes_find_animated_images() {
         assert_eq!(images.animated(id), None, "image {id}");
     }
     assert!(images.bookkeeping_bytes() >= vec_bytes(&images.animated));
+    // A document with one of them (the same file) keeps what was found of it with its pixels;
+    // one without keeps nothing.
     let doc = Doc::parse("![a](anim.gif)");
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    images.attach(&doc, &mut layout);
+    assert_eq!(images.animated.len(), 1);
+    assert_eq!(images.animated(1), anim((6, 4)));
+    let doc = Doc::parse("![e](none.gif)");
     let mut layout = Layout::new(&doc, crate::layout::Params::default());
     images.attach(&doc, &mut layout);
     assert!(images.animated.is_empty());

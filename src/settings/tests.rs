@@ -367,6 +367,7 @@ fn template_is_all_defaults() {
         "line_width",
         "wide",
         "animations",
+        "live_reload",
         "primary_selection",
         "font_sans",
         "font_mono",
@@ -635,6 +636,22 @@ fn toc_is_a_bool_saved_like_the_wide_toggle() {
     again.flush().unwrap();
     assert!(!Store::open(Some(path)).prefs().toc);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `live_reload` is on without a line for it, and `off` turns it off.
+#[test]
+fn live_reload_is_on_by_default() {
+    assert!(Prefs::default().live_reload);
+    for (v, want) in [
+        ("off", false),
+        ("false", false),
+        ("on", true),
+        ("auto", true),
+    ] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("live_reload = {v}")));
+        assert_eq!(p.live_reload, want, "{v}");
+    }
+    assert!(TEMPLATE.contains("# live_reload = on"));
 }
 
 /// `animations` is off without a line for it, takes `on`/`off` like the other switches, and is

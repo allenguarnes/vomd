@@ -38,6 +38,7 @@ use vomd::toolbar::Command;
 #[cfg(feature = "clipboard")]
 use vomd::view::CodeCopy;
 use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
+use vomd::watch::{self, Reloads, Reread, Watch};
 
 /// On Windows, a failed allocation in an SVG's process ends it with the code that says so (see
 /// `image::svg_child`); elsewhere, and in VOMD's own process, the system's allocator as it is.
@@ -130,8 +131,17 @@ enum UserEvent {
     /// ticket the paste was asked for with, which says whether the field is still the one.
     #[cfg(all(feature = "clipboard", feature = "find"))]
     Pasted(u32, Option<String>),
+    /// The document's file was saved, and read again on the watcher's thread: the watch's
+    /// generation and what it found.
+    Reloaded(u32, Fresh),
     /// Only wakes the loop after `quit` asked it to end (see there).
     Quit,
+}
+
+/// What a live reload found: a new version (parsed, with its stamp), or the file gone.
+enum Fresh {
+    Doc(Box<Doc>, Option<Stamp>),
+    Gone,
 }
 
 /// How long the first window waits for the portal's dark preference before painting with
@@ -332,6 +342,14 @@ struct App {
     /// Animations as last applied from or saved to the settings.
     #[cfg(feature = "images")]
     anim_set: bool,
+    /// The `live_reload` setting.
+    live_on: bool,
+    /// The file watcher, once started after the first frame (`None` before, or if there is none).
+    watch: Option<Watch>,
+    /// It was started (or tried).
+    watch_tried: bool,
+    /// Live reloads: the generation watched, a version held while the reader drags.
+    live: Reloads<Doc>,
     exit_code: i32,
 }
 
@@ -493,6 +511,7 @@ impl App {
         }
         self.scan_fonts();
         self.resolve_families();
+        self.start_watch();
         // The caret has moved when the query has.
         #[cfg(feature = "find")]
         self.sync_ime();
@@ -530,6 +549,7 @@ impl App {
             view.set_toc(prefs.toc);
             self.toc_set = prefs.toc;
         }
+        let live = std::mem::replace(&mut self.live_on, prefs.live_reload);
         for mono in [false, true] {
             let (family, cached) = if mono {
                 (&prefs.font_mono, &prefs.font_mono_path)
@@ -554,6 +574,72 @@ impl App {
                 }
             }
         }
+        if live != self.live_on {
+            self.start_watch();
+            self.retarget();
+        }
+        self.redraw();
+    }
+
+    /// Start the file watcher, once the first frame is out (never on the startup path, and not
+    /// for a bench's first frame) and if `live_reload` is on.
+    fn start_watch(&mut self) {
+        if self.watch_tried || !self.live_on || !self.shown || self.bench == Some(Bench::FirstFrame)
+        {
+            return;
+        }
+        self.watch_tried = true;
+        let proxy = self.proxy.clone();
+        self.watch = watch::start(move |generation, found| {
+            // (Parsed here, on the watcher's thread.)
+            let fresh = match found {
+                Reread::Text(text, stamp) => Fresh::Doc(Box::new(Doc::parse(&text)), stamp),
+                _ => Fresh::Gone,
+            };
+            let _ = proxy.send_event(UserEvent::Reloaded(generation, fresh));
+        });
+        self.retarget();
+    }
+
+    /// Watch the document's file (nothing for stdin, a pipe, the empty window, or with
+    /// `live_reload` off) and tell the watcher which version is shown, or look again at what the
+    /// watch needs for it (a symlink pointed elsewhere, a folder that went and is back). For a new
+    /// target, a save that came since the file was read is read now rather than missed.
+    fn retarget(&mut self) {
+        let Some(w) = &self.watch else {
+            return;
+        };
+        let path = match &self.input {
+            Input::File(p) if self.live_on && view::rereadable(&self.input) => Some(p.as_path()),
+            _ => None,
+        };
+        let empty = self.view.as_ref().is_none_or(|v| v.doc().blocks.is_empty());
+        let generation = w.target(path, self.stamp, empty);
+        // (`reload` targets the same path again: no loop.)
+        if std::mem::replace(&mut self.live.generation, generation) != generation
+            && path.is_some_and(|p| view::stamp(p) != self.stamp)
+        {
+            self.reload();
+        }
+    }
+
+    /// Show the version a live reload held, unless the reader is still dragging.
+    fn show_held(&mut self) {
+        if self.view.as_ref().is_none_or(View::holding) {
+            return;
+        }
+        let now = match &self.input {
+            Input::File(path) => view::stamp(path),
+            _ => None,
+        };
+        let Some((doc, stamp)) = self.live.release(now) else {
+            return;
+        };
+        self.stamp = stamp;
+        if let Some(view) = self.view.as_mut() {
+            view.replace(doc, None);
+        }
+        self.retarget();
         self.redraw();
     }
 
@@ -675,12 +761,15 @@ impl App {
         if !view::rereadable(&self.input) {
             return;
         }
+        self.live.reset();
         let loaded = load(&self.input, Origin::Navigation);
         self.stamp = loaded.stamp;
         let message = self.message(&self.input, loaded.message);
         if let Some(view) = self.view.as_mut() {
             view.replace(loaded.doc, message);
         }
+        // (A file deleted and made again is in a new folder, maybe.)
+        self.retarget();
         self.redraw();
     }
 
@@ -690,10 +779,12 @@ impl App {
         let message = self.message(&input, loaded.message);
         self.input = input;
         self.stamp = loaded.stamp;
+        self.live.reset();
         if let Some(view) = self.view.as_mut() {
             view.open_in(loaded.doc, message, nav::base_dir(&self.input));
             view.set_notice(loaded.notice);
         }
+        self.retarget();
         if let Some(g) = &self.gfx {
             g.window.set_title(&view::title(&self.input));
         }
@@ -1194,6 +1285,31 @@ impl ApplicationHandler<UserEvent> for App {
                 self.resolve_families();
             }
             UserEvent::Quit => {}
+            UserEvent::Reloaded(generation, fresh) => {
+                let stamp = match &fresh {
+                    Fresh::Doc(_, stamp) => *stamp,
+                    Fresh::Gone => None,
+                };
+                let now = || match &self.input {
+                    Input::File(path) => view::stamp(path),
+                    _ => None,
+                };
+                match fresh {
+                    _ if !self.live.current(generation, stamp, self.stamp, now) => {}
+                    Fresh::Doc(doc, stamp) => {
+                        self.live.hold(*doc, stamp);
+                        self.show_held();
+                    }
+                    // The last version stays, said once (reports of it gone again are not new);
+                    // the focus reload leaves it (no stamp to differ from), and the file's
+                    // return reads it again.
+                    Fresh::Gone => {
+                        self.stamp = None;
+                        self.live.gone();
+                        self.toast(gone_note(&self.input));
+                    }
+                }
+            }
             UserEvent::Images => {
                 if let Some(view) = self.view.as_mut()
                     && view.poll_images(Instant::now())
@@ -1269,7 +1385,9 @@ impl ApplicationHandler<UserEvent> for App {
             // Changes made here are in the file before another window (or an editor) is used.
             WindowEvent::Focused(false) => {
                 self.held_keys.clear();
-                // A button released elsewhere isn't seen: the drag ends here.
+                // A button released elsewhere isn't seen: the drag ends here (and a version held
+                // for it is shown).
+                let repaint = view.release(now);
                 #[cfg(feature = "clipboard")]
                 {
                     view.release_select();
@@ -1285,6 +1403,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 self.save(|s| s.flush());
+                if repaint {
+                    self.redraw();
+                }
             }
             #[cfg(feature = "images")]
             WindowEvent::Occluded(occluded) => {
@@ -1300,8 +1421,11 @@ impl ApplicationHandler<UserEvent> for App {
                         self.sync_hidden();
                     }
                 }
-                // (`reload` keeps a pipe's document: its stamp says nothing.)
+                // (`reload` keeps a pipe's document: its stamp says nothing. A live reload's read
+                // in flight, or held, is the newer version.)
                 if let Input::File(path) = &self.input
+                    && !self.live.busy()
+                    && !self.watch.as_ref().is_some_and(Watch::busy)
                     && view::stamp(path) != self.stamp
                 {
                     self.reload();
@@ -1453,6 +1577,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
+        // A version held while the reader dragged, once the button is up (or the focus gone).
+        self.show_held();
         // Scrolling, zooming, resizing or a new document move what's under the pointer.
         self.update_hover();
         #[cfg(feature = "find")]
@@ -1649,6 +1775,10 @@ fn main() {
         whole_at: None,
         #[cfg(feature = "images")]
         anim_set: false,
+        live_on: false,
+        watch: None,
+        watch_tried: false,
+        live: Reloads::default(),
         exit_code: 0,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
@@ -1665,6 +1795,14 @@ fn bench_size() -> Option<(f64, f64)> {
     let (w, h) = v.split_once('x')?;
     let (w, h): (f64, f64) = (w.parse().ok()?, h.parse().ok()?);
     (w >= 1.0 && h >= 1.0 && w <= 16384.0 && h <= 16384.0).then_some((w, h))
+}
+
+/// What the toast says when a live reload finds the document's file gone.
+fn gone_note(input: &Input) -> String {
+    format!(
+        "{} was deleted or moved. Showing the last version.",
+        view::title(input)
+    )
 }
 
 /// Family names in settings compare case-insensitively.
@@ -1713,7 +1851,8 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_message, font_notice, is_wayland, leave, parent_name, pop, same_family, system_dark,
+        empty_message, font_notice, gone_note, is_wayland, leave, parent_name, pop, same_family,
+        system_dark,
     };
     use std::ptr::NonNull;
     use std::time::Instant;
@@ -1769,6 +1908,15 @@ mod tests {
             }
         );
         assert_eq!(empty_message(true), "Press Ctrl+O to open a Markdown file");
+    }
+
+    /// The file gone is named as the title names it: its name, not its path.
+    #[test]
+    fn the_gone_note_names_the_file() {
+        assert_eq!(
+            gone_note(&Input::File("docs/guide.md".into())),
+            "guide.md was deleted or moved. Showing the last version."
+        );
     }
 
     /// Wayland is what the display handle says, whatever the environment names.

@@ -3731,10 +3731,9 @@ fn parallel_parse_keeps_few_segments_in_flight() {
                 break;
             }
         }
-        assert!(
-            cfg!(windows) || peaks.iter().any(|&p| p >= 2),
-            "in flight at most {peaks:?}"
-        );
+        if !cfg!(windows) {
+            assert!(peaks.iter().any(|&p| p >= 2), "in flight at most {peaks:?}");
+        }
     }
 }
 

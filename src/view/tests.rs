@@ -838,6 +838,65 @@ mod with_fonts {
         assert_eq!(v.anchor(), Anchor::TOP);
     }
 
+    /// A live reload (a save in the editor beside the window) keeps the place being read, and
+    /// at the very end of the document follows the end as the text grows; a document that fits
+    /// the window stays at its top.
+    #[test]
+    fn a_reload_at_the_end_follows_the_end() {
+        let mut v = view(&paras(100), 600, 400);
+        settle(&mut v);
+        v.set_scroll(v.layout().top(40));
+        v.replace(Doc::parse(&paras(120)), None);
+        assert_eq!(v.anchor().block, 40, "the place is kept");
+        v.apply(Action::Bottom, Instant::now());
+        for n in [130, 160, 90] {
+            v.replace(Doc::parse(&paras(n)), None);
+            settle(&mut v);
+            assert!(
+                (v.scroll() - v.max_scroll()).abs() < 0.5,
+                "{n}: at the end ({} of {})",
+                v.scroll(),
+                v.max_scroll()
+            );
+            let range = v.layout().range_exact(v.scroll(), v.scroll() + 400.0);
+            assert_eq!(range.end, n, "the last paragraph shows");
+        }
+        // Not quite at the end: the place, not the end.
+        v.set_scroll(v.max_scroll() - 100.0);
+        let place = v.anchor();
+        v.replace(Doc::parse(&paras(100)), None);
+        assert_eq!(v.anchor(), place);
+        // A document that fits has no end to follow.
+        let mut v = view(&paras(2), 600, 400);
+        settle(&mut v);
+        v.replace(Doc::parse(&paras(100)), None);
+        assert_eq!(v.scroll(), 0.0);
+    }
+
+    /// While the scrollbar's thumb (or a selection) is dragged, a live reload waits: the shell
+    /// asks [`View::holding`] and shows the new version when the button is up.
+    #[test]
+    fn dragging_holds_a_live_reload() {
+        let now = Instant::now();
+        let mut v = view(&paras(200), 600, 400);
+        settle(&mut v);
+        assert!(!v.holding());
+        let thumb = v.thumb_at(0.0).unwrap();
+        assert!(v.press(f64::from(thumb.x1 - 1), f64::from(thumb.y0 + 2), now));
+        assert!(v.holding(), "the thumb is dragged");
+        v.release(now);
+        assert!(!v.holding());
+        #[cfg(feature = "clipboard")]
+        {
+            v.press(100.0, 100.0, now);
+            assert!(!v.holding(), "a press is no drag yet");
+            v.select_to(300.0, 200.0, now);
+            assert!(v.holding(), "a selection is dragged");
+            v.release_select();
+            assert!(!v.holding());
+        }
+    }
+
     #[test]
     fn open_starts_at_the_top() {
         let mut v = view(&paras(100), 600, 400);
@@ -2467,6 +2526,51 @@ mod with_fonts {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(buf.iter().filter(|&&p| p == 0x119933).count(), 40 * 20);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload (or a live reload: the same `replace`) paints the local images whose files are
+    /// unchanged in its first frame, from the pixels it had: none is decoded again and none shows
+    /// as an empty box in between. An animated one stays animated.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_reload_paints_unchanged_images_at_once() {
+        let dir = std::env::temp_dir().join(format!("vomd-view-carry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = Vec::new();
+        let mut enc = ::png::Encoder::new(&mut png, 40, 20);
+        enc.set_color(::png::ColorType::Rgb);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&[0x11, 0x99, 0x33].repeat(800))
+            .unwrap();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        let gif = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/anim.gif");
+        std::fs::copy(gif, dir.join("anim.gif")).unwrap();
+        let mut v = view("![a](a.png)\n\n![g](anim.gif)", 600, 400);
+        v.set_image_base(Some(dir.clone()));
+        frame(&mut v, Instant::now());
+        wait_images(&mut v, |v| {
+            v.image_stats().decoded >= 2 && v.images.animated(2).is_some()
+        });
+        let decodes = v.image_stats().decodes;
+        let mut buf = vec![0u32; 600 * 400];
+        for edited in [
+            "Edited.\n\n![a](a.png)\n\n![g](anim.gif)",
+            "![a](a.png)\n\n![g](anim.gif)",
+        ] {
+            v.replace(Doc::parse(edited), None);
+            v.paint(&mut buf, 600, Instant::now());
+            assert_eq!(
+                buf.iter().filter(|&&p| p == 0x119933).count(),
+                40 * 20,
+                "painted in the reload's first frame"
+            );
+            assert!(v.images.animated(2).is_some(), "still animated");
+            v.tick(Instant::now(), Some(Instant::now()));
+            v.poll_images(Instant::now());
+        }
+        assert_eq!(v.image_stats().decodes, decodes, "nothing decoded again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

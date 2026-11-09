@@ -188,6 +188,8 @@ pub struct Prefs {
     pub primary_selection: bool,
     /// Animated GIFs and WebPs play (`A` toggles it); off, they show their first frame.
     pub animations: bool,
+    /// The document is shown again as soon as its file is saved (else when the window gets focus).
+    pub live_reload: bool,
 }
 
 /// What `primary_selection` is without a line for it: on where there is a primary selection (X11
@@ -218,6 +220,7 @@ impl Default for Prefs {
             font_mono_path: None,
             primary_selection: DEFAULT_PRIMARY,
             animations: false,
+            live_reload: true,
         }
     }
 }
@@ -307,6 +310,10 @@ impl Prefs {
                 .get("animations")
                 .and_then(parse_bool)
                 .unwrap_or(d.animations),
+            live_reload: s
+                .get("live_reload")
+                .and_then(parse_bool)
+                .unwrap_or(d.live_reload),
         }
     }
 }
@@ -860,6 +867,10 @@ macro_rules! template {
 # Animated GIFs and WebPs: off (their first frame) or on (they play). A toggles it, and a
 # click on an animated image plays or pauses it alone.
 # animations = off
+
+# Show the document again as soon as its file is saved: on or off (then it is reloaded when
+# the window gets focus, or with R).
+# live_reload = on
 ",
             $primary,
             "

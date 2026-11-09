@@ -1420,6 +1420,21 @@ impl View {
         self.drag.is_some()
     }
 
+    /// The reader is dragging something a new version of the document would pull from under the
+    /// pointer (the scrollbar's thumb, a selection, one in the find bar's field): a live reload
+    /// waits for the button to come up.
+    pub fn holding(&self) -> bool {
+        #[cfg(feature = "clipboard")]
+        if self.selecting() {
+            return true;
+        }
+        #[cfg(feature = "find")]
+        if self.find_dragging() {
+            return true;
+        }
+        self.dragging()
+    }
+
     /// Shift is held down (a click then extends the selection).
     #[cfg(any(feature = "clipboard", feature = "find"))]
     pub fn set_shift(&mut self, shift: bool) {
@@ -2491,8 +2506,13 @@ impl View {
     /// follows the nearest heading at or above it (found by its path of heading texts, then
     /// its slug), so edits above it don't move the text being read; without one
     /// (or if the heading is gone) it keeps the block index. A message keeps the position of
-    /// the document it replaced for the next one.
+    /// the document it replaced for the next one. At the very end of a document that scrolls, it
+    /// stays at the end (writing at the bottom of a document beside a live reload).
     pub fn replace(&mut self, doc: Doc, message: Option<String>) {
+        let at_end = self.message.is_none() && {
+            let max = self.max_scroll();
+            max > 0.0 && self.scroll() >= max - 0.5
+        };
         let (place, old) = self
             .kept
             .take()
@@ -2547,6 +2567,9 @@ impl View {
         });
         // Measures around the position, and settles at the end if the new text is shorter.
         self.ensure();
+        if at_end {
+            self.bottom();
+        }
         #[cfg(feature = "find")]
         self.find_again();
     }

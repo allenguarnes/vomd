@@ -15,7 +15,9 @@ mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
 // The default budget with highlighting: 5,963,704 B measured, plus 20 KB, rounded up to 10 KB.
-const SIZE_BUDGET: [u64; 2] = [5_990_000, 3_000_000];
+// Raised to 6,000,000 for 1.9.0 (live reload): the README promises "under 6 MB", and this is
+// that line.
+const SIZE_BUDGET: [u64; 2] = [6_000_000, 3_000_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
 // The default budget with highlighting: 4,698,112 B measured on Windows, plus 20 KB, rounded up
