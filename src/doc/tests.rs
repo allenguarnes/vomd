@@ -4780,7 +4780,7 @@ fn a_fence_names_its_language() {
             _ => None,
         })
         .collect();
-    let code = |lang| Some(Hl { lang, state: 0 });
+    let code = |lang| Some(Hl { lang });
     let math = if cfg!(feature = "math") {
         None
     } else {
@@ -4801,22 +4801,11 @@ fn a_fence_names_its_language() {
 
 #[cfg(feature = "highlight")]
 #[test]
-fn a_highlighted_blocks_chunks_start_where_the_lexer_is() {
-    use crate::highlight::{find, lex};
-    let lang = find("rust").unwrap();
-    // A block comment open across the first cut, and a string across the second.
-    let lines = |n: usize| {
-        (0..n)
-            .map(|i| format!("let x{i} = {i};\n"))
-            .collect::<String>()
-    };
-    let code = format!(
-        "{}/* open\n{}*/\nlet s = \"\n{}\";\n{}",
-        lines(1000),
-        lines(1000),
-        lines(1000),
-        lines(500)
-    );
+fn a_highlighted_blocks_chunks_keep_its_language_and_text() {
+    // (Where the lexer is at the start of each chunk is the layout's: see its test
+    // `a_highlighted_blocks_chunks_start_where_the_lexer_is`.)
+    let lang = crate::highlight::find("rust").unwrap();
+    let code: String = (0..3500).map(|i| format!("let x{i} = {i};\n")).collect();
     let doc = Doc::parse(&format!("```rust\n{code}```\n"));
     check_invariants(&doc);
     assert!(doc.blocks.len() >= 3, "{} chunks", doc.blocks.len());
@@ -4824,24 +4813,9 @@ fn a_highlighted_blocks_chunks_start_where_the_lexer_is() {
         let spans = doc.block_spans(b);
         &doc.text[spans[0].start as usize..spans[spans.len() - 1].end as usize]
     };
-    let mut state = 0;
-    let mut states = Vec::new();
     for b in &doc.blocks {
-        assert_eq!(b.kind, BlockKind::Code(Hl { lang, state }));
-        states.push(state);
-        state = lex(lang, text(b), state, &mut |_, _, _| {});
+        assert_eq!(b.kind, BlockKind::Code(Hl { lang }));
     }
-    // The chunks are the whole text, and the states are those of lexing it whole.
     let all: String = doc.blocks.iter().map(text).collect();
     assert_eq!(all, code.trim_end_matches('\n'));
-    let mut at = 0;
-    for (b, &want) in doc.blocks.iter().zip(&states) {
-        let got = lex(lang, &all[..at], 0, &mut |_, _, _| {});
-        assert_eq!(got, want, "at {at}");
-        at += text(b).len();
-    }
-    assert!(
-        states.iter().filter(|&&s| s != 0).count() >= 2,
-        "{states:?}"
-    );
 }

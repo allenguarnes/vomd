@@ -14,10 +14,11 @@ use std::{env, fs};
 mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
-// The default budget with highlighting: 5,963,704 B measured, plus 20 KB, rounded up to 10 KB.
-// Raised to 6,000,000 for 1.9.0 (live reload): the README promises "under 6 MB", and this is
-// that line.
-const SIZE_BUDGET: [u64; 2] = [6_000_000, 3_000_000];
+// Lowered for 1.9.0 after the unwind tables went (`release_link_args`), with code folding, the
+// remapped source paths and the code font without its ligatures: 5,246,960 B and 2,602,824 B
+// measured; the default budget is a round 5.4 MB (about 150 KB of room, kept for the image
+// viewer), the smallest one the measured size plus about 45 KB (1.7%), rounded up to 10 KB.
+const SIZE_BUDGET: [u64; 2] = [5_400_000, 2_650_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
 // The default budget with highlighting: 4,698,112 B measured on Windows, plus 20 KB, rounded up
@@ -138,48 +139,144 @@ fn baseline_cpu() -> bool {
 /// `.cargo/config.toml`, whose flags these repeat), set through `CARGO_ENCODED_RUSTFLAGS`
 /// (unit-separator-joined), which overrides `[build] rustflags` and `[target] rustflags` in
 /// every config file, so no `target-cpu` from `~/.cargo/config.toml` or a parent directory's
-/// reaches the binary.
-const RELEASE_FLAGS: &str =
-    "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1fllvm-args=-inline-threshold=10";
+/// reaches the binary. [`remap_flags`] are added to them.
+///
+/// On x86_64 also identical code folding (`--icf=all`), about −29 KB. It is here only, not in
+/// `.cargo/config.toml`: the pinned toolchain links with rust-lld, which takes it, but GNU ld
+/// (Rust before 1.90, distribution builds of rustc, aarch64) rejects it. lld folds identical
+/// functions, vtables and read-only data alike, statics included; nothing in VOMD or its crates
+/// relies on two of them having distinct addresses.
+const RELEASE_FLAGS: &str = if cfg!(target_arch = "x86_64") {
+    "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1flink-arg=-Wl,--icf=all\x1f\
+     -C\x1fllvm-args=-inline-threshold=10"
+} else {
+    "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1fllvm-args=-inline-threshold=10"
+};
 
 /// [`RELEASE_FLAGS`] for Windows (MSVC): the C runtime linked in and the inline threshold, as
 /// `.cargo/config.toml` has them.
 const WINDOWS_RELEASE_FLAGS: &str =
     "-C\x1ftarget-feature=+crt-static\x1f-C\x1fllvm-args=-inline-threshold=10";
 
-/// A cargo command in the repository with [`RELEASE_FLAGS`] for what it builds.
+/// `--remap-path-prefix` flags (unit-separator-joined, each after one) that cut the checkout and
+/// every crate registry's source directory off the source paths built into panic messages: the
+/// builder's home directory stays out of the binary, which is also about 22 KB smaller
+/// (`png-0.18.0/src/…` instead of `/home/<user>/.cargo/registry/src/index.crates.io-…/png-…`).
+fn remap_flags() -> String {
+    let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| Path::new(&h).join(".cargo")));
+    let mut prefixes = vec![root()];
+    if let Some(dirs) = cargo_home.and_then(|c| fs::read_dir(c.join("registry/src")).ok()) {
+        prefixes.extend(dirs.flatten().map(|d| d.path()));
+    }
+    prefixes
+        .iter()
+        .map(|p| format!("\x1f--remap-path-prefix={}=", p.display()))
+        .collect()
+}
+
+/// A cargo command in the repository with [`RELEASE_FLAGS`] for what it builds, aborting on
+/// panic whatever a cargo config file says (the environment overrides those), as
+/// [`release_link_args`] needs.
 fn release_cargo() -> Command {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.current_dir(root());
+    cmd.env("CARGO_PROFILE_RELEASE_PANIC", "abort");
     if cfg!(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     )) {
-        cmd.env("CARGO_ENCODED_RUSTFLAGS", RELEASE_FLAGS);
+        cmd.env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            RELEASE_FLAGS.to_owned() + &remap_flags(),
+        );
     } else if cfg!(all(windows, target_env = "msvc")) {
-        cmd.env("CARGO_ENCODED_RUSTFLAGS", WINDOWS_RELEASE_FLAGS);
+        cmd.env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            WINDOWS_RELEASE_FLAGS.to_owned() + &remap_flags(),
+        );
     }
     cmd
 }
 
+/// The link arguments of the Linux release binary alone: `packaging/discard-unwind.ld`, which
+/// leaves out `.eh_frame`, its index and `.gcc_except_table`, about 620 KB. A binary that aborts on
+/// panic ([`release_cargo`]) never uses them: they only let a `RUST_BACKTRACE` backtrace walk
+/// past the first frame (unnamed in a stripped binary anyway), and a panic still prints its
+/// message and aborts. They come precompiled with std, so `-C force-unwind-tables=no` can't drop
+/// them. Given with `cargo rustc` to this one binary, never in rustflags or by `build.rs`: a test
+/// harness or a build that unwinds needs them (`catch_unwind` in `doc::pipeline`, any
+/// `#[should_panic]` test). (`-Xlinker` passes the path whole, where `-Wl,` would cut it at a
+/// comma.)
+fn release_link_args() -> Vec<String> {
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    let script = root().join("packaging/discard-unwind.ld");
+    vec![
+        "-C".into(),
+        "link-arg=-Xlinker".into(),
+        "-C".into(),
+        format!("link-arg=-T{}", script.display()),
+    ]
+}
+
+/// Build the release binary (`extra`: cargo's feature arguments) into `target_dir`.
 fn cargo_build(extra: &[&str], target_dir: &str) -> PathBuf {
     let status = release_cargo()
         .args([
-            "build",
+            "rustc",
             "--release",
             "--locked",
             "--package",
+            "vomd",
+            "--bin",
             "vomd",
             "--target-dir",
             target_dir,
         ])
         .args(extra)
+        .arg("--")
+        .args(release_link_args())
         .status()
         .expect("run cargo");
     assert!(status.success(), "cargo build failed");
-    root()
+    let bin = root()
         .join(target_dir)
-        .join(format!("release/vomd{}", env::consts::EXE_SUFFIX))
+        .join(format!("release/vomd{}", env::consts::EXE_SUFFIX));
+    if cfg!(target_os = "linux") {
+        assert!(
+            !has_unwind_tables(&bin),
+            "{} kept its unwind tables (packaging/discard-unwind.ld)",
+            bin.display()
+        );
+    }
+    bin
+}
+
+/// Whether the ELF file `bin` has a section of unwind tables (`.eh_frame*`), read from its
+/// section headers.
+fn has_unwind_tables(bin: &Path) -> bool {
+    let elf = fs::read(bin).expect("read the binary");
+    let u16_at = |at: usize| u16::from_le_bytes([elf[at], elf[at + 1]]) as usize;
+    let u32_at = |at: usize| u32::from_le_bytes(elf[at..at + 4].try_into().unwrap()) as usize;
+    let u64_at = |at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap()) as usize;
+    // 64-bit little-endian ELF: section headers at e_shoff, e_shnum of e_shentsize bytes, names
+    // in section e_shstrndx.
+    assert!(
+        elf.starts_with(b"\x7fELF\x02\x01"),
+        "not a 64-bit LE ELF file"
+    );
+    let (off, size, count, names) = (u64_at(0x28), u16_at(0x3a), u16_at(0x3c), u16_at(0x3e));
+    let header = |i: usize| off + i * size;
+    let strtab = u64_at(header(names) + 0x18);
+    (0..count).any(|i| {
+        let name = &elf[strtab + u32_at(header(i))..];
+        let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+        name.starts_with(b".eh_frame") || name.starts_with(b".gcc_except_table")
+    })
 }
 
 fn size() -> bool {
@@ -193,7 +290,7 @@ fn size() -> bool {
         let pass = len <= budget;
         ok &= pass;
         println!(
-            "{} {label:<24} {:>9} bytes ({:.2} MB)  budget {:.1} MB",
+            "{} {label:<24} {:>9} bytes ({:.2} MB)  budget {:.2} MB",
             if pass { "PASS" } else { "FAIL" },
             len,
             len as f64 / 1e6,
@@ -609,7 +706,7 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
             "stripped binary".into(),
             label,
             format!("{:.2} MB", len as f64 / 1e6),
-            format!("≤ {:.1} MB", SIZE_BUDGET[i] as f64 / 1e6),
+            format!("≤ {:.2} MB", SIZE_BUDGET[i] as f64 / 1e6),
             len <= SIZE_BUDGET[i],
             true,
         );

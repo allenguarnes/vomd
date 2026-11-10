@@ -170,8 +170,32 @@ impl<'a> Scan<'a> {
 
     /// Feed `text`, which starts at byte `base` of the document's text, in block `block`.
     fn feed(&mut self, block: u32, base: u32, text: &str) {
-        for (i, c) in text.char_indices() {
+        // While no match is under way, the scan skips to the next byte that can start one: the
+        // first character of the needle in either case, or any non-ASCII character (U+212A, the
+        // Kelvin sign, folds to `k`). An ASCII character folds only to ASCII.
+        let first = self.needle[0];
+        let (lower, upper) = if first.is_ascii() {
+            (first as u8, first.to_ascii_uppercase() as u8)
+        } else {
+            (0x80, 0x80)
+        };
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if self.state == 0 {
+                match bytes[i..]
+                    .iter()
+                    .position(|&b| b == lower || b == upper || b >= 0x80)
+                {
+                    Some(skip) => i += skip,
+                    None => return,
+                }
+            }
+            let Some(c) = text[i..].chars().next() else {
+                return;
+            };
             let start = base + i as u32;
+            i += c.len_utf8();
             let end = start + c.len_utf8() as u32;
             if c.is_ascii() {
                 self.step(c.to_ascii_lowercase(), start, end, block);

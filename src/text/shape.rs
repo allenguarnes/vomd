@@ -155,7 +155,9 @@ fn attaches_to_previous(c: char) -> bool {
 
 /// Visible combining marks: they stay in their base's face, so that face must cover them too.
 pub fn is_combining_mark(c: char) -> bool {
-    !is_default_ignorable(c)
+    // No mark is below U+0300: ASCII and Latin-1 skip the category lookup.
+    c >= '\u{0300}'
+        && !is_default_ignorable(c)
         && matches!(
             c.category(),
             Category::NonspacingMark | Category::SpacingMark | Category::EnclosingMark
@@ -166,8 +168,10 @@ pub fn is_combining_mark(c: char) -> bool {
 /// never drawn, so they never count as missing and take the face of their neighbors.
 fn is_default_ignorable(c: char) -> bool {
     // Unicode's Default_Ignorable_Code_Point, all of it: swash leaves out the glyphs of the
-    // same characters, unless they were turned into others (see `shape`).
-    matches!(c,
+    // same characters, unless they were turned into others (see `shape`). None is below
+    // U+00AD, which keeps ASCII to one comparison.
+    c >= '\u{00AD}'
+        && matches!(c,
         '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}'..='\u{1160}'
         | '\u{17B4}'..='\u{17B5}'
         | '\u{180B}'..='\u{180F}'

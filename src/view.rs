@@ -2189,6 +2189,8 @@ impl View {
         let showing = self.message.is_none() && (self.bar_held() || self.fade.visible(now));
         let thumb = showing.then(|| self.thumb_at(self.scroll()));
         let measured = measure_until.is_none_or(|t| self.idle(t));
+        // Code coloured from a guessed state was coloured again (`Layout::idle`).
+        redraw |= self.layout.take_recolored();
         redraw |= thumb.is_some_and(|before| before != self.thumb_at(self.scroll()));
         // No timers when there's nothing to do.
         let wake = match (measured, self.deadline()) {

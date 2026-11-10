@@ -1868,6 +1868,15 @@ mod tests {
     };
     use winit::window::Theme;
 
+    /// The binary's test harness unwinds: only the release binary itself is linked without
+    /// unwind tables (`release_link_args` in xtask), never this harness, in any profile
+    /// (`cargo test --release` included), or a panic here would abort every test.
+    #[test]
+    #[should_panic(expected = "unwinds")]
+    fn the_test_harness_keeps_its_unwind_tables() {
+        panic!("unwinds");
+    }
+
     /// A family a lookup didn't find is said once per process, whatever its case or spaces;
     /// two new ones at once are one toast.
     #[test]

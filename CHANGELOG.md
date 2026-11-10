@@ -19,6 +19,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - Reloading a document no longer makes its images blink: images whose files didn't change stay
   on screen, and only the changed ones load again. The same goes for the other images of a page
   when the theme switches a `<picture>`.
+- The default binary is 5.2 MB on Linux, down from 6.0 MB (745 KB smaller), and the smallest
+  build 2.6 MB, down from 3.0 MB. Release builds leave out unwind tables they never use and fold
+  identical code, and the code font no longer carries the ligatures VOMD never showed. The source
+  paths in panic messages no longer name the directories the binary was built in.
+- Very large documents open faster: a 5 MB document is read in about 70 ms instead of 95, and
+  one that is mostly code blocks in a quarter of the time it took.
+- Find is two to four times faster in large documents: each key typed into the find bar of a
+  5 MB document takes 5 to 10.5 ms instead of 20 to 23.
 
 ### Fixed
 - Alt text outlines of images that aren't shown, such as a README's row of badges, and code

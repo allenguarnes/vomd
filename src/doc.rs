@@ -147,14 +147,13 @@ pub enum BlockKind {
 }
 
 /// How a code block is highlighted: its language (a 1-based index into the highlighter's tables,
-/// 0 for none) and the lexer's state where the block starts, which is not 0 only for a chunk after
-/// the first of an oversized block. Nothing without the `highlight` feature.
+/// 0 for none). The chunks of an oversized block all have it; where the lexer is at the start of
+/// one after the first is found by the layout, which lexes them in order. Nothing without the
+/// `highlight` feature.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hl {
     #[cfg(feature = "highlight")]
     pub lang: u8,
-    #[cfg(feature = "highlight")]
-    pub state: u32,
 }
 
 /// Decoration drawn before the first line of a block.
@@ -1331,33 +1330,14 @@ impl Builder {
 
     /// Split the open block's spans (everything from `first` on) into chunk blocks. The marker
     /// and quote start go to the first chunk; the rest are `joined` to it.
-    fn push_chunks(&mut self, mut kind: BlockKind, first: usize) {
+    fn push_chunks(&mut self, kind: BlockKind, first: usize) {
         let tail = self.doc.spans.split_off(first);
         let (spans, chunks) = split_spans(&self.doc.text, &tail, MAX_BLOCK_BYTES);
         self.doc.spans.extend(spans);
         for (i, chunk) in chunks.into_iter().enumerate() {
             let range = (first as u32 + chunk.start)..(first as u32 + chunk.end);
-            self.push_joined(kind, range.clone(), i > 0);
-            kind = self.after_chunk(kind, range);
+            self.push_joined(kind, range, i > 0);
         }
-    }
-
-    /// The kind of the chunk after one of `kind` (with `spans`): for a highlighted code block,
-    /// the state the lexer is in at the end of this one, so a comment or a string open across
-    /// the cut is coloured as one.
-    fn after_chunk(&self, kind: BlockKind, spans: Range<u32>) -> BlockKind {
-        #[cfg(feature = "highlight")]
-        if let BlockKind::Code(Hl { lang, state }) = kind
-            && lang != 0
-            && let Some(spans) = self.doc.spans.get(spans.start as usize..spans.end as usize)
-            && let (Some(a), Some(b)) = (spans.first(), spans.last())
-        {
-            let text = &self.doc.text[a.start as usize..b.end as usize];
-            let state = crate::highlight::lex(lang, text, state, &mut |_, _, _| {});
-            return BlockKind::Code(Hl { lang, state });
-        }
-        let _ = spans;
-        kind
     }
 
     /// Split an oversized table row (spans from `first_span`, cells from `first_cell`) into
@@ -2412,7 +2392,7 @@ fn code_hl(kind: &pulldown_cmark::CodeBlockKind) -> Hl {
     #[cfg(feature = "highlight")]
     if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind {
         let lang = crate::highlight::find(info).unwrap_or(0);
-        return Hl { lang, state: 0 };
+        return Hl { lang };
     }
     let _ = kind;
     Hl::default()

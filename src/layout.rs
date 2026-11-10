@@ -469,7 +469,40 @@ pub struct Layout {
     /// Formulas laid out, kept by the window across layouts (see [`Layout::set_math`]).
     #[cfg(feature = "math")]
     math: crate::math::Shared,
+    /// Where the lexer is at the start of the chunks of split code blocks (see [`CodeLex`]).
+    code: CodeLex,
 }
+
+/// How many bytes of code the lexer may go through to find where a chunk starts, in one
+/// [`Layout::ensure`] or one turn of [`Layout::idle`]'s catching up: about 2.5 ms.
+#[cfg(feature = "highlight")]
+const CATCH_UP_BYTES: usize = 256 * 1024;
+
+/// Where the lexer is at the start of each chunk after the first of a split code block. It is
+/// found as the chunks before it are laid out, in order, which is how idle measuring goes (see
+/// [`push_highlighted`]). A chunk reached first, deep in a block (the end, a match, a heading
+/// after it), would need all the chunks before it lexed: no more than [`CATCH_UP_BYTES`] of
+/// them are, and if that doesn't get there the chunk is coloured as if it started the block,
+/// and [`Layout::idle`] catches up and colours it again.
+#[cfg(feature = "highlight")]
+#[derive(Default)]
+struct CodeLex {
+    /// The states known, by block: those of the chunks of a block from its second on, up to
+    /// some chunk (each is found from the one before it).
+    states: std::collections::HashMap<u32, u32>,
+    /// The last split block walked: its first chunk, and the last of its chunks known to be
+    /// one, so the next call for it finds them without walking again.
+    span: Option<(usize, usize)>,
+    /// Blocks laid out from a guessed state, waiting for the right one.
+    guessed: Vec<u32>,
+    /// Bytes left to lex in this ensure or turn of catching up.
+    budget: usize,
+    /// A guessed block on screen was coloured again: the window needs a repaint.
+    recolored: bool,
+}
+#[cfg(not(feature = "highlight"))]
+#[derive(Default)]
+struct CodeLex {}
 
 impl Layout {
     pub fn new(doc: &Doc, params: Params) -> Layout {
@@ -499,6 +532,7 @@ impl Layout {
             image_blocks: Vec::new(),
             #[cfg(feature = "math")]
             math: crate::math::Cache::shared(),
+            code: CodeLex::default(),
         };
         layout.meta = layout.prepass(doc);
         layout.set_geometry();
@@ -1045,6 +1079,10 @@ impl Layout {
     /// blocks above it change height.
     pub fn ensure(&mut self, doc: &Doc, fonts: &Fonts, top: Anchor, view_h: f32) -> f32 {
         let view_h = view_h.max(self.em);
+        #[cfg(feature = "highlight")]
+        {
+            self.code.budget = CATCH_UP_BYTES;
+        }
         for pass in 0.. {
             let y = self.y_of(top);
             let view = self.range(y, y + view_h);
@@ -1098,9 +1136,17 @@ impl Layout {
     /// Measure unmeasured blocks until `deadline`. Returns true when the whole document has
     /// exact heights. Callers keep their scroll position with an [`Anchor`].
     pub fn idle(&mut self, doc: &Doc, fonts: &Fonts, deadline: Instant) -> bool {
+        #[cfg(feature = "highlight")]
+        if !self.catch_up(doc, deadline) {
+            return false;
+        }
         while self.cursor < self.geoms.len() {
             let i = self.cursor;
             if !self.geoms[i].measured {
+                #[cfg(feature = "highlight")]
+                {
+                    self.code.budget = CATCH_UP_BYTES;
+                }
                 let (_, h) = self.build(doc, fonts, i);
                 self.set_height(i, h);
                 self.geoms[i].measured = true;
@@ -1110,7 +1156,45 @@ impl Layout {
                 break;
             }
         }
+        #[cfg(feature = "highlight")]
+        if !self.code.guessed.is_empty() {
+            return false;
+        }
         self.cursor >= self.geoms.len()
+    }
+
+    /// Find the states of the code chunks laid out from a guessed one (see [`CodeLex`]), until
+    /// `deadline`, and lay those on screen out again. True when none is left.
+    #[cfg(feature = "highlight")]
+    fn catch_up(&mut self, doc: &Doc, deadline: Instant) -> bool {
+        while let Some(&b) = self.code.guessed.last() {
+            let i = b as usize;
+            self.code.budget = CATCH_UP_BYTES;
+            let lang = match doc.blocks.get(i).map(|b| b.kind) {
+                Some(BlockKind::Code(hl)) => hl.lang,
+                _ => 0,
+            };
+            if lang == 0 || chunk_state(doc, i, lang, &mut self.code).is_some() {
+                self.code.guessed.pop();
+                if self.geoms[i].content.take().is_some() {
+                    self.live.retain(|&l| l != b);
+                    self.code.recolored = true;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        self.code.guessed.is_empty()
+    }
+
+    /// Whether code on screen was coloured again since this was last asked (the window then
+    /// needs a repaint).
+    pub fn take_recolored(&mut self) -> bool {
+        #[cfg(feature = "highlight")]
+        return std::mem::take(&mut self.code.recolored);
+        #[cfg(not(feature = "highlight"))]
+        false
     }
 
     /// Lay out block `i`: its content and total height (spacing above included).
@@ -1204,7 +1288,7 @@ impl Layout {
             BlockKind::Code(_) => self.code(
                 doc,
                 fonts,
-                (block, last),
+                (i, last),
                 indent,
                 avail,
                 gap,
@@ -1511,13 +1595,14 @@ impl Layout {
         &mut self,
         doc: &Doc,
         fonts: &Fonts,
-        (block, last): (&Block, bool),
+        (i, last): (usize, bool),
         indent: f32,
         avail: f32,
         gap: f32,
         out: &mut BlockBox,
         missing: &mut Vec<char>,
     ) -> f32 {
+        let block = &doc.blocks[i];
         let em = self.em;
         let pad = em;
         // A chunked block is one continuous background: padding only at the run's outer edges.
@@ -1536,7 +1621,7 @@ impl Layout {
             link: 0,
         };
         self.para.clear();
-        if !push_highlighted(&mut self.para, doc, block, style) {
+        if !push_highlighted(&mut self.para, doc, i, &mut self.code, style) {
             for span in doc.block_spans(block) {
                 push_expanding_tabs(&mut self.para, doc.span_text(span), span.start, style);
             }
@@ -2422,19 +2507,32 @@ fn fill_para(
 }
 
 /// Copy a highlighted code block's text (with tabs expanded) in its tokens' colours, lexed from
-/// the state the block starts in; false for a block that isn't one.
-fn push_highlighted(para: &mut Para, doc: &Doc, block: &Block, style: TextStyle) -> bool {
+/// the state the block starts in; false for a block that isn't one. A chunk after the first of a
+/// split block starts where the lexer ended the one before it, so a comment or a string open
+/// across the cut is coloured as one: `code` keeps that for the next chunk, and what isn't in it
+/// yet is found by lexing the chunks before, within its budget, or else guessed (see
+/// [`CodeLex`]).
+fn push_highlighted(
+    para: &mut Para,
+    doc: &Doc,
+    i: usize,
+    code: &mut CodeLex,
+    style: TextStyle,
+) -> bool {
     #[cfg(feature = "highlight")]
-    if let BlockKind::Code(hl) = block.kind
+    if let Some(block) = doc.blocks.get(i)
+        && let BlockKind::Code(hl) = block.kind
         && hl.lang != 0
-        && let spans = doc.block_spans(block)
-        && let (Some(a), Some(b)) = (spans.first(), spans.last())
+        && let Some(text) = chunk_text(doc, block)
     {
         use crate::highlight::Tok;
+        let known = chunk_state(doc, i, hl.lang, code);
+        if known.is_none() && !code.guessed.contains(&(i as u32)) {
+            code.guessed.push(i as u32);
+        }
         // A block's spans are one run of the document's text.
-        let at = a.start;
-        let text = &doc.text[at as usize..b.end as usize];
-        crate::highlight::lex(hl.lang, text, hl.state, &mut |s, e, tok| {
+        let at = doc.block_spans(block)[0].start;
+        let end = crate::highlight::lex(hl.lang, text, known.unwrap_or(0), &mut |s, e, tok| {
             let role = match tok {
                 Tok::Plain => Role::Text,
                 t => Role::Syntax(t),
@@ -2446,10 +2544,79 @@ fn push_highlighted(para: &mut Para, doc: &Doc, block: &Block, style: TextStyle)
                 TextStyle { role, ..style },
             );
         });
+        if known.is_some() && doc.blocks.get(i + 1).is_some_and(|b| b.joined) {
+            code.states.insert(i as u32 + 1, end);
+        }
         return true;
     }
-    let _ = (para, doc, block, style);
+    let _ = (para, doc, i, code, style);
     false
+}
+
+/// The text of a code block (or chunk of one): its spans are one run of the document's text.
+#[cfg(feature = "highlight")]
+fn chunk_text<'d>(doc: &'d Doc, block: &Block) -> Option<&'d str> {
+    let spans = doc.block_spans(block);
+    let (a, b) = (spans.first()?, spans.last()?);
+    doc.text.get(a.start as usize..b.end as usize)
+}
+
+/// Where the lexer is at the start of code block `i`: 0 for a block's first chunk, else what
+/// lexing the chunks before it leaves, from the nearest one whose state is known. `None` if that
+/// takes more than the budget left: the states found on the way are kept, so the next call
+/// goes on from there.
+#[cfg(feature = "highlight")]
+fn chunk_state(doc: &Doc, i: usize, lang: u8, code: &mut CodeLex) -> Option<u32> {
+    if i == 0 || !doc.blocks[i].joined {
+        return Some(0);
+    }
+    if let Some(&state) = code.states.get(&(i as u32)) {
+        return Some(state);
+    }
+    // The block's first chunk: the last one found, if `i` is still in that block, else found by
+    // walking back. (Block 0 can't be a later chunk; the guard only keeps a malformed document
+    // from going below it.) Catching up calls this again and again for the same chunk, so each
+    // call costs what it lexes, not what lies before it.
+    let head = match code.span {
+        Some((head, upto)) if head < i && (upto + 1..=i).all(|b| doc.blocks[b].joined) => head,
+        _ => {
+            let mut head = i - 1;
+            while head > 0 && doc.blocks[head].joined {
+                head -= 1;
+            }
+            head
+        }
+    };
+    let upto = code.span.filter(|s| s.0 == head).map_or(i, |s| s.1.max(i));
+    code.span = Some((head, upto));
+    // From the nearest chunk of the block whose state is known, or its start: the known ones are
+    // the chunks after the first up to some chunk, so that one is found by bisection.
+    let (mut from, mut unknown) = (head, i);
+    while unknown - from > 1 {
+        let mid = from + (unknown - from) / 2;
+        if code.states.contains_key(&(mid as u32)) {
+            from = mid;
+        } else {
+            unknown = mid;
+        }
+    }
+    let mut state = if from == head {
+        0
+    } else {
+        code.states[&(from as u32)]
+    };
+    for k in from..i {
+        let text = chunk_text(doc, &doc.blocks[k]).unwrap_or_default();
+        // (One chunk is always lexed with a whole budget, however long, so this ends.)
+        if text.len() > code.budget && code.budget < CATCH_UP_BYTES {
+            code.budget = 0;
+            return None;
+        }
+        code.budget = code.budget.saturating_sub(text.len());
+        state = crate::highlight::lex(lang, text, state, &mut |_, _, _| {});
+        code.states.insert(k as u32 + 1, state);
+    }
+    Some(state)
 }
 
 /// Copy code text with tabs expanded to the next multiple-of-4 column.

@@ -2701,7 +2701,6 @@ fn a_long_highlighted_line_is_pushed_token_by_token() {
     // column is only looked for where there is a tab).
     let line = "a(".repeat(8 * 1024);
     let doc = Doc::parse(&format!("```rust\n{line}\n```\n"));
-    let block = &doc.blocks[0];
     let mut runs = 0;
     let lang = crate::highlight::find("rust").unwrap();
     crate::highlight::lex(lang, &line, 0, &mut |_, _, _| runs += 1);
@@ -2716,7 +2715,13 @@ fn a_long_highlighted_line_is_pushed_token_by_token() {
         shift: 0.0,
         link: 0,
     };
-    assert!(push_highlighted(&mut para, &doc, block, style));
+    assert!(push_highlighted(
+        &mut para,
+        &doc,
+        0,
+        &mut CodeLex::default(),
+        style
+    ));
     assert_eq!(runs, 16 * 1024);
     assert_eq!(para.items.len(), runs);
     assert_eq!(para.text, line);
@@ -2724,8 +2729,256 @@ fn a_long_highlighted_line_is_pushed_token_by_token() {
     // With tabs, they are expanded to the column, mapped to the tab.
     let doc = Doc::parse("```rust\nab\tc(\t)\n```\n");
     para.clear();
-    assert!(push_highlighted(&mut para, &doc, &doc.blocks[0], style));
+    assert!(push_highlighted(
+        &mut para,
+        &doc,
+        0,
+        &mut CodeLex::default(),
+        style
+    ));
     assert_eq!(para.text, "ab  c(  )");
+}
+
+/// A Rust block of `lines(1000)` × 3.5 split in chunks, with a block comment open across the
+/// first cut and a string across the second.
+#[cfg(feature = "highlight")]
+fn split_rust_block() -> String {
+    let lines = |n: usize| {
+        (0..n)
+            .map(|i| format!("let x{i} = {i};\n"))
+            .collect::<String>()
+    };
+    format!(
+        "{}/* open\n{}*/\nlet s = \"\n{}\";\n{}",
+        lines(1000),
+        lines(1000),
+        lines(1000),
+        lines(500)
+    )
+}
+
+/// The chunks of the split code block starting at block `first`, and the states of lexing its
+/// text whole at the start of each.
+#[cfg(feature = "highlight")]
+fn chunk_states_wanted(doc: &Doc, first: usize, lang: u8) -> (std::ops::Range<usize>, Vec<u32>) {
+    let end = (first + 1..doc.blocks.len())
+        .find(|&b| !doc.blocks[b].joined)
+        .unwrap_or(doc.blocks.len());
+    let mut whole = String::new();
+    let mut want = Vec::new();
+    for b in first..end {
+        want.push(crate::highlight::lex(lang, &whole, 0, &mut |_, _, _| {}));
+        whole += chunk_text(doc, &doc.blocks[b]).unwrap();
+    }
+    (first..end, want)
+}
+
+/// A [`CodeLex`] that may lex as much as it takes.
+#[cfg(feature = "highlight")]
+fn unbounded() -> CodeLex {
+    CodeLex {
+        budget: usize::MAX,
+        ..CodeLex::default()
+    }
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn a_highlighted_blocks_chunks_start_where_the_lexer_is() {
+    let lang = crate::highlight::find("rust").unwrap();
+    let code = split_rust_block();
+    let doc = Doc::parse(&format!("```rust\n{code}```\n"));
+    let n = doc.blocks.len();
+    assert!(n >= 3, "{n} chunks");
+    let text = |i: usize| chunk_text(&doc, &doc.blocks[i]).unwrap();
+    let (_, want) = chunk_states_wanted(&doc, 0, lang);
+    assert!(want.iter().filter(|&&s| s != 0).count() >= 2, "{want:?}");
+    // Found from nothing, for the last chunk first and then the others, out of order.
+    let mut code = unbounded();
+    for i in (0..n).rev().step_by(2).chain(0..n) {
+        assert_eq!(
+            chunk_state(&doc, i, lang, &mut code),
+            Some(want[i]),
+            "chunk {i}"
+        );
+    }
+    // Laid out in order, each chunk leaves the next one's start.
+    let style = TextStyle {
+        bold: false,
+        italic: false,
+        mono: true,
+        size: 14.0,
+        role: Role::Text,
+        deco: 0,
+        shift: 0.0,
+        link: 0,
+    };
+    let mut code = CodeLex::default();
+    for i in 0..n {
+        let mut para = Para::default();
+        assert!(push_highlighted(&mut para, &doc, i, &mut code, style));
+        assert_eq!(para.text, text(i));
+        if i + 1 < n {
+            assert_eq!(
+                code.states.get(&(i as u32 + 1)),
+                Some(&want[i + 1]),
+                "chunk {i}"
+            );
+        }
+    }
+    assert_eq!(code.states.len(), n - 1);
+    assert!(code.guessed.is_empty());
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn chunk_walks_stop_at_their_own_blocks_first_chunk() {
+    // Text before, then two split blocks back to back (no block between them), the second
+    // starting in a string the first one never closes, then text and a third split block.
+    let lang = crate::highlight::find("rust").unwrap();
+    let block = split_rust_block();
+    let open = format!("let s = \"\n{}", "x\n".repeat(40_000));
+    let doc = Doc::parse(&format!(
+        "Some text.\n\n```rust\n{open}```\n```rust\n{block}```\n\nMore text.\n\n```rust\n{block}```\n"
+    ));
+    let firsts: Vec<usize> = (0..doc.blocks.len())
+        .filter(|&b| matches!(doc.blocks[b].kind, BlockKind::Code(_)) && !doc.blocks[b].joined)
+        .collect();
+    assert_eq!(firsts.len(), 3, "{firsts:?}");
+    assert!(firsts[0] > 0);
+    for &first in &firsts {
+        let (chunks, want) = chunk_states_wanted(&doc, first, lang);
+        assert!(chunks.len() >= 3, "{chunks:?}");
+        // From nothing, the last chunk first: the walk stops at this block's first chunk, not
+        // in the block before (whose open string would leak in).
+        let mut code = unbounded();
+        for i in chunks.clone().rev() {
+            assert_eq!(
+                chunk_state(&doc, i, lang, &mut code),
+                Some(want[i - first]),
+                "{i}"
+            );
+        }
+        // With the block before's states all known, as idle measuring leaves them.
+        let mut code = unbounded();
+        for i in 0..chunks.end {
+            chunk_state(&doc, i, lang, &mut code);
+        }
+        assert_eq!(
+            chunk_state(&doc, chunks.end - 1, lang, &mut code),
+            want.last().copied()
+        );
+    }
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn a_chunk_walk_never_goes_below_block_0() {
+    // A malformed document whose block 0 says it is a later chunk: the walk starts there, from
+    // the state a block starts in, and block 0 itself starts so.
+    let lang = crate::highlight::find("rust").unwrap();
+    let mut doc = Doc::parse(&format!("```rust\n{}```\n", split_rust_block()));
+    doc.blocks[0].joined = true;
+    let (_, want) = chunk_states_wanted(&doc, 0, lang);
+    let mut code = unbounded();
+    assert_eq!(chunk_state(&doc, 0, lang, &mut code), Some(0));
+    assert_eq!(chunk_state(&doc, 2, lang, &mut code), Some(want[2]));
+}
+
+#[cfg(feature = "highlight")]
+#[test]
+fn a_chunk_walk_takes_no_more_than_its_budget_and_goes_on_from_there() {
+    let lang = crate::highlight::find("rust").unwrap();
+    let block = split_rust_block().repeat(12);
+    let doc = Doc::parse(&format!("```rust\n{block}```\n"));
+    let (chunks, want) = chunk_states_wanted(&doc, 0, lang);
+    let total: usize = chunks
+        .clone()
+        .map(|b| chunk_text(&doc, &doc.blocks[b]).unwrap().len())
+        .sum();
+    assert!(total > 2 * CATCH_UP_BYTES, "{total}");
+    let last = chunks.end - 1;
+    let mut code = CodeLex::default();
+    let mut calls = 0;
+    let mut known = 0;
+    let state = loop {
+        code.budget = CATCH_UP_BYTES;
+        calls += 1;
+        if let Some(state) = chunk_state(&doc, last, lang, &mut code) {
+            break state;
+        }
+        // Each call keeps what it found, and goes on from there.
+        assert!(code.states.len() > known, "call {calls}: no progress");
+        known = code.states.len();
+        // The states found are the true ones.
+        for (&k, &s) in &code.states {
+            assert_eq!(s, want[k as usize - chunks.start], "chunk {k}");
+        }
+    };
+    assert_eq!(state, want[last - chunks.start]);
+    assert!(calls >= 3, "{calls} calls");
+}
+
+/// Jumping to the end of a long split block lexes no more than the budget on the way: the
+/// chunks there are coloured from a guess, and idle measuring catches up and colours them again
+/// as the whole text would have it. The block ends in a comment that is never closed, so the
+/// guess (code) and the truth (comment) differ there.
+#[cfg(all(feature = "highlight", feature = "embed-fonts"))]
+#[test]
+fn a_jump_deep_into_a_split_block_is_coloured_again_once_idle_catches_up() {
+    let tail: String = (0..3000).map(|i| format!("let y{i} = {i};\n")).collect();
+    let block = format!("{}/* never closed\n{tail}", split_rust_block().repeat(12));
+    let doc = Doc::parse(&format!("```rust\n{block}```\n"));
+    let n = doc.blocks.len();
+    let fonts = Fonts::new().unwrap();
+    let roles = |l: &Layout| -> Vec<Vec<Role>> {
+        l.geoms()
+            .iter()
+            .filter_map(|g| g.content.as_deref())
+            .map(|c| {
+                c.glyphs
+                    .iter()
+                    .map(|g| c.styles[g.style as usize].role)
+                    .collect()
+            })
+            .collect()
+    };
+    // As laid out in order.
+    let mut whole = complete(&doc, &fonts, params(900.0, 1.0));
+    let end = whole.anchor_at(whole.total_height());
+    whole.ensure(&doc, &fonts, end, 800.0);
+    let want = roles(&whole);
+    let last_roles = |l: &Layout| -> Vec<Role> {
+        let c = l.geoms()[n - 1].content.as_deref().unwrap();
+        c.glyphs
+            .iter()
+            .map(|g| c.styles[g.style as usize].role)
+            .collect()
+    };
+    let want_last = last_roles(&whole);
+    assert!(
+        want_last
+            .iter()
+            .all(|&r| r == Role::Syntax(crate::highlight::Tok::Comment))
+    );
+    // Straight to the end.
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    let end = l.anchor_at(l.total_height());
+    l.ensure(&doc, &fonts, end, 800.0);
+    assert!(!l.code.guessed.is_empty());
+    assert_ne!(last_roles(&l), want_last, "coloured from a guess");
+    let lexed: usize = l.code.states.len();
+    assert!(
+        lexed * crate::doc::MAX_BLOCK_BYTES <= 2 * CATCH_UP_BYTES,
+        "{lexed} chunks lexed"
+    );
+    while !l.idle(&doc, &fonts, Instant::now() + Duration::from_secs(5)) {}
+    assert!(l.take_recolored());
+    assert!(l.code.guessed.is_empty());
+    let end = l.anchor_at(l.total_height());
+    l.ensure(&doc, &fonts, end, 800.0);
+    assert_eq!(last_roles(&l), want_last);
+    assert_eq!(roles(&l), want);
 }
 
 /// HTML images on lines of their own (a badge row) are one space apart, as in a browser: their

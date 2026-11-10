@@ -838,7 +838,11 @@ impl<'a> Scan<'a> {
 
     #[cfg(feature = "math")]
     fn next_brace(&mut self, from: usize) -> usize {
-        self.seek[2].at(self.src, from, |s| s.find(['{', '}']))
+        // A byte scan: `find` with a char set decodes every character, and this runs over the
+        // whole text of a document with math (both braces are ASCII, so the offset is the same).
+        self.seek[2].at(self.src, from, |s| {
+            s.bytes().position(|b| b == b'{' || b == b'}')
+        })
     }
 
     fn finish(mut self) -> Option<Plan> {

@@ -8,6 +8,7 @@ xtask = "run --quiet --package xtask --"
 # in the smallest build, −33 KB in the default one; 25 and up is larger, 100 is +300 KB. The flag
 # also applies to test builds (about 7% slower; stable cargo has no per-profile rustflags), and
 # xtask repeats it for release builds.
+# (Identical code folding is added by xtask's release builds only: see `RELEASE_FLAGS` there.)
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=10"]
 
