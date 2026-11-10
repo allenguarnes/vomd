@@ -345,3 +345,51 @@ fn a_path_splits_into_its_directory_and_name() {
     assert_eq!(s("/doc.md"), Some(("/".into(), "doc.md".into())));
     assert_eq!(s("a/.."), None);
 }
+
+/// The polling watcher (Windows'), here on any system: a save is reported once, the file gone
+/// once, and back again; nothing watched, nothing is; dropped, its thread ends.
+#[test]
+fn the_polling_watcher_reports_saves_and_a_file_gone() {
+    let dir = temp_dir("poll");
+    let doc = dir.join("doc.md");
+    std::fs::write(&doc, "# One").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let w = poll::start(move |g, found| {
+        let _ = tx.send((g, found));
+    })
+    .unwrap();
+    let g = w.target(Some(&doc), view::stamp(&doc), false);
+    let (wait, nothing) = (Duration::from_secs(30), poll::TICK * 2 + QUIET_INCOMPLETE);
+    let text = |want: &str| match rx.recv_timeout(wait).expect(want) {
+        (got, Reread::Text(t, stamp)) if got == g && t == want => stamp,
+        other => panic!("{want}: {other:?}"),
+    };
+    std::fs::write(&doc, "# Two, longer").unwrap();
+    let stamp = text("# Two, longer");
+    // (As the window does with a version it shows.)
+    w.target(Some(&doc), stamp, false);
+    std::fs::remove_file(&doc).unwrap();
+    // (Most often a look comes meanwhile and finds it gone, and the next finds it back: best
+    // effort, nothing makes a look come between. A whole tick would let that next look come
+    // just before the write.)
+    std::thread::sleep(poll::TICK * 9 / 10);
+    std::fs::write(&doc, "# Three, made again").unwrap();
+    let stamp = text("# Three, made again");
+    w.target(Some(&doc), stamp, false);
+    std::fs::remove_file(&doc).unwrap();
+    let gone = rx.recv_timeout(wait).expect("gone");
+    assert_eq!(gone, (g, Reread::Gone));
+    assert!(rx.recv_timeout(nothing).is_err(), "gone once");
+    std::fs::write(&doc, "# Four").unwrap();
+    text("# Four");
+    w.target(None, None, false);
+    std::fs::write(&doc, "# Five, not watched").unwrap();
+    assert!(rx.recv_timeout(nothing).is_err(), "nothing watched");
+    // Dropped, the watcher's thread ends (and lets go of the report).
+    drop(w);
+    assert_eq!(
+        rx.recv_timeout(wait),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

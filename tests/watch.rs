@@ -1,6 +1,6 @@
 //! The live reload watcher against a real directory: every way editors save a file is reported
 //! once, other files in the directory never are, and a file that goes away reads as gone. Runs on
-//! Linux (inotify) and Windows (change notifications and the file's stamp).
+//! Linux (inotify) and Windows (the file's stamp, looked at every half second).
 //!
 //! Reports are waited for, never slept for ([`WAIT`] is only a limit). That nothing comes is
 //! checked by waiting [`NOTHING`]: a slow runner can only make that pass, never fail.
@@ -14,8 +14,9 @@ use vomd::view::Stamp;
 use vomd::watch::{self, Reloads, Reread, Watch};
 
 const WAIT: Duration = Duration::from_secs(30);
-/// Longer than the longest quiet period, with room: a report that is going to come has by then.
-const NOTHING: Duration = Duration::from_millis(900);
+/// Longer than the longest quiet period (on Windows, after the next look at the file), with room:
+/// a report that is going to come has by then.
+const NOTHING: Duration = Duration::from_millis(if cfg!(windows) { 1500 } else { 900 });
 
 /// A fresh directory for one test, under the target directory (`/tmp` may be in memory).
 fn scratch(name: &str) -> PathBuf {
@@ -290,7 +291,8 @@ fn an_unwatchable_folder_is_left_unwatched() {
 
 /// The folder the document is in can still be renamed and deleted while it is watched (Explorer
 /// on Windows must not find it locked), and the file then reads as gone. Each is done once a save
-/// was reported: the watch is in place (on Windows the thread opens it after `target`).
+/// was reported: the watch is in place (on Windows the thread first looks at the file after
+/// `target`).
 #[test]
 fn the_folder_can_be_renamed_and_deleted_while_watched() {
     let dir = scratch("folder");

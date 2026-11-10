@@ -1,14 +1,15 @@
 //! Live reload: a thread that watches the open document's file and says when it was saved, and
 //! what the window does with that ([`Reloads`], [`reread`]).
 //!
-//! One watcher per process, started after the first frame. It blocks in the system's call with no
-//! timeout while nothing happens (no CPU when idle), and only while an event is pending does it
-//! wait with one: the quiet period of its [`Debounce`]. Then it reads the file again itself (off
-//! the window's thread) and reports what it found. On Linux it is inotify on the
-//! document's directory (an editor's save replaces the file, which a watch on the file would
-//! lose), matched by name; on Windows a change notification on the directory and the file's
-//! stamp. Elsewhere there is none: the window's focus reload is all there is, and it stays the
-//! fallback everywhere (network file systems, inotify's limits).
+//! One watcher per process, started after the first frame. Once an event has come, it waits for
+//! the quiet period of its [`Debounce`], then reads the file again itself (off the window's
+//! thread) and reports what it found. On Linux it is inotify on the document's directory (an
+//! editor's save replaces the file, which a watch on the file would lose), matched by name: the
+//! thread blocks in the system's call with no timeout while nothing happens, and never polls (no
+//! CPU when idle). On Windows it looks at the file's stamp twice a second, keeping nothing open
+//! between looks (`poll.rs`: a handle would lock the folders above the document). Elsewhere there is none: the
+//! window's focus reload is all there is, and it stays the fallback everywhere (network file
+//! systems, inotify's limits).
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -21,15 +22,15 @@ use crate::view::{self, Origin, Stamp};
 mod inotify;
 #[cfg(target_os = "linux")]
 use inotify as sys;
+#[cfg(any(windows, test))]
+mod poll;
 #[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-use windows as sys;
+use poll as sys;
 
 /// How long the file has to be left alone after a complete save (a file closed after writing, or
 /// one moved into place) before it is read: every editor's save is over well within it, and a
-/// second write (a formatter on save) folds into it. Windows says nothing of what changed, so
-/// every change waits the same there, a little longer.
+/// second write (a formatter on save) folds into it. On Windows a change is only a stamp that
+/// differs, so every change waits the same there, a little longer.
 pub const QUIET: Duration = Duration::from_millis(if cfg!(windows) { 150 } else { 75 });
 /// The same after only signs of a save (written to and not closed, deleted, created): a writer
 /// that keeps the file open, or a name that comes back (an editor's delete and create).
@@ -101,7 +102,7 @@ impl Debounce {
 
 /// How long a wait for `deadline` is from `now`, in whole milliseconds rounded up (so the wait
 /// doesn't end before it); `None`: no deadline, no timeout.
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn wait_ms(deadline: Option<Instant>, now: Instant) -> Option<u32> {
     let left = deadline?.saturating_duration_since(now);
     // (No `u128`: its division is code of its own.)
@@ -275,8 +276,11 @@ struct State {
     #[cfg(target_os = "linux")]
     names: Vec<(i32, std::ffi::OsString)>,
     /// The thread is to look at the target again.
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     again: bool,
+    /// The watcher was dropped: the thread ends.
+    #[cfg(any(windows, test))]
+    stop: bool,
 }
 
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -374,7 +378,7 @@ impl Watch {
 }
 
 /// The directory `path` is in and its name there.
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn split(path: &Path) -> Option<(PathBuf, std::ffi::OsString)> {
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
