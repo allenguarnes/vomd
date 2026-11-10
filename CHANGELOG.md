@@ -3,7 +3,7 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.9.0] - 2026-11-10
 
 ### Added
 - Live reload: a document open in VOMD is shown again as soon as its file is saved, at the same
@@ -349,6 +349,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[1.9.0]: https://github.com/allenguarnes/vomd/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/allenguarnes/vomd/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/allenguarnes/vomd/compare/v1.6.3...v1.7.0
 [1.6.3]: https://github.com/allenguarnes/vomd/compare/v1.6.2...v1.6.3

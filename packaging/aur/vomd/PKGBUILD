@@ -6,7 +6,7 @@
 # one, and runs on the build machine's CPU only. `vomd-bin` is the small one. (It still leaves out
 # the unwind tables, as `cargo xtask dist` does, unless those RUSTFLAGS choose mold or gold.)
 pkgname=vomd
-pkgver=1.8.0
+pkgver=1.9.0
 pkgrel=1
 pkgdesc='View-Only Markdown: a tiny, fast Markdown viewer'
 arch=('x86_64' 'aarch64')
@@ -28,7 +28,7 @@ optdepends=('curl: remote images, loaded only after pressing I'
             'noto-fonts-emoji: color emoji')
 options=('!lto' '!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('52cc4085bdff844034d329e8d7859f2b84c24d11b9dd2b0cb4fed406d32e8414')
+sha256sums=('SKIP')
 
 prepare() {
   cd "$pkgname-$pkgver"
