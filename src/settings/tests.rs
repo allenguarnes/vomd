@@ -115,15 +115,15 @@ fn primary_selection_is_a_switch_with_a_platform_default() {
     const {
         assert!(DEFAULT_PRIMARY, "on where there is a primary selection")
     };
-    // Windows has no primary selection: its template leaves the setting out.
-    #[cfg(windows)]
+    // Windows and macOS have no primary selection: their template leaves the setting out.
+    #[cfg(any(windows, target_os = "macos"))]
     {
         assert!(!TEMPLATE.contains("primary_selection"));
         return;
     }
     // The template documents it at that default, and writing it replaces the template's line
     // and keeps the rest of the file.
-    #[cfg_attr(windows, allow(unreachable_code))]
+    #[cfg_attr(any(windows, target_os = "macos"), allow(unreachable_code))]
     let line = format!(
         "# primary_selection = {}",
         if DEFAULT_PRIMARY { "on" } else { "off" }
@@ -293,6 +293,17 @@ fn xdg_paths() {
     assert_eq!(path_from(env(&[])), None);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_path() {
+    let home = |k: &str| (k == "HOME").then(|| OsString::from("/Users/u"));
+    assert_eq!(
+        path_from(home),
+        Some("/Users/u/Library/Application Support/vomd/settings.ini".into())
+    );
+    assert_eq!(path_from(|_| None), None);
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vomd-settings-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -372,8 +383,8 @@ fn template_is_all_defaults() {
         "font_sans",
         "font_mono",
     ] {
-        // (Windows has no primary selection, and its template no line for it.)
-        if cfg!(windows) && key == "primary_selection" {
+        // (Windows and macOS have no primary selection, and their template no line for it.)
+        if cfg!(any(windows, target_os = "macos")) && key == "primary_selection" {
             assert!(s.get(key).is_none());
             continue;
         }

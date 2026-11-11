@@ -15,6 +15,8 @@ use winit::dpi::PhysicalSize;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 #[cfg(feature = "find")]
 use winit::event::Ime;
+#[cfg(target_os = "macos")]
+use winit::event::TouchPhase;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
@@ -40,9 +42,10 @@ use vomd::view::CodeCopy;
 use vomd::view::{self, Origin, Outcome, Stamp, View, Wake};
 use vomd::watch::{self, Reloads, Reread, Watch};
 
-/// On Windows, a failed allocation in an SVG's process ends it with the code that says so (see
-/// `image::svg_child`); elsewhere, and in VOMD's own process, the system's allocator as it is.
-#[cfg(all(feature = "svg", windows))]
+/// On Windows, a failed allocation in an SVG's process ends it with the code that says so, and on
+/// macOS the allocator also holds it to its memory (see `image::svg_child`); elsewhere, and in
+/// VOMD's own process, the system's allocator as it is.
+#[cfg(all(feature = "svg", any(windows, target_os = "macos")))]
 #[global_allocator]
 static ALLOCATOR: vomd::image::SvgChildAllocator = vomd::image::SvgChildAllocator;
 
@@ -57,15 +60,18 @@ const MIN_CHECK: Duration = Duration::from_secs(1);
 /// is painted whole at least this often there.
 #[cfg(feature = "images")]
 const WHOLE_EVERY: Duration = Duration::from_secs(1);
-/// What the empty window says. Dropping a file works on X11 and Windows (winit can't take drops
-/// on Wayland), so it is only offered there.
+/// What the empty window says. Dropping a file works on X11, Windows and macOS (winit can't
+/// take drops on Wayland), so it is only offered there.
 fn empty_message(wayland: bool) -> String {
-    let drop = if wayland || !cfg!(any(windows, all(unix, not(target_os = "macos")))) {
+    let drop = if wayland || !cfg!(any(windows, unix)) {
         ""
     } else {
         ", or drop one here"
     };
-    format!("Press Ctrl+O to open a Markdown file{drop}")
+    format!(
+        concat!("Press ", vomd::cmd_key!("O"), " to open a Markdown file{}"),
+        drop
+    )
 }
 
 /// End the event loop. Also wakes it: on Windows, winit only looks at the request after its next
@@ -97,10 +103,13 @@ fn is_wayland(display: Option<RawDisplayHandle>) -> bool {
 /// Wayland: a parent there is a handle exported through xdg-foreign, which needs the Wayland
 /// protocol crates (`wayland-client`, `wayland-protocols`), which VOMD links for the clipboard
 /// only (and not in the smallest build); the dialog then has no parent.
+/// (macOS's Open panel is a sheet on the window itself.)
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn portal_parent(window: &Window) -> String {
     parent_name(window.window_handle().map(|h| h.as_raw()).ok())
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn parent_name(handle: Option<RawWindowHandle>) -> String {
     match handle {
         Some(RawWindowHandle::Xlib(h)) => format!("x11:{:x}", h.window),
@@ -134,6 +143,9 @@ enum UserEvent {
     /// The document's file was saved, and read again on the watcher's thread: the watch's
     /// generation and what it found.
     Reloaded(u32, Fresh),
+    /// Files the system handed over (Finder's Open With, the Dock, `open -a`): the first opens.
+    #[cfg(target_os = "macos")]
+    OpenFiles(Vec<std::path::PathBuf>),
     /// Only wakes the loop after `quit` asked it to end (see there).
     Quit,
 }
@@ -350,6 +362,13 @@ struct App {
     watch_tried: bool,
     /// Live reloads: the generation watched, a version held while the reader drags.
     live: Reloads<Doc>,
+    /// When the window was made, for the bench's `own_ms`: VOMD's own part of the start, which
+    /// leaves out AppKit's (about 100 ms: launching the application, making the window).
+    #[cfg(target_os = "macos")]
+    window_made: Option<Instant>,
+    /// The theme given to the window's title bar (`None` inside: the system's), once given.
+    #[cfg(target_os = "macos")]
+    title_theme: Option<Option<Theme>>,
     exit_code: i32,
 }
 
@@ -497,9 +516,18 @@ impl App {
             self.shown = true;
             gfx.window.set_visible(true);
             if self.bench == Some(Bench::FirstFrame) {
+                #[cfg(not(target_os = "macos"))]
                 eprintln!(
                     "vomd-bench first_frame_ms={:.2} rss_kb={}",
                     self.start.elapsed().as_secs_f64() * 1e3,
+                    platform::peak_rss_kb()
+                );
+                #[cfg(target_os = "macos")]
+                eprintln!(
+                    "vomd-bench first_frame_ms={:.2} own_ms={:.2} rss_kb={}",
+                    self.start.elapsed().as_secs_f64() * 1e3,
+                    self.window_made
+                        .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3),
                     platform::peak_rss_kb()
                 );
                 quit(event_loop, &self.proxy);
@@ -578,7 +606,34 @@ impl App {
             self.start_watch();
             self.retarget();
         }
+        #[cfg(target_os = "macos")]
+        self.sync_title_theme();
         self.redraw();
+    }
+
+    /// The title bar follows VOMD's theme (`T`, `theme =`): a forced one is the window's own
+    /// appearance, and following the system the system's again. winit says nothing of a system
+    /// change while the window has its own, so the system's theme is then read again.
+    #[cfg(target_os = "macos")]
+    fn sync_title_theme(&mut self) {
+        use vomd::view::ThemeMode;
+        let (Some(view), Some(gfx)) = (self.view.as_mut(), self.gfx.as_ref()) else {
+            return;
+        };
+        let theme = match view.theme_mode() {
+            ThemeMode::Light => Some(Theme::Light),
+            ThemeMode::Dark => Some(Theme::Dark),
+            ThemeMode::System => None,
+        };
+        if self.title_theme == Some(theme) {
+            return;
+        }
+        self.title_theme = Some(theme);
+        gfx.window.set_theme(theme);
+        let dark = system_dark(self.portal, gfx.window.theme(), platform::fallback_dark);
+        if theme.is_none() && view.set_system_dark(dark) {
+            self.redraw();
+        }
     }
 
     /// Start the file watcher, once the first frame is out (never on the startup path, and not
@@ -709,6 +764,8 @@ impl App {
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        self.sync_title_theme();
     }
 
     /// Run what a toolbar button asked for: the same actions as the keys.
@@ -802,6 +859,23 @@ impl App {
             leave(view, &mut self.back, here, &input);
         }
         self.open(input);
+    }
+
+    /// A file the system handed over (Finder, the Dock): the window's first document if it has
+    /// none yet (started for it), else one gone to like a dropped file, Back returning.
+    #[cfg(target_os = "macos")]
+    fn open_handed(&mut self, input: Input) {
+        if self.view.is_some() && (self.input != Input::None || !self.back.is_empty()) {
+            self.go_to(input);
+        } else if self.view.is_some() {
+            self.open(input);
+        } else {
+            // (Before the window: read in its place, a second handed file in place of the first,
+            // so that the input and what is shown are the same.)
+            let theirs = input.clone();
+            self.parse = Some(std::thread::spawn(move || load(&theirs, Origin::Argument)));
+            self.input = input;
+        }
     }
 
     /// Follow a clicked link: `#anchor` scrolls, a relative Markdown file opens in
@@ -987,13 +1061,26 @@ impl App {
             return;
         }
         let folder = nav::base_dir(&self.input).and_then(|d| std::path::absolute(d).ok());
-        let parent = self.gfx.as_ref().map(|g| portal_parent(&g.window));
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            let chosen =
-                platform::choose_file(parent.as_deref().unwrap_or_default(), folder.as_deref());
-            let _ = proxy.send_event(UserEvent::Chosen(chosen));
-        });
+        // A sheet on the window, from the main thread: no thread to wait in.
+        #[cfg(target_os = "macos")]
+        {
+            let proxy = self.proxy.clone();
+            let window = self.gfx.as_ref();
+            let handle = window.and_then(|g| g.window.window_handle().ok().map(|h| h.as_raw()));
+            platform::choose_file_panel(handle, folder.as_deref(), move |chosen| {
+                let _ = proxy.send_event(UserEvent::Chosen(chosen));
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let parent = self.gfx.as_ref().map(|g| portal_parent(&g.window));
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let chosen =
+                    platform::choose_file(parent.as_deref().unwrap_or_default(), folder.as_deref());
+                let _ = proxy.send_event(UserEvent::Chosen(chosen));
+            });
+        }
     }
 
     fn toast(&mut self, text: String) {
@@ -1083,6 +1170,14 @@ impl App {
                     self.paste(which, ticket);
                 }
             }
+            #[cfg(target_os = "macos")]
+            Outcome::Settings => self.open_settings(),
+            #[cfg(target_os = "macos")]
+            Outcome::Minimize => {
+                if let Some(g) = &self.gfx {
+                    g.window.set_minimized(true);
+                }
+            }
             Outcome::Quit => quit(event_loop, &self.proxy),
         }
     }
@@ -1132,6 +1227,12 @@ impl ApplicationHandler<UserEvent> for App {
             attrs.with_window_icon(icon.clone()).with_taskbar_icon(icon)
         };
         let window = match event_loop.create_window(attrs) {
+            #[cfg(target_os = "macos")]
+            Ok(w) => {
+                self.window_made = Some(Instant::now());
+                Arc::new(w)
+            }
+            #[cfg(not(target_os = "macos"))]
             Ok(w) => Arc::new(w),
             Err(e) => {
                 platform::fatal(&format!("vomd: cannot create a window: {e}"));
@@ -1285,6 +1386,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.resolve_families();
             }
             UserEvent::Quit => {}
+            #[cfg(target_os = "macos")]
+            UserEvent::OpenFiles(paths) => {
+                if let Some(path) = paths.into_iter().next() {
+                    self.open_handed(Input::File(path));
+                }
+            }
             UserEvent::Reloaded(generation, fresh) => {
                 let stamp = match &fresh {
                     Fresh::Doc(_, stamp) => *stamp,
@@ -1440,7 +1547,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mods = m.state();
                 #[cfg(any(feature = "clipboard", feature = "find"))]
                 view.set_shift(self.mods.shift_key());
-                view.set_ctrl(self.mods.control_key());
+                view.set_ctrl(platform::image_modifier(self.mods));
                 if !(self.mods.control_key() || self.mods.super_key()) {
                     view.zoom_wheel_end();
                 }
@@ -1473,6 +1580,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(Ime::Commit(text)) => {
                 view.find_type(&text);
                 self.redraw();
+            }
+            // A trackpad's pinch zooms: a step for every tenth of magnification.
+            #[cfg(target_os = "macos")]
+            WindowEvent::PinchGesture { delta, phase, .. } => {
+                view.zoom_wheel(delta * 10.0 * view::ZOOM_PIXELS, now);
+                if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                    view.zoom_wheel_end();
+                }
+                self.redraw();
+                self.record(now);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let zoom = self.mods.control_key() || self.mods.super_key();
@@ -1672,7 +1789,10 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn main() {
     // Started by VOMD to draw an SVG (`image::svg_child`): that, and nothing else.
-    #[cfg(all(feature = "svg", any(target_os = "linux", windows)))]
+    #[cfg(all(
+        feature = "svg",
+        any(target_os = "linux", windows, target_os = "macos")
+    ))]
     if let Some(code) = vomd::image::svg_child() {
         std::process::exit(code);
     }
@@ -1681,7 +1801,7 @@ fn main() {
     // SVGs are drawn by this same binary, in processes that can be killed.
     #[cfg(all(feature = "svg", target_os = "linux"))]
     vomd::image::set_svg_program("/proc/self/exe".into());
-    #[cfg(all(feature = "svg", windows))]
+    #[cfg(all(feature = "svg", any(windows, target_os = "macos")))]
     if let Ok(exe) = std::env::current_exe() {
         vomd::image::set_svg_program(exe);
     }
@@ -1779,8 +1899,21 @@ fn main() {
         watch: None,
         watch_tried: false,
         live: Reloads::default(),
+        #[cfg(target_os = "macos")]
+        window_made: None,
+        #[cfg(target_os = "macos")]
+        title_theme: None,
         exit_code: 0,
     };
+    // Files handed over by the system come as events (the one VOMD was started for too, while
+    // the loop starts).
+    #[cfg(target_os = "macos")]
+    {
+        let proxy = event_loop.create_proxy();
+        platform::on_open_files(move |paths| {
+            let _ = proxy.send_event(UserEvent::OpenFiles(paths));
+        });
+    }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("vomd: {e}");
         std::process::exit(1);
@@ -1908,15 +2041,18 @@ mod tests {
 
     #[test]
     fn the_empty_window_offers_a_drop_where_winit_takes_one() {
-        assert_eq!(
-            empty_message(false),
-            if cfg!(any(windows, all(unix, not(target_os = "macos")))) {
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                empty_message(false),
+                "Press ⌘O to open a Markdown file, or drop one here"
+            );
+        } else {
+            assert_eq!(
+                empty_message(false),
                 "Press Ctrl+O to open a Markdown file, or drop one here"
-            } else {
-                "Press Ctrl+O to open a Markdown file"
-            }
-        );
-        assert_eq!(empty_message(true), "Press Ctrl+O to open a Markdown file");
+            );
+            assert_eq!(empty_message(true), "Press Ctrl+O to open a Markdown file");
+        }
     }
 
     /// The file gone is named as the title names it: its name, not its path.

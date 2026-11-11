@@ -2472,7 +2472,9 @@ fn an_oversized_url_is_refused_before_it_is_copied() {
         &[(1, 40, 30), (2, 40, 30)],
         2,
         Duration::from_millis(1),
-        |i| i.stats().failed >= 1,
+        // The long URL fails at once; the short one's curl is waited for too (it may not have
+        // started by then).
+        |i| i.stats().failed >= 1 && curl_runs(&dir) >= 1,
     );
     let over = image_step_over(img_start);
     println!(

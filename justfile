@@ -1,4 +1,4 @@
-# Mirrors the CI job locally. Windows/macOS are compile-checked only.
+# Mirrors the Linux CI job locally; Windows and macOS are compile-checked here (CI tests them).
 ci: fmt clippy test check-other
     cargo xtask size
 

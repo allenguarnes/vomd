@@ -25,9 +25,92 @@ fn main() {
     probe::main();
 }
 
-#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "ios")))))]
+#[cfg(target_os = "macos")]
 fn main() {
-    eprintln!("clip_probe: X11 only");
+    mac::main();
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(unix, not(any(target_os = "macos", target_os = "ios")))
+)))]
+fn main() {
+    eprintln!("clip_probe: X11, Wayland and macOS only");
+}
+
+/// macOS (`clip_probe` with no arguments, CI only: it replaces what is on the clipboard): a short
+/// text and one of 5 MB copied with VOMD's own code and read back with `pbpaste`, then text put
+/// there with `pbcopy` read with VOMD's code, as a paste into the find bar does (at most
+/// `READ_CAP` bytes of it). Prints `ok`, or what differed and exits with 1.
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::channel;
+
+    use vomd::clipboard::{Clipboard, READ_CAP, READ_WAIT, Which};
+    use vomd::copy::Content;
+    use winit::raw_window_handle::{AppKitDisplayHandle, RawDisplayHandle};
+
+    fn fail(what: &str) -> ! {
+        eprintln!("clip_probe: {what}");
+        std::process::exit(1);
+    }
+
+    pub fn main() {
+        let mut clipboard = Clipboard::new(RawDisplayHandle::AppKit(AppKitDisplayHandle::new()));
+        let long: String = (0..5 << 20)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        for text in ["héllo, pasteboard\nline two".to_owned(), long] {
+            clipboard
+                .set(Which::Clipboard, Content::Text(text.as_str().into()))
+                .unwrap_or_else(|e| fail(&e));
+            let out = Command::new("/usr/bin/pbpaste").output().expect("pbpaste");
+            if out.stdout != text.as_bytes() {
+                fail(&format!(
+                    "pbpaste gave {} bytes, not {}",
+                    out.stdout.len(),
+                    text.len()
+                ));
+            }
+        }
+        // The primary selection is nothing here.
+        clipboard
+            .set(Which::Primary, Content::Text("not this".into()))
+            .unwrap_or_else(|e| fail(&e));
+        let theirs = "from another program ✓".repeat(4000);
+        let mut pbcopy = Command::new("/usr/bin/pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("pbcopy");
+        pbcopy
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(theirs.as_bytes())
+            .unwrap();
+        pbcopy.wait().unwrap();
+        let (tx, rx) = channel();
+        clipboard.read(Which::Clipboard, move |text| _ = tx.send(text));
+        let got = rx
+            .recv_timeout(READ_WAIT * 2)
+            .unwrap_or_else(|_| fail("no answer to a paste"))
+            .unwrap_or_else(|| fail("a paste found nothing"));
+        if got.len() > READ_CAP || !theirs.starts_with(&got) || got.len() + 4 < READ_CAP {
+            fail(&format!(
+                "a paste gave {} bytes of {}",
+                got.len(),
+                theirs.len()
+            ));
+        }
+        let (tx, rx) = channel();
+        clipboard.read(Which::Primary, move |text| _ = tx.send(text));
+        if rx.recv_timeout(READ_WAIT * 2).ok().flatten().is_some() {
+            fail("the primary selection gave text");
+        }
+        println!("ok");
+    }
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]

@@ -1,8 +1,8 @@
 # A `v*` tag builds the Linux x86_64 release (baseline x86-64, no target-cpu, in a Debian 12
 # container), checks the budgets and the .deb and AppImage on Debian and Ubuntu, builds and
-# tests the Windows x86_64 zip, and attaches the tarball, .deb, AppImage and zip, their
-# checksums and the budget report to the GitHub release, whose notes are the version's CHANGELOG
-# section.
+# tests the Windows x86_64 zip and the macOS (Apple Silicon) disk image, and attaches the
+# tarball, .deb, AppImage, zip and .dmg, their checksums and the budget report to the GitHub
+# release, whose notes are the version's CHANGELOG section.
 name: Release
 
 on:
@@ -76,8 +76,29 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  macos-aarch64:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo test --workspace --locked
+      # VOMD.app signed ad hoc, in a disk image laid out by Finder (a plain one, with a note in
+      # the log, if Finder can't be driven). Not notarized: a later "sign and notarize" step
+      # would run here when the secrets exist (Developer ID signing in `dist_macos`, then
+      # `xcrun notarytool submit --wait` and `xcrun stapler staple` on the .dmg).
+      - name: The disk image (fails on an oversized binary or a bad signature)
+        run: cargo xtask dist --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+
   publish:
-    needs: [linux-x86_64, windows-x86_64]
+    needs: [linux-x86_64, windows-x86_64, macos-aarch64]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -116,4 +137,4 @@ jobs:
           } > notes.md
           gh release create "$GITHUB_REF_NAME" --title "VOMD $GITHUB_REF_NAME" \
             --notes-file notes.md dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.zip \
-            dist/*.sha256 dist/budgets.md
+            dist/*.dmg dist/*.sha256 dist/budgets.md

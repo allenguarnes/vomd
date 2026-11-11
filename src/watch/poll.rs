@@ -1,4 +1,5 @@
-//! The Windows watcher: the file's stamp, looked at every [`TICK`] while a file is watched.
+//! The Windows and macOS watcher: the file's stamp, looked at every [`TICK`] while a file is
+//! watched.
 //!
 //! It keeps nothing open between looks (a look's metadata call opens the file for a moment):
 //! Windows refuses to rename a folder while something under it is open, so a change

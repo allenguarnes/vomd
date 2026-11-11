@@ -10,7 +10,7 @@ use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod pkg;
 
 // Budgets (Linux x86_64): (default build, --no-default-features).
@@ -24,11 +24,19 @@ const SIZE_BUDGET: [u64; 2] = [5_400_000, 2_650_000];
 // The default budget with highlighting: 4,698,112 B measured on Windows, plus 20 KB, rounded up
 // to 10 KB.
 const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_720_000, 2_000_000];
+/// The size budgets of the macOS (Apple Silicon) builds: Mach-O, signed ad hoc by the linker.
+// With the macOS code (clipboard, Open panel, files from Finder, SVG processes, live reload):
+// 3,752,432 B and 1,642,704 B measured. The default budget keeps about 150 KB of room for the
+// image viewer, as on Linux; the smallest one is the measured size plus about 1.7%, rounded up to
+// 10 KB.
+const MACOS_SIZE_BUDGET: [u64; 2] = [3_900_000, 1_680_000];
 
 /// The size budgets of the system this runs on.
 fn size_budget() -> [u64; 2] {
     if cfg!(windows) {
         WINDOWS_SIZE_BUDGET
+    } else if cfg!(target_os = "macos") {
+        MACOS_SIZE_BUDGET
     } else {
         SIZE_BUDGET
     }
@@ -52,6 +60,16 @@ const IMAGE_CACHE_KB: u64 = 32_768;
 /// Peak RSS with 50 images, local or remote: 30,000 KB idle and the image budget
 /// of 32 MiB. (The examples have no window, so no Wayland allowance.)
 const IMAGE_RSS_KB: u64 = 30_000 + IMAGE_CACHE_KB;
+/// On macOS memory is the physical footprint (Activity Monitor's figure), and every window
+/// holds about 25 MB of the system's: softbuffer's three frames (each frame is a new buffer
+/// there, which the layer keeps until the next) and Core Animation's. The RSS budgets allow it,
+/// with room: 47,840 KB and 47,680 KB measured for the 50 KB document (default and smallest
+/// build), 68,000 KB for the 5 MB one, on an M2 at 1x.
+const MACOS_WINDOW_KB: u64 = 30_000;
+/// The image budget on macOS (the examples have no window): its malloc keeps large freed blocks
+/// for reuse (decodes' buffers, megabytes each), in the footprint until the system wants the
+/// memory: 50 local PNGs peaked at 104,368 KB (42,448 KB with `MallocLargeCache=0`), plus 5%.
+const MACOS_IMAGE_RSS_KB: u64 = 110_000;
 
 /// The window the RSS budgets are specified for (logical pixels; the CI display is 1x).
 const BENCH_SIZE: &str = "1920x1080";
@@ -158,6 +176,14 @@ const RELEASE_FLAGS: &str = if cfg!(target_arch = "x86_64") {
 const WINDOWS_RELEASE_FLAGS: &str =
     "-C\x1ftarget-feature=+crt-static\x1f-C\x1fllvm-args=-inline-threshold=10";
 
+/// [`RELEASE_FLAGS`] for macOS: the inline threshold alone. Apple's linker has no RELR (Mach-O
+/// has chained fixups) and strips dead code already; the unwind tables are only about 63 KB there.
+const MACOS_RELEASE_FLAGS: &str = "-C\x1fllvm-args=-inline-threshold=10";
+
+/// The oldest macOS release builds run on (`LSMinimumSystemVersion` in the app's Info.plist):
+/// Rust's own floor for Apple Silicon.
+const MACOS_MIN: &str = "11.0";
+
 /// `--remap-path-prefix` flags (unit-separator-joined, each after one) that cut the checkout and
 /// every crate registry's source directory off the source paths built into panic messages: the
 /// builder's home directory stays out of the binary, which is also about 22 KB smaller
@@ -197,6 +223,12 @@ fn release_cargo() -> Command {
             "CARGO_ENCODED_RUSTFLAGS",
             WINDOWS_RELEASE_FLAGS.to_owned() + &remap_flags(),
         );
+    } else if cfg!(target_os = "macos") {
+        cmd.env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            MACOS_RELEASE_FLAGS.to_owned() + &remap_flags(),
+        );
+        cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_MIN);
     }
     cmd
 }
@@ -302,15 +334,16 @@ fn size() -> bool {
 
 /// Drop the binary from the page cache so the first run approximates a cold start.
 /// (Shared libraries stay cached; a true cold start needs root to drop all caches.)
+/// Linux only: elsewhere the first run stands in for a cold one.
 fn evict(path: &Path) {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
         if let Ok(f) = fs::File::open(path) {
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     let _ = path;
 }
 
@@ -326,7 +359,24 @@ fn spawn(bin: &Path, fixture: &Path, mode: &str) -> Option<(Child, mpsc::Receive
     spawn_with(bin, fixture, mode, None)
 }
 
-/// [`spawn`], with the settings of `config` (an `XDG_CONFIG_HOME`) in place of none.
+/// Point `cmd`'s settings at `dir`: its `XDG_CONFIG_HOME`, and on macOS, which reads
+/// `$HOME/Library/Application Support` instead, its `HOME` (the file is [`settings_file`]).
+fn isolate_settings(cmd: &mut Command, dir: &Path) {
+    cmd.env("XDG_CONFIG_HOME", dir);
+    #[cfg(target_os = "macos")]
+    cmd.env("HOME", dir);
+}
+
+/// Where vomd looks for its settings file when [`isolate_settings`] has pointed it at `dir`.
+fn settings_file(dir: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        dir.join("Library/Application Support/vomd/settings.ini")
+    } else {
+        dir.join("vomd/settings.ini")
+    }
+}
+
+/// [`spawn`], with the settings of `config` (see [`isolate_settings`]) in place of none.
 fn spawn_with(
     bin: &Path,
     fixture: &Path,
@@ -335,9 +385,11 @@ fn spawn_with(
 ) -> Option<(Child, mpsc::Receiver<String>)> {
     let mut cmd = Command::new(bin);
     match config {
-        Some(dir) => cmd.env("XDG_CONFIG_HOME", dir),
-        None => cmd.arg("--no-settings"),
-    };
+        Some(dir) => isolate_settings(&mut cmd, dir),
+        None => {
+            cmd.arg("--no-settings");
+        }
+    }
     let mut child = cmd
         .arg(fixture)
         .env("VOMD_BENCH", mode)
@@ -385,6 +437,9 @@ fn reap(mut child: Child) {
 struct Run {
     wall_ms: f64,
     rss_kb: u64,
+    /// VOMD's own part of the start (macOS only): from the window being made to
+    /// the first frame, without AppKit's launch and window creation.
+    own_ms: Option<f64>,
 }
 
 /// Time from spawn until vomd reports its first frame (it prints
@@ -399,13 +454,23 @@ fn run_once(bin: &Path, fixture: &Path) -> Option<Run> {
     Some(Run {
         wall_ms,
         rss_kb: field(&line, "rss_kb").unwrap_or(0.0) as u64,
+        own_ms: field(&line, "own_ms"),
     })
 }
 
-/// Cold (first run after evicting the binary) and warm (median) start of `fixture`, and the
-/// peak RSS at the first frame. `None` unless all [`BENCH_RUNS`] runs gave a first frame: a
+/// A start's timings: cold (the first run after evicting the binary), warm (median) and p90,
+/// the peak RSS at the first frame, and on macOS the median of VOMD's own part.
+struct Startup {
+    cold: f64,
+    warm: f64,
+    p90: f64,
+    rss: u64,
+    own: Option<f64>,
+}
+
+/// [`Startup`] of `fixture`. `None` unless all [`BENCH_RUNS`] runs gave a first frame: a
 /// failed cold run would otherwise make a warm one count as cold.
-fn startup(bin: &Path, fixture: &Path) -> Option<(f64, f64, f64, u64)> {
+fn startup(bin: &Path, fixture: &Path) -> Option<Startup> {
     evict(bin);
     let mut runs: Vec<Run> = Vec::with_capacity(BENCH_RUNS);
     for i in 0..BENCH_RUNS {
@@ -423,7 +488,16 @@ fn startup(bin: &Path, fixture: &Path) -> Option<(f64, f64, f64, u64)> {
     let p90 = runs
         .get((runs.len() * 9 / 10).min(runs.len().saturating_sub(1)))
         .map_or(cold, |r| r.wall_ms);
-    Some((cold, warm, p90, rss))
+    let mut own: Vec<f64> = runs.iter().filter_map(|r| r.own_ms).collect();
+    own.sort_by(f64::total_cmp);
+    let own = own.get(own.len() / 2).copied();
+    Some(Startup {
+        cold,
+        warm,
+        p90,
+        rss,
+        own,
+    })
 }
 
 fn ensure_fixtures() {
@@ -447,28 +521,36 @@ fn bench(only: Option<&str>) -> bool {
     let bin = cargo_build(&[], "target");
     let mut ok = true;
     println!(
-        "{:<12} {:>9} {:>9} {:>9} {:>10}",
-        "fixture", "cold ms", "median", "p90", "peak rss"
+        "{:<12} {:>9} {:>9} {:>9} {:>10} {:>9}",
+        "fixture", "cold ms", "median", "p90", "peak rss", "own ms"
     );
     for name in STARTUP_FIXTURES
         .iter()
         .filter(|n| only.is_none_or(|o| o == **n))
     {
-        let Some((cold, warm, p90, rss)) = startup(&bin, &root().join("fixtures").join(name))
+        let Some(Startup {
+            cold,
+            warm,
+            p90,
+            rss,
+            own,
+        }) = startup(&bin, &root().join("fixtures").join(name))
         else {
             println!("{name:<12} no bench output (is there a display?)");
             ok = false;
             continue;
         };
+        let own = own.map_or("-".into(), |o| format!("{o:.1}"));
         println!(
-            "{name:<12} {cold:>9.1} {warm:>9.1} {p90:>9.1} {:>7.1} MB",
+            "{name:<12} {cold:>9.1} {warm:>9.1} {p90:>9.1} {:>7.1} MB {own:>9}",
             rss as f64 / 1024.0
         );
     }
     ok
 }
 
-/// CPU time of `pid` in clock ticks (user + system), from `/proc` (xtask is Linux-only).
+/// CPU time of `pid` in clock ticks (user + system), from `/proc`.
+#[cfg(not(target_os = "macos"))]
 fn cpu_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name can hold spaces; the fields after it are space-separated.
@@ -478,6 +560,7 @@ fn cpu_ticks(pid: u32) -> Option<u64> {
     Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn rss_now_kb(pid: u32) -> Option<u64> {
     fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()?
@@ -488,6 +571,50 @@ fn rss_now_kb(pid: u32) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// `pid`'s resource usage (`proc_pid_rusage`), for the two readings below.
+#[cfg(target_os = "macos")]
+fn rusage(pid: u32) -> Option<libc::rusage_info_v4> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: the buffer is a rusage_info_v4, the flavor asked for.
+    let ok = unsafe {
+        libc::proc_pid_rusage(
+            i32::try_from(pid).ok()?,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
+        )
+    } == 0;
+    // SAFETY: filled in by the call that succeeded (and zeroed before).
+    ok.then(|| unsafe { info.assume_init() })
+}
+
+/// CPU time of `pid` in clock ticks of 1/100 s (user + system). The times are in Mach absolute
+/// time units, which are not nanoseconds on Apple Silicon (`mach_timebase_info`).
+#[cfg(target_os = "macos")]
+fn cpu_ticks(pid: u32) -> Option<u64> {
+    unsafe extern "C" {
+        /// numer / denom: nanoseconds per Mach time unit.
+        fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+    }
+    let info = rusage(pid)?;
+    let mut base = [0_u32; 2];
+    // SAFETY: fills in the two numbers given.
+    unsafe { mach_timebase_info(&mut base) };
+    let [numer, denom] = base;
+    if denom == 0 {
+        return None;
+    }
+    let units = u128::from(info.ri_user_time + info.ri_system_time);
+    let ns = units * u128::from(numer) / u128::from(denom);
+    u64::try_from(ns / 10_000_000).ok()
+}
+
+/// `pid`'s physical footprint in KB: what Activity Monitor shows as its memory (RSS on macOS
+/// also counts the shared framework pages every app maps).
+#[cfg(target_os = "macos")]
+fn rss_now_kb(pid: u32) -> Option<u64> {
+    Some(rusage(pid)?.ri_phys_footprint / 1024)
 }
 
 struct Idle {
@@ -605,21 +732,16 @@ fn local_image_rss(examples: &Path, generate: &str) -> Option<u64> {
     let dir = scratch("images");
     let config = scratch("images-config");
     let bin = examples.join("image_rss");
-    let made = Command::new(&bin)
-        .arg(generate)
-        .arg(dir.join("img"))
-        .env("XDG_CONFIG_HOME", &config)
-        .stdout(Stdio::null())
-        .status()
-        .ok()?
-        .success();
+    let mut make = Command::new(&bin);
+    make.arg(generate).arg(dir.join("img"));
+    isolate_settings(&mut make, &config);
+    let made = make.stdout(Stdio::null()).status().ok()?.success();
     let peak = made
         .then(|| {
-            Command::new(&bin)
-                .arg(dir.join("img"))
-                .env("XDG_CONFIG_HOME", &config)
-                .output()
-                .ok()
+            let mut run = Command::new(&bin);
+            run.arg(dir.join("img"));
+            isolate_settings(&mut run, &config);
+            run.output().ok()
         })
         .flatten()
         .and_then(|out| image_rss_line(&out));
@@ -670,8 +792,13 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
     }
     ensure_fixtures();
     let fixture = |n: &str| root().join("fixtures").join(n);
-    let wayland = env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
-    let frame_kb = if wayland { WAYLAND_FRAME_KB } else { 0 };
+    let macos = cfg!(target_os = "macos");
+    let wayland = !macos && env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let frame_kb = match () {
+        _ if macos => MACOS_WINDOW_KB,
+        _ if wayland => WAYLAND_FRAME_KB,
+        _ => 0,
+    };
     if wayland {
         println!("Wayland: the RSS budgets allow {frame_kb} KB for softbuffer's second frame");
     }
@@ -694,10 +821,10 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
             });
         };
     let mb = |kb: u64| format!("{kb} KB");
-    let allowance = if wayland {
-        format!(" + {frame_kb} KB (Wayland)")
-    } else {
-        String::new()
+    let allowance = match () {
+        _ if macos => format!(" + {frame_kb} KB (macOS)"),
+        _ if wayland => format!(" + {frame_kb} KB (Wayland)"),
+        _ => String::new(),
     };
     for (i, (label, extra, dir)) in BUILDS.into_iter().enumerate() {
         let bin = cargo_build(extra, dir);
@@ -706,20 +833,25 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
             "stripped binary".into(),
             label,
             format!("{:.2} MB", len as f64 / 1e6),
-            format!("≤ {:.2} MB", SIZE_BUDGET[i] as f64 / 1e6),
-            len <= SIZE_BUDGET[i],
+            format!("≤ {:.2} MB", size_budget()[i] as f64 / 1e6),
+            len <= size_budget()[i],
             true,
         );
         for name in STARTUP_FIXTURES {
             match startup(&bin, &fixture(name)) {
-                Some((cold, warm, _, _)) => {
+                Some(Startup {
+                    cold, warm, own, ..
+                }) => {
+                    // On macOS about 100 ms of every start is AppKit's (launching the
+                    // application, the first window): the whole start is reported there, and
+                    // VOMD's own part is held to the warm budget.
                     gated_row(
                         format!("cold start, {name}"),
                         label,
                         format!("{cold:.1} ms"),
                         format!("≤ {COLD_BUDGET_MS} ms (first of {BENCH_RUNS} runs)"),
                         cold <= COLD_BUDGET_MS,
-                        timings_gated,
+                        timings_gated && !macos,
                     );
                     gated_row(
                         format!("warm start, {name}"),
@@ -727,8 +859,18 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
                         format!("{warm:.1} ms"),
                         format!("≤ {WARM_BUDGET_MS} ms (median of {})", BENCH_RUNS - 1),
                         warm <= WARM_BUDGET_MS,
-                        timings_gated && !WARM_UNGATED.contains(name),
+                        timings_gated && !macos && !WARM_UNGATED.contains(name),
                     );
+                    if macos {
+                        gated_row(
+                            format!("own start, {name}"),
+                            label,
+                            own.map_or("no output".into(), |o| format!("{o:.1} ms")),
+                            format!("≤ {WARM_BUDGET_MS} ms (median, window to first frame)"),
+                            own.is_some_and(|o| o <= WARM_BUDGET_MS),
+                            timings_gated && !WARM_UNGATED.contains(name),
+                        );
+                    }
                 }
                 None => gated_row(
                     format!("start, {name}"),
@@ -778,8 +920,9 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
         // Animations: none play while they are off, or while none is on screen; playing, the
         // CPU (advisory) and the memory (the idle budget and the image cache's).
         let config = scratch("anim-config");
-        fs::create_dir_all(config.join("vomd")).expect("scratch settings");
-        fs::write(config.join("vomd/settings.ini"), "animations = on\n").expect("settings");
+        let file = settings_file(&config);
+        fs::create_dir_all(file.parent().unwrap()).expect("scratch settings");
+        fs::write(&file, "animations = on\n").expect("settings");
         let on = Some(config.as_path());
         for (what, mode, config, ticks, gated) in [
             ("animations off", "idle", None, IDLE_TICKS, true),
@@ -893,7 +1036,12 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
     }
     // Memory with 50 images, from files and from a local server.
     let label = BUILDS[0].0;
-    let budget = format!("≤ {}", mb(IMAGE_RSS_KB));
+    let image_kb = if macos {
+        MACOS_IMAGE_RSS_KB
+    } else {
+        IMAGE_RSS_KB
+    };
+    let budget = format!("≤ {}", mb(image_kb));
     match image_examples() {
         None => gated_row(
             "image RSS examples".into(),
@@ -910,7 +1058,7 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
                     label,
                     mb(kb),
                     budget.clone(),
-                    kb <= IMAGE_RSS_KB,
+                    kb <= image_kb,
                     true,
                 ),
                 None => gated_row(
@@ -991,8 +1139,8 @@ fn budgets(report: Option<&Path>, timings_gated: bool) -> bool {
     ok
 }
 
-/// The release files of the system this runs on: [`dist_linux`]'s, or on Windows
-/// [`dist_windows`]'s.
+/// The release files of the system this runs on: [`dist_linux`]'s, on Windows
+/// [`dist_windows`]'s, on macOS [`dist_macos`]'s.
 fn dist(release: bool) -> bool {
     if !baseline_cpu() {
         return false;
@@ -1003,12 +1151,14 @@ fn dist(release: bool) -> bool {
         let _ = release;
         dist_windows()
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    return dist_macos(release);
+    #[cfg(all(unix, not(target_os = "macos")))]
     return dist_linux(release);
     #[cfg(not(any(unix, windows)))]
     {
         let _ = release;
-        eprintln!("dist: Linux and Windows only");
+        eprintln!("dist: Linux, Windows and macOS only");
         false
     }
 }
@@ -1138,11 +1288,283 @@ fn write_sum_windows(file: &Path) -> bool {
     true
 }
 
+/// The macOS release: `dist/vomd-<version>-aarch64-macos.dmg` and its `.sha256`. The disk image
+/// holds `VOMD.app` (the binary, `packaging/macos/Info.plist` with the version filled in, the
+/// icon, and README, CHANGELOG and the licenses in its Resources) and a link to Applications. Its
+/// window is laid out for dragging the one onto the other, over a background with an arrow: that
+/// takes Finder (AppleScript), so it is only done for a release (`--release`, as CI makes it);
+/// without, or if Finder can't be driven, the disk image is the same without the layout, and says
+/// so. The app is signed ad hoc as a whole (the linker's signature covers only the binary, and a
+/// bundle whose seal doesn't match is "damaged"), and not notarized.
+#[cfg(target_os = "macos")]
+fn dist_macos(release: bool) -> bool {
+    let bin = cargo_build(&[], "target");
+    let len = fs::metadata(&bin).expect("binary").len();
+    let budget = MACOS_SIZE_BUDGET[0];
+    if len > budget {
+        eprintln!("error: the binary is {len} bytes, over the {budget} budget");
+        return false;
+    }
+    // The oldest macOS it runs on, as the plist promises (`LC_BUILD_VERSION`).
+    let otool = Command::new("otool").arg("-l").arg(&bin).output();
+    let minos = otool.ok().and_then(|o| {
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        let line = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("minos "))?;
+        Some(line.trim_start()["minos ".len()..].trim().to_owned())
+    });
+    if minos.as_deref() != Some(MACOS_MIN) {
+        eprintln!("error: the binary needs macOS {minos:?}, not {MACOS_MIN}");
+        return false;
+    }
+    println!("needs macOS {MACOS_MIN}");
+    let ours = vomd_version();
+    let name = format!("vomd-{ours}-aarch64-macos");
+    let dist = root().join("dist");
+    let stage = dist.join(&name);
+    let _ = fs::remove_dir_all(&stage);
+    let app = stage.join("VOMD.app");
+    let contents = app.join("Contents");
+    let docs = DIST_DOCS.iter().map(|&(from, to)| (Path::new(from), to));
+    let lucide = (
+        Path::new("assets/fonts/LICENSE-Lucide.txt"),
+        "LICENSE-Lucide.txt",
+    );
+    stage_files(
+        &contents.join("Resources"),
+        [
+            (Path::new("packaging/macos/vomd.icns"), "vomd.icns"),
+            lucide,
+        ]
+        .into_iter()
+        .chain(docs),
+    );
+    stage_files(&contents.join("MacOS"), [(bin.as_path(), "vomd")]);
+    let plist = fs::read_to_string(root().join("packaging/macos/Info.plist")).expect("Info.plist");
+    fs::write(
+        contents.join("Info.plist"),
+        plist.replace("@VERSION@", &ours),
+    )
+    .expect("plist");
+    let run = |cmd: &mut Command| cmd.status().is_ok_and(|s| s.success());
+    let ok = run(Command::new("plutil")
+        .arg("-lint")
+        .arg(contents.join("Info.plist")))
+        && run(Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&app))
+        && run(Command::new("codesign")
+            .args(["--verify", "--strict", "--verbose=2"])
+            .arg(&app));
+    if !ok {
+        let _ = fs::remove_dir_all(&stage);
+        eprintln!("the app didn't check or sign (plutil, codesign)");
+        return false;
+    }
+    // A notarized release would sign with a Developer ID here (`codesign --options runtime`),
+    // and submit and staple the disk image after it is made (`notarytool`, `stapler`).
+    std::os::unix::fs::symlink("/Applications", stage.join("Applications")).expect("link");
+    let background = stage.join(".background");
+    fs::create_dir_all(&background).expect("create .background");
+    let tiff = run(Command::new("tiffutil")
+        .arg("-cathidpicheck")
+        .arg(root().join("packaging/macos/dmg-background.png"))
+        .arg(root().join("packaging/macos/dmg-background@2x.png"))
+        .arg("-out")
+        .arg(background.join("background.tiff")));
+    let _ = fs::copy(
+        root().join("packaging/macos/vomd.icns"),
+        stage.join(".VolumeIcon.icns"),
+    );
+    let dmg = dist.join(format!("{name}.dmg"));
+    let _ = fs::remove_file(&dmg);
+    let laid_out = release && tiff && dmg_laid_out(&stage, &dmg);
+    if !laid_out {
+        println!("note: the disk image's window is not laid out (that is done with --release)");
+        let made = run(Command::new("hdiutil")
+            .args([
+                "create", "-volname", "VOMD", "-fs", "HFS+", "-format", "UDZO",
+            ])
+            .args(["-imagekey", "zlib-level=9", "-ov", "-srcfolder"])
+            .arg(&stage)
+            .arg(&dmg));
+        if !made {
+            let _ = fs::remove_dir_all(&stage);
+            eprintln!("hdiutil failed");
+            return false;
+        }
+    }
+    let _ = fs::remove_dir_all(&stage);
+    println!("wrote {}", dmg.display());
+    write_sum_macos(&dmg)
+}
+
+/// The disk image `dmg` of `stage` with its window laid out by Finder: a writable image made
+/// and mounted, its window set up through AppleScript (the icons, the background, their places),
+/// then compressed. `false` (and nothing written) if any of it fails: a runner whose Finder
+/// can't be driven makes the image without the layout.
+#[cfg(target_os = "macos")]
+fn dmg_laid_out(stage: &Path, dmg: &Path) -> bool {
+    let rw = dmg.with_extension("rw.dmg");
+    let _ = fs::remove_file(&rw);
+    let staged_mb = Command::new("du")
+        .args(["-sk"])
+        .arg(stage)
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .map_or(200, |kb| kb / 1024 + 1);
+    let made = Command::new("hdiutil")
+        .args([
+            "create",
+            "-volname",
+            "VOMD",
+            "-fs",
+            "HFS+",
+            "-format",
+            "UDRW",
+            "-ov",
+            // Room for Finder's .DS_Store and the like (the image is otherwise exactly full).
+            "-size",
+            &format!("{}m", staged_mb + 20),
+        ])
+        .arg("-srcfolder")
+        .arg(stage)
+        .arg(&rw)
+        .status()
+        .is_ok_and(|s| s.success());
+    let attached = made
+        .then(|| {
+            Command::new("hdiutil")
+                .args(["attach", "-readwrite", "-noverify", "-noautoopen"])
+                .arg(&rw)
+                .output()
+                .ok()
+        })
+        .flatten();
+    // The image's device (the first word of attach's first line) is what is detached, not a path.
+    let Some((device, volume)) = attached.and_then(|o| {
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        let device = text
+            .split_whitespace()
+            .next()
+            .filter(|d| d.starts_with("/dev/"))?;
+        let at = text.find("/Volumes/")?;
+        let volume = PathBuf::from(text[at..].lines().next()?.trim());
+        Some((device.to_owned(), volume))
+    }) else {
+        let _ = fs::remove_file(&rw);
+        return false;
+    };
+    let detach = |force: bool| {
+        let mut c = Command::new("hdiutil");
+        c.arg("detach").arg(&device).arg("-quiet");
+        if force {
+            c.arg("-force");
+        }
+        c.status().is_ok_and(|s| s.success())
+    };
+    // Finder names a disk by its volume's name: if another "VOMD" was mounted first, this one is
+    // "VOMD 1" there, and the layout would go to the wrong disk or none. Leave it be.
+    if volume != Path::new("/Volumes/VOMD") {
+        eprintln!("note: another volume named VOMD is mounted");
+        let _ = detach(false) || detach(true);
+        let _ = fs::remove_file(&rw);
+        return false;
+    }
+    // The volume's icon is VOMD's (a custom icon is a flag on its folder).
+    let _ = Command::new("SetFile")
+        .args(["-a", "C"])
+        .arg(&volume)
+        .status();
+    let script = r#"tell application "Finder"
+  tell disk "VOMD"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set bounds of container window to {200, 120, 800, 548}
+    set opts to the icon view options of container window
+    set arrangement of opts to not arranged
+    set icon size of opts to 128
+    set text size of opts to 13
+    set background picture of opts to file ".background:background.tiff"
+    set position of item "VOMD.app" of container window to {150, 190}
+    set position of item "Applications" of container window to {450, 190}
+    close
+    open
+    update without registering applications
+    delay 2
+    close
+  end tell
+end tell"#;
+    let laid_out = Command::new("osascript")
+        .args(["-e", script])
+        .status()
+        .is_ok_and(|s| s.success());
+    // (Finder writes the layout to the volume's .DS_Store as it closes the window. The system's
+    // own record of the volume's changes isn't for the image.)
+    let _ = fs::remove_dir_all(volume.join(".fseventsd"));
+    let _ = Command::new("sync").status();
+    let detached = detach(false) || detach(true);
+    let converted = laid_out
+        && detached
+        && Command::new("hdiutil")
+            .args([
+                "convert",
+                "-format",
+                "UDZO",
+                "-imagekey",
+                "zlib-level=9",
+                "-ov",
+            ])
+            .arg(&rw)
+            .arg("-o")
+            .arg(dmg)
+            .status()
+            .is_ok_and(|s| s.success());
+    let _ = fs::remove_file(&rw);
+    if !converted {
+        let _ = fs::remove_file(dmg);
+        eprintln!("note: Finder couldn't lay out the disk image's window");
+    }
+    converted
+}
+
+/// `<file>.sha256` next to `file`, in `sha256sum`'s format, from `shasum` (every macOS has it).
+#[cfg(target_os = "macos")]
+fn write_sum_macos(file: &Path) -> bool {
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(file)
+        .output();
+    let sum = out.ok().filter(|o| o.status.success()).and_then(|o| {
+        let text = String::from_utf8_lossy(&o.stdout).into_owned();
+        text.split_whitespace().next().map(str::to_owned)
+    });
+    let Some(sum) = sum else {
+        eprintln!("shasum failed for {}", file.display());
+        return false;
+    };
+    let name = file.file_name().unwrap().to_string_lossy();
+    let line = format!("{sum}  {name}\n");
+    fs::write(format!("{}.sha256", file.display()), &line).expect("write the checksum");
+    print!("{line}");
+    true
+}
+
 /// The Linux release files, each with a `.sha256`: the tarball
 /// `dist/vomd-<version>-x86_64-linux.tar.gz` holding the binary, the desktop entry, the icon, the
 /// man page, README, CHANGELOG and the licenses (ours and those of the embedded fonts), and the
 /// Debian package and AppImage made from the same files (`pkg`).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn dist_linux(release: bool) -> bool {
     let bin = cargo_build(&[], "target");
     // The binary that ships is held to the budget here, where it is built (in the Debian 12
@@ -1229,14 +1651,14 @@ fn dist_linux(release: bool) -> bool {
 }
 
 /// The oldest glibc release binaries support: RELR relocations need 2.36.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 const GLIBC_FLOOR: (u32, u32) = (2, 36);
 
 /// The newest `GLIBC_x.y` version an undefined symbol of `bin` names (`objdump -T`). Weak ones
 /// count too: the binary runs without them, but an older glibc's loader prints "weak version
 /// `GLIBC_x.y' not found" at every start (Rust's std links `pidfd_spawnp` weakly when the build
 /// machine's glibc has it).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn glibc_floor(bin: &Path) -> Option<(u32, u32)> {
     let out = Command::new("objdump").arg("-T").arg(bin).output().ok()?;
     if !out.status.success() {

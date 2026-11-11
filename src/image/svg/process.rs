@@ -13,12 +13,16 @@
 //! the same: the child is killed when VOMD closes the job (as it does when it ends, however it
 //! ends), its committed memory and its CPU time are capped, and it can start no process; a
 //! failed allocation in it exits with the memory code instead of aborting (which would be a crash
-//! for Windows Error Reporting).
+//! for Windows Error Reporting). On macOS the CPU limit and the signal handlers are Linux's, the
+//! memory is counted by the child's own allocator (macOS enforces no data limit), and a thread of
+//! the child ends it once VOMD is gone (`macos.rs`).
 //!
 //! The child opens no display, reads no settings and fetches nothing: it reads the job, and the
 //! font files the job names (the faces VOMD's own text is set in), and nothing else, as SVGs drawn
 //! in VOMD did. The protocol needs no version: the child is the same file as the parent
-//! (`/proc/self/exe`; on Windows the running executable, which can't be replaced while it runs).
+//! (`/proc/self/exe`; on Windows the running executable, which can't be replaced while it runs;
+//! on macOS, where it can be, a child is only started while the file is the one VOMD started
+//! from).
 //!
 //! The job, little-endian: the box (`u32` × 2), the charge (`u64`), forced (`u8`) and the forced
 //! load's memory (`u64`), a test mode (`u8`, [`set_test`]), the SVG's record (`SvgCost`), the
@@ -78,6 +82,8 @@ static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
 /// Draw SVGs with `program` (VOMD's own binary) from now on. Once: the first one stays.
 pub fn set_program(program: PathBuf) {
+    #[cfg(target_os = "macos")]
+    macos::note_program(&program);
     let _ = PROGRAM.set(program);
 }
 
@@ -131,6 +137,11 @@ pub(super) fn draw(
         0 => cpu,
         seconds => seconds,
     };
+    // (Replaced since VOMD started: another build's child could misread the job.)
+    #[cfg(target_os = "macos")]
+    if !macos::same_program(program) {
+        return Rendered::Refused(Refusal::Broken);
+    }
     inline.store(true, Ordering::SeqCst);
     let data = (bytes.len())
         .saturating_add(charge)
@@ -556,6 +567,26 @@ fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
     draw_job()
 }
 
+/// The child on macOS: Linux's handlers and limits, but its memory is counted by its allocator,
+/// and a thread of its own ends it once its parent is gone.
+#[cfg(target_os = "macos")]
+fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
+    // SAFETY: plain integers, and handlers that only exit.
+    unsafe {
+        signal(SIGABRT, stopped as extern "C" fn(i32) as usize);
+        signal(SIGXCPU, stopped as extern "C" fn(i32) as usize);
+    }
+    set_limit(RLIMIT_CORE, 0, 0);
+    // SAFETY: `getppid` can't fail.
+    if u64::try_from(unsafe { getppid() }) != Ok(parent) {
+        return EXIT_INPUT;
+    }
+    macos::watch_parent(parent);
+    set_limit(RLIMIT_CPU, cpu, cpu.saturating_add(1));
+    macos::limit_memory(data);
+    draw_job()
+}
+
 /// The child on Windows: its job object (made by the parent) holds its limits and ends it with
 /// VOMD, so only what its allocations do when they fail is set here.
 #[cfg(windows)]
@@ -686,7 +717,7 @@ fn path_of(bytes: Vec<u8>) -> Option<PathBuf> {
 }
 
 /// Whether `out` has something to read (or has ended), waiting `ms` at the most.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn readable(out: &ChildStdout, ms: i32) -> bool {
     use std::os::fd::AsRawFd;
     let mut fd = PollFd {
@@ -709,7 +740,7 @@ fn readable(out: &ChildStdout, ms: i32) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[repr(C)]
 struct PollFd {
     fd: i32,
@@ -717,36 +748,47 @@ struct PollFd {
     revents: i16,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[repr(C)]
 struct RLimit {
     cur: u64,
     max: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const POLLIN: i16 = 1;
 #[cfg(target_os = "linux")]
 const PR_SET_PDEATHSIG: i32 = 1;
 #[cfg(target_os = "linux")]
 const PR_SET_NAME: i32 = 15;
-#[cfg(target_os = "linux")]
+// (The same numbers on Linux and macOS.)
+#[cfg(unix)]
 const SIGABRT: i32 = 6;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const SIGKILL: i32 = 9;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const SIGXCPU: i32 = 24;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const RLIMIT_CPU: i32 = 0;
 #[cfg(target_os = "linux")]
 const RLIMIT_DATA: i32 = 2;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const RLIMIT_CORE: i32 = 4;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, n: u64, timeout_ms: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
+}
+
+// (`nfds_t` is 32 bits on macOS.)
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, n: u32, timeout_ms: i32) -> i32;
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
     fn getppid() -> i32;
     fn signal(signal: i32, handler: usize) -> usize;
     fn _exit(code: i32) -> !;
@@ -754,7 +796,7 @@ unsafe extern "C" {
 }
 
 /// The handler of the signals the limits end the child with: exit with the code that says which.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 extern "C" fn stopped(signal: i32) {
     let code = if signal == SIGXCPU {
         EXIT_SLOW
@@ -766,13 +808,17 @@ extern "C" fn stopped(signal: i32) {
 }
 
 /// Set the soft and hard limits of `resource` (lowering them needs no privilege).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn set_limit(resource: i32, cur: u64, max: u64) {
     let limit = RLimit { cur, max };
     // SAFETY: a valid `rlimit`.
     unsafe { setrlimit(resource, &limit) };
 }
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::Allocator as SvgChildAllocator;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

@@ -1,5 +1,5 @@
-//! Everything OS-specific. Other modules use only portable std. Linux and Windows are
-//! supported; the macOS branches compile but are untested.
+//! Everything OS-specific. Other modules use only portable std. Linux, Windows and macOS (Apple
+//! Silicon) are supported.
 
 /// The system theme when winit can't tell (`Window::theme()` is `None`). On Linux, dark if
 /// `GTK_THEME` names a dark variant (`Adwaita:dark`), otherwise light.
@@ -21,6 +21,17 @@ fn gtk_theme_dark(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim().ends_with(":dark"))
 }
 
+/// Whether the modifier is held that makes a click act on an image inside a link (load it past
+/// the limits, play or pause it) rather than follow the link: ⌘ on macOS, where Ctrl+click is a
+/// right click, Ctrl elsewhere. (The words for it are in `layout::Refusal::suffix`.)
+#[inline]
+pub fn image_modifier(mods: winit::keyboard::ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    return mods.super_key();
+    #[cfg(not(target_os = "macos"))]
+    mods.control_key()
+}
+
 /// Let `--help` and `--version` print when started from a terminal. A no-op except on Windows,
 /// where the GUI subsystem detaches the console.
 pub fn attach_console() {
@@ -30,8 +41,32 @@ pub fn attach_console() {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod desktop;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
+
+#[cfg(target_os = "macos")]
+pub use macos::on_open_files;
+
+/// The command key as the labels of shortcuts name it, joined to `key`, as one literal: `⌘O` on
+/// macOS, `Ctrl+O` elsewhere. (Ctrl works on macOS too: the keys take either.)
+#[cfg(target_os = "macos")]
+#[macro_export]
+macro_rules! cmd_key {
+    ($key:literal) => {
+        concat!("⌘", $key)
+    };
+}
+/// The command key as the labels of shortcuts name it, joined to `key`, as one literal: `⌘O` on
+/// macOS, `Ctrl+O` elsewhere.
+#[cfg(not(target_os = "macos"))]
+#[macro_export]
+macro_rules! cmd_key {
+    ($key:literal) => {
+        concat!("Ctrl+", $key)
+    };
+}
 
 /// The file name patterns Open offers as Markdown (the first filter of its dialog).
 pub const MARKDOWN_GLOBS: [&str; 5] = ["*.md", "*.markdown", "*.mdown", "*.mkd", "*.mkdn"];
@@ -44,7 +79,8 @@ const OPEN_TITLE: &str = "Open a Markdown file";
 /// window the dialog belongs to (`x11:<id>` for the portal, `win32:<hwnd>` on Windows; empty for
 /// none). Blocks until the dialog closes: run it off the main thread.
 /// `Ok(None)` when the user picked nothing; `Err` says, in words for the window, why there was
-/// no dialog.
+/// no dialog. (macOS has [`choose_file_panel`] instead.)
+#[cfg(not(target_os = "macos"))]
 pub fn choose_file(
     parent: &str,
     folder: Option<&std::path::Path>,
@@ -63,17 +99,30 @@ pub fn choose_file(
     {
         windows::choose_file(OPEN_TITLE, parent, folder)
     }
-    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = (parent, folder, OPEN_TITLE);
         Err("Open has no file dialog on this system yet".into())
     }
 }
 
+/// Open on macOS: the system's Open panel as a sheet on `window`, starting in `folder`. Call it
+/// on the main thread; it returns at once, and `done` is called there when the panel closes with
+/// the file picked (`None`: nothing).
+#[cfg(target_os = "macos")]
+pub fn choose_file_panel(
+    window: Option<winit::raw_window_handle::RawWindowHandle>,
+    folder: Option<&std::path::Path>,
+    done: impl FnOnce(Result<Option<std::path::PathBuf>, String>) + 'static,
+) {
+    macos::choose_file(window, OPEN_TITLE, folder, done);
+}
+
 /// Start the default application for the local file `path`, the way the desktop would (on
-/// Linux also when it runs in a terminal), and wait for the launcher: it can block on
-/// `xdg-mime` or the shell, so call it off the main thread. Errors say why in words fit for the
-/// window: no application, no way to start it, or the launcher giving up.
+/// Linux also when it runs in a terminal; on macOS the default text editor, since nothing may
+/// claim `.ini` files there), and wait for the launcher: it can block on `xdg-mime` or the shell,
+/// so call it off the main thread. Errors say why in words fit for the window: no application,
+/// no way to start it, or the launcher giving up.
 pub fn open_file(path: &std::path::Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput).to_string());
@@ -93,12 +142,23 @@ pub fn open_file(path: &std::path::Path) -> Result<(), String> {
     {
         windows::open_file(path)
     }
-    #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = launcher(path.as_os_str())
-            .and_then(|mut c| c.wait())
+        use std::process::{Command, Stdio};
+        // `-t`: TextEdit, or the editor the user made the default for plain text.
+        let status = Command::new("/usr/bin/open")
+            .arg("-t")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
             .map_err(|e| e.to_string())?;
-        Ok(())
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("open failed ({status})"))
+        }
     }
 }
 
@@ -130,8 +190,7 @@ fn launcher(target: &std::ffi::OsStr) -> std::io::Result<std::process::Child> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = Command::new("xdg-open");
     #[cfg(target_os = "macos")]
-    // Untested.
-    let mut cmd = Command::new("open");
+    let mut cmd = Command::new("/usr/bin/open");
     cmd.arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -252,25 +311,29 @@ pub fn stderr_is_tty() -> bool {
 }
 
 /// Resident set size now in KB, for `VOMD_BENCH` (0 where unknown). On Windows, the working
-/// set.
+/// set; on macOS, the physical footprint.
 pub fn rss_kb() -> u64 {
     #[cfg(windows)]
     return windows::working_set_kb().0;
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return macos::footprint_kb().0;
+    #[cfg(not(any(windows, target_os = "macos")))]
     status_kb("VmRSS:")
 }
 
 /// Peak resident set size in KB, for `VOMD_BENCH` (0 where unknown). On Windows, the peak
-/// working set.
+/// working set; on macOS, the physical footprint's peak.
 pub fn peak_rss_kb() -> u64 {
     #[cfg(windows)]
     return windows::working_set_kb().1;
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return macos::footprint_kb().1;
+    #[cfg(not(any(windows, target_os = "macos")))]
     status_kb("VmHWM:")
 }
 
 /// A `/proc/self/status` field in kB (0 if unknown).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn status_kb(field: &str) -> u64 {
     #[cfg(target_os = "linux")]
@@ -279,7 +342,6 @@ fn status_kb(field: &str) -> u64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Untested: task_info on macOS.
         0
     }
 }
@@ -343,17 +405,20 @@ mod tests {
     }
 
     /// The open must return at once on a FIFO with no writer, and a regular file reads normally.
-    #[cfg(all(
-        target_os = "linux",
-        any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "arm",
-            target_arch = "riscv64",
-            target_arch = "powerpc64",
-            target_arch = "s390x",
-            target_arch = "loongarch64"
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "arm",
+                target_arch = "riscv64",
+                target_arch = "powerpc64",
+                target_arch = "s390x",
+                target_arch = "loongarch64"
+            )
         )
     ))]
     #[test]
@@ -388,7 +453,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     #[test]
     fn reads_peak_rss() {
         assert!(rss_kb() > 0);
@@ -406,6 +471,8 @@ mod tests {
         };
         #[cfg(windows)]
         let (now, peak) = windows::working_set_kb();
+        #[cfg(target_os = "macos")]
+        let (now, peak) = macos::footprint_kb();
         assert!((1..=peak).contains(&now));
     }
 }

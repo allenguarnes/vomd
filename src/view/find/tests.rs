@@ -1710,6 +1710,48 @@ fn the_caret_moves_where_typing_and_the_arrows_say() {
     assert_eq!(v.find_query(), "beXta", "and Ctrl+Backspace");
 }
 
+/// On a Mac the field edits like the system's: Option by words, ⌘ to the start and the end,
+/// Option types what it makes. (Ctrl keeps the other systems' meaning, tested above.)
+#[cfg(target_os = "macos")]
+#[test]
+fn the_field_takes_the_mac_keys() {
+    const ALT: ModifiersState = ModifiersState::ALT;
+    const CMD: ModifiersState = ModifiersState::SUPER;
+    let mut v = field_view(600, "alpha beta gamma");
+    press(&mut v, named(NamedKey::ArrowLeft), None, CMD);
+    assert_eq!(caret(&v), 0, "⌘← is the start");
+    press(&mut v, named(NamedKey::ArrowRight), None, ALT);
+    assert_eq!(caret(&v), 5, "Option→ is a word");
+    press(&mut v, named(NamedKey::ArrowRight), None, CMD);
+    assert_eq!(caret(&v), 16, "⌘→ is the end");
+    press(&mut v, named(NamedKey::ArrowLeft), None, ALT);
+    assert_eq!(caret(&v), 11);
+    press(&mut v, named(NamedKey::Backspace), None, ALT);
+    assert_eq!(
+        v.find_query(),
+        "alpha gamma",
+        "Option+Backspace deletes a word"
+    );
+    press(&mut v, named(NamedKey::Delete), None, ALT);
+    assert_eq!(v.find_query(), "alpha ", "Option+Delete the word after");
+    press(&mut v, ch("å"), Some("å"), ALT);
+    assert_eq!(v.find_query(), "alpha å", "Option types");
+    press(
+        &mut v,
+        named(NamedKey::ArrowLeft),
+        None,
+        ALT | ModifiersState::SHIFT,
+    );
+    assert_eq!(caret(&v), 6, "with Shift it selects");
+    press(&mut v, named(NamedKey::ArrowRight), None, NONE);
+    press(&mut v, named(NamedKey::Backspace), None, CMD);
+    assert_eq!(v.find_query(), "", "⌘+Backspace deletes to the start");
+    // ⌘ with a letter is still a shortcut, not text.
+    typed(&mut v, "ab");
+    press(&mut v, ch("a"), Some("a"), CMD);
+    assert_eq!(v.find_query(), "ab");
+}
+
 #[test]
 fn shift_selects_ctrl_a_selects_all_and_typing_replaces_the_selection() {
     let mut v = field_view(600, "alpha beta");
@@ -2029,11 +2071,14 @@ fn escape_closes_the_bar_before_other_things_whoever_has_the_keyboard() {
 fn the_toolbar_button_names_the_shortcut_for_closing_too() {
     let mut v = view("text\n", 800, 600);
     v.set_toolbar(true);
-    assert_eq!(toolbar::Item::Find.label(&v.toolbar_ctx()), "Find (Ctrl+F)");
+    assert_eq!(
+        toolbar::Item::Find.label(&v.toolbar_ctx()),
+        concat!("Find (", crate::cmd_key!("F"), ")")
+    );
     open(&mut v);
     assert_eq!(
         toolbar::Item::Find.label(&v.toolbar_ctx()),
-        "Close find (Ctrl+F)"
+        concat!("Close find (", crate::cmd_key!("F"), ")")
     );
 }
 

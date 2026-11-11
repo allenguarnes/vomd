@@ -9,15 +9,15 @@
 <p align="center">
   <a href="https://github.com/allenguarnes/vomd/releases/latest"><img src="https://img.shields.io/github/v/release/allenguarnes/vomd?style=flat" alt="Latest release"></a>
   <a href="https://github.com/allenguarnes/vomd/actions/workflows/ci.yml"><img src="https://github.com/allenguarnes/vomd/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-607e60?style=flat" alt="Platforms: Linux and Windows"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-607e60?style=flat" alt="Platforms: Linux, Windows and macOS"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat" alt="License: MIT"></a>
 </p>
 
-<p align="center"><b>View-Only Markdown: a tiny, fast Markdown viewer for Linux and Windows.</b></p>
+<p align="center"><b>View-Only Markdown: a tiny, fast Markdown viewer for Linux, Windows and macOS.</b></p>
 
 <p align="center">
-  Double-click a <code>.md</code> file and it opens in well under a tenth of a second, rendered
-  the way GitHub shows it.
+  Double-click a <code>.md</code> file and it opens in a blink (well under a tenth of a second on
+  Linux), rendered the way GitHub shows it.
 </p>
 
 <p align="center">
@@ -36,8 +36,8 @@
 ## Why VOMD
 
 - **Fast.** Opens in milliseconds; a 5 MB document opens in under 100 ms.
-- **Small.** One file with its fonts built in: about 5.2 MB on Linux, 4.7 MB on Windows. No web
-  engine, no GUI toolkit, nothing else to install.
+- **Small.** One file with its fonts built in: about 5.2 MB on Linux, 4.7 MB on Windows and
+  3.8 MB on macOS. No web engine, no GUI toolkit, nothing else to install.
 - **Private.** Never touches the network unless you ask it to, and never runs a document's HTML.
 - **Just a viewer.** No editor, no workspace, no accounts. Open a file, read it, close it.
 
@@ -71,11 +71,12 @@
 | Platform | Download |
 |---|---|
 | Windows 10 (1803+) and 11 | [`vomd-<version>-x86_64-windows-portable.zip`](https://github.com/allenguarnes/vomd/releases/latest) |
+| macOS 11+ on Apple Silicon | [`vomd-<version>-aarch64-macos.dmg`](https://github.com/allenguarnes/vomd/releases/latest) |
 | Debian 12+, Ubuntu 24.04+ | [`vomd_<version>-1_amd64.deb`](https://github.com/allenguarnes/vomd/releases/latest) |
 | Any Linux (glibc 2.36+) | [AppImage](https://github.com/allenguarnes/vomd/releases/latest) or [tarball](https://github.com/allenguarnes/vomd/releases/latest) |
 | Arch Linux | [Build with `makepkg`](#arch-linux) |
 
-All builds are for x86-64.
+Linux and Windows builds are for x86-64; the macOS build is for Apple Silicon (M1 and newer) only.
 
 ### Windows
 
@@ -103,6 +104,42 @@ Every zip is built from the tagged source by the public
 
 ```bat
 certutil -hashfile vomd-<version>-x86_64-windows-portable.zip SHA256
+```
+
+</details>
+
+### macOS
+
+> [!IMPORTANT]
+> **VOMD isn't notarized by Apple yet, so macOS will block it the first time.** It says Apple
+> could not verify VOMD is free of malware. That doesn't mean it's harmful. Click **Done**, then
+> open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**. You'll
+> only do this once.
+
+1. Download the disk image from the [latest release](https://github.com/allenguarnes/vomd/releases/latest)
+   and open it. Drag **VOMD** onto **Applications**.
+2. Open VOMD, or drop a `.md` file on its icon.
+3. To open `.md` files with VOMD, right-click one, then **Open With → VOMD**. To make it the
+   default, choose **Get Info → Open with → VOMD → Change All**.
+4. To use it from a terminal:
+   `ln -s /Applications/VOMD.app/Contents/MacOS/vomd ~/.local/bin/vomd` (or any folder on your
+   `PATH`).
+
+If you use a terminal, `xattr -dr com.apple.quarantine /Applications/VOMD.app` does the same as
+**Open Anyway**.
+
+Apple Silicon only: Intel Macs aren't supported. To remove VOMD, delete it from Applications (and
+`~/Library/Application Support/vomd`, if you made a settings file).
+
+<details>
+<summary>Check your download</summary>
+
+The disk image is built from the tagged source by the public
+[release workflow](https://github.com/allenguarnes/vomd/actions/workflows/release.yml), with a
+`.sha256` file next to it. To check yours, run this and compare the result with that file:
+
+```sh
+shasum -a 256 vomd-<version>-aarch64-macos.dmg
 ```
 
 </details>
@@ -171,7 +208,7 @@ makepkg -si
 ### From source
 
 With a stable Rust toolchain (on Windows, also the Visual Studio Build Tools with "Desktop
-development with C++"):
+development with C++"; on macOS, the Xcode Command Line Tools):
 
 ```sh
 cargo build --release
@@ -214,10 +251,13 @@ and ⚙ opens the settings file.
 | `Esc` | Close what's open (menu, find bar, panel), else quit |
 | `Q`, `Ctrl+W` | Quit |
 
+On macOS, use `⌘` where the table says `Ctrl`; `⌘R` reloads, `⌘↑` `⌘↓` go to the top and bottom,
+`⌘,` opens the settings file, `⌘M` minimizes, and a trackpad pinch zooms.
+
 **With the mouse:** drag to select, double-click for a word, triple-click for a paragraph, and
 `Shift`+click to extend. Hover a code block for its copy button. Click an animated image to play
 or pause just that one, or an image marked *click to load* to load it past VOMD's limits (hold
-`Ctrl` if the image is a link). On Linux, selected text can also be pasted with a middle click.
+`Ctrl` if the image is a link, `⌘` on macOS). On Linux, selected text can also be pasted with a middle click.
 
 ## Settings
 
@@ -226,6 +266,7 @@ every option listed and commented out. Changes apply as soon as you switch back 
 
 - Linux: `~/.config/vomd/settings.ini` (or `$XDG_CONFIG_HOME/vomd/settings.ini`)
 - Windows: `%APPDATA%\vomd\settings.ini`
+- macOS: `~/Library/Application Support/vomd/settings.ini`
 
 | Key | Values (default first) |
 |---|---|
@@ -262,7 +303,6 @@ VOMD makes no network requests of its own.
 
 ## Limitations
 
-- macOS isn't supported yet. The code compiles there, but it's untested.
 - No screen reader support.
 - Mermaid diagrams show as code.
 - Math: formulas use a common subset of LaTeX math, about what KaTeX reads. Anything else shows
@@ -278,6 +318,7 @@ VOMD makes no network requests of its own.
   rather than right away.
 - Text can't be selected with the keyboard (`Shift` + arrows).
 - On Windows, flag emoji show as two letters, as in other Windows apps.
+- On macOS, VOMD isn't notarized (see [Install](#macos)).
 
 ## Contributing
 

@@ -97,8 +97,10 @@ fn a_child_that_cannot_be_started_is_said_to_be_missing() {
     assert!(inline);
     // (A program that starts and says nothing: its SVG is broken, and not drawn here. On
     // Windows, this test binary, which refuses the arguments on its stderr.)
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let quiet = "/bin/true".to_owned();
+    #[cfg(target_os = "macos")]
+    let quiet = "/usr/bin/true".to_owned();
     #[cfg(windows)]
     let quiet = std::env::current_exe().unwrap().display().to_string();
     let (rendered, inline) = drawn_by(&quiet);

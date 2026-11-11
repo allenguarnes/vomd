@@ -107,6 +107,38 @@ fn keys() {
     }
 }
 
+/// The Mac's own shortcuts: ⌘R reloads, ⌘↑ and ⌘↓ go to the top and the bottom, ⌘, opens the
+/// settings, ⌘M minimizes. Elsewhere they are nothing (Ctrl+R, Ctrl+M) or the plain keys' own
+/// with a modifier that stops them (Ctrl+↑).
+#[test]
+fn mac_keys() {
+    let cmd = ModifiersState::SUPER;
+    let up = Key::Named(NamedKey::ArrowUp);
+    let down = Key::Named(NamedKey::ArrowDown);
+    if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        for (key, want) in [
+            (ch("r"), Action::Reload),
+            (ch("R"), Action::Reload),
+            (up.clone(), Action::Top),
+            (down.clone(), Action::Bottom),
+            (ch(","), Action::Settings),
+            (ch("m"), Action::Minimize),
+        ] {
+            assert_eq!(key_action(&key, cmd), Some(want), "{key:?}");
+        }
+    } else {
+        for key in [ch("r"), up, down, ch(","), ch("m")] {
+            assert_eq!(key_action(&key, cmd), None, "{key:?}");
+        }
+    }
+    // Plain, they keep their meaning.
+    assert_eq!(
+        key_action(&Key::Named(NamedKey::ArrowUp), ModifiersState::empty()),
+        Some(Action::Lines(-1))
+    );
+}
+
 /// A key held when the window gets focus arrives as a synthetic press, and on X11 and Windows
 /// its auto-repeat as ordinary presses: none of them acts, or `Q` held down would close the next
 /// window once the first is gone.

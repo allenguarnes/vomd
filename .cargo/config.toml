@@ -18,3 +18,8 @@ rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inl
 # Windows: the C runtime linked in (no VCRUNTIME140.dll to install), and the same inline threshold.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static", "-C", "llvm-args=-inline-threshold=10"]
+
+# macOS (Apple Silicon): the same inline threshold (−33 KB). Apple's linker has no RELR (Mach-O
+# has chained fixups instead) and strips dead code already.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "llvm-args=-inline-threshold=10"]

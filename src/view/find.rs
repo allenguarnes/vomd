@@ -475,6 +475,10 @@ impl View {
         if !self.find.focused {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        if let Some(outcome) = self.find_mac_key(key, text, mods) {
+            return Some(outcome);
+        }
         let outcome = match key {
             Key::Named(named) if !alt => self.find_named_key(*named, command, shift),
             Key::Character(c) if command && !alt => self.find_command_key(c.as_str()),
@@ -489,6 +493,56 @@ impl View {
         }
         self.find_type(&typed);
         Some(Outcome::Redraw)
+    }
+
+    /// The keys of a Mac text field, while the field has the keyboard: Option moves and deletes
+    /// by words, ⌘ moves to the start or the end and ⌘+Backspace (⌘+Delete) deletes to there,
+    /// and Option types the characters it makes (`å`, a dead key's accent). `None`: the key is
+    /// the others' (Ctrl keeps its meaning of the other systems).
+    #[cfg(target_os = "macos")]
+    fn find_mac_key(
+        &mut self,
+        key: &Key,
+        text: Option<&str>,
+        mods: ModifiersState,
+    ) -> Option<Outcome> {
+        let (line, word, shift) = (mods.super_key(), mods.alt_key(), mods.shift_key());
+        if mods.control_key() || !(line || word) {
+            return None;
+        }
+        let named = match key {
+            Key::Named(named) => *named,
+            Key::Character(_) if !line => {
+                let typed = find::typed_query(text?);
+                if typed.is_empty() {
+                    return None;
+                }
+                self.find_type(&typed);
+                return Some(Outcome::Redraw);
+            }
+            _ => return None,
+        };
+        Some(match named {
+            NamedKey::ArrowLeft if line => self.find_go(Motion::Home, shift),
+            NamedKey::ArrowRight if line => self.find_go(Motion::End, shift),
+            NamedKey::ArrowLeft => self.find_go(Motion::WordLeft, shift),
+            NamedKey::ArrowRight => self.find_go(Motion::WordRight, shift),
+            NamedKey::Backspace if line => self.find_edit(|f| {
+                if !f.has_selection() {
+                    f.go(Motion::Home, true);
+                }
+                f.backspace(false)
+            }),
+            NamedKey::Delete if line => self.find_edit(|f| {
+                if !f.has_selection() {
+                    f.go(Motion::End, true);
+                }
+                f.delete(false)
+            }),
+            NamedKey::Backspace => self.find_edit(|f| f.backspace(true)),
+            NamedKey::Delete => self.find_edit(|f| f.delete(true)),
+            _ => return None,
+        })
     }
 
     /// A named key that is the field's: a motion, a deletion, or a copy, cut or paste key.

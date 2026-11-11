@@ -185,8 +185,12 @@ impl Item {
     /// Tooltip and menu text: name and shortcut.
     pub fn label(self, ctx: &Ctx) -> String {
         match self {
+            // (Backspace is labelled "delete" on a Mac keyboard: ⌘[ is the Mac's own Back.)
+            #[cfg(not(target_os = "macos"))]
             Item::Back => "Back (Backspace)".into(),
-            Item::Open => "Open a file (Ctrl+O)".into(),
+            #[cfg(target_os = "macos")]
+            Item::Back => "Back (⌘[)".into(),
+            Item::Open => concat!("Open a file (", crate::cmd_key!("O"), ")").into(),
             #[cfg(feature = "toc")]
             Item::Contents if ctx.toc => "Hide contents (C)".into(),
             #[cfg(feature = "toc")]
@@ -199,9 +203,12 @@ impl Item {
             }
             Item::Animations if ctx.animations => "Pause animations (A)".into(),
             Item::Animations => "Play animations (A)".into(),
-            Item::ZoomOut => "Zoom out (Ctrl+−)".into(),
-            Item::ZoomReset => format!("Reset zoom {}% (Ctrl+0)", ctx.zoom),
-            Item::ZoomIn => "Zoom in (Ctrl+=)".into(),
+            Item::ZoomOut => concat!("Zoom out (", crate::cmd_key!("−"), ")").into(),
+            Item::ZoomReset => format!(
+                concat!("Reset zoom {}% (", crate::cmd_key!("0"), ")"),
+                ctx.zoom
+            ),
+            Item::ZoomIn => concat!("Zoom in (", crate::cmd_key!("="), ")").into(),
             Item::Wide if ctx.wide => "Normal width (W)".into(),
             Item::Wide => "Wide layout (W)".into(),
             Item::Theme => match ctx.theme {
@@ -212,10 +219,13 @@ impl Item {
             .into(),
             Item::Reload => "Reload (R)".into(),
             #[cfg(feature = "find")]
-            Item::Find if ctx.find => "Close find (Ctrl+F)".into(),
+            Item::Find if ctx.find => concat!("Close find (", crate::cmd_key!("F"), ")").into(),
             #[cfg(feature = "find")]
-            Item::Find => "Find (Ctrl+F)".into(),
+            Item::Find => concat!("Find (", crate::cmd_key!("F"), ")").into(),
+            #[cfg(not(target_os = "macos"))]
             Item::Settings => "Settings".into(),
+            #[cfg(target_os = "macos")]
+            Item::Settings => "Settings (⌘,)".into(),
             Item::More => "More".into(),
         }
     }

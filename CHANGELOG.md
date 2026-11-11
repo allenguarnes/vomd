@@ -3,6 +3,25 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- macOS 11 and newer on Apple Silicon, with everything VOMD does on Linux, as `VOMD.app`. The
+  release has a disk image, `vomd-<version>-aarch64-macos.dmg`: open it and drag VOMD onto
+  Applications. VOMD isn't notarized yet, so the first time it opens, macOS blocks it: click
+  Done, then Open Anyway in System Settings → Privacy & Security (see the README's Install
+  section).
+  - Shortcuts use `⌘` (`Ctrl` works too), and the find field edits like other Mac text fields
+    (Option for words, `⌘` for the start and end). `⌘R`, `⌘↑`/`⌘↓`, `⌘,` and `⌘M` are added, and
+    a trackpad pinch zooms.
+  - Copy and paste use the macOS pasteboard, and Open uses the system's Open panel. Files open
+    from Finder's Open With, a double-click, or a drop on the window or the Dock icon; one opened
+    while VOMD runs opens in the same window, and Back returns.
+  - Remote images are fetched with the system's `/usr/bin/curl`. SVGs are drawn in separate
+    processes with limits on their memory and CPU time, as on Linux and Windows. A saved file
+    reloads within about a second.
+  - The theme and the display's scale follow the system, and the title bar follows VOMD's theme.
+
 ## [1.9.0] - 2026-11-10
 
 ### Added
@@ -349,6 +368,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
+[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.9.0...HEAD
 [1.9.0]: https://github.com/allenguarnes/vomd/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/allenguarnes/vomd/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/allenguarnes/vomd/compare/v1.6.3...v1.7.0

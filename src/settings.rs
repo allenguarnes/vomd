@@ -414,7 +414,6 @@ pub fn path_from(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
         .or_else(|| nonempty("HOME").map(|h| h.join(".config")));
     #[cfg(target_os = "macos")]
-    // TODO(P14): untested.
     let base = nonempty("HOME").map(|h| h.join("Library/Application Support"));
     #[cfg(windows)]
     // TODO(P14): untested.
@@ -809,7 +808,7 @@ impl Store {
 }
 
 /// The template's lines for `primary_selection`, with its default (`on` or `off`).
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 macro_rules! primary {
     ($default:literal) => {
         concat!(
@@ -826,7 +825,7 @@ macro_rules! primary {
 }
 
 /// The template with the platform's lines for `primary_selection` (see [`DEFAULT_PRIMARY`]): its
-/// default, or none on Windows, which has no primary selection.
+/// default, or none on Windows and macOS, which have no primary selection.
 macro_rules! template {
     ($primary:expr) => {
         concat!(
@@ -888,9 +887,9 @@ macro_rules! template {
 /// default, with a line of explanation.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 pub const TEMPLATE: &str = template!(primary!("on"));
-#[cfg(not(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios"))))))]
+#[cfg(not(any(windows, unix)))]
 pub const TEMPLATE: &str = template!(primary!("off"));
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "ios"))]
 pub const TEMPLATE: &str = template!("");
 
 /// Create the file from [`TEMPLATE`] if it doesn't exist (a dangling symlink gets the file at

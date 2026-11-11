@@ -2041,7 +2041,11 @@ fn a_refused_image_says_why() {
             why > none + 20,
             "{why} {none}: the alt text's own, and the suffix"
         );
-        assert!(ctrl > why && linked > refused, "Ctrl+click");
+        // (macOS's "⌘-click" is shorter, and its ⌘ in no built-in face: its width says.)
+        assert!(
+            (ctrl > why || cfg!(target_os = "macos")) && linked > refused,
+            "Ctrl+click"
+        );
     }
     assert_eq!(
         Refusal::Pixels(9000, 8000).suffix(false),
@@ -2049,7 +2053,11 @@ fn a_refused_image_says_why() {
     );
     assert_eq!(
         Refusal::Memory(88 << 20).suffix(true),
-        " · too large (needs 88 MB) · Ctrl+click to load"
+        if cfg!(target_os = "macos") {
+            " · too large (needs 88 MB) · ⌘-click to load"
+        } else {
+            " · too large (needs 88 MB) · Ctrl+click to load"
+        }
     );
     assert_eq!(
         Refusal::Bytes(5 << 20).suffix(false),

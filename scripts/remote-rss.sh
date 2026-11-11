@@ -88,6 +88,11 @@ done
 [ -n "$port" ] || { echo "no server" >&2; exit 1; }
 cd "$root"
 export XDG_CONFIG_HOME="$dir/config"
+if [ "$(uname)" = Darwin ]; then
+    # (macOS reads its settings from under HOME: a scratch one, and cargo kept on the real one.)
+    export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+    export HOME="$dir/config"
+fi
 if [ -n "${REMOTE_RSS_BIN:-}" ]; then
     "$REMOTE_RSS_BIN" "http://127.0.0.1:$port" "${n:-0}" "$mode" "$poll"
 else

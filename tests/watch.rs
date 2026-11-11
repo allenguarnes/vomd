@@ -1,10 +1,10 @@
 //! The live reload watcher against a real directory: every way editors save a file is reported
 //! once, other files in the directory never are, and a file that goes away reads as gone. Runs on
-//! Linux (inotify) and Windows (the file's stamp, looked at every half second).
+//! Linux (inotify), Windows and macOS (the file's stamp, looked at every half second).
 //!
 //! Reports are waited for, never slept for ([`WAIT`] is only a limit). That nothing comes is
 //! checked by waiting [`NOTHING`]: a slow runner can only make that pass, never fail.
-#![cfg(any(target_os = "linux", windows))]
+#![cfg(any(target_os = "linux", windows, target_os = "macos"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -14,9 +14,13 @@ use vomd::view::Stamp;
 use vomd::watch::{self, Reloads, Reread, Watch};
 
 const WAIT: Duration = Duration::from_secs(30);
-/// Longer than the longest quiet period (on Windows, after the next look at the file), with room:
-/// a report that is going to come has by then.
-const NOTHING: Duration = Duration::from_millis(if cfg!(windows) { 1500 } else { 900 });
+/// Longer than the longest quiet period (on Windows and macOS, after the next look at the file),
+/// with room: a report that is going to come has by then.
+const NOTHING: Duration = Duration::from_millis(if cfg!(any(windows, target_os = "macos")) {
+    1500
+} else {
+    900
+});
 
 /// A fresh directory for one test, under the target directory (`/tmp` may be in memory).
 fn scratch(name: &str) -> PathBuf {

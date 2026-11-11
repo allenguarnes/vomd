@@ -1,6 +1,6 @@
 # Linux runs everything, budgets and packages included; Windows runs clippy, the tests and the
-# size budget; macOS is a compile check only (unsupported). Mirrors `just ci` and
-# `cargo xtask budgets`.
+# size budget; macOS (Apple Silicon) clippy, the tests, the budgets and a clipboard check.
+# Mirrors `just ci` and `cargo xtask budgets`.
 name: CI
 
 on:
@@ -112,12 +112,41 @@ jobs:
       - name: Size budget
         run: cargo xtask size
 
-  compile-check:
-    runs-on: macos-latest
+  macos:
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked
-      - run: cargo clippy --locked -- -D warnings
+      - name: Clippy (every feature set)
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --no-default-features --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features images,embed-fonts --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features svg --locked -- -D warnings
+      - name: Tests and goldens
+        run: cargo test --workspace --locked
+      - name: Tests without default features
+        run: cargo test --lib --no-default-features --features images,embed-fonts --locked
+      # The runner has a logged-in desktop, so windows open. Size, memory and idle CPU are gated;
+      # start and scroll times are reported (VOMD's own part of the start is gated on an idle
+      # machine, see `cargo xtask budgets`).
+      - name: Budgets
+        run: |
+          cargo xtask budgets --timings-advisory --report budgets-macos.md
+          cat budgets-macos.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: budgets-macos
+          path: budgets-macos.md
+          if-no-files-found: ignore
+      # Copies with VOMD's code and reads back with pbpaste, and the other way (the runner's own
+      # clipboard: never run it on a machine someone uses).
+      - name: Clipboard
+        run: cargo run --release --locked --example clip_probe
+      # The disk image as a release makes it, Finder's layout included when Finder can be
+      # driven here.
+      - name: Disk image
+        run: cargo xtask dist --release

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
+  <!-- The disk image's window (600 × 400 points): VOMD.app at (150, 190), Applications at
+       (450, 190), and VOMD's green arrow from one to the other. scripts/make-dmg-background.sh
+       makes the PNGs. -->
+  <rect width="600" height="400" fill="#f6f8fa"/>
+  <path d="M236 190H352" stroke="#607e60" stroke-width="6" stroke-linecap="round" fill="none"/>
+  <path d="M340 172L364 190L340 208" stroke="#607e60" stroke-width="6" stroke-linecap="round"
+        stroke-linejoin="round" fill="none"/>
+</svg>

@@ -12,8 +12,9 @@
 //! asks the owner of the selection for text, takes at most [`READ_CAP`] bytes of it, gives up
 //! after [`READ_WAIT`], and hands the text to a callback (see [`Clipboard::read`]). On Windows
 //! (`windows.rs`) a thread of its own owns the clipboard through a message-only window, and makes
-//! the text when a program asks for it too; Windows has no primary selection. macOS has no
-//! backend yet: a copy there does nothing, and a paste finds nothing.
+//! the text when a program asks for it too; Windows has no primary selection. On macOS
+//! (`macos.rs`) a copy writes the text to the general pasteboard at once, and a paste reads it on
+//! a thread; macOS has no primary selection either.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,8 @@ use winit::raw_window_handle::RawDisplayHandle;
 
 use crate::copy::Content;
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 mod wayland;
 #[cfg(windows)]
@@ -58,7 +61,11 @@ pub enum Which {
 
 /// A backend before its first copy, running, or unable to start (it says so once, and a copy
 /// then does nothing; the reason is kept for whoever asks).
-#[cfg(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios")))))]
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(unix, not(any(target_os = "macos", target_os = "ios")))
+))]
 #[derive(Debug)]
 enum Backend<T> {
     Idle,
@@ -66,7 +73,11 @@ enum Backend<T> {
     Failed(String),
 }
 
-#[cfg(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios")))))]
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(unix, not(any(target_os = "macos", target_os = "ios")))
+))]
 impl<T> Backend<T> {
     /// The running backend, started with `start` the first time (a failure is reported once, on
     /// a terminal). `Err` is why there is none.
@@ -102,7 +113,11 @@ impl Reply {
 
     /// The text read, if there was any (nothing at all is no text).
     #[cfg_attr(
-        not(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios"))))),
+        not(any(
+            windows,
+            target_os = "macos",
+            all(unix, not(any(target_os = "macos", target_os = "ios")))
+        )),
         allow(dead_code)
     )]
     fn send(mut self, text: Option<String>) {
@@ -147,6 +162,8 @@ pub struct Clipboard {
     wayland: Backend<wayland::Owner>,
     #[cfg(windows)]
     windows: Backend<windows::Owner>,
+    #[cfg(target_os = "macos")]
+    macos: Backend<macos::Owner>,
     /// A read is under way: one at a time, as a person pastes.
     reading: Arc<AtomicBool>,
 }
@@ -163,6 +180,8 @@ impl Clipboard {
             wayland: Backend::Idle,
             #[cfg(windows)]
             windows: Backend::Idle,
+            #[cfg(target_os = "macos")]
+            macos: Backend::Idle,
             reading: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -193,7 +212,16 @@ impl Clipboard {
             self.windows.get(windows::Owner::start)?.set(which, content);
             Ok(())
         }
-        #[cfg(not(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios"))))))]
+        #[cfg(target_os = "macos")]
+        {
+            self.macos.get(macos::Owner::start)?.set(which, content);
+            Ok(())
+        }
+        #[cfg(not(any(
+            windows,
+            target_os = "macos",
+            all(unix, not(any(target_os = "macos", target_os = "ios")))
+        )))]
         {
             let _ = (which, content);
             Err("this system has no clipboard support".into())
@@ -239,7 +267,16 @@ impl Clipboard {
             Ok(owner) => owner.read(which, reply),
             Err(_) => reply.send(None),
         }
-        #[cfg(not(any(windows, all(unix, not(any(target_os = "macos", target_os = "ios"))))))]
+        #[cfg(target_os = "macos")]
+        match self.macos.get(macos::Owner::start) {
+            Ok(owner) => owner.read(which, reply),
+            Err(_) => reply.send(None),
+        }
+        #[cfg(not(any(
+            windows,
+            target_os = "macos",
+            all(unix, not(any(target_os = "macos", target_os = "ios")))
+        )))]
         {
             let _ = which;
             drop(reply);
@@ -249,7 +286,8 @@ impl Clipboard {
     /// The window is closing: if the clipboard is ours, let a clipboard manager keep it, which
     /// X11 needs (a selection goes with its owner) and a manager may do (the desktop's own
     /// do, and Wayland's data-control ones copy it themselves). Waits a second at the most. On
-    /// Windows the text is made for the clipboard to keep (a few seconds at the most).
+    /// Windows the text is made for the clipboard to keep (a few seconds at the most). (The
+    /// macOS pasteboard has the text already.)
     pub fn save(&self) {
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
         if let Backend::Running(x11) = &self.x11 {

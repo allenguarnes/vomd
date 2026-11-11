@@ -30,6 +30,7 @@ You need:
   and rustup installs it on the first build.
 - **[just](https://github.com/casey/just)** (optional) for the shortcuts below.
 - **Windows:** the Visual Studio Build Tools with the "Desktop development with C++" workload.
+- **macOS** (Apple Silicon): the Xcode Command Line Tools (`xcode-select --install`).
 - **Some checks only:** a display (the performance budgets) and docker (the clipboard and
   packaging checks).
 
@@ -43,7 +44,7 @@ cargo run --release -- README.md
 
 | Command | What it does |
 |---|---|
-| `just ci` | Everything CI checks: formatting, clippy for every feature set, the tests, Windows and macOS compile checks, and the size budget |
+| `just ci` | What CI checks on Linux: formatting, clippy for every feature set, the tests, Windows and macOS compile checks, and the size budget (CI also runs the Windows and macOS (Apple Silicon) tests) |
 | `just test` | The tests, with the default features and two smaller feature sets |
 | `just clippy` | Clippy for every feature set, warnings as errors |
 | `just budgets` | Every performance budget, on release builds (needs a display) |
@@ -52,6 +53,11 @@ cargo run --release -- README.md
 
 The macOS and Windows compile checks (`just check-other`) need
 `rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin`.
+
+On a Mac, `cargo test --workspace`, `just clippy`, `cargo xtask size`, `cargo xtask budgets` and
+`cargo xtask dist` work as on Linux. The clipboard check on macOS is
+`cargo run --release --example clip_probe`, which replaces what is on your clipboard: CI runs it,
+and on your own Mac copy and paste by hand instead.
 
 ## Tests
 
@@ -86,6 +92,9 @@ fails when one is missed.
   idle Wayland window may not be drawn at all.
 - `cargo xtask bench [fixture]` and the programs in `examples/` (`paint_bench`, `layout_bench`,
   `parse_bench`, …) measure single parts more closely.
+- On macOS, `cargo xtask budgets` gates size, idle CPU and memory (Activity Monitor's figure,
+  with its own budgets); the start time is reported but not gated, since about 100 ms of it is
+  AppKit's. VOMD's own part of the start (from the window to the first frame) is gated instead.
 
 If your change makes VOMD bigger or slower, say so in the pull request, with numbers.
 
@@ -138,13 +147,20 @@ the script (a test checks that the font has every character of the table).
 
 | Command | What it does |
 |---|---|
-| `cargo xtask dist` | The release tarball (Linux) or zip (Windows) in `dist/` |
+| `cargo xtask dist` | The release tarball (Linux), zip (Windows) or disk image (macOS) in `dist/` |
 | `scripts/pkg-build.sh` | The tarball, `.deb` and AppImage, built in a Debian 12 container as CI does (needs docker) |
 | `scripts/pkg-check.sh` | Installs and runs the `.deb` and AppImage on Debian 12, Debian 13 and Ubuntu 24.04 (needs docker) |
 | `just aur` | Builds and checks both Arch packages offline, without installing them (commit first) |
 
 Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed. The release
 notes are that version's section of `CHANGELOG.md`.
+
+On macOS, `cargo xtask dist` makes `VOMD.app` (from `packaging/macos/Info.plist`), signs it ad
+hoc and checks the signature, and puts it in a disk image with a link to Applications.
+`cargo xtask dist --release` (what the release job runs) also lays out the disk image's window
+through Finder, which macOS asks you to allow the first time; without it the image has no
+layout. The app icon and the window's background are made once and committed:
+`scripts/make-icns.sh` and `scripts/make-dmg-background.sh`.
 
 ## Vendored crates
 

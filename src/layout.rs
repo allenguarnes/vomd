@@ -118,7 +118,11 @@ impl Refusal {
             Refusal::Ceiling(n) => return format!(" · too large to load (needs {})", mb(n)),
             Refusal::Failed => return " · couldn't load".to_owned(),
         };
+        // (The modifier is `platform::image_modifier`'s.)
+        #[cfg(not(target_os = "macos"))]
         let click = if link { "Ctrl+click" } else { "click" };
+        #[cfg(target_os = "macos")]
+        let click = if link { "⌘-click" } else { "click" };
         format!(" · {why} · {click} to load")
     }
 }

@@ -43,6 +43,18 @@ wayland-client = { version = "0.31", optional = true }
 wayland-backend = { version = "0.3", optional = true, features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.32", optional = true, default-features = false, features = ["client", "unstable"] }
 
+# macOS: the Objective-C runtime and AppKit bindings winit already builds, at its versions, for
+# the clipboard (NSPasteboard), Open's panel (NSOpenPanel) and the files Finder hands over. Only
+# features of the same crates are added (bindings: nothing is built that isn't called).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+block2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSThread", "NSURL"] }
+objc2-app-kit = { version = "0.2", features = [
+    "block2", "NSApplication", "NSOpenPanel", "NSPanel", "NSPasteboard", "NSResponder",
+    "NSSavePanel", "NSView", "NSWindow",
+] }
+
 # A requestor and a clipboard manager for scripts/clipboard-check.sh.
 [[example]]
 name = "clip_probe"

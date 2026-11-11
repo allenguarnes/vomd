@@ -41,7 +41,7 @@ pub fn font_dirs() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        // TODO(P14): untested.
+        // (`Supplemental` is reached by the walk of the system's.)
         dirs.extend(home.as_ref().map(|h| h.join("Library/Fonts")));
         dirs.push("/Library/Fonts".into());
         dirs.push("/System/Library/Fonts".into());
@@ -134,6 +134,11 @@ fn preferred(c: char) -> &'static [&'static str] {
         "yugothr.ttc",
         "malgun.ttf",
         "pingfang.ttc",
+        // macOS's own files (PingFang is a download there, not a file of the system's).
+        #[cfg(target_os = "macos")]
+        "hiragino sans gb.ttc",
+        #[cfg(target_os = "macos")]
+        "applesdgothicneo.ttc",
     ];
     const ARABIC: &[&str] = &[
         "notosansarabic-regular.ttf",
@@ -148,8 +153,18 @@ fn preferred(c: char) -> &'static [&'static str] {
         "segoeui.ttf",
         "arialhb.ttc",
     ];
-    const DEVANAGARI: &[&str] = &["notosansdevanagari-regular.ttf", "mangal.ttf"];
-    const THAI: &[&str] = &["notosansthai-regular.ttf", "leelawui.ttf"];
+    const DEVANAGARI: &[&str] = &[
+        "notosansdevanagari-regular.ttf",
+        "mangal.ttf",
+        #[cfg(target_os = "macos")]
+        "devanagari sangam mn.ttc",
+    ];
+    const THAI: &[&str] = &[
+        "notosansthai-regular.ttf",
+        "leelawui.ttf",
+        #[cfg(target_os = "macos")]
+        "thonburiui.ttc",
+    ];
     const GENERIC: &[&str] = &[
         "notosans-regular.ttf",
         "dejavusans.ttf",
@@ -160,6 +175,11 @@ fn preferred(c: char) -> &'static [&'static str] {
         "notosanssymbols2-regular.ttf",
         "notosansmath-regular.ttf",
         "segoeuisymbol.ttf",
+        // macOS's: ⌘ and ⌥ (the shortcuts' labels) are in Apple Symbols and no built-in face.
+        #[cfg(target_os = "macos")]
+        "apple symbols.ttf",
+        #[cfg(target_os = "macos")]
+        "arial unicode.ttf",
     ];
     match c as u32 {
         0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF => EMOJI,

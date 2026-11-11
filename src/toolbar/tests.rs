@@ -461,8 +461,17 @@ fn hidden_bar_takes_nothing() {
 #[test]
 fn labels_name_the_shortcut() {
     let c = ctx(900);
-    assert_eq!(Item::Back.label(&c), "Back (Backspace)");
-    assert_eq!(Item::Open.label(&c), "Open a file (Ctrl+O)");
+    if cfg!(target_os = "macos") {
+        assert_eq!(Item::Back.label(&c), "Back (⌘[)");
+        assert_eq!(Item::Open.label(&c), "Open a file (⌘O)");
+        assert_eq!(Item::ZoomIn.label(&c), "Zoom in (⌘=)");
+        assert_eq!(Item::Settings.label(&c), "Settings (⌘,)");
+    } else {
+        assert_eq!(Item::Back.label(&c), "Back (Backspace)");
+        assert_eq!(Item::Open.label(&c), "Open a file (Ctrl+O)");
+        assert_eq!(Item::ZoomIn.label(&c), "Zoom in (Ctrl+=)");
+        assert_eq!(Item::Settings.label(&c), "Settings");
+    }
     assert!(Item::ZoomReset.label(&c).contains("100%"));
     assert_eq!(
         Item::Theme.label(&Ctx {
@@ -766,10 +775,13 @@ fn wide_button_names_and_draws_the_layout_it_switches_to() {
 #[test]
 fn the_find_button_shows_whether_the_bar_is_open() {
     let c = ctx(900);
-    assert_eq!(Item::Find.label(&c), "Find (Ctrl+F)");
+    assert_eq!(
+        Item::Find.label(&c),
+        concat!("Find (", crate::cmd_key!("F"), ")")
+    );
     assert_eq!(
         Item::Find.label(&Ctx { find: true, ..c }),
-        "Close find (Ctrl+F)"
+        concat!("Close find (", crate::cmd_key!("F"), ")")
     );
     let s = slots(&c);
     let r = |i| s.items.iter().find(|(x, _)| *x == i).unwrap().1;

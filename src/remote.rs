@@ -172,8 +172,13 @@ pub fn fetchable(url: &str) -> bool {
 
 /// The `curl` to run. On Windows the one the system ships (`System32\curl.exe`, there since
 /// Windows 10 1803) when it is there: a bare name would also be looked for in the directory
-/// VOMD was started from, such as a downloads folder, before the system's. Elsewhere `curl`,
-/// found on `PATH`.
+/// VOMD was started from, such as a downloads folder, before the system's. On macOS the
+/// system's too (`/usr/bin/curl`), not whichever one a shell's `PATH` names first; builds with
+/// debug assertions (the tests) look on `PATH` there, so a test can stand its own in (a
+/// `--release` test run on macOS therefore fetches with the real one; there is no override from
+/// the environment, which would let a `PATH`-like variable pick the program in a release build
+/// too). Elsewhere
+/// `curl`, found on `PATH`.
 fn curl() -> String {
     #[cfg(windows)]
     if let Some(system) = std::env::var_os("SystemRoot")
@@ -183,7 +188,14 @@ fn curl() -> String {
     {
         return system;
     }
-    "curl".into()
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        "/usr/bin/curl".into()
+    }
+    #[cfg(not(all(target_os = "macos", not(debug_assertions))))]
+    {
+        "curl".into()
+    }
 }
 
 /// Fetch `url` with the system `curl` within `limits`.

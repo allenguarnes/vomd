@@ -143,6 +143,12 @@ pub enum Action {
     ToggleAnimations,
     /// Choose a file to open (`Ctrl+O`).
     Open,
+    /// Open the settings file, as the toolbar's ⚙ does (`⌘,`).
+    #[cfg(target_os = "macos")]
+    Settings,
+    /// Minimize the window (`⌘M`: winit's menu has no Window menu to give it).
+    #[cfg(target_os = "macos")]
+    Minimize,
     Quit,
 }
 
@@ -170,6 +176,12 @@ pub enum Outcome {
     /// thread), and give the text to [`View::find_paste`] with the ticket of [`View::find_ticket`].
     #[cfg(all(feature = "clipboard", feature = "find"))]
     Paste(crate::clipboard::Which),
+    /// Open the settings file (the shell does, as for the toolbar's ⚙).
+    #[cfg(target_os = "macos")]
+    Settings,
+    /// Minimize the window.
+    #[cfg(target_os = "macos")]
+    Minimize,
     Quit,
 }
 
@@ -270,8 +282,20 @@ pub fn key_action(key: &Key, mods: ModifiersState) -> Option<Action> {
                 "c" | "C" => Some(Action::Copy),
                 // Cmd+[ is the macOS back key; Ctrl+[ goes back on Linux too.
                 "[" => Some(Action::Back),
+                // The Mac's own: reload, the settings, minimize.
+                #[cfg(target_os = "macos")]
+                "r" | "R" => Some(Action::Reload),
+                #[cfg(target_os = "macos")]
+                "," => Some(Action::Settings),
+                #[cfg(target_os = "macos")]
+                "m" | "M" => Some(Action::Minimize),
                 _ => None,
             },
+            // ⌘↑ and ⌘↓ go to the top and the bottom on a Mac.
+            #[cfg(target_os = "macos")]
+            Key::Named(NamedKey::ArrowUp) => Some(Action::Top),
+            #[cfg(target_os = "macos")]
+            Key::Named(NamedKey::ArrowDown) => Some(Action::Bottom),
             // Ctrl+Insert is the old copy, and the Copy key is the keyboard's own.
             #[cfg(feature = "clipboard")]
             Key::Named(NamedKey::Insert) if mods.control_key() => Some(Action::Copy),
@@ -1175,6 +1199,10 @@ impl View {
             }
             Action::Reload => return Outcome::Reload,
             Action::Open => return Outcome::Open,
+            #[cfg(target_os = "macos")]
+            Action::Settings => return Outcome::Settings,
+            #[cfg(target_os = "macos")]
+            Action::Minimize => return Outcome::Minimize,
             Action::ToggleWide => self.set_wide(!self.wide),
             #[cfg(feature = "toc")]
             Action::ToggleToc => self.set_toc(!self.toc.open),
