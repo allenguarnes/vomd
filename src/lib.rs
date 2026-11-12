@@ -29,4 +29,6 @@ pub mod text;
 pub mod theme;
 pub mod toolbar;
 pub mod view;
+#[cfg(feature = "images")]
+pub(crate) mod viewer;
 pub mod watch;

@@ -71,7 +71,7 @@ pub(crate) mod icon {
     pub const CHEVRON_UP: char = '\u{e070}';
     #[cfg(feature = "find")]
     pub const CHEVRON_DOWN: char = '\u{e06d}';
-    #[cfg(feature = "find")]
+    #[cfg(any(feature = "find", feature = "images"))]
     pub const CLOSE: char = '\u{e1b2}';
 }
 

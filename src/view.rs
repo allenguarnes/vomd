@@ -19,7 +19,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use crate::cli::Input;
 use crate::doc::{Doc, Heading};
 use crate::fonts::Fonts;
-use crate::image::{AnimState, Images, Wake as ImageWake};
+use crate::image::{Images, Wake as ImageWake};
 use crate::layout::{Anchor, BlockBox, ImageSize, Layout, Params};
 use crate::platform;
 use crate::render::{self, Clip, Frame, ScrollbarFade, Viewport};
@@ -40,6 +40,8 @@ mod find;
 mod gesture;
 #[cfg(feature = "toc")]
 mod toc;
+#[cfg(feature = "images")]
+mod viewer;
 
 #[cfg(feature = "clipboard")]
 pub use copybtn::CodeCopy;
@@ -70,13 +72,6 @@ pub const BLOCKED_NOTE: &str = "Remote image blocked · press I to load";
 pub const FORCE_NOTE: &str = "Over VOMD's image limits · click to load anyway";
 /// What hovering an SVG drawn without some of its embedded images says (a click draws them).
 pub const PARTIAL_NOTE: &str = "Some embedded images were skipped · click to load anyway";
-/// What hovering an animated image says, outside a link (a click plays or pauses it): paused,
-/// playing, waiting for the animations above it to scroll off, or over VOMD's limits.
-pub const PLAY_NOTE: &str = "Click to play";
-pub const PAUSE_NOTE: &str = "Click to pause";
-pub const WAITING_NOTE: &str = "Plays when the animations above it scroll off · click to play now";
-pub const ANIM_OVER_NOTE: &str = "Over VOMD's animation limits · click to play anyway";
-pub const ANIM_FAILED_NOTE: &str = "Couldn't load the animation · click to try again";
 /// Passes [`View::bottom`] makes: measuring the last screen changes the total height.
 const BOTTOM_PASSES: usize = 4;
 
@@ -387,17 +382,6 @@ pub fn hover_change(pointer: bool, hovered: bool, changed: bool) -> HoverChange 
     }
 }
 
-/// What hovering an animated image in `state` says: what a click on it does.
-fn anim_note(state: AnimState) -> &'static str {
-    match state {
-        AnimState::Playing => PAUSE_NOTE,
-        AnimState::Paused => PLAY_NOTE,
-        AnimState::Waiting => WAITING_NOTE,
-        AnimState::Over => ANIM_OVER_NOTE,
-        AnimState::Failed => ANIM_FAILED_NOTE,
-    }
-}
-
 /// The notice for a document of `len` bytes: `None` up to [`LARGE_FILE`].
 pub fn large_notice(len: usize) -> Option<String> {
     (len > LARGE_FILE).then(|| format!("This file is {} MB, so it may be slow", len >> 20))
@@ -583,16 +567,18 @@ pub struct View {
     hover: Option<u32>,
     /// What the image under the pointer says at the bottom: a blocked remote image's
     /// placeholder ([`BLOCKED_NOTE`]), one a click loads past the limits ([`FORCE_NOTE`],
-    /// [`PARTIAL_NOTE`]), an animation a click plays or pauses ([`PLAY_NOTE`], ...).
+    /// [`PARTIAL_NOTE`]).
     hover_note: Option<&'static str>,
-    /// The pointer is on an image a click loads past the limits, or plays or pauses (outside a
-    /// link): the hand.
+    /// The pointer is on an image a click loads past the limits, or opens in the viewer
+    /// (outside a link): the hand.
     hover_force: bool,
     /// The link the mouse button went down on; a click is a release on the same link.
     pressed: Option<u32>,
-    /// The image a click loads past the limits, or plays or pauses, that the mouse button went
-    /// down on (with Ctrl in a link); a click is a release on it.
+    /// The image a click loads past the limits, or opens in the viewer, that the mouse button
+    /// went down on (with Ctrl in a link), and when and where: a click is a release on it.
     pressed_image: Option<u32>,
+    #[cfg(feature = "images")]
+    pressed_at: Option<(Instant, (f64, f64))>,
     /// Ctrl is held down (a click on an image in a link loads it, and doesn't follow the link).
     ctrl: bool,
     /// While a message replaces a reloaded document: the reading position of the last good
@@ -634,6 +620,9 @@ pub struct View {
     /// The find bar: whether it is open, the query and the matches.
     #[cfg(feature = "find")]
     find: find::Bar,
+    /// The image viewer, while it is open.
+    #[cfg(feature = "images")]
+    viewer: Option<Box<crate::viewer::Viewer>>,
 }
 
 impl View {
@@ -710,6 +699,8 @@ impl View {
             hover_force: false,
             pressed: None,
             pressed_image: None,
+            #[cfg(feature = "images")]
+            pressed_at: None,
             ctrl: false,
             kept: None,
             images: Images::default(),
@@ -732,6 +723,8 @@ impl View {
             toc: toc::Panel::default(),
             #[cfg(feature = "find")]
             find: find::Bar::default(),
+            #[cfg(feature = "images")]
+            viewer: None,
         };
         view.images.set_base(base);
         #[cfg(feature = "svg")]
@@ -817,6 +810,8 @@ impl View {
         self.announced &= !none;
         self.images_dirty = true;
         self.ensure();
+        #[cfg(feature = "images")]
+        self.viewer_theme(Instant::now());
         true
     }
 
@@ -1045,6 +1040,8 @@ impl View {
         }
         self.top_inset = self.top_inset_wanted.min(height);
         self.relayout();
+        #[cfg(feature = "images")]
+        self.viewer_area(Instant::now());
     }
 
     pub fn set_hidpi(&mut self, hidpi: f64) {
@@ -1056,6 +1053,8 @@ impl View {
         self.top_inset_wanted = self.chrome_inset();
         self.top_inset = self.top_inset_wanted.min(self.height);
         self.relayout();
+        #[cfg(feature = "images")]
+        self.viewer_area(Instant::now());
     }
 
     /// New layout parameters; the anchor keeps the reading position. The blocks around it are
@@ -1118,6 +1117,11 @@ impl View {
 
     /// Wheel notches (line deltas, positive = down).
     pub fn wheel_lines(&mut self, lines: f64, now: Instant) {
+        // (The image viewer's wheel is its own: [`View::viewer_wheel`].)
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return;
+        }
         #[cfg(feature = "toc")]
         if self.toc_wheel_lines(lines) {
             return;
@@ -1129,6 +1133,10 @@ impl View {
     /// the pointer is over it, else the document (and the toolbar's dropdown) does, as in
     /// [`View::scroll_by`].
     pub fn wheel_by(&mut self, dy: f64, now: Instant) {
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return;
+        }
         // The find bar has nothing to scroll, and the document below it is out of reach.
         #[cfg(feature = "find")]
         if self.find_wheel() {
@@ -1144,6 +1152,11 @@ impl View {
     /// Ctrl + trackpad scroll by `pixels` (positive = zoom in): a zoom step for every
     /// [`ZOOM_PIXELS`] gathered, the rest kept for the next event of the gesture.
     pub fn zoom_wheel(&mut self, pixels: f64, now: Instant) {
+        // (A pinch zooms the image in the viewer.)
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return self.viewer_zoom_pixels(pixels, now);
+        }
         self.zoom_pixels += pixels;
         while self.zoom_pixels.abs() >= ZOOM_PIXELS {
             let up = self.zoom_pixels > 0.0;
@@ -1281,6 +1294,10 @@ impl View {
     /// Returns true if the window needs a repaint: the toolbar or the scrollbar took the press, the
     /// selection changed, or the find bar's field lost the keyboard.
     pub fn press(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return self.viewer_press(x, y, now);
+        }
         self.pressed_image = None;
         #[cfg(feature = "clipboard")]
         self.cancel_copy();
@@ -1329,14 +1346,18 @@ impl View {
         #[cfg(not(feature = "find"))]
         let blurred = false;
         self.pressed = if taken { None } else { self.link_at(x, y) };
-        // An image a click loads past the limits, or plays or pauses: outside a link, or with
-        // Ctrl in one (whose link isn't followed then).
-        if !taken && let Some(id) = self.forceable_at(x, y).or_else(|| self.playable_at(x, y)) {
+        // An image a click loads past the limits, or opens in the viewer: outside a link, or
+        // with Ctrl (⌘) in one (whose link isn't followed then).
+        if !taken && let Some(id) = self.forceable_at(x, y).or_else(|| self.open_at(x, y)) {
             if self.pressed.is_none() {
                 self.pressed_image = Some(id);
             } else if self.ctrl {
                 self.pressed = None;
                 self.pressed_image = Some(id);
+            }
+            #[cfg(feature = "images")]
+            {
+                self.pressed_at = Some((now, (x, y)));
             }
         }
         // Not the scrollbar's either: a press on text, which may start a selection.
@@ -1533,6 +1554,10 @@ impl View {
 
     /// [`View::hover`] at a given time (the toolbar's tooltip timer starts then).
     pub fn hover_at(&mut self, x: f64, y: f64, now: Instant) -> bool {
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return self.viewer_hover(x, y);
+        }
         self.ensure_content();
         let ctx = self.toolbar_ctx();
         let bar = self.toolbar.pointer(&ctx, x, y, now);
@@ -1561,24 +1586,19 @@ impl View {
                 .image_at(x, y)
                 .is_some_and(|id| self.images.blocked(id));
         let force = if free { self.forceable_at(x, y) } else { None };
-        let play = if free && force.is_none() {
-            self.playable_at(x, y)
-        } else {
-            None
-        };
+        let open = free && force.is_none() && self.open_at(x, y).is_some();
         let hover_note = if blocked {
             Some(BLOCKED_NOTE)
-        } else if let Some(id) = force {
-            Some(if self.images.partial(id) {
-                PARTIAL_NOTE
-            } else {
-                FORCE_NOTE
-            })
         } else {
-            play.and_then(|id| self.images.anim_state(id))
-                .map(anim_note)
+            force.map(|id| {
+                if self.images.partial(id) {
+                    PARTIAL_NOTE
+                } else {
+                    FORCE_NOTE
+                }
+            })
         };
-        self.hover_force = (force.is_some() || play.is_some()) && link.is_none();
+        self.hover_force = (force.is_some() || open) && link.is_none();
         let note = std::mem::replace(&mut self.hover_note, hover_note) != hover_note;
         #[cfg(feature = "clipboard")]
         let note = note | self.copy_pointer(Some((x, y)));
@@ -1588,6 +1608,10 @@ impl View {
     /// The pointer left the window. Returns true if a link was hovered (or the toolbar needs a
     /// repaint).
     pub fn hover_end(&mut self) -> bool {
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return self.viewer_leave();
+        }
         let note = std::mem::take(&mut self.hover_note).is_some();
         self.hover_force = false;
         // The last position is kept: coming back somewhere else is a move (the bar holds), coming
@@ -1635,20 +1659,18 @@ impl View {
             self.click_toc(row, x, y);
             return None;
         }
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            self.viewer_click(x, y, Instant::now());
+            return None;
+        }
         if let Some(id) = self.pressed_image.take() {
             self.ensure_content();
             if self.forceable_at(x, y) == Some(id) {
                 self.images.force(id, &self.doc, &mut self.layout);
-            } else if self.playable_at(x, y) == Some(id) {
-                if self.images.anim_state(id) == Some(AnimState::Playing) {
-                    self.images.pause(id);
-                } else {
-                    self.images.play(id);
-                }
-                // The note says what the next click does.
-                if self.hover_note.is_some() {
-                    self.hover_note = self.images.anim_state(id).map(anim_note);
-                }
+            } else if self.open_at(x, y) == Some(id) {
+                #[cfg(feature = "images")]
+                self.open_viewer(id, self.pressed_at, Instant::now());
             }
             return None;
         }
@@ -1762,6 +1784,11 @@ impl View {
     /// Paint the window, or what [`Frame::set_limit`] leaves of it; `whole` is a new frame
     /// (else the frame painted last is painted again in part).
     fn paint_frame(&mut self, frame: &mut Frame, now: Instant, whole: bool) {
+        // The image viewer covers everything.
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return self.paint_viewer(frame, now, whole);
+        }
         let w = self.width as usize;
         let theme = self.palette();
         if let Some(text) = self.message.clone() {
@@ -1817,7 +1844,7 @@ impl View {
             }
             let note = self.hovered().or(self.hover_note);
             if let Some(text) = note.map(str::to_owned) {
-                self.paint_preview(frame, &text, theme);
+                self.paint_preview(frame, &text, theme, false);
             }
             if let Some((_, text)) = self.toast.clone() {
                 self.paint_toast(frame, &text, theme, false);
@@ -1844,14 +1871,22 @@ impl View {
         );
     }
 
-    /// The hovered link's target in a small box at the bottom left, cut short with
-    /// an ellipsis when it doesn't fit.
-    fn paint_preview(&mut self, frame: &mut Frame, url: &str, theme: &Theme) {
+    /// The hovered link's target in a small box at the bottom left, cut short with an ellipsis
+    /// when it doesn't fit; or `centered`, the image viewer's alt text, in the box and at the
+    /// height of its zoom label ([`View::paint_toast`]).
+    fn paint_preview(&mut self, frame: &mut Frame, url: &str, theme: &Theme, centered: bool) {
         let (w, h) = (frame.width() as f32, frame.height() as f32);
         // The box sits in what shows of the document, right of the contents panel.
-        let left = self.panel_width() as f32;
-        let scale = self.scale();
-        let size = PREVIEW_SIZE * scale;
+        let left = if centered {
+            0.0
+        } else {
+            self.panel_width() as f32
+        };
+        let (scale, size) = if centered {
+            (self.hidpi as f32, 13.0 * self.hidpi as f32)
+        } else {
+            (self.scale(), PREVIEW_SIZE * self.scale())
+        };
         let style = TextStyle {
             bold: false,
             italic: false,
@@ -1862,7 +1897,11 @@ impl View {
             shift: 0.0,
             link: 0,
         };
-        let (pad_x, pad_y, margin) = (0.5 * size, 0.3 * size, (4.0 * scale).round());
+        let (pad_x, pad_y, margin) = if centered {
+            (0.8 * size, 0.5 * size, (12.0 * scale).round())
+        } else {
+            (0.5 * size, 0.3 * size, (4.0 * scale).round())
+        };
         let max_w = ((w - left) * 0.6)
             .min(w - left - 2.0 * (margin + pad_x))
             .max(size);
@@ -1871,10 +1910,15 @@ impl View {
             .extend(pl.missing.iter().filter(|c| !self.tried.contains(c)));
         let box_w = pl.width.min(max_w) + 2.0 * pad_x;
         let box_h = pl.height + 2.0 * pad_y;
-        let (x0, y1) = (left + margin, h - margin);
+        let x0 = if centered {
+            ((w - box_w) / 2.0).round()
+        } else {
+            left + margin
+        };
+        let y1 = h - margin;
         let y0 = y1 - box_h;
         let px = |v: f32| v.round() as i32;
-        let r = (0.3 * size).round();
+        let r = (if centered { 0.4 } else { 0.3 } * size).round();
         let rect = (px(x0), px(y0), px(x0 + box_w), px(y1));
         frame.rounded_rect(rect, r, None, theme.code_bg, 255);
         frame.rounded_rect(rect, r, Some(scale.round().max(1.0)), theme.border, 255);
@@ -1904,6 +1948,13 @@ impl View {
     /// toolbar (`top`: the large-file notice).
     fn paint_toast(&mut self, frame: &mut Frame, text: &str, theme: &Theme, top: bool) {
         let (w, h) = (frame.width() as f32, frame.height() as f32);
+        #[cfg(feature = "images")]
+        let left = if self.viewing() {
+            0.0
+        } else {
+            self.panel_width() as f32
+        };
+        #[cfg(not(feature = "images"))]
         let left = self.panel_width() as f32;
         let scale = self.hidpi as f32;
         let size = 13.0 * scale;
@@ -2099,6 +2150,8 @@ impl View {
             self.images.deadline(),
             #[cfg(feature = "images")]
             self.anim_deadline(),
+            #[cfg(feature = "images")]
+            self.viewer_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -2136,6 +2189,8 @@ impl View {
         #[cfg(feature = "images")]
         let images =
             images | (self.anim_deadline().is_some_and(|t| now >= t) && !self.anim_damage(now));
+        #[cfg(feature = "images")]
+        let images = images | self.viewer_expire(now);
         fade | pulse
             | toast
             | notice
@@ -2161,6 +2216,10 @@ impl View {
     fn anim_damage(&mut self, now: Instant) -> bool {
         let area = self.viewport().area;
         let ids = self.images.advance(now);
+        // (The viewer is painted whole.)
+        if self.viewing() {
+            return false;
+        }
         let Some(boxes) = self.images.anim_boxes(&ids) else {
             return false;
         };
@@ -2398,6 +2457,8 @@ impl View {
         if !self.images.poll(&self.doc, &mut self.layout) {
             return false;
         }
+        #[cfg(feature = "images")]
+        self.viewer_poll(now);
         if !no_curl && self.images.no_curl() && !self.toolbar.visible() {
             self.toast = Some((now + TOAST, "Remote images: curl not found".into()));
         }
@@ -2440,24 +2501,25 @@ impl View {
         (refused || self.images.partial(id)).then_some(id)
     }
 
-    /// The animated image at (`x`, `y`) that a click plays or pauses: one shown (not its
-    /// placeholder) that VOMD can play.
-    fn playable_at(&self, x: f64, y: f64) -> Option<u32> {
-        if !self.images.has_animated() {
-            return None;
+    /// The image at (`x`, `y`) that a click opens in the viewer ([`View::openable_at`]).
+    fn open_at(&self, x: f64, y: f64) -> Option<u32> {
+        #[cfg(feature = "images")]
+        return self.openable_at(x, y);
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = (x, y);
+            None
         }
-        let id = self.image_at(x, y)?;
-        let shown = !matches!(self.layout.image_size(id), Some(ImageSize::Refused(_)));
-        (shown && self.images.anim_state(id).is_some()).then_some(id)
     }
 
-    /// The pointer is on an image a click loads past VOMD's limits, or plays or pauses, outside a
-    /// link: the hand.
+    /// The pointer is on an image a click loads past VOMD's limits, or opens in the viewer,
+    /// outside a link: the hand.
     pub fn over_force(&self) -> bool {
         self.hover_force
     }
 
-    /// Ctrl is held down: a click on an image in a link that says "Ctrl+click to load" loads it.
+    /// Ctrl (⌘ on macOS) is held down: a click on an image in a link that says "Ctrl+click to
+    /// load" loads it, and one on an image in a link opens it in the viewer.
     pub fn set_ctrl(&mut self, ctrl: bool) {
         self.ctrl = ctrl;
     }
@@ -2492,6 +2554,8 @@ impl View {
     }
 
     fn open_doc(&mut self, doc: Doc, message: Option<String>) {
+        #[cfg(feature = "images")]
+        self.close_viewer();
         self.doc = self.themed(doc);
         self.message = message;
         self.layout = self.new_layout();
@@ -2565,6 +2629,13 @@ impl View {
         self.refresh_toc();
         // A reload keeps remote images on.
         self.attach_images();
+        // The viewer stays open on its image; a message in the document's place closes it.
+        #[cfg(feature = "images")]
+        if self.message.is_some() {
+            self.close_viewer();
+        } else {
+            self.viewer_reload(Instant::now());
+        }
         self.anchor = Anchor::TOP;
         // The matches are those of the new text, and the current one is the first from where the
         // position ends up: nothing scrolls.

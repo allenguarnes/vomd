@@ -1,5 +1,6 @@
 //! An SVG drawn in a process of its own: VOMD's own binary, started with [`ARG`], which reads the
-//! job on its stdin, draws it as [`render_in`] does, writes what it made on its stdout, and exits.
+//! job on its stdin, draws it as [`render_part`] does, writes what it made on its stdout, and
+//! exits.
 //!
 //! usvg's parse and parts of resvg can't be stopped once started, and what they do grows faster
 //! than the counts before the parse can always say: in a process, a drawing that takes too long
@@ -24,10 +25,12 @@
 //! on macOS, where it can be, a child is only started while the file is the one VOMD started
 //! from).
 //!
-//! The job, little-endian: the box (`u32` × 2), the charge (`u64`), forced (`u8`) and the forced
-//! load's memory (`u64`), a test mode (`u8`, [`set_test`]), the SVG's record (`SvgCost`), the
-//! faces (none, or the regular and mono faces' places and each face's index and origin: an
-//! embedded face's place, or a file's path), and the SVG's bytes. The result: pixels (whether
+//! The job, little-endian: the box (`u32` × 2), the part's full size and corner (`u32` × 4: the
+//! whole image's size and where the box is in it; the box alone when the whole is drawn), the
+//! charge (`u64`), forced (`u8`) and the forced load's memory (`u64`), a test mode (`u8`,
+//! [`set_test`]), the SVG's record (`SvgCost`), the faces (none, or the regular and mono faces'
+//! places and each face's index and origin: an embedded face's place, or a file's path), and
+//! the SVG's bytes. The result: pixels (whether
 //! embedded images were left out, the box, and `0xAARRGGBB` per pixel), what it needs (an
 //! `SvgCost`), or why it is refused.
 
@@ -38,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use super::{Caps, Fonts, Refusal, Rendered, render_in};
+use super::{Caps, Fonts, Part, Refusal, Rendered, render_part};
 use crate::fonts::{FontOrigin, SvgFonts};
 use crate::image::{Bitmap, Limits, SvgCost, cancelled};
 
@@ -109,7 +112,7 @@ pub fn running() -> usize {
 
 // ---- The parent -----------------------------------------------------------------------------
 
-/// [`render_in`] in a child run by `program`, killed once `cancel` is set. A child that can't
+/// [`render_part`] in a child run by `program`, killed once `cancel` is set. A child that can't
 /// be started (no `/proc`, no processes left) leaves the SVG to be drawn here, and `inline` says
 /// so (it is set while the drawing is VOMD's own, and cleared when a child draws it): the drawing
 /// can't be killed then, and the SVGs after it wait for it as they do when SVGs are not drawn
@@ -122,6 +125,7 @@ pub(super) fn draw(
     bytes: &[u8],
     svg: &SvgCost,
     (w, h): (u32, u32),
+    crop: Part,
     charge: usize,
     limits: &Limits,
     cancel: &AtomicBool,
@@ -165,7 +169,7 @@ pub(super) fn draw(
     }
     let Ok(child) = command.spawn() else {
         let caps = Caps::of(limits);
-        return render_in(bytes, svg, (w, h), charge, &caps, cancel, fonts);
+        return render_part(bytes, svg, (w, h), crop, charge, &caps, cancel, fonts);
     };
     inline.store(false, Ordering::SeqCst);
     // The child reads its job before it does anything: it is in its job object before then, and
@@ -182,6 +186,7 @@ pub(super) fn draw(
         &mut job,
         svg,
         (w, h),
+        crop,
         charge,
         limits,
         fonts.sources.as_deref(),
@@ -383,12 +388,21 @@ fn put_job(
     out: &mut Vec<u8>,
     svg: &SvgCost,
     (w, h): (u32, u32),
+    crop: Part,
     charge: usize,
     limits: &Limits,
     fonts: Option<&SvgFonts>,
 ) {
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
+    // The full size and the part's corner: the box itself, at 0, 0, for all of it.
+    let c = crop.unwrap_or(crate::image::Crop {
+        full: (w, h),
+        at: (0, 0),
+    });
+    for n in [c.full.0, c.full.1, c.at.0, c.at.1] {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
     out.extend_from_slice(&(charge as u64).to_le_bytes());
     out.push(u8::from(limits.forced));
     out.extend_from_slice(&(limits.memory as u64).to_le_bytes());
@@ -456,6 +470,7 @@ impl<R: Read> Input<R> {
 /// A job as the child reads it.
 struct Job {
     size: (u32, u32),
+    crop: Part,
     charge: usize,
     limits: Limits,
     test: u8,
@@ -466,6 +481,11 @@ struct Job {
 
 fn get_job(r: &mut Input<impl Read>) -> Option<Job> {
     let size = (r.u32()?, r.u32()?);
+    let crop = crate::image::Crop {
+        full: (r.u32()?, r.u32()?),
+        at: (r.u32()?, r.u32()?),
+    };
+    let crop = (crop.full != size || crop.at != (0, 0)).then_some(crop);
     let charge = r.usize()?;
     let forced = r.u8()? != 0;
     let memory = r.usize()?;
@@ -515,6 +535,7 @@ fn get_job(r: &mut Input<impl Read>) -> Option<Job> {
     let bytes = r.vec(len)?;
     Some(Job {
         size,
+        crop,
         charge,
         limits,
         test,
@@ -640,8 +661,8 @@ fn run(job: Job) -> Rendered {
     fonts.set(job.fonts.map(Arc::new));
     let caps = Caps::of(&job.limits);
     let never = AtomicBool::new(false);
-    render_in(
-        &job.bytes, &job.svg, job.size, job.charge, &caps, &never, &mut fonts,
+    render_part(
+        &job.bytes, &job.svg, job.size, job.crop, job.charge, &caps, &never, &mut fonts,
     )
 }
 

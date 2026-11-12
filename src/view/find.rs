@@ -990,6 +990,11 @@ impl View {
     /// is returned.
     #[cfg(feature = "clipboard")]
     pub fn find_middle(&mut self, x: f64, y: f64) -> Option<u32> {
+        // (The image viewer covers the bar: nothing of the document takes input under it.)
+        #[cfg(feature = "images")]
+        if self.viewing() {
+            return None;
+        }
         if !self.find.open {
             return None;
         }

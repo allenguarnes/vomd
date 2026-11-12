@@ -21,6 +21,17 @@ and versions follow [Semantic Versioning](https://semver.org/).
     processes with limits on their memory and CPU time, as on Linux and Windows. A saved file
     reloads within about a second.
   - The theme and the display's scale follow the system, and the title bar follows VOMD's theme.
+- Image viewer: click an image to see it as large as the window allows. Zoom with `Ctrl` + wheel,
+  a pinch, `+` and `-`, or a click (fit or 100%); move around by dragging or scrolling; step
+  through the document's images with `←` and `→`. `Esc` or a click beside the image goes back to
+  the same place in the document. Images over 16 megapixels get a *Full resolution* button that
+  shows the part on screen at the image's own resolution. Remote images are only shown from what
+  was already loaded, or loaded again while remote images are on for the document.
+
+### Changed
+- A click on an animated image opens it in the viewer, where `Space` plays or pauses it. `A` still
+  plays or pauses all of them. Hovering one no longer shows a note.
+- The default binary is 20 KB larger for the image viewer.
 
 ## [1.9.0] - 2026-11-10
 

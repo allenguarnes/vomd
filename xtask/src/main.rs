@@ -17,7 +17,8 @@ mod pkg;
 // Lowered for 1.9.0 after the unwind tables went (`release_link_args`), with code folding, the
 // remapped source paths and the code font without its ligatures: 5,246,960 B and 2,602,824 B
 // measured; the default budget is a round 5.4 MB (about 150 KB of room, kept for the image
-// viewer), the smallest one the measured size plus about 45 KB (1.7%), rounded up to 10 KB.
+// viewer, which took 20 KB of it in 1.10.0: 5,267,568 B), the smallest one the measured size plus
+// about 45 KB (1.7%), rounded up to 10 KB.
 const SIZE_BUDGET: [u64; 2] = [5_400_000, 2_650_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.

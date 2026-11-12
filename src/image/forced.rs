@@ -18,6 +18,10 @@
 //! a node of an SVG, ...; an SVG drawn in a process of its own is killed), which happens when
 //! its document goes, or its box changes size (it is loaded again at the new one).
 //!
+//! The image viewer's decodes run on the same thread ([`Forced::detail`]), before the loads that
+//! wait, and a new one gives up the one before: what they make is the viewer's, sent back as
+//! [`Done::Detail`], and nothing of it is kept here.
+//!
 //! What a load made is kept here ([`Forced`]), beside the cache and not in it: the last size of
 //! each image, the least recently painted going first past [`KEPT_BYTES`] (never one painted in
 //! the current frame), and the bodies of remote ones, so a zoom doesn't fetch them again. The
@@ -95,6 +99,18 @@ pub(crate) struct Job {
     /// A remote image's body, fetched before.
     pub body: Option<Bytes>,
     pub cancel: Arc<AtomicBool>,
+    /// A decode for the image viewer, not a load past the limits ([`Forced::detail`]).
+    pub detail: Option<Detail>,
+}
+
+/// What the image viewer asked for: its number for the result ([`Done::Detail`]), whether the
+/// image was loaded past the limits (the reader's consent holds for it here too, else the
+/// normal limits do, but for its memory, which is [`ceiling`]'s), and the part to make.
+#[derive(Clone, Copy)]
+pub(crate) struct Detail {
+    pub serial: u64,
+    pub forced: bool,
+    pub crop: Option<super::Crop>,
 }
 
 /// What a load made: the pixels (none for a fetch alone), the image's natural size, and a
@@ -111,8 +127,8 @@ pub(crate) struct Loaded {
 #[cfg(feature = "remote-images")]
 type Fetch = crate::remote::ForcedFetch;
 
-/// The load running: what it is for (see [`Job`]), and its flag.
-type Running = (Origin, Option<(u32, u32)>, Arc<AtomicBool>);
+/// The load running: what it is for (see [`Job`]), its flag, and whether it is the viewer's.
+type Running = (Origin, Option<(u32, u32)>, Arc<AtomicBool>, bool);
 
 #[derive(Default)]
 struct Queue {
@@ -255,6 +271,11 @@ impl Forced {
         Some(&k.bitmap)
     }
 
+    /// Whether pixels of `origin` are kept, of any size.
+    pub(crate) fn has_pixels(&self, origin: &Origin) -> bool {
+        self.kept.iter().any(|k| k.origin == *origin)
+    }
+
     /// Whether pixels of `origin` at `w` × `h` are kept.
     fn has(&self, origin: &Origin, size: Option<(u32, u32)>) -> bool {
         let Some((w, h)) = size else {
@@ -290,7 +311,7 @@ impl Forced {
             if self.has(&origin, size) {
                 continue;
             }
-            if let Some((o, s, cancel)) = &q.running
+            if let Some((o, s, cancel, false)) = &q.running
                 && *o == origin
             {
                 // (One cancelled, by a reload, ends with no result: the load is asked for again.)
@@ -299,11 +320,15 @@ impl Forced {
                 }
                 cancel.store(true, Ordering::Relaxed);
             }
-            if let Some(j) = q.jobs.iter().find(|j| j.origin == origin) {
+            if let Some(j) = q
+                .jobs
+                .iter()
+                .find(|j| j.origin == origin && j.detail.is_none())
+            {
                 if j.size == size {
                     continue;
                 }
-                q.jobs.retain(|j| j.origin != origin);
+                q.jobs.retain(|j| j.origin != origin || j.detail.is_some());
             }
             // (Loaded for this document, and not taken yet: it is kept the moment it is. A load
             // of it at another size, cancelled above, would only replace it.)
@@ -323,11 +348,41 @@ impl Forced {
                 size,
                 body,
                 cancel: Arc::default(),
+                detail: None,
             });
             self.loads += 1;
             started = true;
         }
-        if started && !q.alive {
+        if started {
+            self.start(&mut q, tx, wake);
+        }
+        cv.notify_one();
+    }
+
+    /// Run the image viewer's `job` next, before the loads waiting: the one it asked for before
+    /// is given up (it is for a size or part no longer shown).
+    pub(crate) fn detail(&mut self, job: Job, tx: &Sender<Done>, wake: &Wake) {
+        let mut q = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        Forced::drop_detail(&mut q);
+        q.jobs.push_front(job);
+        self.start(&mut q, tx, wake);
+    }
+
+    /// Give up what the image viewer asked for (it was closed).
+    pub(crate) fn cancel_detail(&mut self) {
+        Forced::drop_detail(&mut self.shared.0.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    fn drop_detail(q: &mut Queue) {
+        q.jobs.retain(|j| j.detail.is_none());
+        if let Some((_, _, cancel, true)) = &q.running {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Start the thread for the jobs queued, if it isn't there.
+    fn start(&self, q: &mut Queue, tx: &Sender<Done>, wake: &Wake) {
+        if !q.alive {
             q.alive = true;
             let shared = self.shared.clone();
             let tx = tx.clone();
@@ -359,7 +414,6 @@ impl Forced {
                 q.alive = false;
             }
         }
-        cv.notify_one();
     }
 
     /// Stop every load: the one running at its next check, the queued ones now (the document
@@ -367,7 +421,7 @@ impl Forced {
     pub(crate) fn abandon(&mut self) {
         let mut q = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
         q.jobs.clear();
-        if let Some((_, _, cancel)) = &q.running {
+        if let Some((_, _, cancel, _)) = &q.running {
             cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -508,12 +562,34 @@ fn work(shared: &Shared, tx: &Sender<Done>, wake: &Wake, env: &mut Env) {
                 q.alive = false;
                 return;
             };
-            q.running = Some((job.origin.clone(), job.size, job.cancel.clone()));
+            let detail = job.detail.is_some();
+            q.running = Some((job.origin.clone(), job.size, job.cancel.clone(), detail));
             job
         };
         let result = load(&job, env);
         // A load cancelled made nothing anyone wants: its memory is free before the next starts.
         if job.cancel.load(Ordering::Relaxed) {
+            continue;
+        }
+        // The viewer's is its own: nothing of it is kept here.
+        if let Some(d) = job.detail {
+            // A body just fetched goes back with the pixels, for the viewer to keep (the next
+            // size doesn't fetch it again).
+            let fetched = job.body.is_none();
+            let (bitmap, body) = match result {
+                Ok(l) => (l.bitmap, l.body.filter(|_| fetched)),
+                Err(_) => (None, None),
+            };
+            let done = Done::Detail {
+                serial: d.serial,
+                bitmap,
+                body,
+            };
+            if tx.send(done).is_err() {
+                lock.lock().unwrap_or_else(|e| e.into_inner()).alive = false;
+                return;
+            }
+            wake();
             continue;
         }
         // Noted before it is sent, so that no request finds the load done and its result not
@@ -586,20 +662,35 @@ fn load(job: &Job, env: &mut Env) -> Result<Loaded, Refusal> {
     if !super::is_svg(&header) && need > ceiling {
         return Err(Refusal::Ceiling(need as u64));
     }
-    let limits = super::Limits::forced(room);
+    let (limits, sampling) = match job.detail {
+        Some(d) => {
+            // A part is inside the image at its full size.
+            if let Some(c) = d.crop
+                && (u64::from(c.at.0) + u64::from(w) > u64::from(c.full.0)
+                    || u64::from(c.at.1) + u64::from(h) > u64::from(c.full.1))
+            {
+                return Err(Refusal::Failed);
+            }
+            let limits = if d.forced {
+                super::Limits::forced(room)
+            } else {
+                super::Limits {
+                    memory: room,
+                    ..super::Limits::normal()
+                }
+            };
+            (
+                limits,
+                d.crop.map_or(super::Sampling::Area, super::Sampling::Crop),
+            )
+        }
+        None => (super::Limits::forced(room), super::Sampling::Area),
+    };
     #[cfg(feature = "svg")]
     let fonts = &mut env.fonts;
     #[cfg(not(feature = "svg"))]
     let fonts = &mut ();
-    match super::decode_why(
-        &bytes,
-        w,
-        h,
-        super::Sampling::Area,
-        &limits,
-        &job.cancel,
-        fonts,
-    ) {
+    match super::decode_why(&bytes, w, h, sampling, &limits, &job.cancel, fonts) {
         Ok(bitmap) => Ok(Loaded {
             bitmap: Some(bitmap),
             natural,

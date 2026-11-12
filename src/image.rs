@@ -36,6 +36,9 @@ mod webp;
 
 #[doc(hidden)]
 pub use exif::orientation as exif_orientation;
+/// Where an image comes from (the image viewer follows its image by it over a reload).
+#[cfg(feature = "images")]
+pub(crate) use forced::Origin;
 /// The binary's allocator on Windows and macOS (see `svg::process::windows`, `::macos`).
 #[cfg(all(feature = "svg", any(windows, target_os = "macos")))]
 #[doc(hidden)]
@@ -1029,6 +1032,30 @@ pub fn decode_with(
     decode_why(bytes, w, h, Sampling::Area, limits, cancel, fonts).ok()
 }
 
+/// [`decode_with`] of a part of the image (the image viewer's full resolution): the `w` × `h`
+/// box at `at` of the image resampled to `full`, as shown. `None` also for a box not inside
+/// `full`. For tests and the fuzzer.
+#[cfg(feature = "images")]
+#[doc(hidden)]
+pub fn decode_part(
+    bytes: &[u8],
+    full: (u32, u32),
+    at: (u32, u32),
+    (w, h): (u32, u32),
+    limits: &Limits,
+) -> Option<Bitmap> {
+    let inside = |a: u32, n: u32, f: u32| u64::from(a) + u64::from(n) <= u64::from(f);
+    if w == 0 || h == 0 || !inside(at.0, w, full.0) || !inside(at.1, h, full.1) {
+        return None;
+    }
+    #[cfg(feature = "svg")]
+    let fonts = &mut svg::Fonts::default();
+    #[cfg(not(feature = "svg"))]
+    let fonts = &mut ();
+    let crop = Sampling::Crop(Crop { full, at });
+    decode_why(bytes, w, h, crop, limits, &NO_CANCEL, fonts).ok()
+}
+
 /// How a decode reduces an image to its box: by averaging the source area under each target
 /// pixel (the resampler's own), or, for an SVG's `image-rendering` of `optimizeSpeed`,
 /// `crisp-edges` or `pixelated`, by taking the one under the target pixel's center, as resvg's
@@ -1038,6 +1065,43 @@ pub fn decode_with(
 pub(crate) enum Sampling {
     Area,
     Nearest,
+    /// By area, only the part of the image [`Crop`] says (the image viewer's full resolution).
+    #[cfg(feature = "images")]
+    Crop(Crop),
+}
+
+/// The part of an image a decode makes: the image is resampled to `full` (as shown), and only
+/// the box at `at` of the decode's own size is made of it. What it holds is what decoding to
+/// that box's size holds ([`decode_cost`]): the span tables and rows are the box's, whatever
+/// `full` is.
+#[cfg(feature = "images")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crop {
+    pub full: (u32, u32),
+    pub at: (u32, u32),
+}
+
+#[cfg(feature = "images")]
+impl Crop {
+    /// The same part of the image as stored, for the EXIF orientation `o` (see
+    /// [`Header::orientation`]): `size` is the part's size as shown. [`orient`] turns what is
+    /// made of it into the part as shown.
+    fn stored(self, o: u8, (cw, ch): (u32, u32)) -> Crop {
+        let ((fw, fh), (x, y)) = (self.full, self.at);
+        // The part's left edge mirrored, and its top edge flipped.
+        let (mx, my) = (fw.saturating_sub(x + cw), fh.saturating_sub(y + ch));
+        let (full, at) = match o {
+            2 => (self.full, (mx, y)),
+            3 => (self.full, (mx, my)),
+            4 => (self.full, (x, my)),
+            5 => ((fh, fw), (y, x)),
+            6 => ((fh, fw), (y, mx)),
+            7 => ((fh, fw), (my, mx)),
+            8 => ((fh, fw), (my, x)),
+            _ => (self.full, self.at),
+        };
+        Crop { full, at }
+    }
 }
 
 /// What SVG text is set in, for [`decode_why`].
@@ -1062,10 +1126,15 @@ fn decode_why(
     #[cfg(feature = "svg")]
     if header.format == Format::Svg {
         let (w, h) = clamp_box(w, h);
+        let crop = match sampling {
+            Sampling::Crop(c) => Some(c),
+            _ => None,
+        };
         return match svg::draw(
             bytes,
             &header.svg,
             (w, h),
+            crop,
             limits.memory,
             limits,
             cancel,
@@ -1085,6 +1154,10 @@ fn decode_why(
     let (sw, sh) = (header.w, header.h);
     // The box is the image as shown: it is resampled as stored, and turned after.
     let (w, h) = clamp_box(w, h);
+    let sampling = match sampling {
+        Sampling::Crop(c) => Sampling::Crop(c.stored(header.orientation, (w, h))),
+        s => s,
+    };
     let (w, h) = if header.transposed() { (h, w) } else { (w, h) };
     let bitmap = match header.format {
         Format::Png => decode_png(bytes, w, h, true, sampling, cancel),
@@ -1555,10 +1628,16 @@ struct Spans {
 
 impl Spans {
     fn new(src: u32, dst: u32) -> Spans {
+        Spans::part(src, dst, 0, dst)
+    }
+
+    /// [`Spans::new`] for the target pixels `from..from + len` only (a [`Crop`]): their weights
+    /// are at most [`spans_weights`]`(src, len)`, as `len · src / dst` is at most `src`.
+    fn part(src: u32, dst: u32, from: u32, len: u32) -> Spans {
         let f = f64::from(src) / f64::from(dst);
-        let mut spans = Vec::with_capacity(dst as usize + 1);
-        let mut weights = Vec::with_capacity(spans_weights(src, dst));
-        for t in 0..dst {
+        let mut spans = Vec::with_capacity(len as usize + 1);
+        let mut weights = Vec::with_capacity(spans_weights(src, len));
+        for t in from..from + len {
             let (a, b) = (f64::from(t) * f, f64::from(t + 1) * f);
             let first = a.floor() as usize;
             let last = (b.ceil() as usize).min(src as usize).max(first + 1);
@@ -1569,7 +1648,7 @@ impl Spans {
             );
         }
         spans.push((src, weights.len() as u32));
-        debug_assert!(weights.len() <= spans_weights(src, dst));
+        debug_assert!(weights.len() <= spans_weights(src, len));
         Spans { spans, weights }
     }
 
@@ -1638,11 +1717,16 @@ fn resample_rows(
     cancel: &AtomicBool,
 ) -> Option<Bitmap> {
     let sw_px = sw as usize;
-    let spans = match sampling {
-        Sampling::Area => Spans::new,
-        Sampling::Nearest => Spans::nearest,
+    let (xs, ys) = match sampling {
+        Sampling::Area => (Spans::new(sw, w), Spans::new(sh, h)),
+        Sampling::Nearest => (Spans::nearest(sw, w), Spans::nearest(sh, h)),
+        // (The decode's caller keeps the part inside `full`.)
+        #[cfg(feature = "images")]
+        Sampling::Crop(c) => (
+            Spans::part(sw, c.full.0, c.at.0, w),
+            Spans::part(sh, c.full.1, c.at.1, h),
+        ),
     };
-    let (xs, ys) = (spans(sw, w), spans(sh, h));
     // The last source row, reduced to the target width: (its index, premultiplied sums).
     let mut reduced = (usize::MAX, vec![0f32; w as usize * 4]);
     let mut acc = vec![0f32; w as usize * 4];
@@ -2644,6 +2728,15 @@ pub(crate) enum Done {
         origin: forced::Origin,
         result: Result<forced::Loaded, Refusal>,
     },
+    /// The image viewer's decode `serial` is done ([`Images::detail`]): its pixels, or none if
+    /// they couldn't be made.
+    #[cfg(feature = "images")]
+    Detail {
+        serial: u64,
+        bitmap: Option<Bitmap>,
+        /// A remote image's body, if this decode fetched it: the viewer keeps it.
+        body: Option<Bytes>,
+    },
     /// The anim thread did job `serial` ([`anim::Job`]).
     #[cfg(feature = "images")]
     Anim { serial: u64, output: anim::Output },
@@ -2965,6 +3058,7 @@ fn decode_in(bytes: &[u8], job: &Job, room: usize, state: &mut WorkerState) -> M
             bytes,
             &header.svg,
             (job.w, job.h),
+            None,
             room,
             &Limits::normal(),
             &state.cancel,
@@ -3184,6 +3278,16 @@ pub struct Images {
     /// The images of the document that were chosen to load past the limits, and where from.
     #[cfg(feature = "images")]
     forced_ids: Vec<(u32, forced::Origin)>,
+    /// The image viewer's last decode, done and not taken yet ([`Images::take_detail`]), and the
+    /// number of the last one asked for.
+    #[cfg(feature = "images")]
+    detail: Option<(u64, Option<Bitmap>)>,
+    #[cfg(feature = "images")]
+    detail_serial: u64,
+    /// The remote image the viewer shows and its body, once fetched, kept until it closes (or
+    /// shows another): a body is at most the fetch's cap, and only this one is held.
+    #[cfg(feature = "images")]
+    detail_body: Option<(Arc<str>, Option<Bytes>)>,
     /// The faces SVG text is set in, for the workers ([`Images::set_svg_fonts`]).
     #[cfg(feature = "svg")]
     svg_fonts: Option<Arc<crate::fonts::SvgFonts>>,
@@ -3424,6 +3528,12 @@ impl Default for Images {
             forced: forced::Forced::default(),
             #[cfg(feature = "images")]
             forced_ids: Vec::new(),
+            #[cfg(feature = "images")]
+            detail: None,
+            #[cfg(feature = "images")]
+            detail_serial: 0,
+            #[cfg(feature = "images")]
+            detail_body: None,
             #[cfg(feature = "svg")]
             svg_fonts: None,
             #[cfg(feature = "svg")]
@@ -5189,6 +5299,19 @@ impl Images {
             Done::Anim { serial, output } => {
                 self.anim_done(serial, output);
             }
+            #[cfg(feature = "images")]
+            Done::Detail {
+                serial,
+                bitmap,
+                body,
+            } => {
+                if let (Some(body), true, Some((url, _))) =
+                    (body, serial == self.detail_serial, &self.detail_body)
+                {
+                    self.detail_body = Some((url.clone(), Some(body)));
+                }
+                self.detail = Some((serial, bitmap));
+            }
             #[cfg(feature = "remote-images")]
             Done::Fetched { url, result } => self.arrived(url, result, page.is_some()),
         }
@@ -6630,6 +6753,134 @@ impl Images {
     #[doc(hidden)]
     pub fn forced_loads(&self) -> usize {
         self.forced.loads
+    }
+
+    /// Where image `id` comes from: its file, or its URL.
+    #[cfg(feature = "images")]
+    pub(crate) fn origin(&self, id: u32) -> Option<forced::Origin> {
+        match self.src(id) {
+            Src::File(src) => local_path(src, self.base.as_deref()).map(forced::Origin::File),
+            Src::Remote(url) => Some(forced::Origin::Url(url.clone())),
+            Src::None => None,
+        }
+    }
+
+    /// Whether image `id` is an SVG (drawn at any size, never more pixels than the box), as far
+    /// as its header, or a remote one's body still held, says.
+    #[cfg(feature = "images")]
+    pub(crate) fn vector(&self, id: u32) -> bool {
+        #[cfg(feature = "svg")]
+        {
+            let svg = |h: Option<Header>| h.is_some_and(|h| h.format == Format::Svg);
+            self.key(id).is_some_and(|k| self.is_svg(&k))
+                || match self.origin(id) {
+                    Some(forced::Origin::File(path)) => svg(file_info(&path).map(|f| f.header)),
+                    Some(forced::Origin::Url(url)) => {
+                        svg(self.forced.body(&url).and_then(|b| info_of(&b)))
+                    }
+                    None => false,
+                }
+        }
+        #[cfg(not(feature = "svg"))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
+    /// Whether image `id` shows pixels (of whatever size: a box being decoded again shows the
+    /// last ones), not its placeholder.
+    #[cfg(feature = "images")]
+    pub(crate) fn shown(&self, id: u32) -> bool {
+        let Some(key) = self.key(id) else {
+            return false;
+        };
+        self.cache
+            .slots
+            .iter()
+            .any(|s| s.key == key && s.pixels().is_some())
+            || (self.forced_ids.iter()).any(|(i, o)| *i == id && self.forced.has_pixels(o))
+    }
+
+    /// Decode image `id` for the image viewer at `size`, or the part `crop` says of it at its
+    /// full size, on the forced thread before its loads, in place of the decode asked for before.
+    /// Returns its number, which comes back with the pixels ([`Images::take_detail`]): they are
+    /// the viewer's, not the cache's. From what VOMD has: the file, or a remote image's body if
+    /// it is still held, else fetched again only while remote images are on. `None` if it can't
+    /// be.
+    #[cfg(feature = "images")]
+    pub fn detail(&mut self, id: u32, size: (u32, u32), crop: Option<Crop>) -> Option<u64> {
+        let origin = self.origin(id)?;
+        let forced = self.forced.is_chosen(&origin);
+        let body = match &origin {
+            forced::Origin::File(_) => {
+                self.detail_body = None;
+                None
+            }
+            forced::Origin::Url(url) => {
+                #[cfg(feature = "remote-images")]
+                let body = (self.cache.peek_bytes(url).cloned()).or_else(|| self.forced.body(url));
+                #[cfg(not(feature = "remote-images"))]
+                let body = self.forced.body(url);
+                if self.detail_body.as_ref().is_none_or(|(u, _)| u != url) {
+                    self.detail_body = Some((url.clone(), None));
+                }
+                let body = body.or_else(|| self.detail_body.as_ref().and_then(|d| d.1.clone()));
+                if body.is_none() && !self.remote_on() {
+                    return None;
+                }
+                #[cfg(feature = "remote-images")]
+                {
+                    self.forced.fetch = Some(self.remote.forced_fetch.clone());
+                }
+                body
+            }
+        };
+        self.detail_serial += 1;
+        let job = forced::Job {
+            doc_gen: self.doc_gen,
+            origin,
+            size: Some(size),
+            body,
+            cancel: Arc::default(),
+            detail: Some(forced::Detail {
+                serial: self.detail_serial,
+                forced,
+                crop,
+            }),
+        };
+        self.forced.detail(job, &self.tx, &self.wake);
+        Some(self.detail_serial)
+    }
+
+    /// The frame image `id`'s animation shows in a box of `w` × `h`, if it has one (else the
+    /// image viewer shows its own pixels).
+    #[cfg(feature = "images")]
+    pub(crate) fn anim_frame(&mut self, id: u32, w: u32, h: u32) -> Option<&Bitmap> {
+        if self.anims.idle() || !self.anim_shows(id, w, h) {
+            return None;
+        }
+        self.anim_front(id)
+    }
+
+    /// The image viewer's decode that is done, if one is: its number and its pixels.
+    #[cfg(feature = "images")]
+    pub fn take_detail(&mut self) -> Option<(u64, Option<Bitmap>)> {
+        self.detail.take()
+    }
+
+    /// The image viewer was closed: what it asked for is given up.
+    #[cfg(feature = "images")]
+    pub fn cancel_detail(&mut self) {
+        self.forced.cancel_detail();
+        self.detail = None;
+    }
+
+    /// The image viewer was closed: its decode is given up, and a remote body it kept goes.
+    #[cfg(feature = "images")]
+    pub fn release_detail(&mut self) {
+        self.cancel_detail();
+        self.detail_body = None;
     }
 
     /// Whether the remote image `id` is blocked (remote images are off but could be turned on):

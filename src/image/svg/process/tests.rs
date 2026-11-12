@@ -14,10 +14,15 @@ fn a_job_is_read_as_it_was_written() {
     };
     let fonts = crate::fonts::Fonts::new().unwrap().svg_sources();
     let mut job = Vec::new();
+    let crop = crate::image::Crop {
+        full: (4000, 3000),
+        at: (100, 2900),
+    };
     put_job(
         &mut job,
         &svg,
         (40, 30),
+        Some(crop),
         9 << 20,
         &Limits::forced(1 << 30),
         Some(&fonts),
@@ -26,6 +31,7 @@ fn a_job_is_read_as_it_was_written() {
     job.extend_from_slice(b"<x>");
     let read = get_job(&mut Input(&job[..])).unwrap();
     assert_eq!(read.size, (40, 30));
+    assert_eq!(read.crop, Some(crop));
     assert_eq!(read.charge, 9 << 20);
     assert_eq!(read.limits, Limits::forced(1 << 30));
     assert_eq!(read.svg, svg);
@@ -36,6 +42,11 @@ fn a_job_is_read_as_it_was_written() {
     for ((a, i), (b, j)) in read.sources.iter().zip(&fonts.sources) {
         assert_eq!(((**a).as_ref(), i), ((**b).as_ref(), j));
     }
+    // All of it is no part.
+    let mut whole = Vec::new();
+    put_job(&mut whole, &svg, (40, 30), None, 0, &Limits::normal(), None);
+    whole.extend_from_slice(&0u64.to_le_bytes());
+    assert_eq!(get_job(&mut Input(&whole[..])).unwrap().crop, None);
     // Cut short, it is no job.
     assert!(get_job(&mut Input(&job[..job.len() - 1])).is_none());
 }
@@ -74,6 +85,7 @@ fn drawn_by(program: &str) -> (Rendered, bool) {
             &bytes,
             &header.svg,
             (120, 40),
+            None,
             charge,
             &Limits::normal(),
             &AtomicBool::new(false),
@@ -152,13 +164,14 @@ fn confined(mode: u8, memory: usize, cpu: u64) -> (std::process::Child, Option<w
         &mut input,
         &SvgCost::default(),
         (8, 8),
+        None,
         0,
         &Limits::normal(),
         None,
     );
-    // The test mode's byte, after the box, the charge, forced and the forced memory (`TEST` is
-    // every child's, and other tests draw beside this one).
-    input[4 + 4 + 8 + 1 + 8] = mode;
+    // The test mode's byte, after the box, its part, the charge, forced and the forced memory
+    // (`TEST` is every child's, and other tests draw beside this one).
+    input[4 + 4 + 16 + 8 + 1 + 8] = mode;
     input.extend_from_slice(&0u64.to_le_bytes());
     child.stdin.take().unwrap().write_all(&input).unwrap();
     (child, job)

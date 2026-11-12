@@ -418,6 +418,10 @@ fn reads_stop_at_the_limit() {
 #[cfg(feature = "embed-fonts")]
 mod with_fonts {
     use super::*;
+    #[cfg(feature = "images")]
+    use crate::image::AnimState;
+    #[cfg(feature = "images")]
+    use crate::viewer::Button;
     use std::time::Duration;
 
     fn view(src: &str, w: u32, h: u32) -> View {
@@ -2659,13 +2663,14 @@ mod with_fonts {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An animated image says "Click to play" with the hand under the pointer, and a click plays
-    /// or pauses it alone, whatever the window's animations; a drag doesn't. In a link a click
-    /// follows the link and Ctrl+click plays or pauses. `A` plays or pauses every one, and the
-    /// toolbar has its button once the document has an animated image.
+    /// An animated image shows the hand under the pointer, with no note, and a click opens it in
+    /// the viewer (it no longer plays or pauses it): there `Space` plays or pauses it, and it is
+    /// painted from its frames. A drag doesn't open it. In a link a click follows the link and
+    /// Ctrl+click opens the image. `A` plays or pauses every one, and the toolbar has its button
+    /// once the document has an animated image.
     #[cfg(feature = "images")]
     #[test]
-    fn a_click_plays_or_pauses_an_animated_image() {
+    fn a_click_opens_an_animated_image_where_it_plays() {
         let dir = std::env::temp_dir().join(format!("vomd-view-play-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let gif = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images/anim.gif");
@@ -2697,38 +2702,69 @@ mod with_fonts {
                 .expect("on screen")
         };
         let (a, b) = (at(&v, 1), at(&v, 2));
-        // Under the pointer: the hand and the note; in a link, the link's.
+        // Under the pointer: the hand, no note; in a link, the link's.
         v.hover(a.0, a.1);
-        assert_eq!(v.hover_note, Some(PLAY_NOTE));
+        assert_eq!(v.hover_note, None);
         assert!(v.over_force() && v.hovered().is_none());
         v.hover(b.0, b.1);
         assert!(!v.over_force(), "hand");
         assert!(v.hovered().is_some(), "link");
-        // A click plays it, and the note says the next one pauses it; the other stays paused.
-        v.hover(a.0, a.1);
+        // A drag from it opens nothing.
         v.press(a.0, a.1, now);
-        assert_eq!(v.click(a.0, a.1), None);
-        assert_eq!(state(&v, 1), AnimState::Playing);
-        assert_eq!(state(&v, 2), AnimState::Paused);
-        assert_eq!(v.hover_note, Some(PAUSE_NOTE));
-        assert!(v.poll_images(Instant::now()), "repainted");
+        assert_eq!(v.click(a.0 + 300.0, a.1 + 100.0), None);
+        assert!(!v.viewing());
+        // A click opens it, as it was: paused. `Space` plays it there, and pauses it.
         v.press(a.0, a.1, now + Duration::from_secs(1));
         assert_eq!(v.click(a.0, a.1), None);
+        assert!(v.viewing());
         assert_eq!(state(&v, 1), AnimState::Paused);
-        // A drag from it changes nothing.
-        v.press(a.0, a.1, now + Duration::from_secs(2));
-        assert_eq!(v.click(a.0 + 300.0, a.1 + 100.0), None);
-        assert_eq!(state(&v, 1), AnimState::Paused);
-        // In a link: a click follows it, Ctrl+click plays the image.
+        let space = Key::Named(NamedKey::Space);
         let later = now + Duration::from_secs(5);
+        let none = ModifiersState::empty();
+        // Shift+Space steps back (here, nowhere to go), and doesn't play.
+        v.viewer_key(&space, ModifiersState::SHIFT, later);
+        assert_eq!(state(&v, 1), AnimState::Paused);
+        assert!(v.viewing());
+        assert_eq!(v.viewer_key(&space, none, later), Some(Outcome::Redraw));
+        assert_eq!(state(&v, 1), AnimState::Playing);
+        assert_eq!(state(&v, 2), AnimState::Paused);
+        // The label says what each state is and what Space does.
+        for (s, has) in [
+            (AnimState::Playing, "pauses"),
+            (AnimState::Paused, "plays"),
+            (AnimState::Waiting, "plays now"),
+            (AnimState::Over, "animation limits"),
+            (AnimState::Failed, "tries again"),
+        ] {
+            assert!(super::viewer::anim_note(s).contains(has), "{s:?}");
+        }
+        // It plays in the viewer: frames come, each painting the window whole.
+        let t = Instant::now();
+        loop {
+            frame(&mut v, Instant::now());
+            v.poll_images(Instant::now());
+            if let Some(due) = v.anim_deadline() {
+                assert!(v.tick(due, Some(due)).redraw, "the viewer is painted whole");
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(20), "never played");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        v.viewer_key(&space, none, later);
+        assert_eq!(state(&v, 1), AnimState::Paused);
+        let esc = Key::Named(NamedKey::Escape);
+        assert_eq!(v.viewer_key(&esc, none, later), Some(Outcome::Redraw));
+        assert!(!v.viewing());
+        // In a link: a click follows it, Ctrl+click opens the image.
         v.press(b.0, b.1, later);
         assert_eq!(v.click(b.0, b.1).as_deref(), Some("https://e.x/"));
-        assert_eq!(state(&v, 2), AnimState::Paused);
+        assert!(!v.viewing());
         v.set_ctrl(true);
         v.press(b.0, b.1, later + Duration::from_secs(1));
         assert_eq!(v.click(b.0, b.1), None, "not followed");
         v.set_ctrl(false);
-        assert_eq!(state(&v, 2), AnimState::Playing);
+        assert!(v.viewing() && v.viewer.as_ref().unwrap().id == 2);
+        v.close_viewer();
         // `A`: all of them play, what was chosen for one forgotten; again, none.
         assert_eq!(v.apply(Action::ToggleAnimations, later), Outcome::Redraw);
         assert!(v.animations() && v.toolbar_ctx().animations);
@@ -2736,9 +2772,6 @@ mod with_fonts {
             (state(&v, 1), state(&v, 2)),
             (AnimState::Playing, AnimState::Playing)
         );
-        v.press(a.0, a.1, later + Duration::from_secs(3));
-        v.click(a.0, a.1);
-        assert_eq!(state(&v, 1), AnimState::Paused);
         v.apply(Action::ToggleAnimations, later);
         assert!(!v.animations());
         assert_eq!(
@@ -2748,18 +2781,680 @@ mod with_fonts {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The note of an animation that waits for room, or is over the limits: what it does, and
-    /// that a click plays it now.
+    /// A PNG of `w` × `h`, RGB, its left half `a` and its right half `b`.
+    #[cfg(feature = "images")]
+    fn halves(w: u32, h: u32, a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
+        let mut png = Vec::new();
+        let mut enc = ::png::Encoder::new(&mut png, w, h);
+        enc.set_color(::png::ColorType::Rgb);
+        let data: Vec<u8> = (0..h)
+            .flat_map(|_| (0..w).flat_map(move |x| if x < w / 2 { a } else { b }))
+            .collect();
+        enc.write_header().unwrap().write_image_data(&data).unwrap();
+        png
+    }
+
+    /// A view of `md` over a directory with `big.png` (1200 × 800), `other.png` (300 × 200),
+    /// `tiny.png` (20 × 20) and `wide.png` (2400 × 400), its images decoded; and the directory.
+    #[cfg(feature = "images")]
+    fn image_view(name: &str, md: &str, w: u32, h: u32) -> (View, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vomd-viewer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = |n: &str, w, h, a, b| std::fs::write(dir.join(n), halves(w, h, a, b)).unwrap();
+        png("big.png", 1200, 800, [200, 0, 0], [0, 0, 200]);
+        png("other.png", 300, 200, [0, 150, 0], [0, 150, 0]);
+        png("tiny.png", 20, 20, [9, 9, 9], [9, 9, 9]);
+        png("wide.png", 2400, 400, [50, 50, 50], [250, 250, 0]);
+        let mut v = view(md, w, h);
+        v.set_image_base(Some(dir.clone()));
+        let n = v.doc().images.len() as u32;
+        frame(&mut v, Instant::now());
+        wait_images(&mut v, |v| {
+            (1..=n).all(|id| v.images.shown(id) || v.layout.image_size(id) == Some(ImageSize::Alt))
+        });
+        (v, dir)
+    }
+
+    /// The middle of image `id`'s box on screen.
+    #[cfg(feature = "images")]
+    fn image_point(v: &View, id: u32) -> (f64, f64) {
+        let (w, h) = v.size();
+        let points: Vec<(f64, f64)> = (0..w)
+            .step_by(2)
+            .flat_map(|x| (0..h).step_by(2).map(move |y| (f64::from(x), f64::from(y))))
+            .filter(|&(x, y)| v.image_at(x, y) == Some(id))
+            .collect();
+        assert!(!points.is_empty(), "image {id} on screen");
+        let n = points.len() as f64;
+        let sum = points
+            .iter()
+            .fold((0.0, 0.0), |a, p| (a.0 + p.0, a.1 + p.1));
+        (sum.0 / n, sum.1 / n)
+    }
+
+    /// Wait until the viewer's decode is back and nothing is asked for.
+    #[cfg(feature = "images")]
+    fn settle_viewer(v: &mut View) {
+        let t = Instant::now();
+        loop {
+            let now = Instant::now();
+            v.poll_images(now);
+            if let Some(d) = v.viewer_deadline() {
+                v.expire(d.max(now));
+            }
+            let vw = v.viewer.as_ref().unwrap();
+            if vw.asked.is_none() && vw.settle_at.is_none() {
+                return;
+            }
+            assert!(t.elapsed() < Duration::from_secs(30), "never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Which images a click opens: one that shows its pixels, at least 48 × 48; not a tiny one,
+    /// nor one beside the document. The hand shows over one, with no note.
+    #[cfg(feature = "images")]
     #[test]
-    fn an_animation_that_does_not_play_says_why() {
-        assert_eq!(anim_note(AnimState::Paused), PLAY_NOTE);
-        assert_eq!(anim_note(AnimState::Playing), PAUSE_NOTE);
-        assert!(anim_note(AnimState::Waiting).ends_with("click to play now"));
-        assert!(!anim_note(AnimState::Waiting).contains("limits"));
-        assert_eq!(
-            anim_note(AnimState::Over),
-            "Over VOMD's animation limits · click to play anyway"
+    fn a_click_opens_what_shows_its_pixels() {
+        let md = "![big](big.png)\n\n![tiny](tiny.png)\n\n![none](none.png)\n\nText.";
+        let (mut v, dir) = image_view("openable", md, 800, 1400);
+        frame(&mut v, Instant::now());
+        let big = image_point(&v, 1);
+        assert_eq!(v.openable_at(big.0, big.1), Some(1));
+        let tiny = image_point(&v, 2);
+        assert_eq!(v.openable_at(tiny.0, tiny.1), None, "too small");
+        assert_eq!(v.openable_at(-5.0, big.1), None);
+        assert_eq!(v.openable_at(f64::NAN, f64::NAN), None);
+        v.hover(big.0, big.1);
+        assert!(v.over_force() && v.hover_note.is_none());
+        v.hover(tiny.0, tiny.1);
+        assert!(!v.over_force());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A click and stepping use one rule: the box the document asks for is at least 48 each
+    /// way, however it is zoomed. A large image given a small box is neither clicked nor
+    /// stepped to, a small one given a large box (or a percentage) both.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_click_and_stepping_agree_on_which_images_count() {
+        let md = "<img src=\"big.png\" width=30>\n\n<img src=\"tiny.png\" width=300>\n\n\
+                  <img src=\"tiny.png\" width=\"50%\">\n\n![other](other.png)\n\n![t](tiny.png)";
+        let (mut v, dir) = image_view("agree", md, 800, 1800);
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        for (id, opens) in [(1, false), (2, true), (3, true), (4, true), (5, false)] {
+            let at = image_point(&v, id);
+            assert_eq!(v.openable_at(at.0, at.1), opens.then_some(id), "click {id}");
+        }
+        assert!(v.open_image(4, now));
+        assert_eq!(v.viewer.as_ref().unwrap().list, vec![2, 3, 4]);
+        assert_eq!(v.viewer_place(), Some((3, 3)));
+        v.close_viewer();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A middle click in the viewer doesn't reach the find bar's field under it (it would paste
+    /// the primary selection into the query, and the search could move the document).
+    #[cfg(all(feature = "images", feature = "find", feature = "clipboard"))]
+    #[test]
+    fn a_middle_click_in_the_viewer_leaves_the_find_bar_alone() {
+        let (mut v, dir) = image_view("middle", "![big](big.png)\n\ntext", 600, 600);
+        v.set_find(true);
+        frame(&mut v, Instant::now());
+        let field = (0..600)
+            .step_by(4)
+            .map(f64::from)
+            .find(|&x| v.find_middle(x, 16.0).is_some())
+            .expect("a point on the field");
+        assert!(v.open_image(1, Instant::now()));
+        assert_eq!(v.find_middle(field, 16.0), None);
+        v.close_viewer();
+        assert!(v.find_middle(field, 16.0).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pinch zooms the viewer's image by what the fingers did: e^(magnification).
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_pinch_zooms_the_viewers_image_by_the_magnification() {
+        let (mut v, dir) = image_view("pinch", "![big](big.png)", 600, 600);
+        let now = Instant::now();
+        assert!(v.open_image(1, now));
+        let s0 = v.viewer.as_ref().unwrap().tf.s;
+        // A pinch of 0.05 (what the window reports), as the document counts it.
+        v.zoom_wheel(0.05 * 10.0 * ZOOM_PIXELS, now);
+        let s1 = v.viewer.as_ref().unwrap().tf.s;
+        v.zoom_wheel(-0.05 * 10.0 * ZOOM_PIXELS, now);
+        let s2 = v.viewer.as_ref().unwrap().tf.s;
+        assert!(((s1 / s0) - 0.05f64.exp()).abs() < 1e-9, "{}", s1 / s0);
+        assert!(s2 < s1);
+        v.close_viewer();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A click opens the viewer and paints the image over the whole window, at Fit; `Esc`,
+    /// `Backspace` and a click beside the image close it (never quitting), and the document is
+    /// where it was: its position, its selection and the find bar.
+    #[cfg(feature = "images")]
+    #[test]
+    fn the_viewer_opens_on_a_click_and_leaves_the_document_as_it_was() {
+        let md = format!("{}![big](big.png)\n\n{}", paras(3), paras(80));
+        let (mut v, dir) = image_view("open", &md, 600, 400);
+        let now = Instant::now();
+        v.scroll_by(30.0, now);
+        frame(&mut v, now);
+        #[cfg(feature = "clipboard")]
+        assert_eq!(v.apply(Action::SelectAll, now), Outcome::Selected);
+        #[cfg(feature = "find")]
+        {
+            v.set_find(true);
+            v.find_type("Paragraph 2");
+        }
+        frame(&mut v, now);
+        let (anchor, scroll) = (v.anchor(), v.scroll());
+        #[cfg(feature = "clipboard")]
+        let sel = v.selection();
+        #[cfg(feature = "find")]
+        let found = (v.find_query().to_string(), v.find.current);
+        let at = image_point(&v, 1);
+        let none = ModifiersState::empty();
+        let close = |v: &mut View, key: Key| {
+            assert_eq!(v.viewer_key(&key, none, now), Some(Outcome::Redraw));
+            assert!(!v.viewing());
+        };
+        for (i, how) in ["esc", "backspace", "click"].into_iter().enumerate() {
+            let t = now + Duration::from_secs(10 * i as u64 + 1);
+            v.press(at.0, at.1, t);
+            assert_eq!(v.click(at.0, at.1), None);
+            assert!(v.viewing(), "{how}");
+            // Painted over everything: the backdrop at the corners, the image in the middle.
+            let mut buf = vec![0u32; 600 * 400];
+            v.paint(&mut buf, 600, t);
+            assert_eq!(buf[600 * 399], LIGHT.bg);
+            let vw = v.viewer.as_ref().unwrap();
+            assert!(vw.at_fit() && vw.label_shows(t));
+            let (x, y, w, h) = vw.rect();
+            let px = |x: i32, y: i32| buf[(y as usize) * 600 + x as usize];
+            assert_eq!(px(x + w as i32 / 4, y + h as i32 / 2), 0xC80000);
+            assert_eq!(px(x + w as i32 * 3 / 4, y + h as i32 / 2), 0x0000C8);
+            settle_viewer(&mut v);
+            match how {
+                "esc" => close(&mut v, Key::Named(NamedKey::Escape)),
+                "backspace" => close(&mut v, Key::Named(NamedKey::Backspace)),
+                _ => {
+                    let t = t + Duration::from_secs(2);
+                    v.press(300.0, 395.0, t);
+                    assert_eq!(v.click(300.0, 395.0), None);
+                    assert!(!v.viewing());
+                }
+            }
+            assert_eq!((v.anchor(), v.scroll()), (anchor, scroll), "{how}");
+            #[cfg(feature = "clipboard")]
+            assert_eq!(v.selection(), sel, "{how}");
+            #[cfg(feature = "find")]
+            {
+                assert!(v.find_open());
+                assert_eq!((v.find_query().to_string(), v.find.current), found);
+            }
+        }
+        // Alt+← is Back: it closes too, and goes nowhere.
+        v.press(at.0, at.1, now + Duration::from_secs(60));
+        v.click(at.0, at.1);
+        let back = v.viewer_key(&Key::Named(NamedKey::ArrowLeft), ModifiersState::ALT, now);
+        assert_eq!(back, Some(Outcome::Redraw));
+        assert!(!v.viewing());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A drag that starts on an image selects and opens nothing; Shift+click opens nothing; the
+    /// second click of a double click on an image does nothing in the viewer; a small image
+    /// (whose Fit is 100%) closes on a click, a large one switches between Fit and 100%.
+    #[cfg(feature = "images")]
+    #[test]
+    fn drags_shift_clicks_and_double_clicks() {
+        let md = "![big](big.png)\n\n![other](other.png)\n\nText after.";
+        let (mut v, dir) = image_view("clicks", md, 800, 1200);
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        let big = image_point(&v, 1);
+        v.press(big.0, big.1, now);
+        #[cfg(feature = "clipboard")]
+        assert!(v.select_to(big.0 + 200.0, big.1 + 300.0, now));
+        assert_eq!(v.click(big.0 + 200.0, big.1 + 300.0), None);
+        assert!(!v.viewing(), "a drag");
+        #[cfg(feature = "clipboard")]
+        {
+            v.release_select();
+            v.set_shift(true);
+            v.press(big.0, big.1, now + Duration::from_secs(1));
+            v.click(big.0, big.1);
+            assert!(!v.viewing(), "Shift+click");
+            v.set_shift(false);
+        }
+        // A double click: the first click opens, the second is ignored.
+        let t = now + Duration::from_secs(5);
+        v.press(big.0, big.1, t);
+        v.click(big.0, big.1);
+        assert!(v.viewing());
+        let s = v.viewer.as_ref().unwrap().tf.s;
+        v.press(big.0 + 1.0, big.1, t + Duration::from_millis(150));
+        v.click(big.0 + 1.0, big.1);
+        assert!(
+            v.viewing() && v.viewer.as_ref().unwrap().tf.s == s,
+            "ignored"
         );
+        // A click on it: 100% about the pointer, then Fit.
+        let mid = |v: &View| {
+            let (x, y, w, h) = v.viewer.as_ref().unwrap().rect();
+            (
+                f64::from(x) + f64::from(w) / 2.0,
+                f64::from(y) + f64::from(h) / 2.0,
+            )
+        };
+        let m = mid(&v);
+        v.press(m.0, m.1, t + Duration::from_secs(1));
+        v.click(m.0, m.1);
+        assert_eq!(v.viewer.as_ref().unwrap().tf.s, 1.0);
+        // Dragged: it moves, and that is no click.
+        let x = v.viewer.as_ref().unwrap().tf.x;
+        v.press(400.0, 400.0, t + Duration::from_secs(2));
+        assert!(v.viewer_drag(350.0, 400.0, t + Duration::from_secs(2)));
+        assert_eq!(v.viewer_cursor(), Some(winit::window::CursorIcon::Grabbing));
+        v.release(t);
+        v.click(350.0, 400.0);
+        let vw = v.viewer.as_ref().unwrap();
+        assert!(vw.tf.x == x - 50.0 && vw.tf.s == 1.0);
+        v.hover(350.0, 400.0);
+        assert_eq!(v.viewer_cursor(), Some(winit::window::CursorIcon::Grab));
+        v.press(400.0, 400.0, t + Duration::from_secs(3));
+        v.click(400.0, 400.0);
+        assert!(v.viewer.as_ref().unwrap().at_fit());
+        v.close_viewer();
+        assert_eq!(v.viewer_cursor(), None);
+        // The small one: opened at 100%, a click on it closes.
+        let other = image_point(&v, 2);
+        v.press(other.0, other.1, t + Duration::from_secs(10));
+        v.click(other.0, other.1);
+        assert!(v.viewing());
+        assert_eq!(v.viewer.as_ref().unwrap().tf.s, 1.0);
+        let m = mid(&v);
+        v.press(m.0, m.1, t + Duration::from_secs(11));
+        v.click(m.0, m.1);
+        assert!(!v.viewing());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keys in the viewer: zoom, Fit ↔ 100%, moving the image, stepping through the document's
+    /// images (not the tiny one, and no further at the ends), with the place in the label; the
+    /// document's keys that mean nothing here do nothing, and Q still quits.
+    #[cfg(feature = "images")]
+    #[test]
+    fn keys_zoom_move_and_step_through_the_images() {
+        let md = "![big](big.png)\n\n![tiny](tiny.png)\n\n![wide](wide.png)\n\n\
+                  ![other](other.png)\n\nText.";
+        let (mut v, dir) = image_view("keys", md, 800, 700);
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        let at = image_point(&v, 1);
+        v.press(at.0, at.1, now);
+        v.click(at.0, at.1);
+        let none = ModifiersState::empty();
+        let key = |v: &mut View, k: Key, m: ModifiersState| v.viewer_key(&k, m, now);
+        let s = |v: &View| v.viewer.as_ref().unwrap().tf.s;
+        let fit = s(&v);
+        key(&mut v, ch("+"), none);
+        assert!((s(&v) - fit * 1.25).abs() < 1e-9);
+        key(&mut v, ch("="), ModifiersState::CONTROL);
+        key(&mut v, ch("-"), none);
+        assert!((s(&v) - fit * 1.25).abs() < 1e-9);
+        key(&mut v, ch("0"), none);
+        assert_eq!(s(&v), fit, "Fit again");
+        key(&mut v, ch("0"), ModifiersState::SUPER);
+        assert_eq!(s(&v), 1.0, "100% with ⌘ (or Ctrl) too");
+        let y = v.viewer.as_ref().unwrap().tf.y;
+        key(&mut v, Key::Named(NamedKey::ArrowDown), none);
+        assert_eq!(v.viewer.as_ref().unwrap().tf.y, y - 40.0);
+        key(&mut v, ch("k"), none);
+        assert_eq!(v.viewer.as_ref().unwrap().tf.y, y);
+        // ← → move an image wider than the window.
+        let x = v.viewer.as_ref().unwrap().tf.x;
+        key(&mut v, Key::Named(NamedKey::ArrowRight), none);
+        assert_eq!(v.viewer.as_ref().unwrap().tf.x, x - 40.0);
+        // Nothing here: the contents panel, wide, find, select all, copy.
+        for (k, m) in [
+            (ch("c"), none),
+            (ch("w"), none),
+            (ch("b"), none),
+            (ch("f"), ModifiersState::CONTROL),
+            (ch("a"), ModifiersState::CONTROL),
+            (ch("c"), ModifiersState::CONTROL),
+            (ch("["), none),
+        ] {
+            assert_eq!(key(&mut v, k, m), Some(Outcome::Nothing));
+        }
+        assert!(v.viewing() && !v.toolbar_visible());
+        // Stepping: at Fit, ← → step; PgDn, Space, End, Home too.
+        key(&mut v, ch("0"), none);
+        let id = |v: &View| v.viewer.as_ref().unwrap().id;
+        let place = |v: &View| v.viewer_place();
+        assert_eq!(place(&v), Some((1, 3)));
+        key(&mut v, Key::Named(NamedKey::ArrowLeft), none);
+        assert_eq!(id(&v), 1, "no further");
+        key(&mut v, Key::Named(NamedKey::ArrowRight), none);
+        assert_eq!(id(&v), 3, "the tiny one is skipped");
+        assert_eq!(place(&v), Some((2, 3)));
+        assert!(v.viewer.as_ref().unwrap().at_fit());
+        key(&mut v, Key::Named(NamedKey::PageDown), none);
+        assert_eq!(id(&v), 4);
+        key(&mut v, Key::Named(NamedKey::Space), none);
+        assert_eq!(id(&v), 4, "the last");
+        key(&mut v, Key::Named(NamedKey::Space), ModifiersState::SHIFT);
+        assert_eq!(id(&v), 3);
+        key(&mut v, Key::Named(NamedKey::Home), none);
+        assert_eq!(id(&v), 1);
+        key(&mut v, Key::Named(NamedKey::End), none);
+        assert_eq!(id(&v), 4);
+        let label = v.viewer.as_ref().unwrap().label(now, place(&v), None);
+        assert_eq!(label, "100% · 3 / 3");
+        // The document's: Q quits, T switches the theme.
+        assert_eq!(key(&mut v, ch("t"), none), Some(Outcome::Redraw));
+        assert!(v.viewing());
+        assert_eq!(key(&mut v, ch("q"), none), Some(Outcome::Quit));
+        assert_eq!(
+            key(&mut v, ch("w"), ModifiersState::CONTROL),
+            Some(Outcome::Quit)
+        );
+        v.close_viewer();
+        assert_eq!(
+            key(&mut v, ch("q"), none),
+            None,
+            "closed: the document's keys"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ctrl + wheel (and a touchpad's zoom) zooms about the pointer; the wheel moves the image,
+    /// across with Shift; the document doesn't scroll under the viewer.
+    #[cfg(feature = "images")]
+    #[test]
+    fn the_wheel_moves_and_zooms_the_image() {
+        let md = format!("![big](big.png)\n\n{}", paras(60));
+        let (mut v, dir) = image_view("wheel", &md, 600, 400);
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        let at = image_point(&v, 1);
+        v.press(at.0, at.1, now);
+        v.click(at.0, at.1);
+        v.hover(450.0, 300.0);
+        let under = |v: &View| {
+            let vw = v.viewer.as_ref().unwrap();
+            ((450.0 - vw.tf.x) / vw.tf.s, (300.0 - vw.tf.y) / vw.tf.s)
+        };
+        let before = under(&v);
+        assert!(v.viewer_wheel((0.0, 2.0), true, true, false, now));
+        let after = under(&v);
+        assert!((before.0 - after.0).abs() < 1e-6 && (before.1 - after.1).abs() < 1e-6);
+        let fit = v.viewer.as_ref().unwrap().fit_zoom();
+        assert!((v.viewer.as_ref().unwrap().tf.s - fit * 1.5625).abs() < 1e-9);
+        v.zoom_wheel(100.0, now);
+        assert!(v.viewer.as_ref().unwrap().tf.s > fit * 1.5625);
+        let scroll = v.scroll();
+        // Fit, then 100%, at the image's bottom right corner.
+        v.viewer_key(&ch("0"), ModifiersState::empty(), now);
+        v.viewer_key(&ch("0"), ModifiersState::empty(), now);
+        assert_eq!(v.viewer.as_ref().unwrap().tf.s, 1.0);
+        v.viewer_wheel((-1e9, -1e9), false, false, false, now);
+        let tf = v.viewer.as_ref().unwrap().tf;
+        assert!(v.viewer_wheel((0.0, 1.0), true, false, false, now));
+        assert_eq!(v.viewer.as_ref().unwrap().tf.y, tf.y + 120.0);
+        assert!(v.viewer_wheel((0.0, 30.0), false, false, true, now));
+        assert_eq!(v.viewer.as_ref().unwrap().tf.x, tf.x + 30.0);
+        v.wheel_by(500.0, now);
+        v.wheel_lines(5.0, now);
+        assert_eq!(v.scroll(), scroll);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The viewer decodes the image at the size the zoom needs once it settles, and then nothing
+    /// runs: no deadline, the forced thread gone. Closed, what it held is gone.
+    #[cfg(feature = "images")]
+    #[test]
+    fn the_viewer_settles_with_nothing_running() {
+        let md = "![big](big.png)";
+        let (mut v, dir) = image_view("settle", md, 600, 400);
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        let at = image_point(&v, 1);
+        v.press(at.0, at.1, now);
+        v.click(at.0, at.1);
+        let asked = v.viewer.as_ref().unwrap().asked.expect("asked at once");
+        assert_eq!(asked.size, v.viewer.as_ref().unwrap().target());
+        settle_viewer(&mut v);
+        let vw = v.viewer.as_ref().unwrap();
+        let detail = vw.detail.as_ref().expect("decoded");
+        assert_eq!((detail.width, detail.height), vw.target());
+        assert!(vw.preview.is_none(), "the preview went");
+        // 100%: the image's own size.
+        v.viewer_key(&ch("0"), ModifiersState::empty(), now);
+        settle_viewer(&mut v);
+        let detail = v.viewer.as_ref().unwrap().detail.as_ref().unwrap();
+        assert_eq!((detail.width, detail.height), (1200, 800));
+        let mut buf = vec![0u32; 600 * 400];
+        let t = Instant::now();
+        while v.images.forcing() {
+            assert!(t.elapsed() < Duration::from_secs(10), "the thread ends");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let later = Instant::now() + Duration::from_secs(5);
+        v.expire(later);
+        v.paint(&mut buf, 600, later);
+        assert_eq!(v.deadline(), None, "no timer");
+        assert!(!v.tick(later, Some(later)).redraw);
+        v.close_viewer();
+        assert!(v.viewer.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload keeps the viewer on its image (by its file: its id may change), decoding it
+    /// again if the file changed; an image gone keeps its pixels until the viewer closes. A
+    /// theme that changes a `<picture>`'s image changes the viewer's.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_reload_or_a_theme_keeps_the_viewer_on_its_image() {
+        let md = "![big](big.png)\n\n![other](other.png)";
+        let (mut v, dir) = image_view("reload", md, 600, 1000);
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        let at = image_point(&v, 2);
+        v.press(at.0, at.1, now);
+        v.click(at.0, at.1);
+        settle_viewer(&mut v);
+        // Moved down a place: the same file, the same pixels, nothing decoded again.
+        v.replace(
+            Doc::parse("![x](none.png)\n\n![big](big.png)\n\n![other](other.png)"),
+            None,
+        );
+        let vw = v.viewer.as_ref().unwrap();
+        assert_eq!(vw.id, 3);
+        assert!(vw.detail.is_some() && vw.asked.is_none());
+        // Its file changed (another size): decoded again, and fitted.
+        std::fs::write(
+            dir.join("other.png"),
+            halves(250, 250, [1, 2, 3], [1, 2, 3]),
+        )
+        .unwrap();
+        v.replace(Doc::parse("![other](other.png)"), None);
+        let vw = v.viewer.as_ref().unwrap();
+        assert_eq!((vw.id, vw.natural), (1, (250, 250)));
+        assert!(vw.asked.is_some());
+        settle_viewer(&mut v);
+        let d = v.viewer.as_ref().unwrap().detail.as_ref().unwrap();
+        assert_eq!((d.width, d.height, d.data[0]), (250, 250, 0xFF01_0203));
+        // Gone: the viewer closes, and nothing it was asked afterwards shows another image.
+        v.replace(Doc::parse("No images."), None);
+        assert!(!v.viewing() && !v.viewer_waiting());
+        v.close_viewer();
+        // A `<picture>`: the theme's image.
+        let pdir = picture_dir("viewer-picture");
+        let src = "<picture>\n<source media=\"(prefers-color-scheme: dark)\" srcset=\"d.png\">\n\
+                   <img src=\"l.png\" alt=\"Logo\" width=200>\n</picture>\n";
+        let mut v = view(src, 600, 400);
+        v.set_image_base(Some(pdir.clone()));
+        frame(&mut v, Instant::now());
+        wait_images(&mut v, |v| v.images.shown(1));
+        frame(&mut v, Instant::now());
+        // (Its images are small: a click wouldn't open it, so it is opened as the tests do.)
+        assert!(v.open_image(1, now));
+        assert_eq!(v.viewer.as_ref().unwrap().natural, (30, 10));
+        v.set_theme_mode(ThemeMode::Dark);
+        let vw = v.viewer.as_ref().unwrap();
+        assert_eq!(vw.natural, (20, 40));
+        assert!(vw.asked.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&pdir);
+    }
+
+    /// A reload that drops the image the viewer shows closes it: its id is another image's in the
+    /// new document (the case the review found), so a zoom, a resize, `0`, `+` or Full resolution
+    /// after it must not decode or show that one.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_reload_that_drops_the_image_closes_the_viewer() {
+        let md = "![big](big.png)\n\n![other](other.png)";
+        let (mut v, dir) = image_view("reload-gone", md, 600, 1000);
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        let at = image_point(&v, 1);
+        v.press(at.0, at.1, now);
+        v.click(at.0, at.1);
+        assert!(v.viewing());
+        settle_viewer(&mut v);
+        // A decode in flight (a zoom) when the reload comes.
+        v.viewer_key(&ch("+"), ModifiersState::empty(), now);
+        // The image is gone, and another one has its id.
+        v.replace(Doc::parse("![other](other.png)"), None);
+        assert!(!v.viewing(), "the viewer closes");
+        assert!(!v.viewer_waiting());
+        for key in ["0", "+", "f"] {
+            v.viewer_key(&ch(key), ModifiersState::empty(), now);
+        }
+        v.resize(500, 700);
+        frame(&mut v, Instant::now());
+        assert!(!v.viewing() && !v.viewer_waiting());
+        assert!(v.images.take_detail().is_none(), "nothing decoded for it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload keeps the viewer on the copy it shows of an image the document has more than once
+    /// (the nearest copy), not the first one.
+    #[cfg(feature = "images")]
+    #[test]
+    fn a_reload_keeps_the_viewer_on_its_copy_of_a_repeated_image() {
+        let md = "![a](big.png)\n\n![b](big.png)\n\n![c](big.png)";
+        let (mut v, dir) = image_view("reload-copies", md, 600, 1000);
+        frame(&mut v, Instant::now());
+        wait_images(&mut v, |v| v.images.shown(3));
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        assert!(v.open_image(3, now));
+        settle_viewer(&mut v);
+        v.replace(Doc::parse(md), None);
+        assert_eq!(v.viewer.as_ref().unwrap().id, 3, "the same copy");
+        // One copy fewer before it: the nearest copy, the last one.
+        v.replace(Doc::parse("![b](big.png)\n\n![c](big.png)"), None);
+        assert_eq!(v.viewer.as_ref().unwrap().id, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Full resolution: offered only for an image with more pixels than the detail holds, and
+    /// pressed, the part on screen is decoded at the image's own resolution (as decoding all of
+    /// it at that size would make it); off again on close.
+    #[cfg(feature = "images")]
+    #[test]
+    fn full_resolution_is_offered_for_large_images() {
+        let md = "![big](big.png)\n\n![huge](huge.png)";
+        let dir0 = std::env::temp_dir().join(format!("vomd-viewer-huge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir0);
+        std::fs::create_dir_all(&dir0).unwrap();
+        // 5000 × 3500 (17.5 MP): stripes of 7 pixels, so a part shows where it is from.
+        let (w, h) = (5000u32, 3500u32);
+        let mut png = Vec::new();
+        let mut enc = ::png::Encoder::new(&mut png, w, h);
+        enc.set_color(::png::ColorType::Grayscale);
+        let data: Vec<u8> = (0..h)
+            .flat_map(|_| (0..w).map(|x| (x / 7 % 2 * 255) as u8))
+            .collect();
+        enc.write_header().unwrap().write_image_data(&data).unwrap();
+        let (mut v, dir) = image_view("full", md, 600, 1200);
+        std::fs::write(dir.join("huge.png"), &png).unwrap();
+        drop(png);
+        v.replace(Doc::parse(md), None);
+        frame(&mut v, Instant::now());
+        wait_images(&mut v, |v| v.images.shown(2));
+        frame(&mut v, Instant::now());
+        let now = Instant::now();
+        let mut buf = vec![0u32; 600 * 1200];
+        let at = image_point(&v, 1);
+        v.press(at.0, at.1, now);
+        v.click(at.0, at.1);
+        v.paint(&mut buf, 600, now);
+        assert_eq!(v.viewer.as_ref().unwrap().buttons.len(), 1, "✕ alone");
+        v.close_viewer();
+        let at = image_point(&v, 2);
+        v.press(at.0, at.1, now);
+        v.click(at.0, at.1);
+        v.paint(&mut buf, 600, now);
+        let vw = v.viewer.as_ref().unwrap();
+        let (b, r) = vw.buttons[1];
+        assert_eq!(b, Button::Full);
+        let p = (
+            (f64::from(r.x0) + f64::from(r.x1)) / 2.0,
+            (f64::from(r.y0) + f64::from(r.y1)) / 2.0,
+        );
+        v.hover(p.0, p.1);
+        assert_eq!(v.viewer_cursor(), Some(winit::window::CursorIcon::Pointer));
+        v.press(p.0, p.1, now + Duration::from_secs(1));
+        v.click(p.0, p.1);
+        assert!(v.viewer.as_ref().unwrap().full);
+        // At 100%, once the detail is there, the part on screen at full resolution.
+        v.viewer_key(&ch("0"), ModifiersState::empty(), now);
+        settle_viewer(&mut v);
+        let vw = v.viewer.as_ref().unwrap();
+        let (part, crop) = vw.crop.clone().expect("the part");
+        assert_eq!(crop.full, (5000, 3500));
+        assert!(part.width <= 601 && part.height <= 1201);
+        let whole = crate::image::decode(&std::fs::read(dir.join("huge.png")).unwrap(), 5000, 3500)
+            .unwrap();
+        for (y, row) in part.data.chunks(part.width as usize).enumerate() {
+            let from = (crop.at.1 as usize + y) * 5000 + crop.at.0 as usize;
+            assert_eq!(
+                row,
+                &whole.data[from..from + part.width as usize],
+                "row {y}"
+            );
+        }
+        drop(whole);
+        // Moved, another part; the button again: off, the part goes.
+        v.viewer_key(
+            &Key::Named(NamedKey::ArrowRight),
+            ModifiersState::empty(),
+            now,
+        );
+        settle_viewer(&mut v);
+        let x = v.viewer.as_ref().unwrap().crop.as_ref().unwrap().1.at.0;
+        assert_ne!(x, crop.at.0);
+        v.viewer_key(&ch("f"), ModifiersState::empty(), now);
+        assert!(v.viewer.as_ref().unwrap().crop.is_none());
+        v.viewer_key(&ch("f"), ModifiersState::empty(), now);
+        assert!(v.viewer.as_ref().unwrap().full);
+        v.close_viewer();
+        v.press(at.0, at.1, now + Duration::from_secs(9));
+        v.click(at.0, at.1);
+        assert!(!v.viewer.as_ref().unwrap().full, "off again once closed");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir0);
     }
 
     /// A view of `anim.gif` (6 × 4) in a box `width` wide (filling most of the window), between
@@ -3144,11 +3839,8 @@ mod with_fonts {
         }
         run(&mut v, &mut buf, Duration::from_millis(500));
         assert_eq!(v.images.anim_state(1), Some(AnimState::Waiting));
-        let click = |v: &mut View| {
-            let now = Instant::now();
-            v.press(100.0, 100.0, now);
-            assert_eq!(v.click(100.0, 100.0), None);
-        };
+        // (A click opens the viewer: what played the animation was its play.)
+        let click = |v: &mut View| v.images.play(1);
         click(&mut v);
         run(&mut v, &mut buf, Duration::from_secs(1));
         // (Not fetched again by itself: a request made before a load's result is taken may ask
@@ -3163,7 +3855,7 @@ mod with_fonts {
         );
         assert_eq!(v.layout.image_size(1), Some(ImageSize::Pixels(800, 600)));
         assert_eq!(v.images.anim_state(1), Some(AnimState::Failed));
-        assert_eq!(v.playable_at(100.0, 100.0), Some(1));
+        assert_eq!(v.openable_at(100.0, 100.0), Some(1));
         fails.store(false, Ordering::Relaxed);
         click(&mut v);
         let partial = run(&mut v, &mut buf, Duration::from_secs(2));
@@ -3246,9 +3938,10 @@ mod with_fonts {
             v.poll_images(now);
             std::thread::sleep(Duration::from_millis(2));
         }
+        // (Played past the limits as `Space` plays it in the viewer.)
         let click = |v: &mut View, y: f64| {
-            v.press(100.0, y, Instant::now());
-            assert_eq!(v.click(100.0, y), None);
+            let id = v.image_at(100.0, y).unwrap();
+            v.images.play(id);
         };
         // (The frames each showed: partial paints of the remote's box, and of the local's; for
         // at least `time`, then until `done` says so, as a slow machine shows its first frames

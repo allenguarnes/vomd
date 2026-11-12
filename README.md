@@ -36,7 +36,7 @@
 ## Why VOMD
 
 - **Fast.** Opens in milliseconds; a 5 MB document opens in under 100 ms.
-- **Small.** One file with its fonts built in: about 5.2 MB on Linux, 4.7 MB on Windows and
+- **Small.** One file with its fonts built in: about 5.3 MB on Linux, 4.7 MB on Windows and
   3.8 MB on macOS. No web engine, no GUI toolkit, nothing else to install.
 - **Private.** Never touches the network unless you ask it to, and never runs a document's HTML.
 - **Just a viewer.** No editor, no workspace, no accounts. Open a file, read it, close it.
@@ -52,8 +52,8 @@
   built-in math font.
 - **Syntax highlighting** in code blocks, in GitHub's colours, for 26 languages and their usual
   aliases.
-- **Images:** PNG, JPEG, GIF, WebP and SVG, local or remote. Animated GIFs and WebPs can play
-  (off by default, press `A`).
+- **Images:** PNG, JPEG, GIF, WebP and SVG, local or remote. Click one to see it as large as the
+  window allows, then zoom and pan. Animated GIFs and WebPs can play (off by default, press `A`).
 - **Links:** `#anchors` scroll, links to other `.md` files open in the same window (with Back),
   and web links open in your browser.
 - **Find in page** (`Ctrl+F`), a **contents panel** (`C`), and **text selection** with copy, plus a
@@ -255,9 +255,17 @@ On macOS, use `⌘` where the table says `Ctrl`; `⌘R` reloads, `⌘↑` `⌘�
 `⌘,` opens the settings file, `⌘M` minimizes, and a trackpad pinch zooms.
 
 **With the mouse:** drag to select, double-click for a word, triple-click for a paragraph, and
-`Shift`+click to extend. Hover a code block for its copy button. Click an animated image to play
-or pause just that one, or an image marked *click to load* to load it past VOMD's limits (hold
-`Ctrl` if the image is a link, `⌘` on macOS). On Linux, selected text can also be pasted with a middle click.
+`Shift`+click to extend. Hover a code block for its copy button. Click an image to open it in the
+image viewer, or an image marked *click to load* to load it past VOMD's limits (hold `Ctrl` if
+the image is a link, `⌘` on macOS, for either). On Linux, selected text can also be pasted with a
+middle click.
+
+**In the image viewer:** drag or scroll to move around, `Ctrl` + wheel (or pinch) or `+` `-` to
+zoom, click the image or press `0` to switch between fit and 100%, `←` `→` (or `PgUp` `PgDn`) for
+the previous or next image, `Space` to play or pause an animation, and `Esc`, `Backspace` or a
+click beside the image to go back. An image with more pixels than the viewer holds (over 16
+megapixels) has a *Full resolution* button (or `F`): the part on screen is then shown at the
+image's own resolution.
 
 ## Settings
 

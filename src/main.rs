@@ -332,6 +332,9 @@ struct App {
     #[cfg(feature = "find")]
     ime: Option<(u32, u32, u32, u32)>,
     shown: bool,
+    /// The cursor the image viewer set (`None`: the document's).
+    #[cfg(feature = "images")]
+    viewer_icon: Option<CursorIcon>,
     /// The window has the keyboard: while it hasn't, whether it was minimized is looked at
     /// now and then if an animation plays (X11 says nothing when it is).
     #[cfg(feature = "images")]
@@ -980,6 +983,26 @@ impl App {
         } else {
             view.hover_end()
         };
+        // The image viewer's cursors are its own; once it closes, the document's are set again.
+        #[cfg(feature = "images")]
+        {
+            let icon = view.viewer_cursor();
+            if icon != self.viewer_icon {
+                self.viewer_icon = icon;
+                gfx.window.set_cursor(icon.unwrap_or(CursorIcon::Default));
+                self.pointer = false;
+                #[cfg(any(feature = "clipboard", feature = "find"))]
+                {
+                    self.text_cursor = false;
+                }
+            }
+            if icon.is_some() {
+                if changed {
+                    gfx.window.request_redraw();
+                }
+                return;
+            }
+        }
         // The hand is for what a click acts on: a link, a code block's copy button, an image to
         // load past the limits, a row of the contents panel.
         #[cfg(feature = "clipboard")]
@@ -1504,6 +1527,7 @@ impl ApplicationHandler<UserEvent> for App {
                 view.release_find_drag();
                 #[cfg(feature = "images")]
                 {
+                    view.viewer_unpress();
                     self.focused = false;
                     if view.animating() {
                         self.check_minimized(now);
@@ -1560,12 +1584,16 @@ impl ApplicationHandler<UserEvent> for App {
                 .held_keys
                 .is_user_press(event.physical_key, event.state, is_synthetic) =>
             {
-                // The find bar, when open, has the keys that are text first.
-                #[cfg(feature = "find")]
-                let typed =
-                    view.find_key(&event.logical_key, event.text.as_deref(), self.mods, now);
-                #[cfg(not(feature = "find"))]
+                // The image viewer, when open, has every key; the find bar, when open, those
+                // that are text.
+                #[cfg(feature = "images")]
+                let typed = view.viewer_key(&event.logical_key, self.mods, now);
+                #[cfg(not(feature = "images"))]
                 let typed: Option<Outcome> = None;
+                #[cfg(feature = "find")]
+                let typed = typed.or_else(|| {
+                    view.find_key(&event.logical_key, event.text.as_deref(), self.mods, now)
+                });
                 let outcome = typed.or_else(|| {
                     let action = view::key_action(&event.logical_key, self.mods)?;
                     Some(view.apply(action, now))
@@ -1577,7 +1605,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // What an input method committed goes to the find bar's query.
             #[cfg(feature = "find")]
-            WindowEvent::Ime(Ime::Commit(text)) => {
+            WindowEvent::Ime(Ime::Commit(text)) if !view.viewing() => {
                 view.find_type(&text);
                 self.redraw();
             }
@@ -1590,6 +1618,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.redraw();
                 self.record(now);
+            }
+            // In the image viewer the wheel moves the image, and zooms it with Ctrl (or ⌘).
+            #[cfg(feature = "images")]
+            WindowEvent::MouseWheel { delta, .. } if view.viewing() => {
+                let zoom = self.mods.control_key() || self.mods.super_key();
+                let (xy, lines) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => ((f64::from(x), f64::from(y)), true),
+                    MouseScrollDelta::PixelDelta(p) => ((p.x, p.y), false),
+                };
+                if view.viewer_wheel(xy, lines, zoom, self.mods.shift_key(), now) {
+                    self.redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let zoom = self.mods.control_key() || self.mods.super_key();
@@ -1613,6 +1653,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor = position;
                 self.cursor_in = true;
                 let moved = view.drag_to(position.y, now);
+                #[cfg(feature = "images")]
+                let moved = view.viewer_drag(position.x, position.y, now) | moved;
                 #[cfg(feature = "clipboard")]
                 let moved = view.select_to(position.x, position.y, now) | moved;
                 #[cfg(feature = "find")]
@@ -1648,11 +1690,14 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         #[cfg(all(feature = "find", not(feature = "clipboard")))]
                         view.release_find_drag();
-                        (
-                            view.release(now) | bar,
-                            view.click(x, y),
-                            view.take_command(),
-                        )
+                        // A click in the image viewer, or one that opens it, is painted.
+                        #[cfg(feature = "images")]
+                        let viewing = view.viewing();
+                        let changed = view.release(now) | bar;
+                        let clicked = view.click(x, y);
+                        #[cfg(feature = "images")]
+                        let changed = changed | viewing | view.viewing();
+                        (changed, clicked, view.take_command())
                     }
                 };
                 if changed {
@@ -1881,6 +1926,8 @@ fn main() {
         #[cfg(feature = "find")]
         ime: None,
         shown: false,
+        #[cfg(feature = "images")]
+        viewer_icon: None,
         #[cfg(feature = "images")]
         focused: true,
         #[cfg(feature = "images")]

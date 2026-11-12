@@ -249,6 +249,18 @@ const FORMAT_CASES: &[(&str, f32)] = &[("formats", 1.0), ("formats-2x", 2.0)];
 const ANIM_CASES: &[(&str, f32, bool)] =
     &[("anim-badge", 1.0, false), ("anim-badge-2x", 2.0, true)];
 
+/// `viewer.md`'s image opened in the image viewer, its decode back: the backdrop, the image at
+/// Fit (here 100%), the close button, the zoom label and the alt text; or zoomed to 400% about a
+/// point (the pixels enlarged as they are, the image kept against the window's edges). Name,
+/// scale, dark, zoomed.
+#[cfg(feature = "images")]
+const VIEWER_CASES: &[(&str, f32, bool, bool)] = &[
+    ("viewer-light", 1.0, false, false),
+    ("viewer-dark", 1.0, true, false),
+    ("viewer-2x", 2.0, false, false),
+    ("viewer-zoom", 1.0, false, true),
+];
+
 /// What the pointer is doing at a code block's copy button.
 #[cfg(feature = "clipboard")]
 #[derive(Clone, Copy)]
@@ -595,6 +607,59 @@ fn render_anim(scale: f32, dark: bool) -> Rendered {
     (w as usize, h as usize, px)
 }
 
+/// A [`VIEWER_CASES`] case painted.
+#[cfg(feature = "images")]
+fn render_viewer(scale: f32, dark: bool, zoom: bool) -> Rendered {
+    let src = std::fs::read_to_string(root().join("fixtures/viewer.md")).unwrap();
+    let (w, h) = (
+        (520.0 * scale).round() as u32,
+        (400.0 * scale).round() as u32,
+    );
+    let mut view = View::new(
+        Fonts::new().unwrap(),
+        Doc::parse(&src),
+        None,
+        (w, h),
+        f64::from(scale),
+    );
+    view.set_theme_mode(if dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    });
+    view.set_image_base(Some(root().join("fixtures")));
+    view.ensure();
+    let mut px = vec![0; w as usize * h as usize];
+    let t = Instant::now();
+    while view.image_stats().decoded == 0 {
+        assert!(t.elapsed() < Duration::from_secs(60), "never decoded");
+        view.paint(&mut px, w as usize, Instant::now());
+        let now = Instant::now();
+        view.tick(now, Some(now));
+        std::thread::sleep(Duration::from_millis(5));
+        view.poll_images(Instant::now());
+    }
+    let now = Instant::now();
+    assert!(view.open_image(1, now));
+    if zoom {
+        // From 100% to 400%, about a point left of the middle.
+        view.hover(f64::from(w) * 0.3, f64::from(h) * 0.45);
+        let e = 400.0 * 4f64.ln();
+        view.viewer_wheel((0.0, e), false, true, false, now);
+    }
+    let t = Instant::now();
+    while view.viewer_waiting() {
+        assert!(
+            t.elapsed() < Duration::from_secs(60),
+            "never decoded for the viewer"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        view.poll_images(now);
+    }
+    view.paint(&mut px, w as usize, now);
+    (w as usize, h as usize, px)
+}
+
 /// The button case painted: `(width, height, pixels)`, the whole of `codecopy.md`. The pointer
 /// is over its first code block, and the button is the first block's.
 #[cfg(feature = "clipboard")]
@@ -821,6 +886,12 @@ fn goldens() {
         ANIM_CASES
             .iter()
             .map(|&(name, scale, dark)| (name, render_anim(scale, dark))),
+    );
+    #[cfg(feature = "images")]
+    let cases = cases.chain(
+        VIEWER_CASES
+            .iter()
+            .map(|&(name, scale, dark, zoom)| (name, render_viewer(scale, dark, zoom))),
     );
     #[cfg(feature = "svg")]
     let cases = cases.chain(

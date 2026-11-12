@@ -9285,3 +9285,218 @@ fn an_animation_played_past_the_limits_grows_only_within_the_ceiling() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- The image viewer's decodes ---------------------------------------------------------
+
+/// Poll until the image viewer's decode is back: its number and pixels.
+fn detail_done(doc: &Doc, layout: &mut Layout, images: &mut Images) -> (u64, Option<Bitmap>) {
+    let t = Instant::now();
+    loop {
+        images.poll(doc, layout);
+        if let Some(done) = images.take_detail() {
+            return done;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The viewer's decode is the image decoded at that size, beside the cache (nothing of it is
+/// kept); one asked for in place of another gives up the other, which sends nothing.
+#[test]
+fn the_viewers_decode_is_the_image_at_its_size() {
+    let dir = scratch("detail");
+    let png = png_bytes(900, 600, |x, y| [(x % 256) as u8, (y % 256) as u8, 7, 255]);
+    std::fs::write(dir.join("a.png"), &png).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![a](a.png)");
+    let serial = images.detail(1, (600, 400), None).unwrap();
+    let (got, bitmap) = detail_done(&doc, &mut layout, &mut images);
+    assert_eq!(got, serial);
+    assert_eq!(bitmap.unwrap(), decode(&png, 600, 400).unwrap());
+    assert!(images.cache.slots.is_empty() && !images.forced.has_pixels(&images.origin(1).unwrap()));
+    // Held at its start, then asked for at another size: only the second comes.
+    images.forced.hold.store(true, Ordering::Relaxed);
+    let first = images.detail(1, (300, 200), None).unwrap();
+    let t = Instant::now();
+    while !images.forced.running() {
+        assert!(t.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let second = images.detail(1, (450, 300), None).unwrap();
+    assert!(second > first);
+    images.forced.hold.store(false, Ordering::Relaxed);
+    let (got, bitmap) = detail_done(&doc, &mut layout, &mut images);
+    assert_eq!((got, bitmap.unwrap().width), (second, 450));
+    let t = Instant::now();
+    while images.forcing() {
+        assert!(t.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    images.poll(&doc, &mut layout);
+    assert!(images.take_detail().is_none(), "the first sent nothing");
+    // Given up when the viewer closes: nothing comes.
+    images.forced.hold.store(true, Ordering::Relaxed);
+    images.detail(1, (90, 60), None).unwrap();
+    images.cancel_detail();
+    images.forced.hold.store(false, Ordering::Relaxed);
+    while images.forcing() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    images.poll(&doc, &mut layout);
+    assert!(images.take_detail().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An image shown within the normal limits is decoded within them for the viewer (one over
+/// them makes nothing); one loaded past them with the reader's consent is decoded past them.
+#[test]
+fn the_viewers_decode_keeps_the_images_limits() {
+    let dir = scratch("detail-limits");
+    std::fs::write(dir.join("big.png"), big_png(9000, 8000)).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![big](big.png)");
+    images.detail(1, (90, 80), None).unwrap();
+    assert_eq!(
+        detail_done(&doc, &mut layout, &mut images).1,
+        None,
+        "over the limits"
+    );
+    assert!(images.force(1, &doc, &mut layout));
+    images.detail(1, (90, 80), None).unwrap();
+    let b = detail_done(&doc, &mut layout, &mut images)
+        .1
+        .expect("past them");
+    assert_eq!((b.width, b.height, b.data[0]), (90, 80, 0xFF00_0000));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A part decoded at full resolution is that part of the whole image decoded at that size,
+/// turned by its EXIF orientation; of an SVG, that part of it drawn at that size.
+#[test]
+fn a_part_is_that_part_of_the_whole() {
+    let slice = |all: &Bitmap, at: (u32, u32), w: u32, y: u32| {
+        let from = ((at.1 + y) * all.width + at.0) as usize;
+        all.data[from..from + w as usize].to_vec()
+    };
+    let png = png_bytes(400, 300, |x, y| {
+        [(x % 256) as u8, (y % 256) as u8, (x / 3) as u8, 255]
+    });
+    for (bytes, full) in [
+        (png.clone(), (400, 300)),
+        (png.clone(), (700, 525)),
+        (png, (130, 97)),
+        (fixture("exif-6.jpg"), (64, 96)),
+        (fixture("exif-7.jpg"), (150, 220)),
+        (fixture("exif-3.jpg"), (90, 50)),
+        (fixture("progressive.jpg"), (48, 24)),
+        (fixture("offset.gif"), (40, 40)),
+        (fixture("lossy-alpha.webp"), (33, 21)),
+    ] {
+        let all = decode(&bytes, full.0, full.1).unwrap();
+        for (at, (w, h)) in [
+            ((0, 0), full),
+            ((3, 5), (11, 7)),
+            ((full.0 - 9, full.1 - 4), (9, 4)),
+        ] {
+            let part = decode_part(&bytes, full, at, (w, h), &Limits::normal()).unwrap();
+            assert_eq!((part.width, part.height), (w, h));
+            for y in 0..h {
+                let row = &part.data[(y * w) as usize..((y + 1) * w) as usize];
+                assert_eq!(row, &slice(&all, at, w, y)[..], "{full:?} {at:?} row {y}");
+            }
+        }
+        // Not inside the image at that size: nothing.
+        assert!(decode_part(&bytes, full, (full.0 - 1, 0), (2, 1), &Limits::normal()).is_none());
+    }
+    #[cfg(feature = "svg")]
+    {
+        let svg = fixture("badge.svg");
+        let (_, w, h) = header_of(&svg).unwrap();
+        let full = (w * 3, h * 3);
+        let all = decode(&svg, full.0, full.1).unwrap();
+        let (at, size) = ((w, h / 2), (w, h));
+        let part = decode_part(&svg, full, at, size, &Limits::normal()).unwrap();
+        let near = |a: u32, b: u32| {
+            a.to_be_bytes()
+                .iter()
+                .zip(b.to_be_bytes())
+                .all(|(x, y)| x.abs_diff(y) <= 2)
+        };
+        for y in 0..size.1 {
+            let row = &part.data[(y * size.0) as usize..((y + 1) * size.0) as usize];
+            let want = slice(&all, at, size.0, y);
+            assert!(row.iter().zip(&want).all(|(&a, &b)| near(a, b)), "row {y}");
+        }
+    }
+}
+
+/// A remote image is decoded for the viewer from the body VOMD has, with no fetch; without one
+/// it is fetched again only while remote images are on, never while they are off.
+#[cfg(feature = "remote-images")]
+#[test]
+fn the_viewer_fetches_nothing_the_document_hasnt_allowed() {
+    use std::sync::atomic::AtomicUsize;
+    let url = "https://x.y/a.png";
+    let doc = Doc::parse(&format!("![a]({url})"));
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let body = png_bytes(64, 48, |_, _| [1, 2, 3, 255]);
+    let counted = fetches.clone();
+    images.set_test_body(Arc::new(move |_| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        Some(body.clone())
+    }));
+    images.attach(&doc, &mut layout);
+    // Off, nothing held: no decode, no fetch.
+    assert_eq!(images.detail(1, (64, 48), None), None);
+    assert_eq!(fetches.load(Ordering::Relaxed), 0);
+    // On: fetched for the document, then decoded for the viewer from that body (no fetch),
+    // even once remote images are off again.
+    images.set_remote(true, &doc, &mut layout);
+    let fonts = crate::fonts::Fonts::new().unwrap();
+    layout.ensure(&doc, &fonts, crate::layout::Anchor::TOP, 2000.0);
+    let t = Instant::now();
+    while images.cache.peek_bytes(&Arc::from(url)).is_none() {
+        assert!(t.elapsed() < Duration::from_secs(20), "never fetched");
+        images.begin_frame();
+        images.request(&[], 0);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    let fetched = fetches.load(Ordering::Relaxed);
+    images.set_remote(false, &doc, &mut layout);
+    images.detail(1, (32, 24), None).unwrap();
+    let b = detail_done(&doc, &mut layout, &mut images).1.unwrap();
+    assert_eq!((b.width, b.data[0]), (32, 0xFF01_0203));
+    assert_eq!(fetches.load(Ordering::Relaxed), fetched, "no fetch");
+    // On, with no body held: fetched again, with the same consent.
+    let doc2 = Doc::parse("![b](https://x.y/b.png)");
+    images.attach(&doc2, &mut layout);
+    assert_eq!(images.detail(1, (32, 24), None), None, "off");
+    images.set_remote(true, &doc2, &mut layout);
+    images.detail(1, (32, 24), None).unwrap();
+    assert!(detail_done(&doc2, &mut layout, &mut images).1.is_some());
+    assert_eq!(fetches.load(Ordering::Relaxed), fetched + 1);
+    // What it fetched is kept while the viewer is open: the next sizes and a part don't fetch
+    // again (remote images may go off meanwhile), and closing lets it go.
+    images.set_remote(false, &doc2, &mut layout);
+    for size in [(48, 36), (16, 12)] {
+        images.detail(1, size, None).unwrap();
+        assert!(detail_done(&doc2, &mut layout, &mut images).1.is_some());
+    }
+    assert_eq!(
+        fetches.load(Ordering::Relaxed),
+        fetched + 1,
+        "kept, not fetched again"
+    );
+    images.release_detail();
+    assert_eq!(
+        images.detail(1, (32, 24), None),
+        None,
+        "off, and nothing kept"
+    );
+    images.set_remote(true, &doc2, &mut layout);
+    images.detail(1, (32, 24), None).unwrap();
+    assert!(detail_done(&doc2, &mut layout, &mut images).1.is_some());
+    assert_eq!(fetches.load(Ordering::Relaxed), fetched + 2);
+}

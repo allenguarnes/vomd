@@ -5226,3 +5226,78 @@ fn playing_at_a_box_stays_in_its_charge() {
         }
     }
 }
+
+/// The image viewer's decode ([`Images::detail`]) that `serial` is, its pixels (polled for).
+fn detail(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut PageLayout,
+    serial: u64,
+) -> Option<vomd::image::Bitmap> {
+    let t = Instant::now();
+    loop {
+        images.poll(doc, layout);
+        if let Some((n, bitmap)) = images.take_detail() {
+            assert_eq!(n, serial);
+            return bitmap;
+        }
+        assert!(t.elapsed() < Duration::from_secs(120), "timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The image viewer's decodes: the whole image at a size holds no more than a decode at that
+/// size is charged with, its result and the file; a part at full resolution no more than a decode
+/// at the part's size, however large the image is at that resolution; once the viewer lets its
+/// pixels go, nothing of the decode is left. A PNG of 20,000 × 20,000 loaded past the limits
+/// decodes for it (at the detail's 16 MP) within the ceiling.
+#[test]
+fn the_viewers_decodes_stay_in_their_room() {
+    let _serial = serial();
+    let dir = scratch("viewer");
+    let png = zero_png(8000, 6000, 2, 8, false, 1 << 16);
+    std::fs::write(dir.join("a.png"), &png).unwrap();
+    let huge = zero_png(20_000, 20_000, 0, 1, false, 1 << 16);
+    std::fs::write(dir.join("huge.png"), &huge).unwrap();
+    let (doc, mut layout, mut images) = images_for(&dir, "![a](a.png) ![huge](huge.png)");
+    let crop = vomd::image::Crop {
+        full: (8000, 6000),
+        at: (3000, 2000),
+    };
+    let jobs = [
+        (1, (4096, 3072), None, &png),
+        (1, (1600, 1000), Some(crop), &png),
+    ];
+    for (id, (w, h), crop, bytes) in jobs {
+        let start = mark();
+        let serial = images.detail(id, (w, h), crop).unwrap();
+        let bitmap = detail(&mut images, &doc, &mut layout, serial).expect("decoded");
+        assert_eq!((bitmap.width, bitmap.height), (w, h));
+        let peak = peak_over(start);
+        let charge = vomd::image::decode_reservation(bytes, w, h).unwrap() + 4 * (w * h) as usize;
+        let room = charge + bytes.len() + (64 << 10);
+        assert!(
+            peak <= room,
+            "{peak} bytes for a room of {room} ({w} × {h}, part {crop:?})"
+        );
+        drop(bitmap);
+        let left = LIVE.load(Relaxed).saturating_sub(start);
+        assert!(left <= 16 << 10, "{left} bytes left");
+    }
+    // Past the limits: the reader's consent for it holds in the viewer.
+    let big = vomd::image::header_of(&huge).unwrap();
+    assert_eq!((big.1, big.2), (20_000, 20_000));
+    assert!(images.force(2, &doc, &mut layout));
+    let start = mark();
+    let serial = images.detail(2, (4096, 4096), None).unwrap();
+    let bitmap = detail(&mut images, &doc, &mut layout, serial).expect("decoded past the limits");
+    let peak = peak_over(start);
+    let charge = vomd::image::decode_reservation(&huge, 4096, 4096).unwrap() + 4 * 4096 * 4096;
+    assert!(
+        peak <= charge + huge.len() + (64 << 10),
+        "{peak} bytes for {charge}"
+    );
+    assert!(peak < 1 << 30, "within the ceiling");
+    drop(bitmap);
+    let _ = std::fs::remove_dir_all(&dir);
+}

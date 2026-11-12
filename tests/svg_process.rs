@@ -292,6 +292,10 @@ fn job_of(mode: u8) -> Vec<u8> {
     let mut job = Vec::new();
     job.extend_from_slice(&64u32.to_le_bytes());
     job.extend_from_slice(&64u32.to_le_bytes());
+    // All of it: its full size, and the corner at 0, 0.
+    for n in [64u32, 64, 0, 0] {
+        job.extend_from_slice(&n.to_le_bytes());
+    }
     job.extend_from_slice(&(1u64 << 20).to_le_bytes());
     job.push(0);
     job.extend_from_slice(&0u64.to_le_bytes());

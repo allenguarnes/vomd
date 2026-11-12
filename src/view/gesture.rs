@@ -160,6 +160,9 @@ impl View {
                 // Extending the selection isn't a click on a link under the pointer.
                 self.pressed = None;
             }
+            // (A click on an image that a click loads or opens leaves the selection as it is: a
+            // drag from it makes a new one.)
+            1 if self.pressed_image.is_some() => {}
             1 => self.select.sel = None,
             // The first click of a double click already followed a link (as it does today); the
             // second doesn't select a word of it, or follow it again.

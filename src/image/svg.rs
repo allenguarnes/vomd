@@ -2530,6 +2530,10 @@ pub(super) fn render(
     render_in(bytes, svg, size, charge, &Caps::NORMAL, cancel, fonts)
 }
 
+/// [`render_in`] of the part `crop` says of the SVG drawn at `crop.full`, `size` being the part's
+/// (the image viewer's full resolution), or of all of it.
+pub(super) type Part = Option<super::Crop>;
+
 /// [`render_in`] within the caps of `limits`, in a process of its own if SVGs are drawn apart
 /// ([`process::set_program`]): one that takes too long, or isn't wanted any more (`cancel`), is
 /// killed. `inline` is set while the drawing is VOMD's own process's after all (a child couldn't
@@ -2539,6 +2543,7 @@ pub(super) fn draw(
     bytes: &[u8],
     svg: &SvgCost,
     size: (u32, u32),
+    crop: Part,
     charge: usize,
     limits: &super::Limits,
     cancel: &AtomicBool,
@@ -2548,11 +2553,12 @@ pub(super) fn draw(
     #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
     if let Some(program) = process::program() {
         return process::draw(
-            program, bytes, svg, size, charge, limits, cancel, inline, fonts,
+            program, bytes, svg, size, crop, charge, limits, cancel, inline, fonts,
         );
     }
     let _ = inline;
-    render_in(bytes, svg, size, charge, &Caps::of(limits), cancel, fonts)
+    let caps = Caps::of(limits);
+    render_part(bytes, svg, size, crop, charge, &caps, cancel, fonts)
 }
 
 /// Whether SVGs are drawn in processes of their own, which are killed when they are given up.
@@ -2567,7 +2573,22 @@ pub(super) fn apart() -> bool {
 pub(super) fn render_in(
     bytes: &[u8],
     svg: &SvgCost,
+    size: (u32, u32),
+    charge: usize,
+    caps: &Caps,
+    cancel: &AtomicBool,
+    fonts: &mut Fonts,
+) -> Rendered {
+    render_part(bytes, svg, size, None, charge, caps, cancel, fonts)
+}
+
+/// [`render_in`] of the part `crop` says (see [`Part`]).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_part(
+    bytes: &[u8],
+    svg: &SvgCost,
     (w, h): (u32, u32),
+    crop: Part,
     charge: usize,
     caps: &Caps,
     cancel: &AtomicBool,
@@ -2604,7 +2625,13 @@ pub(super) fn render_in(
     let Some(tree) = tree else {
         return Rendered::Refused(Refusal::Broken);
     };
-    let transform = fit(&tree, w, h);
+    // A part is the whole drawn at its full size, moved for the part's corner to be the canvas's.
+    let transform = match crop {
+        Some(c) => {
+            fit(&tree, c.full.0, c.full.1).post_translate(-(c.at.0 as f32), -(c.at.1 as f32))
+        }
+        None => fit(&tree, w, h),
+    };
     let canvas = w as usize * h as usize * 4;
     let mut a = Analysis::of(&tree, transform, w, h);
     if b.rasters > 0 {
