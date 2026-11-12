@@ -55,11 +55,11 @@ const IDLE_WATCH: Duration = Duration::from_secs(3);
 /// How long the idle watch waits once vomd is idle, so that anything due right after (a
 /// scrollbar fading out) has passed. On GitHub's macOS runner, AppKit wakes a newly opened
 /// window's run loop about 75 times a second for several seconds (a bare winit window that
-/// paints once and waits shows it too, for about 7 s), so macOS waits until that has settled.
-/// Lasting CPU work over the limit still fails; work that stops within those 10 s does not,
-/// on macOS.
+/// paints once and waits shows it too, for about 7 s), and the first ticks after 10 s still
+/// came and went (0 to 2, then at most 1 from 13 s on), so macOS waits 15 s. Lasting CPU work
+/// over the limit still fails; work that stops within those 15 s does not, on macOS.
 const IDLE_SETTLE: Duration = if cfg!(target_os = "macos") {
-    Duration::from_secs(10)
+    Duration::from_secs(15)
 } else {
     Duration::from_secs(1)
 };
