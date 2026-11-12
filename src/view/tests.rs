@@ -3946,9 +3946,10 @@ mod with_fonts {
             let id = v.image_at(100.0, y).unwrap();
             v.images.play(id);
         };
-        // (The frames each showed: partial paints of the remote's box, and of the local's; for
-        // at least `time`, then until `done` says so, as a slow machine shows its first frames
-        // late.)
+        // (The frames each showed: partial paints of the remote's box (rows 64 to 1144), and of
+        // the local's (1176 to 2256); for at least `time`, then until `done` says so, as a slow
+        // machine shows its first frames late. Frames of both due together are one repaint, and
+        // their boxes, this close, one rect of damage: it counts for each.)
         let run =
             |v: &mut View, buf: &mut [u32], time: Duration, done: &dyn Fn(usize, usize) -> bool| {
                 let (t, mut remote, mut local) = (Instant::now(), 0, 0);
@@ -3960,8 +3961,9 @@ mod with_fonts {
                         v.request_images();
                     } else if !v.damage().is_empty() {
                         let rects = v.damage().to_vec();
-                        remote += usize::from(rects.iter().any(|r| r.y0 < 1100));
-                        local += usize::from(rects.iter().any(|r| r.y0 > 1100 && r.y0 < 2200));
+                        let rows = |y0, y1| rects.iter().any(|r| r.y0 < y1 && r.y1 > y0);
+                        remote += usize::from(rows(64, 1144));
+                        local += usize::from(rows(1176, 2256));
                         v.paint_rects(buf, 2050, &rects, now);
                     }
                     std::thread::sleep(Duration::from_millis(1));
