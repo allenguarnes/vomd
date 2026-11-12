@@ -34,6 +34,14 @@ mod svg;
 #[cfg(feature = "images")]
 mod webp;
 
+/// For the tests: animated WebPs (a screen recording's, one made larger) and the animation limits
+/// the corner cases are worked out at, and the rest a test that moves the view sets (see
+/// `anim::tests`).
+#[cfg(all(test, feature = "images"))]
+pub(crate) use anim::tests::{
+    Limits as TestAnimLimits, Rest as TestAnimRest, padded as test_padded,
+    recording as test_recording,
+};
 #[doc(hidden)]
 pub use exif::orientation as exif_orientation;
 /// Where an image comes from (the image viewer follows its image by it over a reload).
@@ -63,7 +71,12 @@ pub use svg::process::{
 };
 
 /// Memory for decoded images (and fetched bytes), at most. Images painted in the
-/// current frame are never evicted, so a window full of images may hold more.
+/// current frame are never evicted, so a window full of images may hold more. Animations take
+/// half of it at most; what they hold past that (up to `anim::ANIM_ALL_MAX` in all, whether it is
+/// one large animation or several) is added to it while they hold it: also for a moment while
+/// one is read and while the step of one that has gone finishes, and while the window is
+/// minimised or covered (what was painted is held till the next paint). A remote animation's
+/// fetched body is not theirs: it comes out of the stills' half.
 pub const CACHE_BYTES: usize = 32 << 20;
 /// Largest local image file read, in bytes.
 pub const MAX_FILE: u64 = 64 << 20;
@@ -2116,6 +2129,13 @@ impl Slot {
     }
 }
 
+/// What animations holding `bytes` hold past their share of the cache's budget
+/// ([`anim::ANIM_SHARE`]), which is added to it.
+#[cfg(feature = "images")]
+fn past_share(bytes: usize) -> usize {
+    bytes.saturating_sub(anim::ANIM_SHARE)
+}
+
 /// Decoded images and fetched bytes under one memory budget, least recently painted first out.
 struct Cache {
     slots: Vec<Slot>,
@@ -2137,6 +2157,10 @@ struct Cache {
     /// ([`anim::Anims::out`]).
     #[cfg(feature = "images")]
     anims: usize,
+    /// What the animations' slots hold: a part of `bytes`. With [`Cache::anims`], what the
+    /// animations hold past [`anim::ANIM_SHARE`] is added to the budget ([`Cache::budget`]).
+    #[cfg(feature = "images")]
+    anim_bytes: usize,
     /// The URLs of the remote slots removed since [`Images::forget_evicted`] last looked: what is
     /// kept of a URL that has no slot left, and isn't the document's, is forgotten.
     dropped: Vec<Arc<str>>,
@@ -2163,6 +2187,8 @@ impl Cache {
             overhead: 0,
             #[cfg(feature = "images")]
             anims: 0,
+            #[cfg(feature = "images")]
+            anim_bytes: 0,
             dropped: Vec::new(),
             expect: 0,
             floor: 0,
@@ -2179,6 +2205,51 @@ impl Cache {
         #[cfg(feature = "images")]
         let held = held.saturating_add(self.anims);
         held
+    }
+
+    /// The budget everything is held to: [`Cache::cap`], and what the animations' reads and
+    /// steps outside the slots ([`Cache::anims`]) hold past [`anim::ANIM_SHARE`]. (What their
+    /// slots hold past it is taken off what the slots are charged: [`Cache::charged`].) The
+    /// animations' memory past their share is added to the budget, not taken from the stills',
+    /// and only for as long as it is held.
+    fn budget(&self) -> usize {
+        #[cfg(feature = "images")]
+        return self.cap.saturating_add(past_share(self.anims));
+        #[cfg(not(feature = "images"))]
+        self.cap
+    }
+
+    /// What `bytes` of slots, `anim` of them the animations', are charged against
+    /// [`Cache::budget`]: all of them less what the animations hold, with [`Cache::anims`], past
+    /// [`anim::ANIM_SHARE`] that the budget doesn't already add. (`bytes` held with what is set
+    /// aside, [`Cache::held`], fit the cap and the animations' memory past their share exactly
+    /// when the charge does.)
+    fn charged(&self, bytes: usize, anim: usize) -> usize {
+        #[cfg(feature = "images")]
+        {
+            let all = past_share(anim.saturating_add(self.anims));
+            bytes.saturating_sub(all - past_share(self.anims))
+        }
+        #[cfg(not(feature = "images"))]
+        {
+            let _ = anim;
+            bytes
+        }
+    }
+
+    /// Whether the animations hold more than their share of the budget ([`anim::ANIM_SHARE`]).
+    #[cfg(feature = "images")]
+    fn anims_past_share(&self) -> bool {
+        past_share(self.anim_bytes.saturating_add(self.anims)) > 0
+    }
+
+    /// What the animations' slots hold, if `slot` is one.
+    fn anim_cost(slot: &Slot) -> usize {
+        match &slot.data {
+            #[cfg(feature = "images")]
+            Data::Anim(_) => slot.cost(),
+            _ => 0,
+        }
     }
 
     /// What the slot list holds, and the list of URLs waiting to be forgotten: the capacity of
@@ -2199,6 +2270,10 @@ impl Cache {
     fn remove(&mut self, i: usize) {
         let s = self.slots.swap_remove(i);
         self.bytes -= s.cost();
+        #[cfg(feature = "images")]
+        {
+            self.anim_bytes -= Cache::anim_cost(&s);
+        }
         if let Key::Remote(url) = s.key {
             self.dropped.push(url);
         }
@@ -2207,14 +2282,14 @@ impl Cache {
     /// What stays however long things are waited for: the pixels painted in this frame (by a frame
     /// that was drawn: [`Cache::pixels`]). (The bodies waiting for their decodes, or held by them,
     /// are not here: each lets go of its body when its decode is done, and the decodes run one
-    /// after another; [`Cache::would_fit`] counts them.)
+    /// after another; [`Cache::would_fit`] counts them.) As it is charged ([`Cache::charged`]).
     #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
     fn kept(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| s.painted_in(self.frame))
-            .map(Slot::cost)
-            .sum()
+        let kept = self.slots.iter().filter(|s| s.painted_in(self.frame));
+        let (all, anim) = kept.fold((0, 0), |(all, anim), s| {
+            (all + s.cost(), anim + Cache::anim_cost(s))
+        });
+        self.charged(all, anim)
     }
 
     fn has(&self, key: &Key, w: u32, h: u32) -> bool {
@@ -2330,8 +2405,13 @@ impl Cache {
             file: None,
         };
         // Room is made before the slot is in, so it can't be the one evicted.
-        self.evict_to(slot.cost());
+        let anim = Cache::anim_cost(&slot);
+        self.evict_to_as(slot.cost(), anim);
         self.bytes += slot.cost();
+        #[cfg(feature = "images")]
+        {
+            self.anim_bytes += anim;
+        }
         self.slots.push(slot);
         self.trim();
     }
@@ -2390,13 +2470,18 @@ impl Cache {
     }
 
     /// What no eviction can free: the pixels painted in this frame and the bodies decodes hold
-    /// ([`Slot::unevictable`]).
+    /// ([`Slot::unevictable`]), as it is charged ([`Cache::charged`]).
     fn stuck(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|s| s.unevictable(self.frame))
-            .map(Slot::cost)
-            .sum()
+        let (all, anim) = self.stuck_parts();
+        self.charged(all, anim)
+    }
+
+    /// What no eviction can free, and how much of it the animations' slots hold, uncharged.
+    fn stuck_parts(&self) -> (usize, usize) {
+        let stuck = self.slots.iter().filter(|s| s.unevictable(self.frame));
+        stuck.fold((0, 0), |(all, anim), s| {
+            (all + s.cost(), anim + Cache::anim_cost(s))
+        })
     }
 
     #[cfg(test)]
@@ -2415,8 +2500,13 @@ impl Cache {
 
     /// [`Cache::evict_for`] without cutting the list to size.
     fn evict_to(&mut self, extra: usize) {
-        let held = self.held().saturating_add(extra);
-        while self.bytes.saturating_add(held) > self.cap {
+        self.evict_to_as(extra, 0);
+    }
+
+    /// [`Cache::evict_to`] for `extra` bytes of which `anim` are an animation's ([`Cache::charged`]).
+    fn evict_to_as(&mut self, extra: usize, anim: usize) {
+        let held = self.held();
+        while self.charged_with(extra, anim).saturating_add(held) > self.budget() {
             let Some((i, _)) = self
                 .slots
                 .iter()
@@ -2453,16 +2543,31 @@ impl Cache {
     /// ([`Cache::stuck`]) and what is set aside ([`Cache::held`]), once everything that can be is:
     /// nothing is evicted to find out.
     fn can_fit(&self, extra: usize) -> bool {
-        self.can_fit_without(extra, 0)
+        self.can_fit_without(extra, 0, 0, 0)
     }
 
-    /// [`Cache::can_fit`] with `freed` of what can't be evicted let go.
-    fn can_fit_without(&self, extra: usize, freed: usize) -> bool {
-        self.stuck()
-            .saturating_sub(freed)
-            .saturating_add(self.held())
-            .saturating_add(extra)
-            <= self.cap
+    /// [`Cache::can_fit`] with `freed` of what can't be evicted let go, `freed_anim` of it the
+    /// animations' slots, and `anim` of `extra` an animation's ([`Cache::charged`]).
+    fn can_fit_without(&self, extra: usize, anim: usize, freed: usize, freed_anim: usize) -> bool {
+        let (all, anims) = self.stuck_parts();
+        let all = all.saturating_sub(freed).saturating_add(extra);
+        let anims = anims.saturating_sub(freed_anim).saturating_add(anim);
+        self.charged(all, anims).saturating_add(self.held()) <= self.budget()
+    }
+
+    /// What the slots and `extra` bytes more, `anim` of them an animation's, are charged.
+    fn charged_with(&self, extra: usize, anim: usize) -> usize {
+        #[cfg(feature = "images")]
+        let anims = self.anim_bytes.saturating_add(anim);
+        #[cfg(not(feature = "images"))]
+        let anims = anim;
+        self.charged(self.bytes.saturating_add(extra), anims)
+    }
+
+    /// Whether the slots and `extra` bytes more, `anim` of them an animation's, fit the budget
+    /// beside what is set aside, as they are (nothing is evicted).
+    fn fits_now(&self, extra: usize, anim: usize) -> bool {
+        self.charged_with(extra, anim).saturating_add(self.held()) <= self.budget()
     }
 
     /// What [`Cache::room_for`] would say if `reserve` and `fetching` were what is set aside,
@@ -2490,7 +2595,7 @@ impl Cache {
             .saturating_add(fetching)
             .saturating_add(cost)
             .saturating_add(decode.saturating_sub(reserve))
-            <= self.cap
+            <= self.budget()
     }
 
     /// Whether a fetched body is held that was used this frame, which can't be evicted.
@@ -2543,6 +2648,8 @@ impl Cache {
     /// is doubled and copied.)
     fn retain_untrimmed(&mut self, mut keep: impl FnMut(&Slot) -> bool) {
         let (bytes, dropped) = (&mut self.bytes, &mut self.dropped);
+        #[cfg(feature = "images")]
+        let anim_bytes = &mut self.anim_bytes;
         self.slots.retain(|s| {
             let k = keep(s);
             if !k {
@@ -2553,6 +2660,10 @@ impl Cache {
                     "an animation whose step runs was dropped"
                 );
                 *bytes -= s.cost();
+                #[cfg(feature = "images")]
+                {
+                    *anim_bytes -= Cache::anim_cost(s);
+                }
                 if let Key::Remote(url) = &s.key {
                     dropped.push(url.clone());
                 }
@@ -4526,6 +4637,9 @@ impl Images {
         let (mut heavy_wanted, mut heavy_chosen) = (false, false);
         #[cfg(feature = "remote-images")]
         let mut held: Option<Key> = None;
+        // (The stills in view asked for, for the allocation: [`anim::Anims::view_stills`].)
+        #[cfg(feature = "images")]
+        let mut view_stills = Vec::new();
         for (n, &(id, w, h)) in boxes.iter().enumerate() {
             let Some(key) = self.key(id) else {
                 continue;
@@ -4564,8 +4678,13 @@ impl Images {
                 .saturating_sub(bodies)
                 .saturating_sub(reserve.max(retired.saturating_add(cost)));
             // Kept only if it fits with the ones before it (one that crosses the line is the one
-            // that doesn't: the budget is not gone over by a box).
+            // that doesn't: the budget is not gone over by a box). An animation held in the cache
+            // takes what it is charged beside its still's box (counted at its box alone, two
+            // images just outside the view that didn't both fit beside it were both asked for, and
+            // each one's result evicted the other's, for as long as the view stayed).
             let bytes = w as usize * h as usize * 4;
+            #[cfg(feature = "images")]
+            let bytes = bytes.saturating_add(self.anim_charge(&key));
             let over = n >= on_screen && wanted.saturating_add(bytes) > room;
             wanted = wanted.saturating_add(bytes);
             if over {
@@ -4713,6 +4832,10 @@ impl Images {
                 self.cache.bytes_of(url);
             }
             reserve = reserve.max(retired.saturating_add(cost));
+            #[cfg(feature = "images")]
+            if n < on_screen && !self.animated.iter().any(|a| a.0 == key) {
+                view_stills.push((key.clone(), (w, h), cost));
+            }
             if fresh_body {
                 bodies = bodies.saturating_add(body_cost(&key, &source));
             }
@@ -4726,6 +4849,30 @@ impl Images {
                 h,
                 cost,
             });
+        }
+        // (One asked for before that is still in view and still to come stays, asked for again
+        // or not: an animation let go for it isn't let in again before it is in.)
+        #[cfg(feature = "images")]
+        {
+            for (key, size, cost) in std::mem::take(&mut self.anims.view_stills) {
+                let in_view = boxes[..on_screen]
+                    .iter()
+                    .any(|b| clamp_box(b.1, b.2) == size && self.key(b.0).as_ref() == Some(&key));
+                let new = !view_stills
+                    .iter()
+                    .any(|v: &(Key, _, _)| v.0 == key && v.1 == size);
+                if in_view && new && !self.cache.has(&key, size.0, size.1) {
+                    view_stills.push((key, size, cost));
+                }
+            }
+            let view = &boxes[..on_screen];
+            if !view_stills.is_empty() || self.anims.view != view {
+                self.anims.rest = Some(std::time::Instant::now() + anim::rest());
+                if self.anims.view != view && view.len() <= VIEW_MAX {
+                    self.anims.view = view.to_vec();
+                }
+            }
+            self.anims.view_stills = view_stills;
         }
         // A body dropped for lack of room is fetched again only if it would fit now, beside
         // what this frame keeps (the decoded images and bodies painted or wanted, which can't
@@ -6133,22 +6280,25 @@ impl Images {
     /// its size, and has a defined answer to `false` (defer, refuse or skip: the audit table says
     /// which, site by site). `site` names the call for the tests' probe ([`set_room_probe`]).
     fn make_room(&mut self, site: &'static str, bytes: usize) -> bool {
+        self.make_room_as(site, bytes, 0)
+    }
+
+    /// [`Images::make_room`] for `bytes` of which `anim` are what an animation holds (its slot
+    /// grows, or it is read): what animations hold past their share is added to the budget
+    /// ([`Cache::budget`]).
+    fn make_room_as(&mut self, site: &'static str, bytes: usize, anim: usize) -> bool {
         #[cfg(debug_assertions)]
         if let Some(probe) = ROOM_PROBE.get() {
             probe(site, bytes, None);
         }
         let _ = site;
         self.charge_bookkeeping();
-        self.cache.evict_for(bytes);
+        self.cache.evict_to_as(bytes, anim);
+        self.cache.trim();
         #[cfg(feature = "remote-images")]
         self.forget_evicted();
         self.charge_bookkeeping();
-        let fits = self
-            .cache
-            .bytes
-            .saturating_add(self.cache.held())
-            .saturating_add(bytes)
-            <= self.cache.cap;
+        let fits = self.cache.fits_now(bytes, anim);
         #[cfg(debug_assertions)]
         if let Some(probe) = ROOM_PROBE.get() {
             probe(site, bytes, Some(fits));
@@ -6160,7 +6310,7 @@ impl Images {
     fn room_limit(&mut self) -> usize {
         self.charge_bookkeeping();
         self.cache
-            .cap
+            .budget()
             .saturating_sub(self.cache.held())
             .saturating_sub(self.cache.stuck())
     }
@@ -6451,7 +6601,17 @@ impl Images {
                 .filter(|(k, p)| p.painted == frame.saturating_add(1) && self.anims.wanted(k))
                 .filter_map(|(_, p)| p.due())
                 .min();
-            anim::next_tick(due, self.anims.last)
+            let tick = anim::next_tick(due, self.anims.last);
+            // (One that waits for the view to rest starts when it does.)
+            let alloc = &self.anims.alloc;
+            let rest = self
+                .anims
+                .rest
+                .filter(|_| alloc.moving && !alloc.waiting.is_empty());
+            match (tick, rest) {
+                (Some(t), Some(r)) => Some(t.min(r)),
+                (t, r) => t.or(r),
+            }
         }
         #[cfg(not(feature = "images"))]
         None
@@ -6991,8 +7151,12 @@ enum At {
 // in view, on screen first from the top down, one box a key), whether each is to play (the
 // window's `A`, the reader's choice), what each holds at its frame size (measured once a key and
 // size, [`anim::Anims::costs`]), the refusals and those played past the limits (which take no
-// part), and the room the cache has for them. It walks them in their order and lets each play
-// that fits beside those before it, within [`anim::ANIM_ALL_MAX`] and that room; the others wait.
+// part), and the room the cache has for them (less what the stills in view that were asked for
+// and aren't in yet need: [`Images::anims_room_now`]; decodes ahead of the view take none of it).
+// It walks them in their order and lets each play that fits beside those before it, within
+// [`anim::ANIM_ALL_MAX`] and that room (which their slots take only their share of,
+// [`anim::ANIM_SHARE`]: the cache's budget grows by what they hold past it, [`Cache::budget`]);
+// the others wait.
 // What is done follows from it ([`Images::pump_anims`]): one it plays that isn't made is read
 // (room made for it from those it doesn't play), one held that waits is let go once its step is
 // back, and steps are run only for those it plays. The same inputs make the same allocation, and
@@ -7180,7 +7344,7 @@ impl Images {
                         self.anim_changed(key);
                         continue;
                     };
-                    if read > anim::ANIM_ALL_MAX {
+                    if read > anim::one_max() {
                         self.anims.refuse(key.clone(), true);
                         self.anim_changed(key);
                         continue;
@@ -7215,14 +7379,24 @@ impl Images {
         0
     }
 
-    /// The room the cache has for the animations painted: its budget less what stays whatever
-    /// they do (the bookkeeping, the pixels painted in this frame, the steps of animations gone).
+    /// The room the cache has for the animations painted: its own budget ([`Cache::cap`], which
+    /// their slots take only their share of, [`anim::allocate`]) less what stays whatever they do
+    /// (the bookkeeping, the pixels painted in this frame, the steps of animations gone).
     /// The bodies remote animations play from are their bids' ([`Images::anim_body`]): a paused
     /// one's goes with it. One played past the limits plays from the cached body it was read
     /// from, if it was: that body stays while it does (it bids for nothing, and isn't let go for
     /// room), so it is fixed too. What comes and goes as images load (the decodes' reserve, the
     /// fetchers', a request's wishes) is left out, so that the allocation doesn't come and go
-    /// with it: a read waits for it instead ([`Images::anim_room`]).
+    /// with it: a read waits for it instead ([`Images::anim_room`]). The exception is the stills
+    /// in view that a request asked to be decoded and that aren't in the cache yet
+    /// ([`anim::Anims::view_stills`]): each is taken off at what decoding it holds until it is in
+    /// the cache, then at its pixels (which, once painted, are among what stays). An animation
+    /// that holds what they need is let go (its still shown) and isn't let in again until they
+    /// are in, instead of stills in view staying blank as long as it plays (a paused one keeps
+    /// its memory, and the stills can't evict a slot painted); one let go while the view moves
+    /// waits for it to rest ([`anim::Anims::rest`]). That changes only with the view and as those
+    /// stills come, so it doesn't come and go with the decodes ahead of the view, which never stop
+    /// an animation.
     fn anims_room_now(&self) -> usize {
         let frame = self.cache.frame;
         let fixed: usize = (self.cache.slots.iter())
@@ -7242,6 +7416,35 @@ impl Images {
             .saturating_sub(fixed)
             .saturating_sub(self.cache.overhead)
             .saturating_sub(gone)
+            .saturating_sub(self.view_stills_need())
+    }
+
+    /// What the stills in view still to come hold for the allocation ([`Images::anims_room_now`]):
+    /// one not decoded what decoding it holds, one decoded but not painted yet its pixels (one
+    /// painted is counted with what is painted).
+    fn view_stills_need(&self) -> usize {
+        let frame = self.cache.frame;
+        let mut need = 0usize;
+        for (key, (w, h), cost) in &self.anims.view_stills {
+            let slot = self.cache.slots.iter().find(|s| {
+                s.pixels().is_some_and(|b| (b.width, b.height) == (*w, *h)) && s.key == *key
+            });
+            need = need.saturating_add(match slot {
+                Some(s) if s.painted_in(frame) => 0,
+                Some(s) => s.cost(),
+                None => *cost,
+            });
+        }
+        need
+    }
+
+    /// What the animation of `key` held in the cache is charged against its budget, if it is
+    /// held: its share at most ([`anim::ANIM_SHARE`]).
+    fn anim_charge(&self, key: &Key) -> usize {
+        match self.anim_at(key) {
+            Some(At::Slot(i)) => self.cache.slots[i].cost().min(anim::ANIM_SHARE),
+            _ => 0,
+        }
     }
 
     /// Make the allocation again ([`anim::allocate`]) if what it weighs changed.
@@ -7251,9 +7454,27 @@ impl Images {
         });
         let bids = self.anim_bids(shown);
         let room = self.anims_room_now();
+        let moving = self
+            .anims
+            .rest
+            .is_some_and(|t| std::time::Instant::now() < t);
         let alloc = &self.anims.alloc;
-        if bids != alloc.bids || room != alloc.room {
-            self.anims.alloc = anim::allocate(bids, room);
+        if bids != alloc.bids || room != alloc.room || moving != alloc.moving {
+            let mut alloc = anim::allocate(bids, room);
+            // (While the view moves, one let go for a still in view waits: [`anim::Anims::rest`].)
+            if moving {
+                let starts: Vec<Key> = (alloc.play.iter())
+                    .filter(|k| self.anims.yielded.contains(k) && self.anim_at(k).is_none())
+                    .cloned()
+                    .collect();
+                alloc.play.retain(|k| !starts.contains(k));
+                alloc.waiting.extend(starts);
+            }
+            alloc.moving = moving;
+            self.anims.alloc = alloc;
+        }
+        if !moving {
+            self.anims.yielded = Vec::new();
         }
     }
 
@@ -7262,10 +7483,13 @@ impl Images {
     /// its slot). The animations let go for it are those the allocation doesn't play (paused,
     /// ended, off screen): those not painted first, least recently used first, then those
     /// painted, from the bottom up. One running a step is not (it is asked for no more, and let go
-    /// once it is back). Nothing goes if not enough can. Whether it fits.
-    fn anim_room(&mut self, slot: usize, read: usize) -> bool {
+    /// once it is back). Nothing goes if not enough can. Whether it fits. `fetch`: what is read is
+    /// a remote body fetched again for it, which isn't the animation's memory (the cache's budget
+    /// doesn't grow for it, [`Cache::budget`]), not a file.
+    fn anim_room(&mut self, slot: usize, read: usize, fetch: bool) -> bool {
         let frame = self.cache.frame;
         let need = slot.max(read);
+        let anim = if fetch { slot } else { need };
         let held = self.anim_slots_cost();
         let mut can = Vec::new();
         for s in &self.cache.slots {
@@ -7283,22 +7507,27 @@ impl Images {
             can.push((
                 rank,
                 s.cost(),
-                stuck + self.body_freed(&s.key),
+                (stuck, self.body_freed(&s.key)),
                 s.key.clone(),
             ));
         }
         can.sort_unstable_by_key(|c| c.0);
         self.charge_bookkeeping();
-        let (mut freed, mut stuck, mut keys) = (0usize, 0usize, Vec::new());
+        let (mut freed, mut unstuck, mut keys) = (0usize, (0usize, 0usize), Vec::new());
         let mut can = can.into_iter();
-        while held.saturating_sub(freed).saturating_add(slot) > anim::ANIM_ALL_MAX
-            || !self.cache.can_fit_without(need, stuck)
-        {
-            let Some((_, cost, unstuck, key)) = can.next() else {
+        while held.saturating_sub(freed).saturating_add(slot) > anim::all_max() || {
+            let (anims, bodies) = unstuck;
+            let all = anims.saturating_add(bodies);
+            !self.cache.can_fit_without(need, anim, all, anims)
+        } {
+            let Some((_, cost, (anims, bodies), key)) = can.next() else {
                 return false;
             };
             freed = freed.saturating_add(cost);
-            stuck = stuck.saturating_add(unstuck);
+            unstuck = (
+                unstuck.0.saturating_add(anims),
+                unstuck.1.saturating_add(bodies),
+            );
             keys.push(key);
         }
         for key in keys {
@@ -7405,6 +7634,14 @@ impl Images {
             if let Some(at @ At::Slot(_)) = self.anim_at(key)
                 && !self.playing(at).running
             {
+                // (Let go for room while the view moves: it waits for the view to rest.)
+                if !forced
+                    && (self.anims.alloc.moving || self.view_stills_need() > 0)
+                    && !self.anims.yielded.contains(key)
+                    && self.anims.yielded.len() < VIEW_MAX
+                {
+                    self.anims.yielded.push(key.clone());
+                }
                 self.drop_anim(at);
                 n += 1;
             }
@@ -7482,6 +7719,16 @@ impl Images {
             let Some(at) = self.anim_of(serial) else {
                 continue;
             };
+            // One in the cache that isn't painted is evicted like any slot, unless the animations
+            // hold more than their share of the budget, which grows for them: then it goes.
+            if let At::Slot(_) = at
+                && self.cache.anims_past_share()
+                && !shown.iter().any(|s| s.1 == *self.key_at(at))
+                && !self.playing(at).running
+            {
+                self.drop_anim(at);
+                continue;
+            }
             let p = self.playing(at);
             // One played past the limits goes once it isn't painted (it isn't the cache's to
             // evict): it is read again when it is.
@@ -7597,7 +7844,7 @@ impl Images {
                 // (Room is made for it to be fetched again in: those it lets go don't come back.)
                 None => {
                     if let Some(cost) = cost
-                        && !self.anim_room(cost, self.anim_body(&key))
+                        && !self.anim_room(cost, self.anim_body(&key), true)
                     {
                         self.stall(&key);
                     }
@@ -7636,7 +7883,7 @@ impl Images {
             return true;
         }
         if let Some(cost) = cost
-            && !(self.anim_room(cost, read) && self.make_room("anim index", read))
+            && !(self.anim_room(cost, read, false) && self.make_room_as("anim index", read, read))
         {
             self.stall(&key);
             return false;
@@ -7714,7 +7961,7 @@ impl Images {
         } else {
             self.read_cost(id, key)
         };
-        if read.is_some_and(|read| self.anim_room(cost, read)) {
+        if read.is_some_and(|read| self.anim_room(cost, read, fetch)) {
             anim::retain_keys(&mut self.anims.stalled, &|k| k != key);
         }
     }
@@ -7732,8 +7979,9 @@ impl Images {
                 let (old, new) = (p.cost, p.charge());
                 let grow = new.saturating_sub(old);
                 let key = self.key_at(at).clone();
-                if new > anim::ANIM_ONE_MAX
-                    || !(self.anim_room(grow, 0) && self.make_room("anim box", grow))
+                if new > anim::one_max()
+                    || !(self.anim_room(grow, 0, false)
+                        && self.make_room_as("anim box", grow, grow))
                 {
                     // (Room was made: the slot may have moved.)
                     if let Some(at) = self.anim_at(&key) {
@@ -7778,6 +8026,7 @@ impl Images {
         p.cost = new;
         if let At::Slot(_) = at {
             self.cache.bytes = self.cache.bytes - old + new;
+            self.cache.anim_bytes = self.cache.anim_bytes - old + new;
         }
     }
 
@@ -7878,7 +8127,13 @@ impl Images {
         }
         let keep = engine.keeps(out.size);
         if !keep {
-            engine.lean(out.size, anim::ANIM_ONE_MAX);
+            // (Made late, as one bitmap, when two would be over what one took before the limit
+            // was raised, and one is within it, as for an 800 × 600 GIF at 2×: they are charged
+            // what they were; else when only that lets it within the limit.)
+            engine.lean(out.size, anim::LATE_MAX);
+            if !engine.late {
+                engine.lean(out.size, anim::one_max());
+            }
         }
         let p = anim::Playing::new(serial, engine, out.size, keep);
         let slot = p
@@ -7888,7 +8143,7 @@ impl Images {
                 Key::Local(_) => 0,
                 Key::Remote(url) => str_bytes(url),
             });
-        if p.cost > anim::ANIM_ONE_MAX {
+        if p.cost > anim::one_max() {
             return self.anims.refuse(out.key, true);
         }
         // What it holds is known now: it plays if the allocation, weighing that, plays it at the
@@ -7900,7 +8155,7 @@ impl Images {
         let size = shown.iter().find(|s| s.1 == out.key).map(|s| s.2);
         if size != Some(out.size)
             || !self.anims.alloc.play.contains(&out.key)
-            || !self.anim_room(slot, 0)
+            || !self.anim_room(slot, 0, false)
         {
             return;
         }
@@ -8001,6 +8256,10 @@ impl Images {
         self.anims.fetched = Vec::new();
         self.anims.failed = Vec::new();
         self.anims.placed = Vec::new();
+        self.anims.view_stills = Vec::new();
+        self.anims.rest = None;
+        self.anims.view = Vec::new();
+        self.anims.yielded = Vec::new();
     }
 
     /// The ids of the document's images of `keys`.

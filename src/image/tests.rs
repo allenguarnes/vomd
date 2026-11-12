@@ -5178,6 +5178,8 @@ fn anim_slots(images: &Images) -> usize {
 fn charged_right(images: &Images) {
     let sum: usize = images.cache.slots.iter().map(Slot::cost).sum();
     assert_eq!(images.cache.bytes, sum);
+    let anims: usize = images.cache.slots.iter().map(Cache::anim_cost).sum();
+    assert_eq!(images.cache.anim_bytes, anims);
 }
 
 /// A page of `md` whose images are the fixtures `names`, decoded at their boxes.
@@ -5269,8 +5271,14 @@ fn an_animation_plays_frame_by_frame() {
 
 #[test]
 fn an_animation_over_the_limits_plays_when_asked() {
-    let (dir, doc, mut layout, mut images) =
-        anim_page("anim-over", "![a](big-anim.webp)", &[(1, 1024, 768)]);
+    // (A recording of 2600 × 1600: its canvas, a frame's pixels and its decode take 47 MB.)
+    let dir = scratch("anim-over");
+    std::fs::write(dir.join("big.webp"), test_recording(2600, 1600, 3, 0)).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![a](big.webp)");
+    pump(&doc, &mut layout, &mut images, &[(1, 1024, 768)], |i, _| {
+        use crate::render::Pixels;
+        i.pixels(1, 1024, 768).is_some()
+    });
     images.set_animations(true);
     paint_until(&mut images, &doc, &mut layout, (1, 1024, 768), |i| {
         i.anim_over(1)
@@ -5441,8 +5449,8 @@ fn demo_gif(w: u16, h: u16, n: usize) -> Vec<u8> {
 
 /// The README demo GIF sizes play by themselves on a HiDPI screen, within one animation's limit:
 /// 640 × 360 at 2× and 3× (frames made at the GIF's size, enlarged by the paint), and 800 × 600 at
-/// 2× in the line's width (1440 × 1080, a fraction: one bitmap of the box, made again as each frame
-/// is shown) or wider (1600 × 1200), each of them beside the other playing ones.
+/// 2× in the line's width (1440 × 1080, a fraction: frames made at the box) or wider
+/// (1600 × 1200), each of them beside the other playing ones.
 #[test]
 fn demo_sized_animations_play_by_themselves_on_a_hidpi_screen() {
     let dir = scratch("anim-hidpi");
@@ -5498,6 +5506,526 @@ fn demo_sized_animations_play_by_themselves_on_a_hidpi_screen() {
         charged_right(&images);
         eprintln!("{file} at {w} × {h}: {held}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A screen recording the size of the README's demo (a lossless WebP of 1600 × 1000 and 292
+/// frames, 3.2 MB) plays by itself, within one animation's limit, at 1× and 2× in the line's
+/// width (720 × 450, 1440 × 900) and at 2× wider (1800 × 1125). The cache's budget grows by what
+/// it holds past the animations' share while it plays (it is charged its share only, so the
+/// stills keep theirs), and the cache is its own size again once it is off screen.
+#[test]
+fn a_screen_recording_plays_by_itself() {
+    let bytes = test_recording(1600, 1000, 292, 3_200_000);
+    // What it holds playing at each box, as `anim_measured` weighs it.
+    for size in [(720, 450), (1440, 900), (1800, 1125)] {
+        let index = anim::Index::new(&bytes).unwrap();
+        assert_eq!(index.frames.len(), 292);
+        let mut e = anim::Engine::new(Arc::new(bytes.clone()), true, index);
+        assert!(!e.keeps(size));
+        e.lean(size, anim::ANIM_ONE_MAX);
+        let cost = e.cost(size);
+        eprintln!("{size:?}: {cost} (index held {})", e.index.held());
+        assert!(cost <= anim::ANIM_ONE_MAX, "{size:?}: {cost}");
+    }
+    let dir = scratch("anim-recording");
+    std::fs::write(dir.join("demo.webp"), &bytes).unwrap();
+    for (w, h) in [(720, 450), (1440, 900), (1800, 1125)] {
+        let (doc, mut layout, mut images) = forced_page(&dir, "![a](demo.webp)");
+        pump(&doc, &mut layout, &mut images, &[(1, w, h)], |i, _| {
+            i.pixels(1, w, h).is_some()
+        });
+        images.set_animations(true);
+        let placed = [(1, w, h, 0)];
+        let mut frames: Vec<Vec<u32>> = Vec::new();
+        play_until(&mut images, &doc, &mut layout, &placed, |i| {
+            if anim_shows_frame(i, 1) {
+                let at = i.anim_at(&i.key(1).unwrap()).unwrap();
+                let front = &i.playing(at).front().unwrap().data;
+                if frames.last() != Some(front) {
+                    frames.push(front.clone());
+                }
+            }
+            frames.len() >= 3
+        });
+        assert_eq!(images.anim_state(1), Some(AnimState::Playing), "{w} × {h}");
+        assert!(!images.anim_over(1) && !images.paused(1), "{w} × {h}");
+        let held = images.anims_held();
+        assert!(
+            held > anim::ANIM_SHARE && held <= anim::ANIM_ONE_MAX,
+            "{w} × {h}: {held}"
+        );
+        // Charged its share of the budget only: what it holds past it is added to the budget.
+        let c = &images.cache;
+        assert_eq!(c.charged(c.anim_bytes, c.anim_bytes), anim::ANIM_SHARE);
+        // (At 2×, with its still, the cache holds more than its own budget.)
+        assert!(w < 1440 || c.bytes + c.held() > CACHE_BYTES);
+        assert!(c.charged(c.bytes, c.anim_bytes) + c.held() <= c.budget());
+        charged_right(&images);
+        eprintln!("{w} × {h}: {held}");
+        // Off screen, it goes (not left for an eviction): the cache is its own size again.
+        paint_placed_until(&mut images, &doc, &mut layout, &[], |i| anim_slots(i) == 0);
+        assert!(!images.cache.anims_past_share());
+        assert!(images.cache.bytes + images.cache.held() <= CACHE_BYTES);
+        charged_right(&images);
+    }
+    // At 2× it is asked for a wider box (the window is widened) while it plays: it is made
+    // again at the new frame size, plays there, and is charged within its limit.
+    let (doc, mut layout, mut images) = forced_page(&dir, "![a](demo.webp)");
+    pump(&doc, &mut layout, &mut images, &[(1, 1440, 900)], |i, _| {
+        i.pixels(1, 1440, 900).is_some()
+    });
+    images.set_animations(true);
+    let key = images.key(1).unwrap();
+    let natural = images.animated(1).unwrap().size;
+    let at_size = |i: &mut Images, size| {
+        anim_shows_frame(i, 1) && {
+            let at = i.anim_at(&i.key(1).unwrap()).unwrap();
+            i.playing(at).size == anim::frame_size(natural, size)
+        }
+    };
+    play_until(&mut images, &doc, &mut layout, &[(1, 1440, 900, 0)], |i| {
+        i.request(&[(1, 1440, 900)], 1);
+        at_size(i, (1440, 900)) && i.anim_state(1) == Some(AnimState::Playing)
+    });
+    let wide = [(1, 1800, 1125, 0)];
+    play_until(&mut images, &doc, &mut layout, &wide, |i| {
+        i.request(&[(1, 1800, 1125)], 1);
+        i.cache.has(&key, 1800, 1125)
+            && at_size(i, (1800, 1125))
+            && i.anim_state(1) == Some(AnimState::Playing)
+    });
+    assert!(!images.anim_over(1) && !images.paused(1));
+    let held = images.anims_held();
+    assert!(
+        held > anim::ANIM_SHARE && held <= anim::ANIM_ONE_MAX,
+        "{held}"
+    );
+    let c = &images.cache;
+    assert!(c.charged(c.bytes, c.anim_bytes) + c.held() <= c.budget());
+    charged_right(&images);
+    // It goes off screen while a step runs (slow steps): nothing is let go under the step, and
+    // the animation goes as soon as the step is back, the cache within its own size again.
+    images.anims.player.slow_steps(Duration::from_millis(80));
+    play_until(&mut images, &doc, &mut layout, &wide, |i| {
+        let at = i.anim_at(&key);
+        at.is_some_and(|at| i.playing(at).running)
+    });
+    let mut went_while_running = false;
+    paint_placed_until(&mut images, &doc, &mut layout, &[], |i| {
+        went_while_running |= i.anim_at(&key).is_some_and(|at| i.playing(at).running);
+        anim_slots(i) == 0
+    });
+    assert!(went_while_running, "off screen while a step ran");
+    paint_placed_until(&mut images, &doc, &mut layout, &[], |i| i.cache.anims == 0);
+    assert!(!images.cache.anims_past_share());
+    assert!(images.cache.bytes + images.cache.held() <= CACHE_BYTES);
+    charged_right(&images);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A still that comes into view while a screen recording plays, charged its whole share, gets
+/// its memory: the recording waits (is let go, its still shown) until the still is decoded and
+/// plays again beside it, instead of the still staying blank for as long as it plays.
+#[test]
+fn a_still_coming_into_view_decodes_beside_a_playing_recording() {
+    use crate::render::Pixels;
+    let dir = scratch("anim-still-room");
+    std::fs::write(
+        dir.join("demo.webp"),
+        test_recording(1600, 1000, 292, 3_200_000),
+    )
+    .unwrap();
+    for n in 1..=4 {
+        let png = png_bytes(1100, 1000, |x, y| [x as u8, y as u8, (x ^ y) as u8, 255]);
+        std::fs::write(dir.join(format!("s{n}.png")), png).unwrap();
+    }
+    let md = "![a](demo.webp) ![b](s1.png) ![c](s2.png) ![d](s3.png) ![e](s4.png)";
+    let (doc, mut layout, mut images) = forced_page(&dir, md);
+    let sizes = [(1, 720, 450), (2, 1100, 1000), (3, 1100, 1000)];
+    let sizes = [sizes.as_slice(), &[(4, 1100, 1000), (5, 1100, 1000)]].concat();
+    let placed: Vec<(u32, u32, u32, i32)> = sizes
+        .iter()
+        .scan(0, |top, &(id, w, h)| {
+            let at = *top;
+            *top += h as i32;
+            Some((id, w, h, at))
+        })
+        .collect();
+    // The recording and three stills are in view, loaded, and it plays.
+    let few = &sizes[..4];
+    pump(&doc, &mut layout, &mut images, few, |i, _| {
+        few.iter().all(|&(id, w, h)| i.pixels(id, w, h).is_some())
+    });
+    images.set_animations(true);
+    let playing =
+        |i: &mut Images| anim_shows_frame(i, 1) && i.anim_state(1) == Some(AnimState::Playing);
+    let asked = |i: &mut Images, n: usize| i.request(&sizes[..n], n);
+    play_until(&mut images, &doc, &mut layout, &placed[..4], |i| {
+        asked(i, 4);
+        playing(i)
+    });
+    assert_eq!(images.cache.anim_bytes, images.anims_held());
+    assert!(images.anims_held() > anim::ANIM_SHARE);
+    // A fourth still scrolls into view: it decodes, whatever the recording does, and the
+    // recording, let go for it, isn't read again before it is in (nor after: with the four
+    // stills painted it has no room).
+    let key = images.key(5).unwrap();
+    let serial = images.anims.serial;
+    play_until(&mut images, &doc, &mut layout, &placed, |i| {
+        asked(i, 5);
+        i.cache.has(&key, 1100, 1000)
+    });
+    for _ in 0..50 {
+        paint_placed(&mut images, &doc, &mut layout, &placed);
+        asked(&mut images, 5);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(images.anims.serial, serial, "read again beside the still");
+    // The recording was let go for it (with the four stills painted it has no room: that's as
+    // it was shown), and plays again, within the budget, once the fourth is scrolled off.
+    assert!(!playing(&mut images));
+    play_until(&mut images, &doc, &mut layout, &placed[..4], |i| {
+        asked(i, 4);
+        playing(i)
+    });
+    let c = &images.cache;
+    assert!(c.charged(c.bytes, c.anim_bytes) + c.held() <= c.budget());
+    charged_right(&images);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A column of images of `sizes` (id, w, h), one under the other: (id, w, h, top).
+fn column(sizes: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32, i32)> {
+    let mut top = 0;
+    let mut out = Vec::new();
+    for &(id, w, h) in sizes {
+        out.push((id, w, h, top));
+        top += h as i32;
+    }
+    out
+}
+
+/// One frame of a window showing `column` from `top`, `height` tall, made as the window makes
+/// it: the boxes in view placed and painted, then a request for them and for a screen above and
+/// below (decoded ahead), a poll, and the frames due shown (the clock jumping to them).
+fn window_frame(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut Layout,
+    column: &[(u32, u32, u32, i32)],
+    (top, height): (i32, i32),
+    now: &mut Instant,
+) {
+    use crate::render::Pixels;
+    let near = |b: &&(u32, u32, u32, i32), above: i32, below: i32| {
+        b.3 < top + height + below && b.3 + b.2 as i32 > top - above
+    };
+    let shown: Vec<_> = column.iter().filter(|b| near(b, 0, 0)).collect();
+    images.begin_frame();
+    for &&(id, w, h, y) in &shown {
+        images.placed(id, (0, y - top, w as i32, y - top + h as i32));
+        let _ = images.pixels(id, w, h);
+    }
+    images.painted();
+    let mut boxes: Vec<_> = shown.iter().map(|b| (b.0, b.1, b.2)).collect();
+    let ahead = column
+        .iter()
+        .filter(|b| near(b, height, height) && !near(b, 0, 0));
+    boxes.extend(ahead.map(|b| (b.0, b.1, b.2)));
+    images.request(&boxes, shown.len());
+    images.poll(doc, layout);
+    if let Some(due) = images.anim_deadline() {
+        *now = (*now).max(due);
+        images.set_anim_clock(Some(*now));
+        images.advance(*now);
+    }
+}
+
+/// The frame image `id`'s animation shows, if it shows one of its own.
+fn anim_front(images: &mut Images, id: u32) -> Option<Vec<u32>> {
+    let key = images.key(id)?;
+    let at = images.anim_at(&key)?;
+    Some(images.playing(at).front()?.data.clone())
+}
+
+/// [`window_frame`] until what it asks for is settled, however slow the machine: the decoder idle,
+/// and no image decoded for 300 ms.
+fn settle_window(
+    images: &mut Images,
+    doc: &Doc,
+    layout: &mut Layout,
+    column: &[(u32, u32, u32, i32)],
+    view: (i32, i32),
+    now: &mut Instant,
+) {
+    let t = Instant::now();
+    let (mut decodes, mut since) = (images.stats().decodes, Instant::now());
+    while !(images.is_idle() && since.elapsed() >= Duration::from_millis(300)) {
+        assert!(t.elapsed() < Duration::from_secs(30), "doesn't settle");
+        window_frame(images, doc, layout, column, view, now);
+        if images.stats().decodes != decodes {
+            (decodes, since) = (images.stats().decodes, Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A screen recording between screenshots, at 1× and 2×, keeps playing, and isn't read again,
+/// while the stills in view and those decoded ahead of the view load beside it (decodes ahead
+/// never stop it, and two of them that don't both fit beside it don't take turns), and while the
+/// window scrolls past it it is read again about once, however many stills come into view (one
+/// let go for room while the view moves starts again once the view rests; at 1× it plays in most
+/// frames it is in view), and plays again, and stays, once the view rests.
+#[test]
+fn a_recording_keeps_playing_while_stills_load_beside_it() {
+    let dir = scratch("anim-beside-stills");
+    std::fs::write(
+        dir.join("demo.webp"),
+        test_recording(1600, 1000, 292, 3_200_000),
+    )
+    .unwrap();
+    let png = png_bytes(1100, 700, |x, y| [x as u8, y as u8, (x ^ y) as u8, 255]);
+    let mut md = String::new();
+    for n in 1..=8 {
+        std::fs::write(dir.join(format!("s{n}.png")), &png).unwrap();
+        md.push_str(&format!("![s](s{n}.png)\n\n"));
+        if n == 3 {
+            md.push_str("![a](demo.webp)\n\n");
+        }
+    }
+    for scale in [1u32, 2] {
+        let (doc, mut layout, mut images) = forced_page(&dir, &md);
+        images.set_animations(true);
+        let (w, still_h, anim_h) = (720 * scale, 458 * scale, 450 * scale);
+        let sizes: Vec<_> = (1..=9)
+            .map(|id| (id, w, if id == 4 { anim_h } else { still_h }))
+            .collect();
+        let column = column(&sizes);
+        let height = 1200 * scale as i32;
+        let anim_top = column[3].3;
+        let view = (anim_top - 300 * scale as i32, height);
+        let mut now = Instant::now();
+        let in_view = |i: &Images, view: (i32, i32)| {
+            column
+                .iter()
+                .filter(|b| b.0 != 4 && b.3 < view.0 + view.1 && b.3 + b.2 as i32 > view.0)
+                .all(|b| i.cache.has(&i.key(b.0).unwrap(), b.1, b.2))
+        };
+        let t = Instant::now();
+        while !(in_view(&images, view)
+            && anim_shows_frame(&mut images, 4)
+            && images.anim_state(4) == Some(AnimState::Playing))
+        {
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "{scale}×: doesn't play"
+            );
+            window_frame(&mut images, &doc, &mut layout, &column, view, &mut now);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // (Settled: what is in view and what fits ahead decoded.)
+        settle_window(&mut images, &doc, &mut layout, &column, view, &mut now);
+        // It stays for ten frames of its own: playing, not read again; nothing is decoded again.
+        let (serial, decodes) = (images.anims.serial, images.stats().decodes);
+        let mut frames = Vec::new();
+        let t = Instant::now();
+        while frames.len() < 10 {
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "{scale}×: doesn't play on"
+            );
+            window_frame(&mut images, &doc, &mut layout, &column, view, &mut now);
+            assert_eq!(images.anim_state(4), Some(AnimState::Playing), "{scale}×");
+            let front = anim_front(&mut images, 4).expect("plays");
+            if frames.last() != Some(&front) {
+                frames.push(front);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let decoded = images.stats().decodes - decodes;
+        eprintln!("{scale}×: {decoded} decodes in {:?}", t.elapsed());
+        assert_eq!(images.anims.serial, serial, "{scale}×: read again");
+        assert_eq!(decoded, 0, "{scale}×: {decoded} decodes beside it");
+        // What decodes ahead of the view hold (as when one is queued) doesn't stop it: the
+        // allocation doesn't weigh it.
+        let key = images.key(4).unwrap();
+        images.cache.reserve = 20 << 20;
+        let shown = images.anims_shown();
+        images.reallocate(&shown);
+        assert!(images.anims.alloc.play.contains(&key), "{scale}×: stopped");
+        images.cache.reserve = 0;
+        let c = &images.cache;
+        assert!(c.charged(c.bytes, c.anim_bytes) + c.held() <= c.budget());
+        charged_right(&images);
+        // Scrolled past it, down and back up.
+        let end = column.last().map(|b| b.3 + b.2 as i32).unwrap() - height;
+        let step = 30 * scale as i32;
+        let tops: Vec<i32> = (0..=end / step)
+            .map(|k| k * step)
+            .chain((0..=end / step).rev().map(|k| k * step))
+            .collect();
+        // (The scroll is one movement however a loaded machine spaces its steps: the view doesn't
+        // rest in it. That it rests after it is the end of this test.)
+        let rest = TestAnimRest::set(Duration::from_secs(3600));
+        let serial = images.anims.serial;
+        let (mut shown, mut playing, mut came) = (0, 0, 0);
+        let mut seen = std::collections::HashSet::new();
+        for top in tops {
+            let view = (top, height);
+            window_frame(&mut images, &doc, &mut layout, &column, view, &mut now);
+            // (Each time a still comes into view.)
+            let now_seen: std::collections::HashSet<u32> = (column.iter())
+                .filter(|b| b.3 < top + height && b.3 + b.2 as i32 > top && b.0 != 4)
+                .map(|b| b.0)
+                .collect();
+            came += now_seen.difference(&seen).count();
+            seen = now_seen;
+            if anim_top < top + height && anim_top + anim_h as i32 > top {
+                shown += 1;
+                playing += usize::from(anim_shows_frame(&mut images, 4));
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let reads = images.anims.serial - serial;
+        drop(rest);
+        images.anims.rest = None;
+        eprintln!(
+            "{scale}×, scrolled: playing in {playing} of {shown} frames, read {reads} times, \
+             stills came into view {came} times"
+        );
+        // (At 1× it fits beside the stills in view and one decoding. At 2× a screenshot coming
+        // into view needs more than the stills' half leaves beside what is painted while it
+        // decodes: the recording is let go for it, and read again once it is in.)
+        if scale == 1 {
+            assert!(
+                2 * playing >= shown,
+                "1×: playing in {playing} of {shown} frames"
+            );
+        }
+        // (Let go for room while the view moves, it starts again once it rests: one scroll past
+        // all the screenshots reads it again about once, not once for each.)
+        assert!(
+            reads <= 3,
+            "{scale}×: read {reads} times for {came} stills coming into view"
+        );
+        // Back at rest beside it, it plays again, and stays.
+        let t = Instant::now();
+        while !(anim_shows_frame(&mut images, 4)
+            && images.anim_state(4) == Some(AnimState::Playing))
+        {
+            assert!(
+                t.elapsed() < Duration::from_secs(20),
+                "{scale}×: doesn't play again"
+            );
+            window_frame(&mut images, &doc, &mut layout, &column, view, &mut now);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let serial = images.anims.serial;
+        for _ in 0..100 {
+            window_frame(&mut images, &doc, &mut layout, &column, view, &mut now);
+            assert_eq!(images.anim_state(4), Some(AnimState::Playing), "{scale}×");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(images.anims.serial, serial, "{scale}×: read again at rest");
+        charged_right(&images);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An 800 × 600 GIF at 2× in the line's width plays beside screenshots as it did before the
+/// limits were raised: made late, as one bitmap, it is charged under 10 MB, which fits beside
+/// the stills painted, and the stills decoded ahead don't take turns beside it.
+#[test]
+fn a_gif_of_the_old_size_plays_beside_stills_at_2x() {
+    let dir = scratch("anim-gif-beside-stills");
+    std::fs::write(dir.join("demo.gif"), demo_gif(800, 600, 10)).unwrap();
+    let png = png_bytes(1200, 900, |x, y| [y as u8, x as u8, (x ^ y) as u8, 255]);
+    let mut md = String::new();
+    for n in 1..=6 {
+        std::fs::write(dir.join(format!("s{n}.png")), &png).unwrap();
+        md.push_str(&format!("![s](s{n}.png)\n\n"));
+        if n == 2 {
+            md.push_str("![a](demo.gif)\n\n");
+        }
+    }
+    let (doc, mut layout, mut images) = forced_page(&dir, &md);
+    images.set_animations(true);
+    let sizes: Vec<_> = (1..=7)
+        .map(|id| {
+            if id == 3 {
+                (id, 1440, 1080)
+            } else {
+                (id, 1200, 900)
+            }
+        })
+        .collect();
+    let column = column(&sizes);
+    let view = (column[2].3 - 500, 2000);
+    let mut now = Instant::now();
+    let t = Instant::now();
+    while !(anim_shows_frame(&mut images, 3) && images.anim_state(3) == Some(AnimState::Playing)) {
+        assert!(t.elapsed() < Duration::from_secs(20), "doesn't play");
+        window_frame(&mut images, &doc, &mut layout, &column, view, &mut now);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let held = images.anims_held();
+    assert!(held < 10 << 20, "{held}");
+    // (Settled: what is in view and what fits ahead decoded.)
+    settle_window(&mut images, &doc, &mut layout, &column, view, &mut now);
+    // It stays for ten frames of its own (a loop): playing, not read again, nothing decoded.
+    let (serial, decodes) = (images.anims.serial, images.stats().decodes);
+    let mut frames = Vec::new();
+    let t = Instant::now();
+    while frames.len() < 10 {
+        assert!(t.elapsed() < Duration::from_secs(30), "doesn't play on");
+        window_frame(&mut images, &doc, &mut layout, &column, view, &mut now);
+        assert_eq!(images.anim_state(3), Some(AnimState::Playing));
+        let front = anim_front(&mut images, 3).expect("plays");
+        if frames.last() != Some(&front) {
+            frames.push(front);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let decoded = images.stats().decodes - decodes;
+    eprintln!("GIF at 1440 × 1080: {held}, {decoded} decodes");
+    assert_eq!(images.anims.serial, serial, "read again");
+    assert_eq!(decoded, 0, "{decoded} decodes beside it");
+    charged_right(&images);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two copies of a large screen recording in one document both show their first frames: each
+/// decode needs more than the cache has, so each runs alone, the second once the first's still
+/// is painted (and so kept). Asked as the window does, a frame painted and then its request: a
+/// request made before the paint of what has just decoded would evict it for the next decode's
+/// room, and the two would go on taking turns.
+#[test]
+fn two_large_animations_both_decode_their_first_frames() {
+    use crate::render::Pixels;
+    let dir = scratch("anim-two-large");
+    let bytes = test_recording(1600, 1000, 4, 0);
+    std::fs::write(dir.join("a.webp"), &bytes).unwrap();
+    std::fs::write(dir.join("b.webp"), &bytes).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![a](a.webp) ![b](b.webp)");
+    let boxes = [(1, 720, 450), (2, 720, 450)];
+    // (Painted as the window does: each frame asks for what is wanted, and paints what it has.)
+    let t = Instant::now();
+    let mut shown = [false; 2];
+    while !shown.iter().all(|s| *s) {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "timed out: {shown:?}"
+        );
+        images.begin_frame();
+        for (n, &(id, w, h)) in boxes.iter().enumerate() {
+            shown[n] = images.pixels(id, w, h).is_some();
+        }
+        images.request(&boxes, boxes.len());
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+    }
+    charged_right(&images);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5697,8 +6225,16 @@ fn due_frames_share_a_tick_and_ticks_are_capped() {
 fn animations_on_screen_play_first_from_the_top_down() {
     let size = (800, 600);
     let boxes: Vec<_> = (1..=4).map(|id| (id, size.0, size.1)).collect();
-    let md = "![a](anim.webp) ![b](anim.webp) ![c](anim.webp) ![d](anim.webp)";
-    let (dir, doc, mut layout, mut images) = anim_page("anim-order", md, &boxes);
+    // (Made 10 MB larger: three play within the limit for all, not four.)
+    let dir = scratch("anim-order");
+    let big = test_padded(fixture("anim.webp"), 10 << 20);
+    std::fs::write(dir.join("big.webp"), big).unwrap();
+    let md = "![a](big.webp) ![b](big.webp) ![c](big.webp) ![d](big.webp)";
+    let (doc, mut layout, mut images) = forced_page(&dir, md);
+    pump(&doc, &mut layout, &mut images, &boxes, |i, _| {
+        use crate::render::Pixels;
+        boxes.iter().all(|&(id, w, h)| i.pixels(id, w, h).is_some())
+    });
     images.set_anim_clock(Some(Instant::now()));
     images.set_animations(true);
     let at = |id: u32| (id, size.0, size.1, (id as i32 - 1) * 610);
@@ -5796,9 +6332,11 @@ fn big_above_playing(name: &str) -> BigAbove {
     let boxes = [(1, size.0, size.1), (2, size.0, size.1)];
     let dir = scratch(name);
     let mut big = fixture("anim.gif");
-    big.resize(14 << 20, 0);
+    big.resize(39 << 20, 0);
     std::fs::write(dir.join("big.gif"), &big).unwrap();
-    std::fs::write(dir.join("anim.webp"), fixture("anim.webp")).unwrap();
+    // (The one below holds enough that both are over the limit for all animations.)
+    let below = anim::tests::padded(fixture("anim.webp"), 5_500_000);
+    std::fs::write(dir.join("anim.webp"), below).unwrap();
     let (doc, mut layout, mut images) = forced_page(&dir, "![a](big.gif) ![b](anim.webp)");
     pump(&doc, &mut layout, &mut images, &boxes, |i, _| {
         use crate::render::Pixels;
@@ -5817,7 +6355,7 @@ fn big_above_playing(name: &str) -> BigAbove {
         + STR_OVERHEAD
         + anim::MEASURE_FIXED;
     assert!(
-        one + cost > anim::ANIM_ALL_MAX && cost < anim::ANIM_ALL_MAX,
+        one + cost > anim::ANIM_ALL_MAX && cost <= anim::ANIM_ONE_MAX,
         "{one} {cost}"
     );
     // Not room for its file beside what is painted, whether the one below stays or goes.
@@ -5827,8 +6365,11 @@ fn big_above_playing(name: &str) -> BigAbove {
         images.placed(id, (0, top, w as i32, top + h as i32));
         let _ = images.pixels(id, w, h);
     }
-    images.cache.cap =
-        (images.cache.stuck() + images.cache.held() + cost - one).saturating_sub(1 << 20);
+    // (What it holds past the animations' share is added to the budget: only the share has to
+    // fit.)
+    images.cache.cap = (images.cache.stuck() + images.cache.held() + cost.min(anim::ANIM_SHARE)
+        - one)
+        .saturating_sub(1 << 20);
     let serial = images.anims.serial;
     for _ in 0..50 {
         paint_placed(&mut images, &doc, &mut layout, &both);
@@ -5877,7 +6418,7 @@ fn a_file_over_the_limits_for_all_animations_plays_when_asked() {
     let boxes = [(1, size.0, size.1)];
     let dir = scratch("anim-big-file");
     let mut big = fixture("anim.gif");
-    big.resize(20 << 20, 0);
+    big.resize(50 << 20, 0);
     std::fs::write(dir.join("big.gif"), &big).unwrap();
     let (doc, mut layout, mut images) = forced_page(&dir, "![a](big.gif)");
     pump(&doc, &mut layout, &mut images, &boxes, |i, _| {
@@ -6009,6 +6550,7 @@ fn a_waiting_animation_with_room_for_its_hold_only_asks_for_no_repaints() {
 /// again once, for its note, and then no more.
 #[test]
 fn a_waiting_animation_that_turns_over_is_painted_again_once() {
+    let _limits = TestAnimLimits::small();
     let size = (800, 600);
     let boxes = [(1, size.0, size.1)];
     let dir = scratch("anim-wait-over");
@@ -6182,6 +6724,7 @@ fn a_waiting_animation_is_paused_with_animations_off_and_waits_again_when_they_a
 /// outside the cache) when it is: it stays over the limits, and a click isn't needed again.
 #[test]
 fn an_animation_played_past_the_limits_is_read_again_when_painted_again() {
+    let _limits = TestAnimLimits::small();
     let size = (800, 600);
     let dir = scratch("anim-forced-again");
     let mut big = fixture("anim.gif");
@@ -6282,6 +6825,7 @@ fn an_animation_that_cant_be_read_isnt_one_and_isnt_read_again() {
 /// them: one over that is no animation to play (nothing shows, nothing is read again).
 #[test]
 fn an_animation_over_the_ceiling_for_forced_loads_isnt_played_when_asked() {
+    let _limits = TestAnimLimits::small();
     let size = (800, 600);
     let dir = scratch("anim-forced-ceiling");
     let mut big = fixture("anim.gif");
@@ -6930,6 +7474,7 @@ fn a_body_fetched_for_its_image_is_judged_for_its_decode_whatever_is_left_in_fet
 #[cfg(feature = "remote-images")]
 #[test]
 fn a_large_remote_animation_is_over_the_limits_and_plays_when_clicked() {
+    let _limits = TestAnimLimits::small();
     let url: Arc<str> = "https://x.y/anim.gif".into();
     let md = "![a](https://x.y/anim.gif)";
     let mut gif = fixture("anim.gif");
@@ -7135,6 +7680,7 @@ fn a_cached_remote_animation_is_still_one_after_leaving_the_document_and_coming_
 #[test]
 fn a_waiting_animation_starts_when_a_kept_build_gives_back_room_and_only_the_changed_boxes_are_painted()
  {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("kept-room");
     std::fs::write(dir.join("large.gif"), demo_gif(1600, 1200, 3)).unwrap();
     std::fs::write(dir.join("small.gif"), fixture("anim.gif")).unwrap();
@@ -7190,6 +7736,7 @@ fn a_waiting_animation_starts_when_a_kept_build_gives_back_room_and_only_the_cha
 
 #[test]
 fn a_waiting_animation_that_still_doesnt_fit_is_not_asked_for_when_room_is_given_back() {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("kept-no-room");
     std::fs::write(dir.join("a.gif"), demo_gif(1600, 1200, 3)).unwrap();
     std::fs::write(dir.join("b.gif"), fixture("anim.gif")).unwrap();
@@ -7301,6 +7848,7 @@ fn paint_partially(
 /// that starts it, and nothing else does (the paints after are of the changed boxes).
 #[test]
 fn a_waiting_animation_starts_when_the_one_below_finishes_a_step_without_giving_bytes_back() {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("wait-below");
     let gif = demo_gif(800, 600, 10);
     std::fs::write(dir.join("a.gif"), &gif).unwrap();
@@ -7394,6 +7942,7 @@ fn a_waiting_animation_starts_when_the_one_below_finishes_a_step_without_giving_
 /// doesn't fit, and then it is not the poll that does.
 #[test]
 fn a_waiting_animation_that_cant_fit_causes_no_repaints_as_the_one_above_plays() {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("wait-above");
     let gif = demo_gif(800, 600, 10);
     std::fs::write(dir.join("a.gif"), &gif).unwrap();
@@ -7436,6 +7985,7 @@ fn a_waiting_animation_that_cant_fit_causes_no_repaints_as_the_one_above_plays()
 /// for the paint of its badge, once, with nothing else to prompt it.
 #[test]
 fn an_animation_found_over_the_limits_after_it_was_painted_asks_for_one_repaint() {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("over-painted");
     let mut gif = fixture("anim.gif");
     // The first frame stays normal; the second's scratch is over what one animation may hold.
@@ -7515,6 +8065,7 @@ fn a_streamed_animation_that_ends_asks_for_one_repaint() {
 #[cfg(feature = "remote-images")]
 #[test]
 fn remote_animation_refusals_are_forgotten_with_their_documents_and_slots() {
+    let _limits = TestAnimLimits::small();
     let mut gif = fixture("anim.gif");
     // The first frame stays normal; the second's scratch is over what one animation may hold.
     let index = anim::Index::new(&gif).unwrap();
@@ -7588,6 +8139,7 @@ fn waiting_above(name: &str, delay_cs: Option<u16>) -> (PathBuf, Doc, Layout, Im
 /// paints asked for a few, not one for each step.
 #[test]
 fn a_waiting_animation_starts_though_the_one_below_never_idles_between_steps() {
+    let _limits = TestAnimLimits::small();
     let (dir, doc, mut layout, mut images) = waiting_above("wait-slow", Some(2));
     images.anims.player.slow_steps(Duration::from_millis(80));
     images.set_animations(true);
@@ -7623,6 +8175,7 @@ fn a_waiting_animation_starts_though_the_one_below_never_idles_between_steps() {
 /// at its pace.
 #[test]
 fn a_waiter_that_couldnt_fit_anyway_doesnt_stop_the_one_below() {
+    let _limits = TestAnimLimits::small();
     let (dir, doc, mut layout, mut images) = waiting_above("wait-claim", None);
     images.set_animations(true);
     images.set_anim_clock(Some(Instant::now()));
@@ -7680,6 +8233,7 @@ fn paint_boxes_until(
 /// if both now fit, with no click.
 #[test]
 fn a_waiting_animation_is_read_again_when_its_box_shrinks() {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("wait-shrink");
     std::fs::write(dir.join("a.gif"), demo_gif(900, 600, 10)).unwrap();
     std::fs::write(dir.join("b.gif"), demo_gif(800, 600, 10)).unwrap();
@@ -7714,6 +8268,7 @@ fn a_waiting_animation_is_read_again_when_its_box_shrinks() {
 /// goes on repainting or reading as it waits.
 #[test]
 fn an_animation_that_no_longer_fits_after_a_zoom_in_waits_quietly() {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("wait-grow");
     std::fs::write(dir.join("a.gif"), demo_gif(900, 600, 10)).unwrap();
     std::fs::write(dir.join("b.gif"), demo_gif(800, 600, 10)).unwrap();
@@ -7836,6 +8391,7 @@ fn holder_waiter_below(name: &str) -> ThreeHigh {
 /// part in the allocation).
 #[test]
 fn playing_a_waiter_past_the_limits_leaves_the_others_playing() {
+    let _limits = TestAnimLimits::small();
     let (dir, doc, mut layout, mut images, placed) = holder_waiter_below("forced-waiter");
     images.anims.player.slow_steps(Duration::from_millis(80));
     let (key2, key3) = (images.key(2).unwrap(), images.key(3).unwrap());
@@ -7876,6 +8432,7 @@ fn playing_a_waiter_past_the_limits_leaves_the_others_playing() {
 /// SOL4-M3: the file of a waiting animation goes: the others play on, whatever it is now.
 #[test]
 fn a_waiter_whose_file_went_leaves_the_others_playing() {
+    let _limits = TestAnimLimits::small();
     let (dir, doc, mut layout, mut images, placed) = holder_waiter_below("missing-waiter");
     std::fs::remove_file(dir.join("b.gif")).unwrap();
     let swaps = swaps_by_image(
@@ -7896,6 +8453,7 @@ fn a_waiter_whose_file_went_leaves_the_others_playing() {
 /// read: no badge, read no more), and the one below plays again.
 #[test]
 fn an_animation_above_whose_file_went_gives_the_room_back() {
+    let _limits = TestAnimLimits::small();
     let (dir, doc, mut layout, mut images) = waiting_above("missing-above", Some(2));
     images.anims.player.slow_steps(Duration::from_millis(80));
     images.set_animations(true);
@@ -7946,6 +8504,7 @@ fn an_animation_above_whose_file_went_gives_the_room_back() {
 /// document comes (the reviewer's lifecycle probe, sol-4).
 #[test]
 fn the_one_below_a_waiter_plays_once_the_waiter_is_out_of_the_way() {
+    let _limits = TestAnimLimits::small();
     for action in ["scroll", "pause", "off", "document"] {
         let (dir, doc, mut layout, mut images, placed) =
             holder_waiter_below(&format!("waiter-gone-{action}"));
@@ -8091,6 +8650,7 @@ fn a_waiting_remote_animation_used_at_two_sizes_stays_quiet() {
 /// answer; [`anim::allocate`] is a function of its arguments.
 #[test]
 fn the_allocation_does_nothing_again_for_the_same_inputs() {
+    let _limits = TestAnimLimits::small();
     let (dir, doc, mut layout, mut images, placed) = holder_waiter_below("alloc-idempotent");
     // (Settled: what the last paints set going is done.)
     paint_partially(
@@ -8130,6 +8690,7 @@ fn the_allocation_does_nothing_again_for_the_same_inputs() {
 /// for again, without end.
 #[test]
 fn the_stills_of_animations_shown_are_not_decoded_again_and_again() {
+    let _limits = TestAnimLimits::small();
     let dir = scratch("anim-stills-kept");
     std::fs::write(dir.join("a.gif"), demo_gif(800, 600, 10)).unwrap();
     std::fs::write(dir.join("b.gif"), demo_gif(800, 600, 10)).unwrap();
@@ -8430,12 +8991,12 @@ fn a_random_walk_keeps_every_animation_that_should_play_playing() {
                 // What the animations hold is within the limits, whatever is going on.
                 let held = images.anim_slots_cost();
                 assert!(
-                    held <= anim::ANIM_ALL_MAX,
+                    held <= anim::all_max(),
                     "seed {seed} step {step} ({what}): {held}"
                 );
                 for s in &images.cache.slots {
                     if let Data::Anim(p) = &s.data {
-                        assert!(p.cost <= anim::ANIM_ONE_MAX, "seed {seed} step {step}");
+                        assert!(p.cost <= anim::one_max(), "seed {seed} step {step}");
                     }
                 }
                 // One that ended isn't played again by itself.
@@ -8603,6 +9164,7 @@ fn an_ended_animation_let_go_for_room_stays_ended() {
 /// to play: it is weighed again (refused, over the limits), and the one below keeps playing.
 #[test]
 fn an_animation_above_whose_file_grew_gives_the_room_back() {
+    let _limits = TestAnimLimits::small();
     let (dir, doc, mut layout, mut images) = waiting_above("anim-grown-above", Some(2));
     images.anims.player.slow_steps(Duration::from_millis(80));
     images.set_animations(true);
@@ -8856,6 +9418,7 @@ fn an_animation_whose_body_fetched_past_the_limits_fails_keeps_its_still() {
 #[cfg(feature = "remote-images")]
 #[test]
 fn a_paused_remote_animation_lets_its_body_go_for_one_that_plays() {
+    let _limits = TestAnimLimits::small();
     use crate::render::Pixels;
     let dir = scratch("anim-paused-body");
     std::fs::write(dir.join("b.gif"), demo_gif(1200, 900, 3)).unwrap();
@@ -8970,6 +9533,7 @@ fn play_partially(
 #[cfg(feature = "remote-images")]
 #[test]
 fn a_body_played_past_the_limits_is_no_room_for_another_animation() {
+    let _limits = TestAnimLimits::small();
     use crate::render::Pixels;
     let dir = scratch("anim-forced-body");
     std::fs::write(dir.join("b.gif"), demo_gif(800, 600, 10)).unwrap();
@@ -9179,7 +9743,10 @@ fn a_paused_animation_whose_room_came_back_plays_within_the_limits() {
         Duration::from_millis(200),
     );
     assert_eq!(images.anim_state(2), Some(AnimState::Paused));
-    assert!(images.anim_room(cost, 0), "the room didn't come back");
+    assert!(
+        images.anim_room(cost, 0, false),
+        "the room didn't come back"
+    );
     images.play(2);
     let forced = images.anims.forced.contains(&key);
     let swaps = play_partially(
@@ -9204,6 +9771,7 @@ fn a_paused_animation_whose_room_came_back_plays_within_the_limits() {
 #[cfg(feature = "remote-images")]
 #[test]
 fn an_animation_played_past_the_limits_grows_only_within_the_ceiling() {
+    let _limits = TestAnimLimits::small();
     use crate::render::Pixels;
     let dir = scratch("anim-forced-resize");
     let (doc, mut layout, mut images) = forced_page(&dir, "![remote](https://x.y/a.gif)");

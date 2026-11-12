@@ -12,6 +12,55 @@ fn fixture(name: &str) -> Vec<u8> {
     .unwrap()
 }
 
+thread_local! {
+    /// The limits a test set for its thread ([`Limits`]): one animation's, and all of them
+    /// together's.
+    pub(in crate::image) static LIMITS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The limits of 12 MiB for one animation and 16 MiB for all of them (the animations' share of
+/// the cache, [`ANIM_SHARE`], so its budget doesn't grow for them) for the test whose thread makes
+/// it, until it is dropped: the corner cases of the allocation and the room it makes are worked out
+/// there with animations of that size (a few 800 × 600 GIFs), which decode in a fraction of the
+/// time of animations the size of the limits. What the limits let play is tested at their size.
+pub(crate) struct Limits;
+
+impl Limits {
+    pub(crate) fn small() -> Limits {
+        LIMITS.set(Some((12 << 20, ANIM_SHARE)));
+        Limits
+    }
+}
+
+impl Drop for Limits {
+    fn drop(&mut self) {
+        LIMITS.set(None);
+    }
+}
+
+thread_local! {
+    pub(in crate::image) static REST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long the view must rest ([`super::REST`]) for the test whose thread makes it, until it is
+/// dropped: a test that moves the view in steps a loaded machine may space out keeps it moving.
+pub(crate) struct Rest;
+
+impl Rest {
+    pub(crate) fn set(rest: Duration) -> Rest {
+        REST.set(Some(rest));
+        Rest
+    }
+}
+
+impl Drop for Rest {
+    fn drop(&mut self) {
+        REST.set(None);
+    }
+}
+
 const RED: u32 = 0xFFFF_0000;
 const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
@@ -489,6 +538,36 @@ fn webp_anim(w: u32, h: u32, loops: u16, anmfs: &[Vec<u8>]) -> Vec<u8> {
     out.extend((body.len() as u32).to_le_bytes());
     out.extend(body);
     out
+}
+
+/// An animated lossless WebP of `w` × `h` and `n` frames of the whole canvas (forever) in which
+/// every pixel changes each frame, as in a screen recording, made `len` bytes long at least by a
+/// chunk after the frames that nothing reads (a recording's file is its frames' data).
+pub(crate) fn recording(w: u32, h: u32, n: usize, len: usize) -> Vec<u8> {
+    let frame = |i: usize| {
+        let px: Vec<u8> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| ((x / 8 + y / 8) as usize + i) % 64))
+            .flat_map(|v| [v as u8 * 4, 255 - v as u8 * 4, v as u8 * 2, 255])
+            .collect();
+        anmf([0, 0, w, h], 100, 2, &vp8l(w, h, &px))
+    };
+    let two = [frame(0), frame(1)];
+    let frames: Vec<Vec<u8>> = (0..n).map(|i| two[i % 2].clone()).collect();
+    padded(webp_anim(w, h, 0, &frames), len)
+}
+
+/// The WebP `bytes` made `len` bytes long at least by a chunk at its end that nothing reads.
+pub(crate) fn padded(mut bytes: Vec<u8>, len: usize) -> Vec<u8> {
+    if bytes.len() + 8 < len {
+        let pad = (len - bytes.len() - 8).next_multiple_of(2);
+        bytes.extend(b"PADD");
+        bytes.extend((pad as u32).to_le_bytes());
+        bytes.resize(bytes.len() + pad, 0);
+        let riff = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&riff.to_le_bytes());
+    }
+    bytes.shrink_to_fit();
+    bytes
 }
 
 /// Blending (source over, premultiplied) and not, and disposal to transparent, on 8 × 8 frames
@@ -1053,8 +1132,8 @@ fn a_turned_animated_webp_is_shown_as_its_still() {
 }
 
 /// The allocation lets each animation in turn play that fits beside those before it, within the
-/// room and [`ANIM_ALL_MAX`]; one that doesn't waits, and doesn't keep a smaller one after it
-/// from playing. The same bids and room give the same answer.
+/// room (their share of it, [`ANIM_SHARE`]) and [`ANIM_ALL_MAX`]; one that doesn't waits, and
+/// doesn't keep a smaller one after it from playing. The same bids and room give the same answer.
 #[test]
 fn the_allocation_plays_those_that_fit_in_their_order() {
     let bid = |id: u32, cost: usize| Bid {
@@ -1066,26 +1145,36 @@ fn the_allocation_plays_those_that_fit_in_their_order() {
     let keys = |ids: &[u32]| ids.iter().map(|&id| Key::Local(id)).collect::<Vec<_>>();
     let mb = 1 << 20;
     let bids = vec![
-        bid(1, 9 * mb),
-        bid(2, 9 * mb),
-        bid(3, 2 * mb),
-        bid(4, 6 * mb),
+        bid(1, 27 * mb),
+        bid(2, 27 * mb),
+        bid(3, 6 * mb),
+        bid(4, 18 * mb),
     ];
+    assert_eq!(ANIM_ALL_MAX, 48 * mb);
     let a = allocate(bids.clone(), usize::MAX);
     assert_eq!(a.play, keys(&[1, 3]));
     assert_eq!(a.waiting, keys(&[2, 4]));
-    // The room the cache has decides too, below the limit for all.
+    // The room the cache has decides too, below the limit for all; the slots take only their
+    // share of it (what they hold past it is added to the cache's budget).
+    assert_eq!(allocate(bids.clone(), ANIM_SHARE).play, keys(&[1, 3]));
     let a = allocate(bids.clone(), 10 * mb);
-    assert_eq!(a.play, keys(&[1]));
-    assert_eq!(a.waiting, keys(&[2, 3, 4]));
+    assert_eq!(a.play, keys(&[3]));
+    assert_eq!(a.waiting, keys(&[1, 2, 4]));
     let b = allocate(bids.clone(), 10 * mb);
     assert_eq!((a.play, a.waiting), (b.play, b.waiting));
     assert_eq!(allocate(Vec::new(), 0).play, Vec::new());
-    // A remote one's body is weighed against the room only, not the limit for all.
+    // A remote one's body is weighed against the room only, not the limit for all, and whole.
     let body = Bid {
         body: 9 * mb,
-        ..bid(5, 9 * mb)
+        ..bid(5, 27 * mb)
     };
     assert_eq!(allocate(vec![body.clone()], usize::MAX).play, keys(&[5]));
-    assert_eq!(allocate(vec![body], 17 * mb).waiting, keys(&[5]));
+    assert_eq!(
+        allocate(vec![body.clone()], ANIM_SHARE + 9 * mb).play,
+        keys(&[5])
+    );
+    assert_eq!(
+        allocate(vec![body], ANIM_SHARE + 8 * mb).waiting,
+        keys(&[5])
+    );
 }

@@ -24,14 +24,61 @@ pub(super) const MAX_FRAMES: usize = 8192;
 /// [`keeps`]).
 pub(super) const KEEP_MAX: usize = 2 << 20;
 
-/// What one animation may hold in the cache, three eighths of it: one over it plays only past
-/// the limits, when the reader asks. Room for an 800 × 600 GIF at 2× in the line's width (a box
-/// of 1440 × 1080: one bitmap of it, [`Engine::late`], and the canvas take 8.1 MB) and a few MB
-/// of file.
-pub(super) const ANIM_ONE_MAX: usize = 12 << 20;
+/// What one animation may hold in the cache: one over it plays only past the limits, when the
+/// reader asks. Room for a 1600 × 1000 screen recording of a few MB (a lossless WebP: its canvas,
+/// a frame's pixels and decode, and its file take 22.3 MB) made at 2× in the line's width or wider
+/// (a box of 1440 × 900: 32.8 MB in all; of 1800 × 1125, enlarged by a fraction: 38.6 MB).
+pub(super) const ANIM_ONE_MAX: usize = 40 << 20;
 
-/// What all animations may hold in the cache together, half of it: the stills keep the other.
-pub(super) const ANIM_ALL_MAX: usize = 16 << 20;
+/// How long the view rests (the same boxes in view, no still in view to decode) before an
+/// animation let go for room while it moved starts again ([`Anims::rest`]).
+pub(super) const REST: Duration = Duration::from_millis(250);
+
+/// [`REST`], or in a test the rest it set for its thread ([`tests::Rest`]).
+pub(super) fn rest() -> Duration {
+    #[cfg(test)]
+    if let Some(rest) = tests::REST.get() {
+        return rest;
+    }
+    REST
+}
+
+/// Frames are made late, as one bitmap ([`Engine::late`]), if two would be over this and one
+/// isn't: what one animation could hold before [`ANIM_ONE_MAX`] was raised, so that one that played
+/// beside stills then is charged what it was (an 800 × 600 GIF at 2× in the line's width, 9.7 MB,
+/// not 15.9 MB). Past it, only if that is what lets one within [`ANIM_ONE_MAX`].
+pub(super) const LATE_MAX: usize = 12 << 20;
+
+/// What all animations may hold in the cache together: the largest one and a few small ones
+/// beside it.
+pub(super) const ANIM_ALL_MAX: usize = 48 << 20;
+
+/// [`ANIM_ONE_MAX`], or in a test the limit it set for its thread ([`tests::Limits`]).
+pub(super) fn one_max() -> usize {
+    #[cfg(test)]
+    if let Some((one, _)) = tests::LIMITS.get() {
+        return one;
+    }
+    ANIM_ONE_MAX
+}
+
+/// [`ANIM_ALL_MAX`], or in a test the limit it set for its thread ([`tests::Limits`]).
+pub(super) fn all_max() -> usize {
+    #[cfg(test)]
+    if let Some((_, all)) = tests::LIMITS.get() {
+        return all;
+    }
+    ANIM_ALL_MAX
+}
+
+/// What the animations hold of the cache's own budget ([`super::CACHE_BYTES`]) at most, half of
+/// it: the stills keep the other half whatever plays (but for the bodies of remote animations,
+/// which come out of it). What the animations hold together past it is added to the budget for
+/// as long as they hold it (see `Cache::budget`), so the cache is larger only while animations
+/// that large are held (playing, or paused where they are shown; for a moment while one is read
+/// or its step finishes after it went; and while the window is minimised or covered, where what
+/// was painted stays held), never for the stills.
+pub(super) const ANIM_SHARE: usize = super::CACHE_BYTES / 2;
 
 /// What an animation holds besides its buffers: the boxes of [`Playing`] and [`Engine`] and
 /// the allocator's rounding of their buffers, at most.
@@ -1347,20 +1394,25 @@ pub(super) struct Alloc {
     /// Those that don't fit beside those before them: they wait (a click plays one past the
     /// limits).
     pub(super) waiting: Vec<Key>,
+    /// Made while the view was moving ([`Anims::rest`]): those let go for room meanwhile
+    /// ([`Anims::yielded`]) that it would let start wait instead.
+    pub(super) moving: bool,
 }
 
 /// The animations that play, given `bids` in their order (on screen from the top down) and the
 /// `room` the cache has for them: each in turn that fits beside those before it, within
-/// [`ANIM_ALL_MAX`] and (with its body) the room, plays; one that doesn't, waits. Nothing but its
-/// arguments decides it.
+/// [`ANIM_ALL_MAX`] and (with its body) the room, plays; one that doesn't, waits. What the slots
+/// hold past [`ANIM_SHARE`] is added to the cache's budget, so only their share of it, and the
+/// bodies, take room. Nothing but its arguments decides it.
 pub(super) fn allocate(bids: Vec<Bid>, room: usize) -> Alloc {
     let mut alloc = Alloc::default();
-    let (mut slots, mut given) = (0usize, 0usize);
+    let (mut slots, mut bodies) = (0usize, 0usize);
     for bid in &bids {
-        let all = given.saturating_add(bid.cost).saturating_add(bid.body);
-        if slots.saturating_add(bid.cost) <= ANIM_ALL_MAX && all <= room {
-            slots += bid.cost;
-            given = all;
+        let held = slots.saturating_add(bid.cost);
+        let all = bodies.saturating_add(bid.body);
+        if held <= all_max() && held.min(ANIM_SHARE).saturating_add(all) <= room {
+            slots = held;
+            bodies = all;
             alloc.play.push(bid.key.clone());
         } else {
             alloc.waiting.push(bid.key.clone());
@@ -1410,6 +1462,22 @@ pub(super) struct Anims {
     /// on screen first from the top down, and the states they were painted in: one whose state
     /// changed since is painted again ([`super::Images::state_changed`]).
     pub(super) placed: Vec<Placed>,
+    /// The stills in view that a request asked to be decoded and that aren't in the cache yet (key,
+    /// box, what decoding one holds; kept while in view, asked for again or not): until each is in
+    /// the cache the allocation keeps its room for it, so an animation
+    /// that holds it waits, and isn't let in again before the still is in
+    /// ([`super::Images::anims_room_now`]). Decodes for images out of view aren't here: they
+    /// never stop an animation.
+    pub(super) view_stills: Vec<(Key, (u32, u32), usize)>,
+    /// The boxes in view at the last request, and until when the view is taken to be moving:
+    /// [`REST`] after the last request whose boxes in view changed or that had a still in view to
+    /// decode.
+    pub(super) view: Vec<(u32, u32, u32)>,
+    pub(super) rest: Option<Instant>,
+    /// The animations let go for room while the view moved, or for stills in view to decode: one
+    /// starts again only once the view rests ([`Anims::rest`]), so that scrolling past screenshots
+    /// beside it reads it again once, not once for each.
+    pub(super) yielded: Vec<Key>,
     /// What each animation measured holds playing at a frame size (its slot), by key and size:
     /// measured once each, so another size is another entry and two boxes of one image don't
     /// undo each other's.
@@ -1449,6 +1517,9 @@ impl Anims {
             .saturating_add(vec_bytes(&self.stalled))
             .saturating_add(vec_bytes(&self.failed))
             .saturating_add(vec_bytes(&self.ended))
+            .saturating_add(vec_bytes(&self.view_stills))
+            .saturating_add(vec_bytes(&self.view))
+            .saturating_add(vec_bytes(&self.yielded))
     }
 
     /// Whether nothing of animations is to be done: none plays, none is chosen, none is made
@@ -1701,8 +1772,9 @@ fn measure(source: Source, limit: usize) -> Option<Box<Engine>> {
 /// thread play it (each frame pulled once the one before is shown, streamed or kept), giving
 /// `each` the frames shown; `None` if it isn't an animation or what it is charged is over `room`
 /// (checked once the index is made, before the canvas is). It is made [`Engine::late`] if that
-/// is what fits it in `room`, as the window makes one within [`ANIM_ONE_MAX`]. Returns the
-/// charge: the most it holds besides `bytes`.
+/// is what fits it in `room` (the window goes late by [`LATE_MAX`] first, then by the limit for one
+/// animation if that didn't make it late: [`Engine::lean`] with each). Returns the charge: the most
+/// it holds besides `bytes`.
 pub(super) fn play_box(
     bytes: Bytes,
     size: (u32, u32),
@@ -1742,4 +1814,4 @@ pub(super) fn play_box(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

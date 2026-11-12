@@ -31,6 +31,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Changed
 - A click on an animated image opens it in the viewer, where `Space` plays or pauses it. `A` still
   plays or pauses all of them. Hovering one no longer shows a note.
+- Larger animations, such as a 1600 × 1000 screen recording (the README's demo), now play by
+  themselves at 1× and on a 2× HiDPI screen, where before they waited for a click. One animation
+  may use up to 40 MiB and all of them 48 MiB. Still images keep at least the 16 MiB they had:
+  image memory goes over 32 MiB only while animations holding more than 16 MiB between them are
+  on screen (or the window is minimised), and comes back once they aren't.
 - The default binary is 20 KB larger for the image viewer.
 
 ## [1.9.0] - 2026-11-10

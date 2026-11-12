@@ -3502,8 +3502,9 @@ mod with_fonts {
             }
         }
         std::fs::write(dir.join("once.gif"), once).unwrap();
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/images");
-        std::fs::copy(fixtures.join("big-anim.webp"), dir.join("over.webp")).unwrap();
+        // (Over one animation's limit at any box: its canvas, a frame and its decode take 47 MB.)
+        let over = crate::image::test_recording(2600, 1600, 3, 0);
+        std::fs::write(dir.join("over.webp"), over).unwrap();
         // (A box of 400: its frames are streamed; of 200: they are kept.)
         for (file, width, end) in [
             ("once.gif", 400, AnimState::Paused),
@@ -3565,6 +3566,7 @@ mod with_fonts {
     #[cfg(feature = "images")]
     #[test]
     fn a_waiting_animation_plays_once_a_zoom_out_makes_it_fit() {
+        let _limits = crate::image::TestAnimLimits::small();
         fn gif(w: u16, h: u16) -> Vec<u8> {
             let palette: Vec<u8> = (0..64u8)
                 .flat_map(|i| [i * 4, 255 - i * 4, i * 2])
@@ -3873,6 +3875,7 @@ mod with_fonts {
     #[cfg(all(feature = "images", feature = "remote-images"))]
     #[test]
     fn an_animation_with_no_room_beside_a_body_played_past_the_limits_waits() {
+        let _limits = crate::image::TestAnimLimits::small();
         fn gif(w: u16, h: u16, frames: usize) -> Vec<u8> {
             let palette: Vec<u8> = (0..64u8)
                 .flat_map(|i| [i * 4, 255 - i * 4, i * 2])

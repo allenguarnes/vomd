@@ -5185,8 +5185,9 @@ fn playing_an_animation_stays_in_its_charge() {
 
 /// Playing an animation resampled to its box, as the window plays it, holds no more than it is
 /// charged: streamed (the canvas and a frame's decode, the resampler, the frame shown and the one
-/// made), kept (all its frames, made while it streams its first play), and past the limits (one
-/// over `ANIM_ONE_MAX`, as a click plays it, under the ceiling it is checked against).
+/// made), kept (all its frames, made while it streams its first play), and at any size, with no
+/// limit (as one over `ANIM_ONE_MAX` plays when a click asks, under the ceiling it is checked
+/// against).
 #[test]
 fn playing_at_a_box_stays_in_its_charge() {
     let _serial = serial();
