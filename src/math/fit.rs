@@ -108,8 +108,9 @@ pub fn fit(f: &Formula, avail: f32) -> (Cow<'_, Formula>, f32) {
         return (Cow::Borrowed(f), shrink);
     };
     let broken = split(f, &starts);
-    // So many lines that they would be taller than any formula may be: one line, shrunk.
-    if broken.height + broken.depth > MAX_EXTENT {
+    // So many lines that they would be taller than any formula may be, or ink that reached
+    // past the extent once its line moved (see [`within`]): one line, shrunk.
+    if broken.height + broken.depth > MAX_EXTENT || !within(&broken) {
         return (Cow::Borrowed(f), shrink);
     }
     if broken.width <= avail {
@@ -184,6 +185,26 @@ fn widest(pieces: &[Piece], starts: &[usize]) -> f32 {
             )
         })
         .fold(0.0, f32::max)
+}
+
+/// Whether every coordinate of a broken formula is inside [`MAX_EXTENT`] em, plus the indent
+/// of its lines: as far as a fitted formula may reach. A glyph or rule can stick out of its
+/// piece (`\mathllap`, negative space, `\smash`) by as much as the formula is wide or tall;
+/// whole, it stays inside the extent because what it overlaps does, but a line moves its
+/// pieces left (to its indent) and down, and what sticks out of a piece far to the right, or
+/// on a line far down, can then reach past it (fuzz finding: `\mathllap` around 1,000 em of
+/// rules, on the second line, put a glyph at −1,010 em;
+/// fuzz/seeds/math/llap-past-the-extent-after-fit.bin).
+fn within(f: &Formula) -> bool {
+    let inside = |v: f32| v.is_finite() && v.abs() <= MAX_EXTENT + CONT_INDENT;
+    // A cut's end may be open (infinite): the end of a stretched delimiter.
+    let edge = |v: f32| v.is_infinite() || inside(v);
+    f.glyphs
+        .iter()
+        .all(|g| inside(g.x) && inside(g.y) && g.cut.is_none_or(|c| edge(c.lo) && edge(c.hi)))
+        && f.rules
+            .iter()
+            .all(|r| inside(r.x) && inside(r.y) && inside(r.x + r.w) && inside(r.y + r.h))
 }
 
 /// `f` with its pieces in lines starting at `starts`, one under the other: the first line's

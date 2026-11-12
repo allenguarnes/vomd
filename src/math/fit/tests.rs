@@ -199,3 +199,38 @@ fn a_first_line_of_one_small_atom_is_not_made() {
     ]);
     assert_eq!(lines(&wide.pieces, 6.0, PASSES[0]), [0, 1]);
 }
+
+#[test]
+fn ink_that_would_reach_past_the_extent_on_a_line_is_shrunk_instead() {
+    use crate::fonts::FaceId;
+    use crate::math::layout::MGlyph;
+    // `<10 em> = <10 em>`, a glyph of the `=` piece 995 em to the left of the formula (as
+    // `\mathllap` around 1,000 em of rules puts it): inside the extent where it is…
+    let mut f = formula(vec![
+        piece(0.0, 10.0, None),
+        piece(10.0, 1.0, Some(Break::Rel)),
+        Piece {
+            glyphs: 1,
+            ..piece(11.0, 10.0, None)
+        },
+    ]);
+    f.glyphs.push(MGlyph {
+        x: -995.0,
+        y: 0.0,
+        id: 1,
+        face: FaceId(0),
+        size: 1.0,
+        cut: None,
+    });
+    assert_eq!(lines(&f.pieces, 13.0, PASSES[0]), [0, 1]);
+    // …but 1,003 em to the left once its line starts at the indent: not broken.
+    assert!(split(&f, &[0, 1]).glyphs[0].x < -(MAX_EXTENT + CONT_INDENT));
+    let (g, s) = fit(&f, 13.0);
+    assert!(matches!(g, Cow::Borrowed(_)), "not broken");
+    assert_eq!(s, quantize(13.0 / 21.0));
+    // 15 em to the left: within reach on its line, so broken as before.
+    f.glyphs[0].x = -15.0;
+    let (g, s) = fit(&f, 13.0);
+    assert!(matches!(g, Cow::Owned(_)) && s == 1.0);
+    assert_eq!(g.glyphs[0].x, -23.0);
+}

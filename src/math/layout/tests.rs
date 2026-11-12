@@ -837,6 +837,15 @@ fn fuzz_seeds() {
             let (g, s) = crate::math::fit::fit(&f, avail);
             assert!(g.width * s <= avail && s > 0.0 && s <= 1.0, "{src}");
             assert!(g.height + g.depth <= crate::math::MAX_EXTENT, "{src}");
+            let reach = crate::math::MAX_EXTENT + crate::math::fit::CONT_INDENT;
+            let ok = |v: f32| v.is_finite() && v.abs() <= reach;
+            assert!(g.glyphs.iter().all(|g| ok(g.x) && ok(g.y)), "{src}");
+            assert!(
+                g.rules
+                    .iter()
+                    .all(|r| ok(r.x) && ok(r.y) && ok(r.x + r.w) && ok(r.y + r.h)),
+                "{src}"
+            );
         }
         n += 1;
     }
