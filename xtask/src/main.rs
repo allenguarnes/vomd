@@ -52,6 +52,17 @@ const RSS_HUGE_KB: [u64; 2] = [60_000, 55_000];
 /// the window system; a timer or a busy loop takes many more.
 const IDLE_TICKS: u64 = 1;
 const IDLE_WATCH: Duration = Duration::from_secs(3);
+/// How long the idle watch waits once vomd is idle, so that anything due right after (a
+/// scrollbar fading out) has passed. On GitHub's macOS runner, AppKit wakes a newly opened
+/// window's run loop about 75 times a second for several seconds (a bare winit window that
+/// paints once and waits shows it too, for about 7 s), so macOS waits until that has settled.
+/// Lasting CPU work over the limit still fails; work that stops within those 10 s does not,
+/// on macOS.
+const IDLE_SETTLE: Duration = if cfg!(target_os = "macos") {
+    Duration::from_secs(10)
+} else {
+    Duration::from_secs(1)
+};
 /// Playing `anim.md`'s animations at its top in a 1080p window: 10% of one core over
 /// [`IDLE_WATCH`]. Reported, not gated, until CI has measured it.
 const PLAYING_TICKS: u64 = 30;
@@ -639,8 +650,7 @@ fn idle_with(bin: &Path, fixture: &Path, mode: &str, config: Option<&Path>) -> O
     let result = (|| {
         let line = bench_line(&rx, Duration::from_secs(60))?;
         let ready_ms = field(&line, "idle_ms")?;
-        // Let anything due right after (a scrollbar fading out) pass first.
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(IDLE_SETTLE);
         let before = cpu_ticks(pid)?;
         std::thread::sleep(IDLE_WATCH);
         let ticks = cpu_ticks(pid)?.checked_sub(before)?;
