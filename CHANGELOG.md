@@ -3,7 +3,7 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.10.0] - 2026-11-14
 
 ### Added
 - macOS 11 and newer on Apple Silicon, with everything VOMD does on Linux, as `VOMD.app`. The
@@ -37,6 +37,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   image memory goes over 32 MiB only while animations holding more than 16 MiB between them are
   on screen (or the window is minimised), and comes back once they aren't.
 - The default binary is 20 KB larger for the image viewer.
+
+### Fixed
+- A formula broken into lines no longer draws a glyph or rule far outside its space when part of
+  it sticks out of its piece (`\mathllap`, negative space, `\smash`): such a formula is kept on
+  one line instead.
 
 ## [1.9.0] - 2026-11-10
 
@@ -385,6 +390,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
 [Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.9.0...HEAD
+[1.10.0]: https://github.com/allenguarnes/vomd/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/allenguarnes/vomd/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/allenguarnes/vomd/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/allenguarnes/vomd/compare/v1.6.3...v1.7.0
