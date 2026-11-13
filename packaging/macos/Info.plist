@@ -13,7 +13,7 @@
 	<key>CFBundleIconFile</key>
 	<string>vomd</string>
 	<key>CFBundleIdentifier</key>
-	<string>io.github.allenguarnes.vomd</string>
+	<string>com.allenguarnes.vomd</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
