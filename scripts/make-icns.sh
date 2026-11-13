@@ -12,8 +12,10 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# (type, pixels): the sizes of an .iconset, 16, 32, 128, 256 and 512 and each one's @2x.
-types="icp4:16 icp5:32 ic07:128 ic08:256 ic09:512 ic10:1024 ic11:32 ic12:64 ic13:256 ic14:512"
+# (type, pixels): the sizes of an .iconset, 128, 256 and 512 and each one's @2x, and the @2x of
+# 16 and 32. Not the 16 and 32 themselves (icp4, icp5): macOS's icon service draws those PNGs as
+# noise (iconutil writes them in an older format instead); without them it scales the others.
+types="ic07:128 ic08:256 ic09:512 ic10:1024 ic11:32 ic12:64 ic13:256 ic14:512"
 for t in $types; do
   px=${t#*:}
   [ -f "$tmp/$px.png" ] && continue
