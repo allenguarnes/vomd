@@ -8414,19 +8414,37 @@ fn playing_a_waiter_past_the_limits_leaves_the_others_playing() {
     assert_eq!(images.anim_state(2), Some(AnimState::Waiting));
     images.play(2);
     assert!(images.anims.forced.contains(&key2));
-    let swaps = swaps_by_image(
+    let mut swaps = swaps_by_image(
         &mut images,
         &doc,
         &mut layout,
         &placed,
         Duration::from_secs(2),
     );
+    let swapped = |swaps: &std::collections::HashMap<u32, usize>, id| {
+        swaps.get(&id).copied().unwrap_or(0) >= 3
+    };
+    let others = [1, 3].map(|id| swapped(&swaps, id));
+    // (The one played past the limits is read first, late on a slow machine: it has until its
+    // third frame, 20 s at most.)
+    let t = Instant::now();
+    while !swapped(&swaps, 2) && t.elapsed() < Duration::from_secs(20) {
+        let more = swaps_by_image(
+            &mut images,
+            &doc,
+            &mut layout,
+            &placed,
+            Duration::from_millis(500),
+        );
+        for (id, n) in more {
+            *swaps.entry(id).or_insert(0) += n;
+        }
+    }
     let outside = matches!(images.anim_at(&key2), Some(At::Outside(_)));
     let _ = std::fs::remove_dir_all(&dir);
     assert!(outside, "played outside the cache");
-    for id in 1..=3 {
-        assert!(swaps.get(&id).copied().unwrap_or(0) >= 3, "{id}: {swaps:?}");
-    }
+    assert_eq!(others, [true; 2], "the others play on: {swaps:?}");
+    assert!(swapped(&swaps, 2), "it plays: {swaps:?}");
 }
 
 /// SOL4-M3: the file of a waiting animation goes: the others play on, whatever it is now.
