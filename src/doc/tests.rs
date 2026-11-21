@@ -44,14 +44,29 @@ fn dump(doc: &Doc) -> String {
                 out.push_str(&span_dump(doc, span));
             }
         };
-        if let BlockKind::TableRow { .. } = block.kind {
+        if let BlockKind::TableRow { header, .. } = block.kind {
             let mut next = 0;
-            for (col, cell) in doc.row_cells(block) {
+            for (c, (col, cell)) in doc.row_cell_list(block).iter().zip(doc.row_cells(block)) {
                 // Fragments of a split row skip the columns that ran out of text.
                 if col != next {
                     out.push_str(&format!(" c{col}"));
                 }
-                next = col + 1;
+                next = col + c.span as usize;
+                // What isn't a plain cell (a Markdown header's are header cells).
+                if c.span > 1 {
+                    out.push_str(&format!(" span={}", c.span));
+                }
+                if c.align != Align::None {
+                    out.push_str(&format!(" {:?}", c.align));
+                }
+                for (flag, name) in [(Cell::TOP, "top"), (Cell::BOTTOM, "bottom")] {
+                    if c.flags & flag != 0 {
+                        out.push_str(&format!(" {name}"));
+                    }
+                }
+                if (c.flags & Cell::TH != 0) != header {
+                    out.push_str(if header { " td" } else { " th" });
+                }
                 out.push_str(" [");
                 spans_of(cell, &mut out);
                 out.push_str(" ]");
@@ -74,6 +89,22 @@ fn dump(doc: &Doc) -> String {
     }
     for (slug, block) in &doc.anchors {
         out.push_str(&format!("anchor #{slug} -> {block}\n"));
+    }
+    #[cfg(feature = "details")]
+    for s in &doc.sections {
+        let open = if s.open { " open" } else { "" };
+        out.push_str(&format!("section {:?} {:?}{open}\n", s.summary, s.body));
+    }
+    for (i, t) in doc.tables.iter().enumerate() {
+        if t.center || !t.widths.is_empty() || !t.rowspans.is_empty() {
+            let spans: Vec<_> = (t.rowspans.iter())
+                .map(|s| format!("c{}+{} {}..{}", s.col, s.cols, s.first, s.end))
+                .collect();
+            out.push_str(&format!(
+                "table t{i}: center={} widths={:?} rowspans={spans:?}\n",
+                t.center, t.widths
+            ));
+        }
     }
     out
 }
@@ -133,15 +164,53 @@ fn check_invariants(doc: &Doc) {
         assert!(block.spans.start <= block.spans.end);
         assert!(block.spans.end as usize <= doc.spans.len());
         if let BlockKind::TableRow {
-            first_cell, cells, ..
+            table,
+            first_cell,
+            cells,
+            ..
         } = block.kind
         {
             assert!((first_cell + cells) as usize <= doc.cells.len());
-            let mut col = 0;
+            let (mut col, mut at) = (0, block.spans.start);
+            let ncols = doc.tables[table as usize].aligns.len().max(1) as u32;
             for cell in doc.cells[first_cell as usize..][..cells as usize].iter() {
-                assert!(cell.spans.start >= block.spans.start && cell.spans.end <= block.spans.end);
+                assert!(
+                    cell.spans.start >= at && cell.spans.end <= block.spans.end,
+                    "cells apart"
+                );
+                at = cell.spans.end;
                 assert!(cell.col >= col, "columns ascend");
-                col = cell.col + 1;
+                assert!(cell.span >= 1);
+                col = cell.col + cell.span as u32;
+                assert!(col <= ncols, "within the table's columns");
+            }
+        }
+    }
+    // A table's rows are consecutive blocks.
+    let mut last_row = HashMap::new();
+    for (i, block) in doc.blocks.iter().enumerate() {
+        if let BlockKind::TableRow { table, .. } = block.kind {
+            if let Some(at) = last_row.insert(table, i) {
+                assert_eq!(at + 1, i, "the rows of t{table} are together");
+            }
+            assert!((table as usize) < doc.tables.len());
+        }
+    }
+    // Sections: a summary of a block or more, the body right after it, nested whole.
+    #[cfg(feature = "details")]
+    {
+        let n = doc.blocks.len() as u32;
+        for (k, s) in doc.sections.iter().enumerate() {
+            assert!(!s.summary.is_empty() && s.summary.end == s.body.start && s.body.end <= n);
+            for t in &doc.sections[k + 1..] {
+                assert!(t.summary.start >= s.summary.start, "sorted");
+                let inside = t.summary.start >= s.body.start && t.body.end <= s.body.end;
+                // (`<summary><details>…</details></summary>`: in the summary.)
+                let in_summary = t.body.end <= s.summary.end;
+                assert!(
+                    inside || in_summary || t.summary.start >= s.body.end,
+                    "nested whole"
+                );
             }
         }
     }
@@ -248,9 +317,38 @@ fn raw_html() {
     insta::assert_snapshot!(parse(
         "<p align=\"center\">\n  <img src=\"logo.png\" alt=\"Logo &amp; mark\" width=200>\n</p>\n\n\
          <!-- hidden comment -->\n\n\
-         Inline <b>bold</b> tag, line<br>break, <img src='https://x.y/a.png'>.\n\n\
-         <details>\n<summary>More &lt;info&gt;</summary>\n\nMarkdown *inside*.\n\n</details>\n"
+         Inline <b>bold</b> tag, line<br>break, <img src='https://x.y/a.png'>.\n"
     ));
+}
+
+/// Without the `details` feature a section is all shown, its summary a paragraph; without
+/// `html-tables` a table's cells are a line of text, kept apart. (With them, see `html`.)
+#[test]
+fn html_sections_and_tables_without_their_features() {
+    let doc = Doc::parse(
+        "<details>\n<summary>More &lt;info&gt;</summary>\n\nMarkdown *inside*.\n\n</details>\n\n\
+         <table><tr><td>one</td><td>two</td></tr><tr><td>three</td></tr></table>\n",
+    );
+    check_invariants(&doc);
+    let texts: Vec<String> = (doc.blocks.iter())
+        .filter(|b| !matches!(b.kind, BlockKind::TableRow { .. }))
+        .map(|b| {
+            doc.block_spans(b)
+                .iter()
+                .map(|s| doc.span_text(s))
+                .collect()
+        })
+        .collect();
+    // The same blocks either way: a section only says which of them show.
+    let mut want = vec!["More <info>", "Markdown inside."];
+    #[cfg(feature = "details")]
+    assert_eq!(doc.sections.len(), 1);
+    if !cfg!(feature = "html-tables") {
+        want.extend(["one two ", "three "]);
+    } else {
+        assert_eq!(doc.tables.len(), 1);
+    }
+    assert_eq!(texts, want);
 }
 
 /// Whitespace in a block of HTML follows the browser's rule: a run of spaces, tabs and newlines
@@ -308,8 +406,7 @@ fn html_block_whitespace_collapses_like_a_browser() {
     );
 }
 
-/// Inline HTML that GitHub styles, script/style content dropped, flattened HTML
-/// table cells kept apart, and GFM autolinks.
+/// Inline HTML that GitHub styles, script/style content dropped, and GFM autolinks.
 #[test]
 fn inline_html_styles_and_autolinks() {
     let doc = Doc::parse(
@@ -319,7 +416,6 @@ fn inline_html_styles_and_autolinks() {
          Unclosed <b>bold ends with the block.\n\n\
          Not bold. Inline <script>alert(1)</script>script and <style>p{}</style>style.\n\n\
          <script>\nlet x = 1;\n</script>\n\n\
-         <table><tr><td>one</td><td>two</td></tr><tr><td>three</td></tr></table>\n\n\
          See www.example.com/a, https://x.y/z) and me@mail.example. Not `https://in.code` or \
          [https://in.link](https://t), nor xhttps://no.pe.\n",
     );
@@ -1131,8 +1227,16 @@ fn img_sizes_are_parsed() {
     assert_eq!(w("50%"), Want::Pct(5_000));
     assert_eq!(w("4000"), Want::Px(400_000));
     assert_eq!(w("99999"), Want::Px(MAX_SIDE * 100), "clamped");
+    // HTML's rules for dimension values: the leading number counts, what follows it doesn't,
+    // but for a `%` (the all-contributors template writes `width="100px;"`).
+    for (value, px) in [("64px;", 64), ("12abc", 12), ("2em", 2), ("10vw", 10)] {
+        assert_eq!(w(value), Want::Px(px * 100), "{value:?}");
+    }
+    assert_eq!(w("7.5.3"), Want::Px(750));
+    assert_eq!(w("1."), Want::Px(100));
+    assert_eq!(w("25%;"), Want::Pct(2_500));
     for junk in [
-        "0", "-5", "", "auto", "abc", "12abc", "2em", "10vw", "NaN", "inf", ".", "0.001",
+        "0", "-5", "+5", "", "auto", "abc", "NaN", "inf", ".", ".5", "0.001",
     ] {
         assert_eq!(w(junk), Want::Auto, "{junk:?}");
     }
@@ -4652,10 +4756,19 @@ const MATH_SPEC: [&str; 48] = [
 #[cfg(feature = "math")]
 #[test]
 fn math_spec_examples() {
+    // What a `<details>` makes of its summary (with the `details` feature) isn't this test's.
+    let math = |src: &str| -> String {
+        let dump = parse(src);
+        let lines = dump.lines().filter(|l| !l.starts_with("section "));
+        lines
+            .filter(|&l| l != "P | \"Details\"")
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
     let out: String = MATH_SPEC
         .iter()
         .enumerate()
-        .map(|(i, src)| format!("== {}: {src:?}\n{}", i + 1, parse(src)))
+        .map(|(i, src)| format!("== {}: {src:?}\n{}", i + 1, math(src)))
         .collect();
     insta::assert_snapshot!(out);
 }
@@ -4916,3 +5029,7 @@ fn a_highlighted_blocks_chunks_keep_its_language_and_text() {
     let all: String = doc.blocks.iter().map(text).collect();
     assert_eq!(all, code.trim_end_matches('\n'));
 }
+
+/// `<details>` and HTML `<table>`s.
+#[cfg(all(feature = "details", feature = "html-tables"))]
+mod html;

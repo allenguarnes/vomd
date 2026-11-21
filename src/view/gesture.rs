@@ -72,6 +72,10 @@ impl View {
     /// else the document and the range, which the text is made from when a program pastes it.
     pub fn copy_content(&self) -> Option<Content> {
         let range = self.selection()?;
+        // (Closed sections aren't copied: a snapshot of them, as the copy may be pasted later.)
+        #[cfg(feature = "details")]
+        return Some(Content::shown(&self.doc, range, self.hidden_ranges()));
+        #[cfg(not(feature = "details"))]
         Some(Content::of(&self.doc, range))
     }
 

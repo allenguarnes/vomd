@@ -17,9 +17,11 @@ HTML `<img>` with `width` and `height`; the same images as Markdown follow, at t
 <img src="images/wide.jpg" width="4000"> width="4000" (fitted to the column)
 
 Ignored: <img src="images/gradient.jpg" width="0"> width="0",
-<img src="images/gradient.jpg" width="abc"> width="abc",
-<img src="images/gradient.jpg" width="12abc"> width="12abc",
-<img src="images/gradient.jpg" width="2em"> width="2em".
+<img src="images/gradient.jpg" width="abc"> width="abc".
+
+The number they start with, as in a browser: <img src="images/gradient.jpg" width="64px;">
+width="64px;" (the all-contributors template), <img src="images/gradient.jpg" width="12abc">
+width="12abc", <img src="images/gradient.jpg" width="20em"> width="20em".
 
 | Half of a cell | Text |
 |---|---|

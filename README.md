@@ -45,6 +45,8 @@
 
 - **GitHub-style Markdown:** CommonMark and GFM, with tables, task lists, footnotes, alerts
   (`> [!NOTE]`) and autolinks. YAML front matter is shown as a table, as on GitHub.
+- **Collapsible sections** (`<details>`) open and close with a click, and **HTML tables** show as
+  tables, with column and row spans, alignment and images.
 - **Light and dark themes** that follow your system (on Omarchy, its current theme's colors),
   zoom from 50% to 300%, and sharp text on HiDPI screens.
 - **Math:** LaTeX formulas, written as on GitHub: `$…$` and `` $`…`$ `` in the text, `$$…$$`
@@ -314,7 +316,8 @@ VOMD makes no network requests of its own.
   that document. They're then fetched with your system's `curl`, at most 12 MiB each, and kept in
   memory only. `remote_images = always` loads them for every document; `never` turns them off.
 - **HTML** in a document is never run. Tags are removed and their text kept; a few, such as
-  `<b>`, `<img>`, `<picture>` and `<a>`, are shown the way GitHub shows them.
+  `<b>`, `<img>`, `<picture>`, `<a>`, `<details>` and `<table>`, are shown the way GitHub shows
+  them.
 - **SVGs** never load other files or URLs. Each one is drawn in a separate, short-lived process
   that is stopped if it takes too long.
 - **Recent files:** VOMD keeps the paths of the last 20 files you opened, and nothing else about
@@ -335,6 +338,14 @@ VOMD makes no network requests of its own.
   whose closing `$` is followed right away by a digit stays text, so a price range like
   `$5-$10` isn't read as math.
 - AVIF, HEIC, BMP, TIFF and ICO images show their alt text.
+- A `<details>` inside a table cell or a summary is shown open, as text, and so are sections
+  nested more than 32 deep. Sections open and close with the mouse only.
+- HTML tables: a cell that spans rows shows its text at the top of the span (GitHub centres it),
+  a table inside a cell shows as lines of text, and Markdown blocks in a cell (lists, code) show
+  as plain lines, without boxes or highlighting. Text outside the cells shows after the table,
+  not before it. `height` and `nowrap` are ignored. A table has at most 1,000 columns (a cell
+  past them goes on in the last one) and 1,024 cells that span rows (`rowspan` on more is 1),
+  and `colspan` adds at most one column per 8 bytes of the document.
 - YAML front matter: nested maps and lists are shown as an indented outline inside their row,
   not as tables inside the table as on GitHub. Front matter over 1 MiB, nested more than 32
   levels deep or with more than 100,000 values is shown as an error. A time without a zone is

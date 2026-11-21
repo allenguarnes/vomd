@@ -21,8 +21,20 @@ and versions follow [Semantic Versioning](https://semver.org/).
     neither reads nor writes it.
   - On macOS, a File menu has Open… (`⌘O`) and Open Recent with the same files, and the Dock
     icon's menu lists them too.
+- Collapsible sections: a `<details>` block shows only its summary, with a ▶ in front of it,
+  until you click it, as on GitHub (`<details open>` starts open, and one without a summary gets
+  GitHub's "Details"). Find, links, the contents panel and Back open a section to show what's
+  inside it, and it stays open. Copying leaves out closed sections. A live reload keeps them open
+  or closed. Images in a closed section aren't loaded, and animations in one don't play, until
+  it's opened. The `details` Cargo feature (on by default) holds it.
+- HTML tables (`<table>`) are shown as tables instead of a line of text: header rows and cells,
+  `align`, `valign`, `width`, `colspan` and `rowspan`, `<table align="center">`, images and links
+  in cells (logo and contributor grids), and Markdown in cells after a blank line. The
+  `html-tables` Cargo feature (on by default) holds it.
 
 ### Changed
+- Table cells line up as on GitHub, in Markdown tables too: a header cell is centered unless its
+  column is aligned (`:--`, `--:`), and the cells of a row are centered vertically.
 - YAML front matter is shown as a table at the top of the document, as on GitHub, instead of
   being hidden: a row per key, with the key in bold. Values read as GitHub reads them (`yes` is
   `true`, `0755` is `493`, `4.50` is `4.5`, a time is shown with its zone), and nested maps and
@@ -36,6 +48,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
     as before (but a `...` line no longer closes it, in either build).
 
 ### Fixed
+- An `<img>` whose `width` or `height` has text after the number (`width="64px;"`, as the
+  all-contributors template writes it, or `2em`) gets that many pixels, as in a browser, instead
+  of its own size.
 - On macOS, a file opened from Finder (a double-click, Open With, a drop on the Dock icon) while
   VOMD isn't running shows at once, without an empty window first. macOS hands the file over just
   after the window is ready: the window now waits for it, half a second at most. A launch from

@@ -1,0 +1,9 @@
+---
+source: src/doc/tests/html.rs
+expression: "parse(\"<table align=\\\"center\\\"><tr><td colspan=2 width=\\\"120px;\\\">wide</td><td rowspan=\\\"3\\\">\\\n         tall</td></tr><tr><td width=40%>a</td><td>b</td></tr><tr><td colspan=\\\"0\\\">c</td>\\\n         <td>d</td></tr><tr><td>e</td><td>f</td><td>g</td></tr></table>\\n\")"
+---
+Row(t0) | span=2 [ "wide" ] [ "tall" ]
+Row(t0) | [ "a" ] [ "b" ]
+Row(t0) | [ "c" ] [ "d" ]
+Row(t0) | [ "e" ] [ "f" ] [ "g" ]
+table t0: center=true widths=[Pct(4000)] rowspans=["c2+1 0..3"]

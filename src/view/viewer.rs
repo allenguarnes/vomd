@@ -185,8 +185,18 @@ impl View {
     /// will, once in view), in order: those [`View::viewer_worthy`] says. An image not measured
     /// yet costs a read of its file's first 4 KiB (as laying it out will), here and when a
     /// reload comes with the viewer open. Blocked, broken and refused ones are left out.
-    fn viewer_list(&self) -> Vec<u32> {
+    /// Those in closed sections, which can't be seen, are left out too.
+    pub(super) fn viewer_list(&self) -> Vec<u32> {
+        // (Before a file is looked at for its size: the closed sections' images are never read.)
+        #[cfg(feature = "details")]
+        let hidden = self.hidden_images();
         (1..=self.doc.images.len() as u32)
+            .filter(|_id| {
+                #[cfg(feature = "details")]
+                return hidden.binary_search(_id).is_err();
+                #[cfg(not(feature = "details"))]
+                true
+            })
             .filter(|&id| self.viewer_worthy(id))
             .collect()
     }

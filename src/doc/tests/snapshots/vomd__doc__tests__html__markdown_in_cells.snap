@@ -1,0 +1,6 @@
+---
+source: src/doc/tests/html.rs
+expression: "parse(\"<table><tr><td>\\n\\n**Bold** start.\\n\\nSecond paragraph.\\n\\n- one\\n- two\\n  1. nested\\n\\n\\\n         ```rust\\nfn main() {}\\n```\\n\\n### Heading\\n\\n</td><td><p>a</p><p>b<br>c</p></td></tr>\\\n         </table>\\n\")"
+---
+Row(t0) | [ [B]"Bold" " start.\n\nSecond paragraph.\n\n• one\n• two\n\u{a0}\u{a0}\u{a0}1. nested\n\n" [C]"fn main() {}" "\n\n" [B]"Heading" ] [ "a\nb\nc" ]
+anchor #heading -> 0

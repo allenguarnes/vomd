@@ -268,6 +268,60 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// `html.md`: collapsible sections as they start (`false`) or all opened (`true`), and HTML
+/// tables (a header, alignment, spans, a logo grid with its images shown, a centered table).
+#[cfg(all(feature = "details", feature = "html-tables"))]
+const HTML_CASES: &[(Case, bool)] = &[
+    (
+        Case {
+            name: "html-light",
+            fixture: "html.md",
+            width: 760.0,
+            scale: 1.0,
+            theme: &LIGHT,
+            view: None,
+            select: None,
+        },
+        false,
+    ),
+    (
+        Case {
+            name: "html-dark",
+            fixture: "html.md",
+            width: 760.0,
+            scale: 1.0,
+            theme: &DARK,
+            view: None,
+            select: None,
+        },
+        false,
+    ),
+    (
+        Case {
+            name: "html-2x",
+            fixture: "html.md",
+            width: 600.0,
+            scale: 2.0,
+            theme: &LIGHT,
+            view: None,
+            select: None,
+        },
+        false,
+    ),
+    (
+        Case {
+            name: "html-open",
+            fixture: "html.md",
+            width: 760.0,
+            scale: 1.0,
+            theme: &LIGHT,
+            view: None,
+            select: None,
+        },
+        true,
+    ),
+];
+
 /// `formats.md` with its images decoded by the viewer's own code: SVG drawn at the box (sharp
 /// at 2×), the other formats, EXIF orientation, `<img width>`, and a placeholder over the
 /// limits.
@@ -447,7 +501,8 @@ fn root() -> &'static Path {
 }
 
 /// The case painted: `(width, height, pixels)`. A whole-document case is cut off at [`MAX_H`].
-fn render_case(case: &Case, fonts: &Fonts) -> Rendered {
+/// An `html` case has its images shown, and its sections all opened with `open`.
+fn render_case(case: &Case, fonts: &Fonts, html: bool, open: bool) -> Rendered {
     let src = std::fs::read_to_string(root().join("fixtures").join(case.fixture)).unwrap();
     let doc = Doc::parse(&src);
     let width = (case.width * case.scale).round();
@@ -459,8 +514,15 @@ fn render_case(case: &Case, fonts: &Fonts) -> Rendered {
             ..Params::default()
         },
     );
+    #[cfg(feature = "details")]
+    if open {
+        layout.set_sections(&doc, &vec![true; doc.sections.len()]);
+    }
+    #[cfg(not(feature = "details"))]
+    let _ = open;
+    let images = html || case.select.is_some();
     // The images of a selection case are shown, at a size of their own.
-    if case.select.is_some() {
+    if images {
         for id in 1..=doc.images.len() as u32 {
             layout.set_image(&doc, id, ImageSize::Pixels(120, 60));
         }
@@ -514,7 +576,7 @@ fn render_case(case: &Case, fonts: &Fonts) -> Rendered {
         #[cfg(feature = "find")]
         None,
     );
-    if case.select.is_some() {
+    if images {
         render::paint_images(
             &mut frame,
             vp,
@@ -958,7 +1020,13 @@ fn goldens() {
     let mut failures = Vec::new();
     let cases = CASES
         .iter()
-        .map(|case| (case.name, render_case(case, &fonts)));
+        .map(|case| (case.name, render_case(case, &fonts, false, false)));
+    #[cfg(all(feature = "details", feature = "html-tables"))]
+    let cases = cases.chain(
+        HTML_CASES
+            .iter()
+            .map(|(case, open)| (case.name, render_case(case, &fonts, true, *open))),
+    );
     #[cfg(feature = "clipboard")]
     let cases = cases.chain(
         BUTTON_CASES

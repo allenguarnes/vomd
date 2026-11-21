@@ -79,7 +79,31 @@ fuzz_target!(|data: &[u8]| {
         for (i, (g, f)) in layout.geoms().iter().zip(fresh.geoms()).enumerate() {
             assert!(!unmeasured[i] || g.h == f.h, "block {i}");
         }
+        // Every other section opened or closed, then all of them flipped: the heights stay
+        // sound, and a block shown or hidden as a fresh layout of those states has it.
+        let mut open: Vec<bool> = (0..doc.sections.len()).map(|s| s % 2 == 0).collect();
+        layout.set_sections(&doc, &open);
+        open.iter_mut().for_each(|o| *o = !*o);
+        layout.set_sections(&doc, &open);
+        let mut fresh = Layout::new(&doc, again);
+        fresh.set_sections(&doc, &open);
+        for i in 0..doc.blocks.len() {
+            assert_eq!(layout.hidden(i), fresh.hidden(i), "block {i}");
+            assert!(!layout.hidden(i) || layout.geoms()[i].h == 0.0, "block {i}");
+        }
         while !layout.idle(&doc, fonts, Instant::now() + Duration::from_secs(1)) {}
+        // The same states reached one section at a time, innermost first: once measured, every
+        // block is as tall (the spacing after a body included).
+        let mut reverse = Layout::new(&doc, again);
+        let mut now: Vec<bool> = doc.sections.iter().map(|s| s.open).collect();
+        for s in (0..doc.sections.len()).rev() {
+            now[s] = open[s];
+            reverse.set_open(&doc, s, &now);
+        }
+        while !reverse.idle(&doc, fonts, Instant::now() + Duration::from_secs(1)) {}
+        for (i, (a, b)) in layout.geoms().iter().zip(reverse.geoms()).enumerate() {
+            assert!((a.h - b.h).abs() < 0.01, "block {i}: {} vs {}", a.h, b.h);
+        }
         let scroll = layout.ensure(&doc, fonts, layout.anchor_at(0.0), H as f32);
         paint(&layout, fonts, scroll, params.scale);
     });

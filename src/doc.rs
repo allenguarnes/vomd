@@ -16,8 +16,14 @@ use unicase::UniCase;
 use crate::image::MAX_SIDE;
 
 mod autolink;
+#[cfg(feature = "details")]
+mod details;
 #[cfg(feature = "front-matter")]
 mod front;
+#[cfg(feature = "html-tables")]
+mod html_table;
+#[cfg(feature = "html-tables")]
+use html_table::takeable_end;
 #[cfg(feature = "math")]
 mod math;
 mod pipeline;
@@ -231,8 +237,9 @@ const SEGMENT_BYTES: usize = 16 * 1024;
 /// What pulldown-cmark lets a parser spend on copying link definitions into links, at least.
 const MIN_EXPANSION: usize = 100_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Align {
+    #[default]
     None,
     Left,
     Center,
@@ -246,11 +253,55 @@ pub struct Cell {
     pub col: u32,
     /// Range into [`Doc::spans`].
     pub spans: Range<u32>,
+    /// The columns it spans (`colspan`), at least 1.
+    pub span: u16,
+    /// Its own alignment (`align`), over its column's.
+    pub align: Align,
+    /// [`Cell::TOP`], [`Cell::BOTTOM`] (`valign`; neither is the middle) and [`Cell::TH`].
+    pub flags: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl Cell {
+    pub const TOP: u8 = 1;
+    pub const BOTTOM: u8 = 2;
+    /// A header cell (`<th>`, or a Markdown table's header row): bold, and centered unless an
+    /// alignment says otherwise.
+    pub const TH: u8 = 4;
+
+    /// A cell of one column, of no alignment of its own.
+    pub fn plain(col: u32, spans: Range<u32>, flags: u8) -> Cell {
+        Cell {
+            col,
+            spans,
+            span: 1,
+            align: Align::None,
+            flags,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
     pub aligns: Vec<Align>,
+    /// The width an HTML table's cells of one column ask for, by column (`width`): empty for a
+    /// Markdown table.
+    pub widths: Vec<Want>,
+    /// An HTML table centered in the column (`<table align="center">`).
+    pub center: bool,
+    /// An HTML table: a row ends with its last cell (Markdown rows have every column).
+    pub html: bool,
+    /// Cells that span rows (`rowspan`), in the order of their first rows.
+    pub rowspans: Vec<RowSpan>,
+}
+
+/// A cell of an HTML table that spans rows: its text is in its first row, and the rows below it
+/// have no cell in its columns. Blocks are counted from the table's first one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowSpan {
+    pub col: u32,
+    pub cols: u32,
+    pub first: u32,
+    pub end: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,17 +348,20 @@ pub enum Want {
 }
 
 impl Want {
-    /// The `width` (`height` false) or `height` attribute `value`, entity-decoded: `128`,
-    /// `128.5` and `128px` are pixels, `50%` a percentage of a width. Anything else (0,
-    /// negative, `auto`, `2em`, `12abc`, a percentage height) is as if it weren't there, and
-    /// a side over [`MAX_SIDE`] is that.
+    /// The `width` (`height` false) or `height` attribute `value`, entity-decoded, read by
+    /// HTML's rules for dimension values: the number it starts with (`128`, `128.5`) is pixels
+    /// whatever follows it (`128px`, `64px;`, `2em`, `12abc`), unless that is `%`, which makes
+    /// it a percentage of a width. A value that doesn't start with a digit (`auto`, `-5`), 0
+    /// and a percentage height are as if they weren't there, and a side over [`MAX_SIDE`] is
+    /// that.
     pub fn parse(value: &str, width: bool) -> Want {
-        let v = value.trim();
-        let digits = v
-            .find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(v.len());
-        let (num, unit) = v.split_at(digits);
-        let Some(n) = num
+        let v = value.trim_ascii_start();
+        let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+        let mut end = digits(v);
+        if end > 0 && v[end..].starts_with('.') && digits(&v[end + 1..]) > 0 {
+            end += 1 + digits(&v[end + 1..]);
+        }
+        let Some(n) = v[..end]
             .parse::<f32>()
             .ok()
             .filter(|n| n.is_finite() && *n > 0.0)
@@ -316,12 +370,11 @@ impl Want {
         };
         // (Hundredths: a side of less than one is none.)
         let n = (n * 100.0).round().min(MAX_SIDE as f32 * 100.0) as u32;
-        match unit {
+        match v[end..].starts_with('%') {
             _ if n == 0 => Want::Auto,
-            "" => Want::Px(n),
-            u if u.eq_ignore_ascii_case("px") => Want::Px(n),
-            "%" if width => Want::Pct(n),
-            _ => Want::Auto,
+            false => Want::Px(n),
+            true if width => Want::Pct(n),
+            true => Want::Auto,
         }
     }
 }
@@ -350,6 +403,25 @@ pub struct Doc {
     /// them out. None without footnotes.
     #[cfg(feature = "clipboard")]
     pub backlinks: Vec<u32>,
+    /// The collapsible sections (`<details>`), in the order of their summaries.
+    #[cfg(feature = "details")]
+    pub sections: Vec<Section>,
+}
+
+/// A collapsible section (`<details>`): the blocks of its summary, then those of its body, which
+/// show only while it is open. Sections nest: a section's body holds the whole of any section
+/// in it.
+#[cfg(feature = "details")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section {
+    /// At least one block (an empty `<summary>` has an empty paragraph).
+    pub summary: Range<u32>,
+    /// Right after the summary; may be empty.
+    pub body: Range<u32>,
+    /// How it starts (`<details open>`).
+    pub open: bool,
+    /// The section whose body it is in (`u32::MAX`: none).
+    pub parent: u32,
 }
 
 impl Doc {
@@ -521,16 +593,20 @@ impl Doc {
     /// blocks). A whole row has every column; a later fragment of a split row only the columns
     /// that still have text, so callers treat missing columns as empty.
     pub fn row_cells(&self, block: &Block) -> impl Iterator<Item = (usize, &[Span])> {
-        let cells = match block.kind {
+        self.row_cell_list(block).iter().map(|c| {
+            let spans = &self.spans[c.spans.start as usize..c.spans.end as usize];
+            (c.col as usize, spans)
+        })
+    }
+
+    /// The stored cells of a table row (see [`Doc::row_cells`]).
+    pub fn row_cell_list(&self, block: &Block) -> &[Cell] {
+        match block.kind {
             BlockKind::TableRow {
                 first_cell, cells, ..
             } => &self.cells[first_cell as usize..(first_cell + cells) as usize],
             _ => &[],
-        };
-        cells.iter().map(|c| {
-            let spans = &self.spans[c.spans.start as usize..c.spans.end as usize];
-            (c.col as usize, spans)
-        })
+        }
     }
 
     pub fn remote_image_count(&self) -> usize {
@@ -551,6 +627,32 @@ impl Doc {
             }
         }
         changed
+    }
+
+    /// The section whose summary holds block `b`.
+    #[cfg(feature = "details")]
+    pub fn summary_of(&self, b: u32) -> Option<usize> {
+        // (No section is in a summary: the last one starting at or before it.)
+        let s = self.sections.partition_point(|s| s.summary.start <= b);
+        s.checked_sub(1)
+            .filter(|&s| self.sections[s].summary.contains(&b))
+    }
+
+    /// The sections whose bodies hold block `b`, outermost first: the last section to start
+    /// before it and those around that one (at most 32).
+    #[cfg(feature = "details")]
+    pub fn sections_around(&self, b: u32) -> Vec<usize> {
+        let mut s = self.sections.partition_point(|s| s.summary.start < b) as u32;
+        let mut out = Vec::new();
+        s = s.wrapping_sub(1);
+        while let Some(sec) = self.sections.get(s as usize) {
+            if sec.body.contains(&b) {
+                out.push(s as usize);
+            }
+            s = sec.parent;
+        }
+        out.reverse();
+        out
     }
 }
 
@@ -698,6 +800,31 @@ struct Builder {
     /// up to the next text, are dropped.
     #[cfg(feature = "math")]
     after_display: bool,
+    /// Container blocks open now (list items, quotes, footnote definitions): a section or an HTML
+    /// table ends with the container it opened in.
+    depth: usize,
+    /// The `<details>` open now, innermost last.
+    #[cfg(feature = "details")]
+    open_sections: Vec<details::OpenSection>,
+    /// Whether each section's blocks are footnote definitions' (by index into `Doc::sections`).
+    #[cfg(feature = "details")]
+    section_fn: Vec<bool>,
+    /// `<details>` open past the deepest kept or in a summary (see `details::MAX_SECTIONS`), in
+    /// the text and in footnote definitions.
+    #[cfg(feature = "details")]
+    ignored_sections: [u32; 2],
+    /// The HTML `<table>` open now.
+    #[cfg(feature = "html-tables")]
+    html_table: Option<Box<html_table::HtmlTable>>,
+    /// For each Markdown block open now that a table cell could take (paragraphs, quotes, lists,
+    /// items, code, headings, tables and their parts): whether a cell took it, so its end goes
+    /// to the cell too, even once the cell or the table has ended inside it.
+    #[cfg(feature = "html-tables")]
+    taken: Vec<html_table::Taken>,
+    /// Columns that cells spanning several may still add to HTML tables, beyond their first: one
+    /// per 8 bytes of the document, so tables take memory in proportion to their source.
+    #[cfg(feature = "html-tables")]
+    spare_cols: usize,
 }
 
 /// Inline HTML state of the open block (see `Builder::inline_tag`).
@@ -764,6 +891,19 @@ impl Builder {
             math_fence: None,
             #[cfg(feature = "math")]
             after_display: false,
+            depth: 0,
+            #[cfg(feature = "details")]
+            open_sections: Vec::new(),
+            #[cfg(feature = "details")]
+            section_fn: Vec::new(),
+            #[cfg(feature = "details")]
+            ignored_sections: [0; 2],
+            #[cfg(feature = "html-tables")]
+            html_table: None,
+            #[cfg(feature = "html-tables")]
+            taken: Vec::new(),
+            #[cfg(feature = "html-tables")]
+            spare_cols: src_len / 8,
         }
     }
 
@@ -792,9 +932,14 @@ impl Builder {
             && self.html_block.is_none()
             && self.image.is_none()
             && !self.continue_list;
+        #[cfg(feature = "html-tables")]
+        let held = held && self.html_table.is_none();
         if !held {
             self.misfit();
         }
+        // (The end isn't fed: the list's entry goes, as its end would take it.)
+        #[cfg(feature = "html-tables")]
+        self.taken.pop();
         held
     }
 
@@ -912,7 +1057,11 @@ impl Builder {
                 if self.hidden_styles.pop() == Some(true) => {}
             Event::Start(tag) => self.start(tag),
             #[cfg(feature = "math")]
-            Event::End(TagEnd::CodeBlock) if self.math_fence.is_some() => self.end_math_fence(),
+            Event::End(TagEnd::CodeBlock) if self.math_fence.is_some() => {
+                #[cfg(feature = "html-tables")]
+                self.taken.pop();
+                self.end_math_fence();
+            }
             Event::End(tag) => {
                 let def = matches!(tag, TagEnd::FootnoteDefinition);
                 self.end(tag);
@@ -953,6 +1102,15 @@ impl Builder {
             Event::FootnoteReference(label) => self.footnote_ref(&label),
             Event::SoftBreak => self.text(" ", 0, 0),
             Event::HardBreak => self.text("\n", 0, 0),
+            // In an HTML table's cell, a line of its own; between its rows, nothing.
+            #[cfg(feature = "html-tables")]
+            Event::Rule | Event::TaskListMarker(_) if self.table_started() => {
+                if let Event::TaskListMarker(done) = event {
+                    self.text(if done { "[x] " } else { "[ ] " }, 0, 0);
+                } else {
+                    self.cell_break(2);
+                }
+            }
             Event::Rule => {
                 self.close();
                 self.flush_marker();
@@ -963,6 +1121,30 @@ impl Builder {
     }
 
     fn start(&mut self, tag: Tag) {
+        #[cfg(feature = "html-tables")]
+        let tag = {
+            let kind = html_table::Taken::of(&tag);
+            // The parts of a Markdown table a cell took, once the HTML table ended in it: text.
+            let inert = matches!(tag, Tag::TableHead | Tag::TableRow | Tag::TableCell)
+                && self.taken.contains(&html_table::Taken::Table)
+                && self.html_table.as_ref().is_none_or(|t| t.cell.is_none());
+            let tag = if inert { None } else { self.table_start(tag) };
+            if let Some(kind) = kind {
+                let taken = if tag.is_some() {
+                    html_table::Taken::No
+                } else {
+                    kind
+                };
+                self.taken.push(taken);
+            }
+            let Some(tag) = tag else {
+                return;
+            };
+            tag
+        };
+        if matches!(tag, Tag::Item | Tag::BlockQuote(_)) {
+            self.depth += 1;
+        }
         match tag {
             Tag::Paragraph => self.open(BlockKind::Paragraph),
             Tag::Heading { level, .. } => self.open(BlockKind::Heading(level as u8)),
@@ -1037,6 +1219,9 @@ impl Builder {
                     self.skip_def = self.fn_depth;
                     return;
                 }
+                // A definition can't be in an HTML table: it ends the table.
+                #[cfg(feature = "html-tables")]
+                self.end_html_table();
                 if !self
                     .footnotes
                     .defined
@@ -1059,6 +1244,7 @@ impl Builder {
                     return;
                 }
                 self.close();
+                self.depth += 1;
                 self.footnotes.active = true;
                 self.footnotes.quote_start = std::mem::take(&mut self.quote_start);
                 self.footnotes.defs.push(FootnoteDef {
@@ -1082,7 +1268,10 @@ impl Builder {
                         Alignment::Right => Align::Right,
                     })
                     .collect();
-                self.doc.tables.push(Table { aligns });
+                self.doc.tables.push(Table {
+                    aligns,
+                    ..Table::default()
+                });
             }
             Tag::TableHead | Tag::TableRow => {
                 self.close();
@@ -1129,6 +1318,37 @@ impl Builder {
     }
 
     fn end(&mut self, tag: TagEnd) {
+        // The end of a block a cell took is the cell's, wherever the cell is now.
+        #[cfg(feature = "html-tables")]
+        if takeable_end(&tag) && self.taken.pop().is_some_and(|t| t != html_table::Taken::No) {
+            self.cell_end(tag);
+            return;
+        }
+        let container = match tag {
+            TagEnd::Item | TagEnd::BlockQuote(_) => true,
+            TagEnd::FootnoteDefinition => self.footnotes.nested == 0,
+            _ => false,
+        };
+        if container {
+            // What opened inside the container ends first, in it.
+            self.depth = self.depth.saturating_sub(1);
+            #[cfg(feature = "html-tables")]
+            if self
+                .html_table
+                .as_ref()
+                .is_some_and(|t| t.depth > self.depth)
+            {
+                self.end_html_table();
+            }
+            #[cfg(feature = "details")]
+            while self
+                .open_sections
+                .last()
+                .is_some_and(|s| s.depth > self.depth)
+            {
+                self.close_section();
+            }
+        }
         match tag {
             TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => self.close(),
             TagEnd::Item => {
@@ -1155,16 +1375,22 @@ impl Builder {
                 self.flush_marker();
                 self.footnote_backlink();
                 self.footnotes.active = false;
+                // (A `<details>` left open in it, shown as text, ends with it.)
+                #[cfg(feature = "details")]
+                {
+                    self.ignored_sections[1] = 0;
+                }
                 self.quote_start = self.footnotes.quote_start;
             }
             TagEnd::TableHead | TagEnd::TableRow => self.close(),
             TagEnd::TableCell => {
                 let start = self.merge_floor as u32;
-                let first = self.row.map_or(0, |(_, first)| first as usize);
-                self.doc.cells.push(Cell {
-                    col: (self.doc.cells.len() - first) as u32,
-                    spans: start..self.doc.spans.len() as u32,
-                });
+                let (header, first) = self.row.map_or((false, 0), |(h, f)| (h, f as usize));
+                let col = (self.doc.cells.len() - first) as u32;
+                let spans = start..self.doc.spans.len() as u32;
+                // GitHub's header cells are `<th>`s.
+                let th = if header { Cell::TH } else { 0 };
+                self.doc.cells.push(Cell::plain(col, spans, th));
                 self.merge_floor = self.doc.spans.len();
             }
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
@@ -1184,6 +1410,10 @@ impl Builder {
     }
 
     fn code_block(&self) -> bool {
+        #[cfg(feature = "html-tables")]
+        if self.cell_code() {
+            return true;
+        }
         matches!(
             self.open,
             Some(Open {
@@ -1272,12 +1502,23 @@ impl Builder {
         } else {
             s
         };
+        // A paragraph that starts after a tag ended the one before it (`</table>`,
+        // `</details>` in the middle of a line) has no space in front.
+        let s = if self.open.is_none() {
+            s.trim_start_matches([' ', '\t'])
+        } else {
+            s
+        };
         if s.is_empty() {
             return;
         }
         #[cfg(feature = "math")]
         {
             self.after_display = false;
+        }
+        #[cfg(feature = "html-tables")]
+        if self.stray(s) {
+            return;
         }
         if self.open.is_none() {
             // Nothing to close, and the inline HTML state stays: `- <b>bold</b> item` opened
@@ -1289,6 +1530,12 @@ impl Builder {
 
     /// Append `s` to the open block (see `text`) in the given style and link.
     fn push_text(&mut self, s: &str, style: u16, link: u32, image: u32) {
+        #[cfg(feature = "html-tables")]
+        if self.stray(s) {
+            return;
+        }
+        #[cfg(feature = "html-tables")]
+        self.cell_sep();
         let start = self.doc.text.len() as u32;
         if let Some(img) = (image as usize)
             .checked_sub(1)
@@ -1331,6 +1578,11 @@ impl Builder {
     }
 
     fn close(&mut self) {
+        // An HTML table's row stays open over the blocks in its cells (see `html_table`).
+        #[cfg(feature = "html-tables")]
+        if self.html_table.as_ref().is_some_and(|t| t.block) {
+            return;
+        }
         #[cfg(feature = "math")]
         {
             self.after_display = false;
@@ -1438,7 +1690,7 @@ impl Builder {
                     _ => (0, 0),
                 };
                 CellRest {
-                    col: c.col,
+                    cell: c.clone(),
                     spans,
                     next: 0,
                     at,
@@ -1457,7 +1709,10 @@ impl Builder {
                 let from = self.doc.spans.len() as u32;
                 take_chunk(&self.doc.text, r, budget, &mut self.doc.spans);
                 let spans = from..self.doc.spans.len() as u32;
-                self.doc.cells.push(Cell { col: r.col, spans });
+                self.doc.cells.push(Cell {
+                    spans,
+                    ..r.cell.clone()
+                });
             }
             #[cfg(test)]
             ROW_CELL_VISITS.with(|n| n.set(n.get() + 2 * rest.len()));
@@ -1784,7 +2039,13 @@ impl Builder {
             if self.inline_tag(&name, tag, closing) {
                 continue;
             }
+            #[cfg(feature = "html-tables")]
+            if self.html_table_tag(&name, tag, closing) {
+                continue;
+            }
             match name.as_str() {
+                #[cfg(feature = "details")]
+                "details" | "summary" => self.section_tag(name == "details", closing, tag),
                 "br" => {
                     // As in a browser, spaces before a line break are dropped.
                     self.html_inline.gap = None;
@@ -1814,12 +2075,10 @@ impl Builder {
                         source(themed, tag);
                     }
                 }
-                "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "tr" | "table"
-                | "details" | "summary" | "ul" | "ol" | "blockquote" | "pre" | "hr"
-                    if block =>
-                {
-                    self.close()
-                }
+                "tr" | "table" if block => self.close(),
+                name if block && block_tag(name) => self.close(),
+                #[cfg(not(feature = "details"))]
+                "details" | "summary" if block => self.close(),
                 // Cells of an HTML table, flattened: keep them apart.
                 "td" | "th" if block && closing => {
                     self.html_inline.gap = None;
@@ -1887,6 +2146,9 @@ impl Builder {
         let blank = self.open.as_ref().is_none_or(|open| {
             open.span_start as usize == self.doc.spans.len() || self.doc.text.ends_with('\n')
         });
+        // (A cell's start, or a line a cell's block starts, is the start of a block.)
+        #[cfg(feature = "html-tables")]
+        let blank = blank || self.cell_line_start();
         let mut space = blank || self.doc.text.ends_with(' ') || self.html_inline.gap.is_some();
         for c in decoded.chars() {
             // A no-break space (`&nbsp;`) is not whitespace to HTML.
@@ -1923,6 +2185,13 @@ impl Builder {
 
     fn finish(mut self) -> Doc {
         self.flush_text();
+        // An unclosed table or section takes the rest of the document, as an HTML parser has it.
+        #[cfg(feature = "html-tables")]
+        self.end_html_table();
+        #[cfg(feature = "details")]
+        while !self.open_sections.is_empty() {
+            self.close_section();
+        }
         self.close();
         self.doc.main_headings = self.doc.headings.len();
         let mut fn_blocks = std::mem::take(&mut self.footnotes.blocks);
@@ -2022,6 +2291,14 @@ impl Builder {
                 let at = self.doc.anchors[anchor].1 as usize;
                 self.doc.anchors[anchor].1 = moved[at];
             }
+            // A section in a definition moves with it (whole: it ends with the definition).
+            #[cfg(feature = "details")]
+            for (s, _) in (self.doc.sections.iter_mut().zip(&self.section_fn)).filter(|p| *p.1) {
+                let to = |r: &Range<u32>, start: u32| start..start + r.len() as u32;
+                let start = moved[s.summary.start as usize];
+                s.summary = to(&s.summary, start);
+                s.body = to(&s.body, s.summary.end);
+            }
             let mut noted: Vec<Heading> = std::mem::take(&mut self.footnotes.headings)
                 .into_iter()
                 .map(|(at, level, slug, bare)| Heading {
@@ -2036,6 +2313,32 @@ impl Builder {
         }
         #[cfg(feature = "clipboard")]
         self.doc.backlinks.sort_unstable();
+        // Sections in the order of their summaries, an outer one before an inner one at the same
+        // block (by index): a sort of pairs, as `resolve_refs` sorts.
+        #[cfg(feature = "details")]
+        {
+            let old = std::mem::take(&mut self.doc.sections);
+            let mut order: Vec<(u32, u32)> = (old.iter().enumerate())
+                .map(|(i, s)| (s.summary.start, i as u32))
+                .collect();
+            order.sort_unstable();
+            self.doc.sections = order
+                .iter()
+                .map(|&(_, i)| old[i as usize].clone())
+                .collect();
+            // Each one's parent: the innermost of those open around it, in order.
+            let mut around: Vec<u32> = Vec::new();
+            for k in 0..self.doc.sections.len() {
+                let start = self.doc.sections[k].summary.start;
+                while (around.last())
+                    .is_some_and(|&p| self.doc.sections[p as usize].body.end <= start)
+                {
+                    around.pop();
+                }
+                self.doc.sections[k].parent = around.last().copied().unwrap_or(u32::MAX);
+                around.push(k as u32);
+            }
+        }
         self.doc
     }
 }
@@ -2219,7 +2522,7 @@ fn expansion(tag: &Tag) -> usize {
 /// the machine is busy. Load hits one run and not the other, so a failure is measured again, twice,
 /// before it counts.
 #[cfg(test)]
-fn assert_scales_linearly(what: &str, small: impl Fn(), large: impl Fn()) {
+pub(crate) fn assert_scales_linearly(what: &str, small: impl Fn(), large: impl Fn()) {
     use std::time::{Duration, Instant};
     let time = |run: &dyn Fn()| {
         let t = Instant::now();
@@ -2239,7 +2542,7 @@ fn assert_scales_linearly(what: &str, small: impl Fn(), large: impl Fn()) {
 
 /// [`assert_scales_linearly`] for `work(n)`, at `quarter` and `4 * quarter`.
 #[cfg(test)]
-fn assert_linear(what: &str, quarter: usize, work: impl Fn(usize)) {
+pub(crate) fn assert_linear(what: &str, quarter: usize, work: impl Fn(usize)) {
     assert_scales_linearly(what, || work(quarter), || work(quarter * 4));
 }
 
@@ -2266,6 +2569,29 @@ fn end_of_raw_text(s: &str, name: &str) -> Option<usize> {
         from = at + 2;
     }
     None
+}
+
+/// An HTML block element that breaks a paragraph (in an HTML table's cell, a line).
+fn block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "div"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "li"
+            | "ul"
+            | "ol"
+            | "blockquote"
+            | "pre"
+            | "hr"
+            | "dl"
+            | "dt"
+            | "dd"
+    )
 }
 
 /// Index of the `>` closing the tag at the start of `s`, skipping quoted attribute values.
@@ -2310,6 +2636,17 @@ fn push_id<T>(v: &mut Vec<T>, item: T) -> u32 {
 /// Value of an HTML attribute (quoted or unquoted), case-insensitive name match. Walks the
 /// tag's real attribute boundaries, so text inside another attribute's value never matches.
 fn attr(tag: &str, name: &str) -> Option<String> {
+    attr_any(tag, name).flatten()
+}
+
+/// The tag has the attribute, with a value or without one (`<details open>`).
+#[cfg(feature = "details")]
+fn has_attr(tag: &str, name: &str) -> bool {
+    attr_any(tag, name).is_some()
+}
+
+/// [`attr`], `Some(None)` for an attribute without a value.
+fn attr_any(tag: &str, name: &str) -> Option<Option<String>> {
     let b = tag.as_bytes();
     let skip_space = |mut i: usize| {
         while i < b.len() && b[i].is_ascii_whitespace() {
@@ -2337,7 +2674,7 @@ fn attr(tag: &str, name: &str) -> Option<String> {
         i = skip_space(i);
         if b.get(i) != Some(&b'=') {
             if found {
-                return None;
+                return Some(None);
             }
             continue;
         }
@@ -2363,7 +2700,7 @@ fn attr(tag: &str, name: &str) -> Option<String> {
             }
         };
         if found {
-            return Some(value.to_owned());
+            return Some(Some(value.to_owned()));
         }
     }
 }
@@ -2378,9 +2715,10 @@ thread_local! {
 }
 
 /// A table cell whose text is being cut into pieces: `spans` are its spans, `at..end` the text
-/// not placed yet, `next` the first span that may still overlap it.
+/// not placed yet, `next` the first span that may still overlap it; `cell` is the cell, which
+/// each piece copies.
 struct CellRest<'a> {
-    col: u32,
+    cell: Cell,
     spans: &'a [Span],
     next: usize,
     at: usize,
@@ -2446,7 +2784,7 @@ fn split_spans(text: &str, spans: &[Span], max: usize) -> (Vec<Span>, Vec<Range<
     let mut out = Vec::with_capacity(spans.len() + end.saturating_sub(at) / max.max(1) + 1);
     let mut chunks = Vec::new();
     let mut cell = CellRest {
-        col: 0,
+        cell: Cell::plain(0, 0..0, 0),
         spans,
         next: 0,
         at,

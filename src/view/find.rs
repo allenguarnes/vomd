@@ -827,6 +827,11 @@ impl View {
         if self.message.is_some() {
             return;
         }
+        // A match in a closed section opens it, as in a browser, and it stays open.
+        #[cfg(feature = "details")]
+        if self.reveal(m.block) {
+            self.ensure();
+        }
         let height = f64::from(self.area_height());
         let wanted = |view: &View, top: f64| (top - PLACE * height).clamp(0.0, view.max_scroll());
         // Blocks near the window are shaped, so one that is not is out of view.

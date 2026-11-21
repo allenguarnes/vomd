@@ -122,6 +122,8 @@ All features are on by default. Turning some off makes a smaller binary:
 | `math` | LaTeX math, with the STIX Two Math font when `embed-fonts` is on (an installed math font otherwise) |
 | `highlight` | Syntax highlighting in code blocks |
 | `front-matter` | YAML front matter shown as a table (without it, front matter is hidden) |
+| `details` | Collapsible sections (`<details>`) that open and close (without it, they are shown open) |
+| `html-tables` | HTML tables laid out as tables (without it, their cells are a line of text) |
 
 Sizes are of these plain builds. The release files (`cargo xtask dist`, and `cargo xtask size`)
 are about 0.6 MB smaller on Linux: the binary is linked without the unwind tables it never uses
@@ -129,9 +131,9 @@ are about 0.6 MB smaller on Linux: the binary is linked without the unwind table
 
 ```sh
 # Without SVG (SVGs show their alt text), about 4.5 MB on Linux:
-cargo build --release --no-default-features --features images,remote-images,embed-fonts,clipboard,toc,find,math,highlight,front-matter
+cargo build --release --no-default-features --features images,remote-images,embed-fonts,clipboard,toc,find,math,highlight,front-matter,details,html-tables
 # Without math (formulas show as their source), about 5.6 MB on Linux:
-cargo build --release --no-default-features --features images,remote-images,svg,embed-fonts,clipboard,toc,find,highlight,front-matter
+cargo build --release --no-default-features --features images,remote-images,svg,embed-fonts,clipboard,toc,find,highlight,front-matter,details,html-tables
 # The smallest build: no images and system fonts only, about 3.0 MB on Linux and 1.9 MB on Windows:
 cargo build --release --no-default-features
 ```

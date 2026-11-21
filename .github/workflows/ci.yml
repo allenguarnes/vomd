@@ -43,6 +43,8 @@ jobs:
           cargo clippy --all-targets --no-default-features --features math,embed-fonts --locked -- -D warnings
           cargo clippy --all-targets --no-default-features --features highlight --locked -- -D warnings
           cargo clippy --all-targets --no-default-features --features front-matter --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features details --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features html-tables --locked -- -D warnings
       - name: Tests and goldens
         run: cargo test --workspace --locked
       - name: Tests without default features
@@ -53,6 +55,8 @@ jobs:
           cargo test --lib --no-default-features --features math,embed-fonts --locked
           cargo test --lib --no-default-features --features highlight --locked
           cargo test --lib --no-default-features --features front-matter --locked
+          cargo test --lib --no-default-features --features details --locked
+          cargo test --lib --no-default-features --features html-tables --locked
       # A shared runner is two to three times slower than the machine the time budgets are
       # for, so start and scroll times are reported here, not gated; size and memory still are.
       # `cargo xtask budgets` on an idle machine gates them all before a release.

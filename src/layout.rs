@@ -44,6 +44,8 @@ const LIST_INDENT: f32 = 2.0;
 const CELL_PAD_X: f32 = 0.8125;
 const CELL_PAD_Y: f32 = 0.375;
 const FOOTNOTE_SIZE: f32 = 0.875;
+/// Room for the disclosure triangle in front of a section's summary, in em.
+const DISCLOSURE: f32 = 1.25;
 /// Width and height of an alert icon, in em.
 const ALERT_ICON: f32 = 1.0;
 /// Shaped content is kept within this many viewport heights of the viewport.
@@ -354,6 +356,12 @@ impl Meta {
     const FOOTNOTE: u8 = 4;
     /// The rows of padding, 0 to 2, in the two bits above.
     const PADS_SHIFT: u32 = 3;
+    /// The first block of a section's summary (`<summary>`): the disclosure triangle is drawn in
+    /// front of it, ▼ while the section is `OPEN`.
+    const SUMMARY: u8 = 32;
+    const OPEN: u8 = 64;
+    /// In a closed section's body: no height, never laid out.
+    const HIDDEN: u8 = 128;
 
     fn stripe(self) -> bool {
         self.flags & Self::STRIPE != 0
@@ -368,7 +376,11 @@ impl Meta {
     }
 
     fn pads(self) -> u8 {
-        self.flags >> Self::PADS_SHIFT
+        (self.flags >> Self::PADS_SHIFT) & 3
+    }
+
+    fn hidden(self) -> bool {
+        self.flags & Self::HIDDEN != 0
     }
 
     fn set(&mut self, flag: u8, on: bool) {
@@ -475,6 +487,9 @@ pub struct Layout {
     math: crate::math::Shared,
     /// Where the lexer is at the start of the chunks of split code blocks (see [`CodeLex`]).
     code: CodeLex,
+    /// Whether each section is open, as laid out.
+    #[cfg(feature = "details")]
+    open: Vec<bool>,
 }
 
 /// How many bytes of code the lexer may go through to find where a chunk starts, in one
@@ -537,6 +552,8 @@ impl Layout {
             #[cfg(feature = "math")]
             math: crate::math::Cache::shared(),
             code: CodeLex::default(),
+            #[cfg(feature = "details")]
+            open: Vec::new(),
         };
         layout.meta = layout.prepass(doc);
         layout.set_geometry();
@@ -574,6 +591,11 @@ impl Layout {
 
     pub fn geoms(&self) -> &[BlockGeom] {
         &self.geoms
+    }
+
+    /// Block `i` is in a closed section: it isn't shown.
+    pub fn hidden(&self, i: usize) -> bool {
+        self.meta.get(i).is_some_and(|m| m.hidden())
     }
 
     /// Every block has an exact height.
@@ -650,6 +672,138 @@ impl Layout {
     #[cfg(feature = "math")]
     pub fn set_math(&mut self, cache: crate::math::Shared) {
         self.math = cache;
+    }
+
+    /// Open or close the sections whose state in `open` (by section) isn't the layout's.
+    #[cfg(feature = "details")]
+    /// It is one pass over the blocks however many change (a reload restoring the window's
+    /// states, a new layout).
+    pub fn set_sections(&mut self, doc: &Doc, open: &[bool]) {
+        if self.open[..] == open[..doc.sections.len()] {
+            return;
+        }
+        for (s, sec) in doc.sections.iter().enumerate() {
+            if self.open[s] != open[s] {
+                self.open[s] = open[s];
+                let summary = sec.summary.start as usize;
+                self.meta[summary].set(Meta::OPEN, open[s]);
+                self.reset_rows(summary as u32..summary as u32 + 1);
+            }
+        }
+        let (n, basis) = (self.geoms.len(), self.basis());
+        let mut shown = 0;
+        for (i, hide) in hidden_blocks(doc, |s| open[s]).enumerate() {
+            let gap = if i == 0 {
+                0
+            } else {
+                quarters(Self::gap_em(doc, shown, i)) as u8
+            };
+            let m = &mut self.meta[i];
+            let (was, moved) = (m.hidden(), m.gap != gap && !hide);
+            m.gap = gap;
+            m.set(Meta::HIDDEN, hide);
+            if !hide {
+                shown = i;
+            }
+            if hide == was && !moved {
+                continue;
+            }
+            m.est = Self::estimate_at(*m, i, n, basis);
+            let g = &mut self.geoms[i];
+            g.unmeasure();
+            // (A hidden block is measured: its height is exactly none.)
+            g.measured = hide;
+            g.h = m.est;
+            self.cursor = self.cursor.min(i);
+        }
+        self.rebuild_heights();
+        let geoms = &self.geoms;
+        self.live.retain(|&i| geoms[i as usize].content.is_some());
+    }
+
+    /// Section `s` opened or closed (`open[s]`, `open` being every section's state): the blocks
+    /// of its body show, but for those of sections closed in it, or hide (all of them while a
+    /// section around it is closed). The blocks after the body don't move, nor do those above,
+    /// and it costs the body's blocks and the sections in it: O(log n) per block for the tops,
+    /// or O(n) for them all once the body is more than an eighth of the document.
+    #[cfg(feature = "details")]
+    pub fn set_open(&mut self, doc: &Doc, s: usize, open: &[bool]) {
+        let Some(sec) = doc.sections.get(s) else {
+            return;
+        };
+        let summary = sec.summary.start as usize;
+        self.open[s] = open[s];
+        // Its triangle turns (if it's its: see `prepass`).
+        if doc.summary_of(summary as u32) == Some(s) {
+            self.meta[summary].set(Meta::OPEN, open[s]);
+            self.reset_rows(summary as u32..summary as u32 + 1);
+        }
+        // In a closed section nothing of it shows either way: the section around it lays its
+        // body out when it opens.
+        let mut p = sec.parent as usize;
+        while let Some(around) = doc.sections.get(p) {
+            if !open[p] {
+                return;
+            }
+            p = around.parent as usize;
+        }
+        let body = sec.body.start as usize..sec.body.end as usize;
+        let all = !open[s];
+        let mut diff = vec![0i32; body.len() + 1];
+        if !all {
+            // (A section in the summary, `<summary><details>`, isn't in the body.)
+            let inner = doc.sections[s + 1..]
+                .iter()
+                .enumerate()
+                .take_while(|(_, t)| (t.summary.start as usize) < body.end)
+                .filter(|(_, t)| t.summary.start as usize >= body.start);
+            for (_, t) in inner.filter(|&(k, _)| !open[s + 1 + k]) {
+                diff[t.body.start as usize - body.start] += 1;
+                diff[t.body.end as usize - body.start] -= 1;
+            }
+        }
+        let (n, basis) = (self.geoms.len(), self.basis());
+        let bulk = body.len() > n / 8;
+        // The block shown last before each, which its spacing is against.
+        let mut shown = body.start.saturating_sub(1);
+        let mut depth = 0;
+        for i in body.start..(body.end + 1).min(n) {
+            let in_body = i < body.end;
+            if in_body {
+                depth += diff[i - body.start];
+            }
+            let was = self.meta[i].hidden();
+            // (The block after the body only has its spacing looked at again.)
+            let hide = if in_body { all || depth > 0 } else { was };
+            let gap = quarters(Self::gap_em(doc, shown, i)) as u8;
+            let m = &mut self.meta[i];
+            let moved = m.gap != gap && !hide;
+            m.gap = gap;
+            m.set(Meta::HIDDEN, hide);
+            if !hide {
+                shown = i;
+            }
+            if hide == was && !moved {
+                continue;
+            }
+            m.est = Self::estimate_at(*m, i, n, basis);
+            let est = m.est;
+            let g = &mut self.geoms[i];
+            g.unmeasure();
+            // (A hidden block is measured: its height is exactly none.)
+            g.measured = hide;
+            self.cursor = self.cursor.min(i);
+            if bulk {
+                g.h = est;
+            } else {
+                self.set_height(i, est);
+            }
+        }
+        if bulk {
+            self.rebuild_heights();
+        }
+        let geoms = &self.geoms;
+        self.live.retain(|&i| geoms[i as usize].content.is_some());
     }
 
     /// The faces text is set in changed (`font_sans` / `font_mono`): everything is remeasured.
@@ -847,6 +1001,24 @@ impl Layout {
             .blocks
             .iter()
             .position(|b| matches!(b.marker, Marker::Footnote(_)));
+        // Sections as they start: closed ones hide their bodies.
+        #[cfg(feature = "details")]
+        {
+            let hidden = hidden_blocks(doc, |s| doc.sections[s].open);
+            for (m, h) in meta.iter_mut().zip(hidden) {
+                m.set(Meta::HIDDEN, h);
+            }
+            // (Sections whose summaries start at one block, `<summary><details>`: the triangle
+            // is the innermost's, the last.)
+            for s in &doc.sections {
+                let m = &mut meta[s.summary.start as usize];
+                m.flags |= Meta::SUMMARY;
+                m.set(Meta::OPEN, s.open);
+            }
+            self.open = doc.sections.iter().map(|s| s.open).collect();
+        }
+        // The last block shown: spacing is against it.
+        let mut shown = 0;
         for (i, b) in doc.blocks.iter().enumerate() {
             // A quote that starts at or outside the alert's depth is a different quote.
             if alert.is_some_and(|(_, d)| b.quote < d || (b.quote_start != 0 && b.quote_start <= d))
@@ -860,16 +1032,20 @@ impl Layout {
             if let BlockKind::TableRow { table, header, .. } = b.kind {
                 // A table's rows are consecutive blocks.
                 let r = &mut self.table_rows[table as usize];
-                if r.start == r.end {
+                let first = r.start == r.end;
+                if first {
                     *r = i as u32..i as u32 + 1;
                 } else {
                     r.end = i as u32 + 1;
                 }
-                // Fragments of one row (`joined`) share its parity.
+                // Fragments of one row (`joined`) share its parity; an HTML table may have no
+                // header, and its first row is the first data row.
                 row = if header {
                     0
                 } else if b.joined {
                     row
+                } else if first {
+                    1
                 } else {
                     row + 1
                 };
@@ -883,11 +1059,14 @@ impl Layout {
             m.gap = if i == 0 {
                 0
             } else {
-                quarters(Self::gap_em(doc, i)) as u8
+                quarters(Self::gap_em(doc, shown, i)) as u8
             };
+            if !m.hidden() {
+                shown = i;
+            }
             let pads = !b.joined as u8 + !joined_next(doc, i) as u8;
             m.flags |= pads << Meta::PADS_SHIFT;
-            m.indent = quarters(nesting_x(doc, b, b.quote, b.list) + Self::footnote_x(b, *m));
+            m.indent = quarters(nesting_x(doc, b, b.quote, b.list) + Self::extra_x(b, *m));
             m.shape = match b.kind {
                 BlockKind::Paragraph | BlockKind::AlertTitle(_) => Est::Text,
                 BlockKind::Heading(level) => Est::Heading(level.clamp(1, 6)),
@@ -1102,7 +1281,8 @@ impl Layout {
             };
             let mut changed = false;
             for i in r {
-                if self.geoms[i].content.is_some() {
+                // (A block in a closed section has no height, and nothing to lay out.)
+                if self.geoms[i].content.is_some() || self.meta[i].hidden() {
                     continue;
                 }
                 let (content, h) = self.build(doc, fonts, i);
@@ -1119,7 +1299,7 @@ impl Layout {
             let y = self.y_of(top);
             let bare = self
                 .range(y, y + view_h)
-                .any(|i| self.geoms[i].content.is_none());
+                .any(|i| self.geoms[i].content.is_none() && !self.meta[i].hidden());
             if !bare && (!changed || pass + 1 >= MEASURE_PASSES) {
                 break;
             }
@@ -1205,8 +1385,11 @@ impl Layout {
     fn build(&mut self, doc: &Doc, fonts: &Fonts, i: usize) -> (BlockBox, f32) {
         let block = &doc.blocks[i];
         let meta = self.meta[i];
+        if meta.hidden() {
+            return (BlockBox::default(), 0.0);
+        }
         let em = self.em;
-        let gap = self.gap_before(doc, i) * em;
+        let gap = self.gap_before(i) * em;
         let indent = self.indent(doc, block, meta);
         let avail = (self.col_w - indent).max(em);
         let last = !joined_next(doc, i);
@@ -1342,7 +1525,7 @@ impl Layout {
             BlockKind::TableRow { table, .. } => self.table_row(
                 doc,
                 fonts,
-                (block, meta, last),
+                (i, meta, last),
                 table as usize,
                 indent,
                 gap,
@@ -1350,11 +1533,51 @@ impl Layout {
                 &mut missing,
             ),
         };
+        if meta.flags & Meta::SUMMARY != 0 {
+            let baseline = out.lines.first().map_or(gap + em, |l| l.baseline);
+            let x = indent - DISCLOSURE * em;
+            self.disclosure(
+                fonts,
+                meta.flags & Meta::OPEN != 0,
+                body,
+                (x, baseline),
+                &mut out,
+            );
+        }
         self.quote_bars(doc, i, meta, gap, content_h, &mut out);
         // Always flag the block: a fallback scan may still be running for these characters.
         self.geoms[i].missing |= !missing.is_empty();
         self.report_missing(&missing);
         (out, gap + content_h + self.page_end(doc, i))
+    }
+
+    /// The triangle in front of a section's summary, ▶ closed and ▼ open, on the summary's first
+    /// baseline at `x`. Like a browser's marker it is no text of the document's: it is neither
+    /// found nor copied.
+    fn disclosure(
+        &mut self,
+        fonts: &Fonts,
+        open: bool,
+        body: TextStyle,
+        (x, baseline): (f32, f32),
+        out: &mut BlockBox,
+    ) {
+        let style = TextStyle {
+            bold: false,
+            size: 0.625 * self.em,
+            role: Role::Text,
+            link: 0,
+            ..body
+        };
+        self.para.clear();
+        self.para
+            .push_synthetic(if open { "▼" } else { "▶" }, 0, style);
+        let pl = self
+            .ctx
+            .layout(fonts, &self.para, NO_WRAP, Align::Start, BODY_LH);
+        let dy = baseline - pl.lines.first().map_or(0.0, |l| l.baseline);
+        let s = out.push_style(style);
+        out.append_decor(&pl, s, x, dy);
     }
 
     /// The icon in front of an alert's title (GitHub draws Octicons; ours are built from an
@@ -1425,19 +1648,20 @@ impl Layout {
     }
 
     /// Spacing above block `i`, in em.
-    fn gap_before(&self, doc: &Doc, i: usize) -> f32 {
+    fn gap_before(&self, i: usize) -> f32 {
         if i == 0 {
             return self.params.page_pad;
         }
-        Self::gap_em(doc, i)
+        from_quarters(self.meta[i].gap)
     }
 
-    /// Spacing above block `i`, which is not the first, in em.
-    fn gap_em(doc: &Doc, i: usize) -> f32 {
+    /// Spacing above block `i`, which is not the first, after block `prev`, the last one shown
+    /// before it, in em.
+    fn gap_em(doc: &Doc, prev: usize, i: usize) -> f32 {
         if doc.blocks[i].joined {
             return 0.0;
         }
-        let (prev, cur) = (&doc.blocks[i - 1], &doc.blocks[i]);
+        let (prev, cur) = (&doc.blocks[prev], &doc.blocks[i]);
         match (prev.kind, cur.kind) {
             (_, BlockKind::Heading(_)) => 1.5,
             (BlockKind::Rule, _) | (_, BlockKind::Rule) => 1.5,
@@ -1467,9 +1691,19 @@ impl Layout {
         if footnote { LIST_INDENT } else { 0.0 }
     }
 
+    /// [`Layout::footnote_x`], and the room for the disclosure triangle in front of a summary.
+    fn extra_x(block: &Block, meta: Meta) -> f32 {
+        let summary = if meta.flags & Meta::SUMMARY != 0 {
+            DISCLOSURE
+        } else {
+            0.0
+        };
+        Self::footnote_x(block, meta) + summary
+    }
+
     /// Left edge of the block's content.
     fn indent(&self, doc: &Doc, block: &Block, meta: Meta) -> f32 {
-        (nesting_x(doc, block, block.quote, block.list) + Self::footnote_x(block, meta)) * self.em
+        (nesting_x(doc, block, block.quote, block.list) + Self::extra_x(block, meta)) * self.em
     }
 
     /// Where the block's marker hangs from: the content edge of the item's list level, left of
@@ -1682,13 +1916,17 @@ impl Layout {
     }
 
     /// One table row, or one fragment of a split row: a fragment has no rule or padding where
-    /// it joins its neighbor, but keeps the row's stripe and vertical rules.
+    /// it joins its neighbor, but keeps the row's stripe and vertical rules. As on GitHub, a
+    /// header cell is bold and centered unless it or its column is aligned otherwise, and a
+    /// whole row's cells are centered vertically unless they say otherwise (`valign`). A cell
+    /// spanning columns has no rules inside it; one spanning rows has its text in its first row,
+    /// and the rows below have no rule across it, and its first row's stripe.
     #[allow(clippy::too_many_arguments)]
     fn table_row(
         &mut self,
         doc: &Doc,
         fonts: &Fonts,
-        (block, meta, last): (&Block, Meta, bool),
+        (i, meta, last): (usize, Meta, bool),
         table: usize,
         indent: f32,
         gap: f32,
@@ -1696,64 +1934,130 @@ impl Layout {
         missing: &mut Vec<char>,
     ) -> f32 {
         let em = self.em;
+        let block = &doc.blocks[i];
         let cols = self.table_cols(doc, fonts, table, indent);
         let (px, py) = (CELL_PAD_X * em, CELL_PAD_Y * em);
         let (top, bottom) = (
             if block.joined { 0.0 } else { py },
             if last { py } else { 0.0 },
         );
-        let header = matches!(block.kind, BlockKind::TableRow { header: true, .. });
-        let body = TextStyle {
-            bold: header,
-            ..self.body_style(block, meta)
+        let body = self.body_style(block, meta);
+        let tbl = &doc.tables[table];
+        // A centered table narrower than the column sits in its middle.
+        let x0 = if tbl.center {
+            indent + ((self.col_w - indent - cols.iter().sum::<f32>()) / 2.0).max(0.0)
+        } else {
+            indent
         };
-        let aligns = &doc.tables[table].aligns;
         // There is no horizontal scrolling: columns that start past the document's right edge
         // can't be seen, so a row costs its visible columns (and the populated cells among them),
         // however many columns the table has. A column's cell and rules count from its left edge.
-        let reach = (self.params.width - self.col_x - indent).max(0.0);
+        let reach = (self.params.width - self.col_x - x0).max(0.0);
         let (mut visible, mut edge) = (0, 0.0f32);
         while visible < cols.len() && edge < reach {
             edge += cols[visible];
             visible += 1;
         }
+        // Per visible column: no rule on its right (inside a cell that spans it), no rule below
+        // it (a cell spanning rows goes on below), and its stripe (a cell spanning rows gives
+        // its first row's).
+        let mut inner = vec![false; visible];
+        let mut open_below = vec![false; visible];
+        let mut stripe = vec![meta.stripe(); visible];
+        // A rule above (the table's first row; every whole HTML row, over its own cells, as a
+        // longer row under a shorter one needs it), but not through a cell spanning from above.
+        let mut above = vec![meta.first_row() || (tbl.html && !block.joined); visible];
+        let first_row = self.table_rows[table].start as usize;
+        let rel = i.saturating_sub(first_row) as u32;
+        let spans = &tbl.rowspans;
+        let reaching = spans[..spans.partition_point(|s| s.first <= rel)].iter();
+        let mut filled = 0;
+        for s in reaching.filter(|s| rel < s.end) {
+            let c = (s.col as usize).min(visible)..((s.col + s.cols) as usize).min(visible);
+            filled = filled.max(c.end);
+            if rel + 1 < s.end {
+                open_below[c.clone()].fill(true);
+            }
+            if rel > s.first {
+                let first = self.meta[first_row + s.first as usize].stripe();
+                stripe[c.clone()].fill(first);
+                above[c.clone()].fill(false);
+                inner[c.start..c.end.saturating_sub(1).max(c.start)].fill(true);
+            }
+        }
+        // An HTML row ends with its last cell (or the last spanning into it from above): nothing
+        // is drawn where a cell is missing, as in a browser. (A row's first block has its cells.)
+        if tbl.html {
+            let mut head = i;
+            while head > first_row && doc.blocks[head].joined {
+                head -= 1;
+            }
+            let cells = doc.row_cell_list(&doc.blocks[head]).iter();
+            let end = cells.map(|c| c.col as usize + c.span as usize).max();
+            let filled = filled.max(end.unwrap_or(0)).min(visible);
+            stripe[filled..].fill(false);
+            above[filled..].fill(false);
+            // The row above has its rule below its own cells: this one's goes past them only.
+            if head > first_row {
+                let mut prev = head - 1;
+                while prev > first_row && doc.blocks[prev].joined {
+                    prev -= 1;
+                }
+                let r = (prev - first_row) as u32;
+                let cells = doc.row_cell_list(&doc.blocks[prev]).iter();
+                let spanned = (spans.iter().filter(|s| s.first <= r && r < s.end))
+                    .map(|s| (s.col + s.cols) as usize);
+                let end = cells
+                    .map(|c| c.col as usize + c.span as usize)
+                    .chain(spanned)
+                    .max();
+                above[..end.unwrap_or(0).min(visible)].fill(false);
+            }
+            open_below[filled..].fill(true);
+            inner[filled..].fill(true);
+            edge = cols[..filled].iter().sum();
+        }
+        let whole = !block.joined && last;
         let mut cells = Vec::new();
         let mut row_h: f32 = 0.0;
         #[cfg(feature = "math")]
         let math = self.math.clone();
         // A fragment of a split row only stores the cells that still have text.
-        let stored = doc.row_cells(block).take_while(|&(c, _)| c < visible);
-        for (c, spans) in stored {
+        let stored = doc.row_cell_list(block).iter();
+        for cell in stored.take_while(|c| (c.col as usize) < visible) {
+            let c = cell.col as usize;
+            let k = (cell.span as usize).clamp(1, cols.len() - c);
+            inner[c..(c + k - 1).min(visible)].fill(true);
+            let w = (cols[c..c + k].iter().sum::<f32>() - 2.0 * px).max(1.0);
+            let spans = &doc.spans[cell.spans.start as usize..cell.spans.end as usize];
             self.resolve_images(doc, spans);
             let boxes = Boxes {
                 sizes: &self.images,
                 scale: self.params.scale,
                 em,
-                max_w: (cols[c] - 2.0 * px).max(1.0),
+                max_w: w,
             };
             #[cfg(feature = "math")]
             let mut formulas = Formulas::new(&math, fonts);
+            let th = cell.flags & doc::Cell::TH != 0;
             fill_para(
                 &mut self.para,
                 doc,
                 spans,
-                body,
+                TextStyle { bold: th, ..body },
                 &boxes,
                 #[cfg(feature = "math")]
                 &mut formulas,
             );
-            let align = match aligns.get(c) {
-                Some(doc::Align::Center) => Align::Center,
-                Some(doc::Align::Right) => Align::Right,
-                _ => Align::Start,
+            let align = match (cell.align, tbl.aligns.get(c).copied().unwrap_or_default()) {
+                (doc::Align::None, doc::Align::None) if th => Align::Center,
+                (doc::Align::None, a) | (a, _) => match a {
+                    doc::Align::Center => Align::Center,
+                    doc::Align::Right => Align::Right,
+                    _ => Align::Start,
+                },
             };
-            let pl = self.ctx.layout(
-                fonts,
-                &self.para,
-                (cols[c] - 2.0 * px).max(1.0),
-                align,
-                BODY_LH,
-            );
+            let pl = self.ctx.layout(fonts, &self.para, w, align, BODY_LH);
             #[cfg(test)]
             {
                 self.cells_laid += 1;
@@ -1762,6 +2066,7 @@ impl Layout {
             row_h = row_h.max(pl.height);
             cells.push((
                 c,
+                cell.flags,
                 pl,
                 std::mem::take(&mut self.para.styles),
                 #[cfg(feature = "math")]
@@ -1779,32 +2084,59 @@ impl Layout {
         let h = row_h + top + bottom;
         let width = edge.min(reach);
         let line = self.hairline();
-        if meta.stripe() {
-            out.rect(indent, gap, width, h, Role::TableStripe);
-        }
-        if meta.first_row() {
-            out.rect(indent, gap, width, line, Role::Border);
-        }
+        // Runs of the row's columns that something is true of, as `(x, width)`.
+        let runs = |on: &[bool], f: &mut dyn FnMut(f32, f32)| {
+            let mut x = x0;
+            let mut run: Option<f32> = None;
+            for (c, w) in cols[..visible].iter().enumerate() {
+                match (run, on[c]) {
+                    (None, true) => run = Some(x),
+                    (Some(at), false) => {
+                        f(at, x - at);
+                        run = None;
+                    }
+                    _ => {}
+                }
+                x += w;
+            }
+            if let Some(at) = run {
+                f(at, (x0 + width - at).max(0.0));
+            }
+        };
+        runs(&stripe, &mut |x, w| {
+            out.rect(x, gap, w, h, Role::TableStripe)
+        });
+        runs(&above, &mut |x, w| out.rect(x, gap, w, line, Role::Border));
         if last {
-            out.rect(indent, gap + h - line, width, line, Role::Border);
+            let closed: Vec<bool> = open_below.iter().map(|o| !o).collect();
+            runs(&closed, &mut |x, w| {
+                out.rect(x, gap + h - line, w, line, Role::Border)
+            });
         }
-        out.rect(indent, gap, line, h, Role::Border);
-        let mut x = indent;
+        out.rect(x0, gap, line, h, Role::Border);
+        let mut x = x0;
         let mut cells = cells.into_iter().peekable();
         for (c, w) in cols[..visible].iter().enumerate() {
-            #[cfg(not(feature = "math"))]
-            if let Some((_, pl, styles)) = cells.next_if(|(col, ..)| *col == c) {
-                out.append(pl, &styles, x + px, gap + top);
-            }
-            #[cfg(feature = "math")]
-            if let Some((_, pl, styles, formulas)) = cells.next_if(|(col, ..)| *col == c) {
-                let from = out.boxes.len();
-                out.append(pl, &styles, x + px, gap + top);
-                formulas.place(out, from, missing);
+            if let Some(cell) = cells.next_if(|cell| cell.0 == c) {
+                // Its lines within the row's height.
+                let dy = match cell.1 {
+                    _ if !whole => 0.0,
+                    f if f & doc::Cell::TOP != 0 => 0.0,
+                    f if f & doc::Cell::BOTTOM != 0 => row_h - cell.2.height,
+                    _ => (row_h - cell.2.height) / 2.0,
+                };
+                #[cfg(not(feature = "math"))]
+                out.append(cell.2, &cell.3, x + px, gap + top + dy);
+                #[cfg(feature = "math")]
+                {
+                    let from = out.boxes.len();
+                    out.append(cell.2, &cell.3, x + px, gap + top + dy);
+                    cell.4.place(out, from, missing);
+                }
             }
             x += w;
             // A rule on the far side of the visible width can't be seen.
-            if x - indent <= reach {
+            if x - x0 <= reach && !inner[c] {
                 out.rect(x - line, gap, line, h, Role::Border);
             }
         }
@@ -1846,14 +2178,21 @@ impl Layout {
         let sample = self.table_sample(doc, table);
         let truncated = sample.end < self.table_rows[table].end;
         let mut missing = Vec::new();
+        // Cells spanning columns, measured once the others are: their min and max, and columns.
+        let mut wide = Vec::new();
         for r in sample {
             let block = &doc.blocks[r as usize];
-            let header = matches!(block.kind, BlockKind::TableRow { header: true, .. });
-            let body = TextStyle {
-                bold: header,
-                ..self.body_style(block, self.meta[r as usize])
-            };
-            for (c, spans) in doc.row_cells(block).take_while(|&(c, _)| c < n) {
+            let body = self.body_style(block, self.meta[r as usize]);
+            for cell in doc.row_cell_list(block) {
+                let c = cell.col as usize;
+                if c >= n {
+                    break;
+                }
+                let body = TextStyle {
+                    bold: cell.flags & doc::Cell::TH != 0,
+                    ..body
+                };
+                let spans = &doc.spans[cell.spans.start as usize..cell.spans.end as usize];
                 self.resolve_images(doc, spans);
                 // An image claims at most its column's share of the line, so one doesn't push
                 // the others off the edge (a cell shrinks it to fit).
@@ -1875,9 +2214,44 @@ impl Layout {
                     &mut formulas,
                 );
                 let (lo, hi, absent) = self.ctx.measure_missing(fonts, &self.para);
+                missing.extend(absent);
+                let k = (cell.span as usize).clamp(1, n - c);
+                if k > 1 {
+                    wide.push((c..c + k, lo, hi));
+                    continue;
+                }
                 min[c] = min[c].max(lo);
                 max[c] = max[c].max(hi);
-                missing.extend(absent);
+            }
+        }
+        // A width a column's cells ask for (an HTML table's): pixels are the column's width
+        // unless its text can't be that narrow, a percentage of the line is as wide as it grows.
+        for (c, want) in doc.tables[table].widths.iter().enumerate().take(n) {
+            match *want {
+                Want::Px(v) => {
+                    let w = min[c].max(v as f32 / 100.0 * self.params.scale);
+                    (min[c], max[c]) = (w, w);
+                }
+                Want::Pct(v) => {
+                    let w = (self.col_w - indent) * v as f32 / 10_000.0 - 2.0 * px;
+                    max[c] = min[c].max(w);
+                }
+                Want::Auto => {}
+            }
+        }
+        // A cell spanning columns that is wider than they are widens them, evenly (it has their
+        // padding between them too).
+        for (cols, lo, hi) in wide {
+            let pad = (cols.len() - 1) as f32 * 2.0 * px;
+            for (lo, w) in [(lo, &mut min), (hi, &mut max)] {
+                let short = lo - pad - w[cols.clone()].iter().sum::<f32>();
+                if short > 0.0 {
+                    let each = short / cols.len() as f32;
+                    w[cols.clone()].iter_mut().for_each(|x| *x += each);
+                }
+            }
+            for c in cols {
+                max[c] = max[c].max(min[c]);
             }
         }
         // The sampled rows may never be laid out themselves, so their missing characters are
@@ -1980,6 +2354,9 @@ impl Layout {
     /// for any `basis`; reads nothing else.
     #[inline(always)]
     fn estimate_at(meta: Meta, i: usize, n: usize, basis: Basis) -> f32 {
+        if meta.hidden() {
+            return 0.0;
+        }
         let em = basis.em;
         let pad = basis.page_pad * em;
         let edges = if i == 0 { pad } else { 0.0 } + if i + 1 == n { pad } else { 0.0 };
@@ -2016,6 +2393,23 @@ fn text_bytes(doc: &Doc, block: &Block) -> usize {
         .iter()
         .map(|s| (s.end - s.start) as usize)
         .sum()
+}
+
+/// Whether each block is in the body of a section that `open` (by section) says is closed.
+#[cfg(feature = "details")]
+pub fn hidden_blocks(doc: &Doc, open: impl Fn(usize) -> bool) -> impl Iterator<Item = bool> {
+    let mut diff = vec![0i32; doc.blocks.len() + 1];
+    for (s, sec) in doc.sections.iter().enumerate() {
+        if !open(s) {
+            diff[sec.body.start as usize] += 1;
+            diff[sec.body.end as usize] -= 1;
+        }
+    }
+    diff.pop();
+    diff.into_iter().scan(0, |depth, d| {
+        *depth += d;
+        Some(*depth > 0)
+    })
 }
 
 /// The next block continues this one (see [`Block::joined`]).

@@ -424,6 +424,10 @@ mod with_fonts {
     use crate::viewer::Button;
     use std::time::Duration;
 
+    /// Collapsible sections in the window.
+    #[cfg(feature = "details")]
+    mod details;
+
     fn view(src: &str, w: u32, h: u32) -> View {
         let mut v = View::new(Fonts::new().unwrap(), Doc::parse(src), None, (w, h), 1.0);
         v.ensure();

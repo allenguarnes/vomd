@@ -1,0 +1,10 @@
+---
+source: src/doc/tests/html.rs
+expression: "parse(\"<details>\\n<summary>More &lt;info&gt; <code>x</code> <a href=\\\"#y\\\">y</a></summary>\\n\\n\\\n         Markdown *inside*.\\n\\n- an item\\n\\n</details>\\n\\nAfter.\\n\")"
+---
+P | "More <info> " [C]"x" " " [L1]"y"
+P | "Markdown " [I]"inside" "."
+P list=1 Bullet | "an item"
+P | "After."
+link 1: #y
+section 0..1 1..3

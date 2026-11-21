@@ -754,3 +754,37 @@ fn formulas_copy_with_their_delimiters() {
     );
     assert_eq!(between("a\n\n$$\nxyz\n$$\n\nb\n", "y", "b"), "b");
 }
+
+/// Blocks left out (closed sections' bodies) are not in the copy, small or lazy, and the
+/// separators around them are those of the blocks that are.
+#[test]
+fn hidden_blocks_are_left_out() {
+    let body = "Hidden paragraph of words.\n\n".repeat(20_000);
+    let d = doc(&format!("Before\n\n- item\n\n{body}After\n"));
+    let last = d.blocks.len() as u32 - 1;
+    let all = (Pos::start(0), Pos::end(last));
+    // What is left out isn't counted: a copy of what remains is small, and made at once.
+    let shown = Content::shown(&d, all, std::iter::once(2..last).collect());
+    assert!(matches!(shown, Content::Text(_)));
+    assert_eq!(
+        shown.chunks().collect::<String>(),
+        "Before\n\n- item\n\nAfter"
+    );
+    assert!(matches!(Content::of(&d, all), Content::Lazy { .. }));
+    // Lazy, with a hidden range in the middle of what is made later.
+    let lazy = Content::shown(&d, all, Hidden::from([2..3, 7..9]));
+    assert!(matches!(lazy, Content::Lazy { .. }));
+    let text: String = lazy.chunks().collect();
+    assert_eq!(text.matches("Hidden paragraph").count(), 20_000 - 3);
+    assert!(lazy.size_hint() <= text.len());
+    // Small: made at once.
+    let d = doc("One\n\nTwo\n\nThree\n");
+    let text: String = Content::shown(
+        &d,
+        (Pos::start(0), Pos::end(2)),
+        std::iter::once(1..2).collect(),
+    )
+    .chunks()
+    .collect();
+    assert_eq!(text, "One\n\nThree");
+}

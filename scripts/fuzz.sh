@@ -41,9 +41,9 @@ mkdir -p "$corpus" "artifacts/$target"
 # Seeds: the fixtures for the Markdown targets, the images for `image` (the SVGs for `svg`, the
 # GIFs and WebPs for `anim`), and seeds/<target>/: the sample files of the settings, sample
 # formulas for `math`, a code sample per language for `highlight`, front matter for `yaml`,
-# Markdown with math and front matter for `doc` and `layout`, and the inputs of past findings
-# (also run as tests). The seeds go in
-# every run, so a finding is run also from a corpus that was seeded before it.
+# Markdown with math, front matter, sections and HTML tables for `doc` and `layout`, and the
+# inputs of past findings (also run as tests). The seeds go in every run, so a finding is run
+# also from a corpus that was seeded before it.
 if [ "$target" = image ] && [ -z "$(ls -A "$corpus")" ]; then
     cp "$root"/fixtures/images/* "$corpus/"
 elif [ "$target" = svg ] && [ -z "$(ls -A "$corpus")" ]; then

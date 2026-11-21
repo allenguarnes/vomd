@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-vomd = { path = "..", default-features = false, features = ["embed-fonts", "images", "svg", "math", "highlight", "front-matter"] }
+vomd = { path = "..", default-features = false, features = ["embed-fonts", "images", "svg", "math", "highlight", "front-matter", "details", "html-tables"] }
 
 # As in ../Cargo.toml.
 [patch.crates-io]

@@ -43,8 +43,8 @@ jobs:
               [ "${{ matrix.target }}" != highlight ] && [ "${{ matrix.target }}" != yaml ]; then
             find fixtures -maxdepth 1 -name '*.md' -size -16k -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
           fi
-          # Sample files (settings, formulas, code, front matter, Markdown with math) and the
-          # inputs of past findings.
+          # Sample files (settings, formulas, code, front matter, Markdown with math, sections and
+          # HTML tables) and the inputs of past findings.
           if [ -d fuzz/seeds/${{ matrix.target }} ]; then
             cp fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
           fi

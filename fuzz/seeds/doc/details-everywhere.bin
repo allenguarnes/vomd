@@ -1,0 +1,36 @@
+<details>
+<summary>S <code>c</code></summary>
+
+Body *md*
+
+<details open>
+
+Inner, no summary
+
+</details>
+
+text </details> after
+
+- <details><summary>item</summary>
+
+  in item
+- next
+
+> <details>
+> quote
+
+[^1]: <details><summary>note</summary>
+
+    in the note
+
+Ref[^1]
+
+<details>
+
+before <summary>late</summary>
+
+## heading
+
+<summary>second</summary>
+
+unclosed to the end

@@ -3079,3 +3079,7 @@ fn outlines_and_images_across_a_space_stay_apart() {
         );
     }
 }
+
+/// Collapsible sections and HTML tables.
+#[cfg(all(feature = "details", feature = "html-tables"))]
+mod html;

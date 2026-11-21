@@ -576,11 +576,14 @@ impl View {
             return Some(i);
         }
         let at = self.scroll() + 0.5 * self.line();
-        current(
+        let i = current(
             list.entries.len(),
             |i| self.layout.top(list.entries[i].block as usize),
             at,
-        )
+        )?;
+        // A heading in a closed section isn't shown: the one before it is current.
+        let hidden = |i: usize| self.layout.hidden(list.entries[i].block as usize);
+        (0..=i).rev().find(|&i| !hidden(i))
     }
 
     /// Keep the panel's scroll within its content, and when the current heading is another than

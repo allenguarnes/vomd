@@ -76,7 +76,7 @@ name = "math_bench"
 required-features = ["math", "embed-fonts"]
 
 [features]
-default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find", "math", "highlight", "front-matter"]
+default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find", "math", "highlight", "front-matter", "details", "html-tables"]
 # Text selection and copy, and paste into the find bar. The X11 and Wayland clipboards use crates
 # that winit already brings in; the minimal build leaves all of it out.
 clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayland-protocols"]
@@ -90,6 +90,12 @@ math = []
 # YAML front matter shown as a table, as GitHub shows it: VOMD's own YAML reader, no crates.
 # Without it, front matter is hidden.
 front-matter = []
+# Collapsible sections (`<details>`), opened and closed with a click, as on GitHub. No crates.
+# Without it, a section's summary and body are all shown.
+details = []
+# HTML tables (`<table>`) laid out as tables, with column and row spans, alignment and widths.
+# No crates. Without it, an HTML table's cells are a line of text.
+html-tables = []
 # Syntax highlighting of fenced code blocks, in GitHub's colours: one small lexer, no crates.
 highlight = []
 images = ["dep:png", "dep:zune-jpeg", "dep:gif", "dep:image-webp"]

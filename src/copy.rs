@@ -28,45 +28,73 @@ pub enum Content {
         lo: Pos,
         hi: Pos,
         code: bool,
+        /// Blocks left out (see [`TextCursor::hiding`]).
+        hidden: Hidden,
     },
 }
+
+/// Ranges of blocks a copy leaves out, ascending: the bodies of closed sections, which a browser
+/// doesn't copy either. Empty without any.
+pub type Hidden = Arc<[std::ops::Range<u32>]>;
 
 impl Content {
     /// The copy of `lo..hi`: its text, if it is short, else what makes it. Short is judged by
     /// the text of the selected spans, which costs a walk over the blocks and no copy.
     pub fn of(doc: &Arc<Doc>, range: (Pos, Pos)) -> Content {
-        Content::make(doc, range, false)
+        Content::shown(doc, range, Hidden::default())
+    }
+
+    /// [`Content::of`] leaving out the blocks in `hidden`.
+    pub fn shown(doc: &Arc<Doc>, range: (Pos, Pos), hidden: Hidden) -> Content {
+        Content::make(doc, range, false, hidden)
     }
 
     /// The copy of the code block whose chunks are blocks `first..=last` (the button on it): the
     /// code as written, with no prefix of the quote or list it is in and no line break after its
     /// last line, made like [`Content::of`] does.
     pub fn code(doc: &Arc<Doc>, first: u32, last: u32) -> Content {
-        Content::make(doc, (Pos::start(first), Pos::end(last)), true)
+        let range = (Pos::start(first), Pos::end(last));
+        Content::make(doc, range, true, Hidden::default())
     }
 
-    fn make(doc: &Arc<Doc>, (lo, hi): (Pos, Pos), code: bool) -> Content {
-        let mut cursor = TextCursor::new(doc.clone(), lo, hi).whole_code(code);
+    fn make(doc: &Arc<Doc>, (lo, hi): (Pos, Pos), code: bool, hidden: Hidden) -> Content {
+        let lazy = Content::Lazy {
+            doc: doc.clone(),
+            lo,
+            hi,
+            code,
+            hidden,
+        };
+        let mut cursor = lazy.cursor();
         if cursor.size_hint() > EAGER {
-            return Content::Lazy {
-                doc: doc.clone(),
-                lo,
-                hi,
-                code,
-            };
+            return lazy;
         }
         let mut text = String::new();
         cursor.fill(&mut text, usize::MAX);
         Content::Text(text.into())
     }
 
+    /// What makes the text of a `Lazy` one.
+    fn cursor(&self) -> TextCursor {
+        let Content::Lazy {
+            doc,
+            lo,
+            hi,
+            code,
+            hidden,
+        } = self
+        else {
+            unreachable!("only a lazy copy has a cursor")
+        };
+        let cursor = TextCursor::new(doc.clone(), *lo, *hi).whole_code(*code);
+        cursor.hiding(hidden.clone())
+    }
+
     /// The text in pieces of [`CHUNK`] bytes, as it is made.
     pub fn chunks(&self) -> Chunks {
         Chunks(match self {
             Content::Text(text) => Source::Text(text.clone(), 0),
-            Content::Lazy { doc, lo, hi, code } => Source::Lazy(Box::new(
-                TextCursor::new(doc.clone(), *lo, *hi).whole_code(*code),
-            )),
+            Content::Lazy { .. } => Source::Lazy(Box::new(self.cursor())),
         })
     }
 
@@ -74,9 +102,7 @@ impl Content {
     pub fn size_hint(&self) -> usize {
         match self {
             Content::Text(text) => text.len(),
-            Content::Lazy { doc, lo, hi, code } => TextCursor::new(doc.clone(), *lo, *hi)
-                .whole_code(*code)
-                .size_hint(),
+            Content::Lazy { .. } => self.cursor().size_hint(),
         }
     }
 }
@@ -143,6 +169,7 @@ pub struct TextCursor {
     done: bool,
     /// The range is one code block (see [`Content::code`]): its text and nothing else.
     code: bool,
+    hidden: Hidden,
 }
 
 impl TextCursor {
@@ -159,6 +186,7 @@ impl TextCursor {
             row: None,
             done: false,
             code: false,
+            hidden: Hidden::default(),
         }
     }
 
@@ -166,6 +194,18 @@ impl TextCursor {
     fn whole_code(mut self, code: bool) -> TextCursor {
         self.code = code;
         self
+    }
+
+    /// Leave out the blocks in `hidden`, as if they weren't in the range.
+    pub fn hiding(mut self, hidden: Hidden) -> TextCursor {
+        self.hidden = hidden;
+        self
+    }
+
+    /// Block `b` is left out.
+    fn hides(&self, b: u32) -> bool {
+        let at = self.hidden.partition_point(|r| r.end <= b);
+        self.hidden.get(at).is_some_and(|r| r.contains(&b))
     }
 
     /// Append about `max` bytes of the text to `out` (never half a character, and at least one
@@ -200,7 +240,7 @@ impl TextCursor {
         let last = self.hi.block.min(doc.blocks.len().saturating_sub(1) as u32);
         let mut total = 0;
         for b in self.lo.block..=last {
-            let Some(sel) = BlockSel::of(b, (self.lo, self.hi)) else {
+            let Some(sel) = BlockSel::of(b, (self.lo, self.hi)).filter(|_| !self.hides(b)) else {
                 continue;
             };
             let (from, to) = sel.span();
@@ -240,6 +280,9 @@ impl TextCursor {
         while self.next <= last && !doc.blocks.is_empty() {
             let b = self.next;
             self.next += 1;
+            if self.hides(b) {
+                continue;
+            }
             if matches!(doc.blocks[b as usize].kind, BlockKind::TableRow { .. }) {
                 let mut end = b;
                 while doc.blocks.get(end as usize + 1).is_some_and(|f| f.joined) {

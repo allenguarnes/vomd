@@ -34,6 +34,8 @@ use crate::toolbar::{self, Toolbar};
 mod clicks;
 #[cfg(feature = "clipboard")]
 mod copybtn;
+#[cfg(feature = "details")]
+mod details;
 #[cfg(feature = "find")]
 mod find;
 #[cfg(feature = "clipboard")]
@@ -639,6 +641,15 @@ pub struct View {
     /// The image viewer, while it is open.
     #[cfg(feature = "images")]
     viewer: Option<Box<crate::viewer::Viewer>>,
+    /// Whether each section (`<details>`) of the document is open.
+    #[cfg(feature = "details")]
+    open: Vec<bool>,
+    /// The summary a press went down on, and where: a click on it opens or closes its section.
+    #[cfg(feature = "details")]
+    pressed_section: Option<(usize, (f64, f64))>,
+    /// While a message replaces a reloaded document: its sections' states, for the next one.
+    #[cfg(feature = "details")]
+    kept_open: Vec<(u32, u32)>,
 }
 
 impl View {
@@ -669,6 +680,8 @@ impl View {
         let params = params(width, hidpi, 100, text, false);
         #[cfg(feature = "math")]
         let (mut fonts, math) = (fonts, crate::math::Cache::shared());
+        #[cfg(feature = "details")]
+        let open = doc.sections.iter().map(|s| s.open).collect();
         let mut view = View {
             #[cfg(feature = "math")]
             layout: layout_with_math(&doc, params, &mut fonts, &math),
@@ -743,6 +756,12 @@ impl View {
             recent: recent::Screen::default(),
             #[cfg(feature = "images")]
             viewer: None,
+            #[cfg(feature = "details")]
+            open,
+            #[cfg(feature = "details")]
+            pressed_section: None,
+            #[cfg(feature = "details")]
+            kept_open: Vec::new(),
         };
         view.images.set_base(base);
         #[cfg(feature = "svg")]
@@ -1331,6 +1350,10 @@ impl View {
             return self.viewer_press(x, y, now);
         }
         self.pressed_image = None;
+        #[cfg(feature = "details")]
+        {
+            self.pressed_section = None;
+        }
         #[cfg(feature = "clipboard")]
         self.cancel_copy();
         let ctx = self.toolbar_ctx();
@@ -1398,6 +1421,11 @@ impl View {
             {
                 self.pressed_at = Some((now, (x, y)));
             }
+        }
+        // Neither: on a summary, the start of a click that opens or closes its section.
+        #[cfg(feature = "details")]
+        if !taken && self.pressed.is_none() && self.pressed_image.is_none() {
+            self.press_summary(x, y);
         }
         // Not the scrollbar's either: a press on text, which may start a selection.
         #[cfg(feature = "clipboard")]
@@ -1478,6 +1506,9 @@ impl View {
         let row = self.toc.pressed.is_some();
         #[cfg(not(feature = "toc"))]
         let row = false;
+        // A press on a summary may be a click that opens or closes its section (see `click`).
+        #[cfg(feature = "details")]
+        let row = row || self.pressed_section.is_some();
         // The document's scrollbar lingers after its own drag, not after the panel's.
         #[cfg(feature = "toc")]
         if self.drag.take_if(|d| d.panel).is_some() {
@@ -1638,6 +1669,9 @@ impl View {
                 }
             })
         };
+        // A summary takes a click as well: the hand.
+        #[cfg(feature = "details")]
+        let open = open || (free && self.summary_at(x, y).is_some());
         self.hover_force = (force.is_some() || open) && link.is_none();
         let note = std::mem::replace(&mut self.hover_note, hover_note) != hover_note;
         #[cfg(feature = "clipboard")]
@@ -1719,6 +1753,12 @@ impl View {
             }
             return None;
         }
+        #[cfg(feature = "details")]
+        if self.pressed_section.is_some() {
+            self.ensure_content();
+            self.click_summary(x, y);
+            return None;
+        }
         let pressed = self.pressed.take()?;
         self.ensure_content();
         if self.link_at(x, y) != Some(pressed) {
@@ -1744,9 +1784,14 @@ impl View {
         self.fade.poke(now);
     }
 
-    /// Go to a reading position (from the back stack), kept inside the document.
+    /// Go to a reading position (from the back stack), kept inside the document. The sections
+    /// closed around it open.
     pub fn set_anchor(&mut self, anchor: Anchor) {
         let n = self.doc.blocks.len() as u32;
+        #[cfg(feature = "details")]
+        if anchor.block < n {
+            self.reveal(anchor.block);
+        }
         self.move_to(if n == 0 {
             Anchor::TOP
         } else {
@@ -1768,7 +1813,10 @@ impl View {
         let at = self
             .toc_aimed()
             .map_or(at, |block| self.layout.top(block as usize));
-        let mut blocks: Vec<u32> = self.doc.headings.iter().map(|h| h.block).collect();
+        // (Not to a heading in a closed section, which isn't shown.)
+        let mut blocks: Vec<u32> = (self.doc.headings.iter().map(|h| h.block))
+            .filter(|&b| !self.layout.hidden(b as usize))
+            .collect();
         blocks.sort_unstable();
         blocks.dedup();
         let top = |b: u32| self.layout.top(b as usize);
@@ -2591,9 +2639,19 @@ impl View {
     fn new_layout(&mut self) -> Layout {
         let params = self.layout_params();
         #[cfg(feature = "math")]
-        return layout_with_math(&self.doc, params, &mut self.fonts, &self.math);
+        let layout = layout_with_math(&self.doc, params, &mut self.fonts, &self.math);
         #[cfg(not(feature = "math"))]
-        Layout::new(&self.doc, params)
+        let layout = Layout::new(&self.doc, params);
+        // The sections open or closed as the window has them.
+        #[cfg(feature = "details")]
+        let layout = {
+            let mut layout = layout;
+            if self.open.len() == self.doc.sections.len() {
+                layout.set_sections(&self.doc, &self.open);
+            }
+            layout
+        };
+        layout
     }
 
     /// The document as the view holds it, its `<picture>`s showing the theme on screen.
@@ -2607,6 +2665,12 @@ impl View {
         self.close_viewer();
         self.doc = self.themed(doc);
         self.message = message;
+        #[cfg(feature = "details")]
+        {
+            self.open = self.doc.sections.iter().map(|s| s.open).collect();
+            self.pressed_section = None;
+            self.kept_open.clear();
+        }
         self.layout = self.new_layout();
         self.anchor = Anchor::TOP;
         self.drag = None;
@@ -2672,8 +2736,23 @@ impl View {
             self.clear_selection();
             self.forget_copy();
         }
+        // The sections open or closed as they were, found by their summaries' texts.
+        #[cfg(feature = "details")]
+        let states = if self.message.is_some() {
+            std::mem::take(&mut self.kept_open)
+        } else {
+            self.section_states()
+        };
         self.doc = self.themed(doc);
         self.message = message;
+        #[cfg(feature = "details")]
+        {
+            self.open = details::carry_sections(&states, &self.doc);
+            self.pressed_section = None;
+            if self.message.is_some() {
+                self.kept_open = states;
+            }
+        }
         self.layout = self.new_layout();
         #[cfg(feature = "toc")]
         self.refresh_toc();
@@ -2716,6 +2795,8 @@ impl View {
             block: old.block.min(n as u32 - 1),
             frac: old.frac,
         });
+        #[cfg(feature = "details")]
+        self.keep_shown();
         // Measures around the position, and settles at the end if the new text is shorter.
         self.ensure();
         if at_end {
@@ -2736,7 +2817,7 @@ impl View {
             .headings
             .iter()
             .enumerate()
-            .filter(|(_, h)| h.block <= at)
+            .filter(|(_, h)| h.block <= at && !self.layout.hidden(h.block as usize))
             .max_by_key(|(_, h)| h.block)?;
         let paths = heading_paths(&self.doc);
         // A bare heading has no slug to find it by (see `Heading::bare`).
