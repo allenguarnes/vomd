@@ -106,6 +106,9 @@ const WARM_UNGATED: &[&str] = &["huge.md"];
 /// which X11 (CI's Xvfb) doesn't: the RSS budgets allow for it there.
 const WAYLAND_FRAME_KB: u64 = 1920 * 1080 * 4 / 1024;
 const BENCH_RUNS: usize = 20;
+/// The pause before each run after the first: launched back to back, every warm run was about
+/// 10 ms slower on Xvfb (a readme start 32 ms instead of 21 ms), which hid real changes.
+const BENCH_GAP: Duration = Duration::from_millis(300);
 
 const BUILDS: [(&str, &[&str], &str); 2] = [
     ("default", &[], "target"),
@@ -486,6 +489,9 @@ fn startup(bin: &Path, fixture: &Path) -> Option<Startup> {
     evict(bin);
     let mut runs: Vec<Run> = Vec::with_capacity(BENCH_RUNS);
     for i in 0..BENCH_RUNS {
+        if i > 0 {
+            std::thread::sleep(BENCH_GAP);
+        }
         let Some(run) = run_once(bin, fixture) else {
             eprintln!("run {} of {BENCH_RUNS} gave no first frame", i + 1);
             return None;
