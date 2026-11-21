@@ -1,0 +1,8 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"---\\na: 1\\nb: 2\\n---\\n| x | y |\\n|---|---|\\n| 1 | 2 |\\n\")"
+---
+Row(t0) | [ [B]"a" ] [ "1" ]
+Row(t0) | [ [B]"b" ] [ "2" ]
+Row(t1,head) | [ "x" ] [ "y" ]
+Row(t1) | [ "1" ] [ "2" ]

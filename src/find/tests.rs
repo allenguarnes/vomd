@@ -115,7 +115,7 @@ fn a_query_is_cut_to_its_limit() {
 }
 
 #[test]
-fn markup_urls_and_front_matter_are_not_text() {
+fn markup_and_urls_are_not_text() {
     assert!(texts("[click](https://example.com/page)", "example").is_empty());
     assert_eq!(
         texts("[click](https://example.com/page)", "click"),
@@ -125,9 +125,24 @@ fn markup_urls_and_front_matter_are_not_text() {
     assert!(texts("**bold** and `code`", "`").is_empty());
     assert!(texts("![alt](image.png)", "image.png").is_empty());
     assert!(texts("# Title\n\n## Sub", "#").is_empty());
-    assert!(texts("---\ntitle: secret\n---\n\nbody", "secret").is_empty());
     assert_eq!(texts("---\ntitle: secret\n---\n\nbody", "body"), ["body"]);
     assert!(texts("<!-- hidden -->\n\nshown", "hidden").is_empty());
+}
+
+#[test]
+fn front_matter_is_text_when_shown() {
+    // As browser find on GitHub's table: keys and values are found, typed as they are shown.
+    let src = "---\ntitle: secret\nmode: 0755\nlist: [one, two]\n---\n\nbody";
+    if cfg!(feature = "front-matter") {
+        assert_eq!(texts(src, "secret"), ["secret"]);
+        assert_eq!(texts(src, "title"), ["title"]);
+        assert_eq!(texts(src, "493"), ["493"]);
+        assert!(texts(src, "0755").is_empty());
+        assert_eq!(texts(src, "one, two"), ["one, two"]);
+    } else {
+        assert!(texts(src, "secret").is_empty());
+    }
+    assert_eq!(texts(src, "body"), ["body"]);
 }
 
 #[test]

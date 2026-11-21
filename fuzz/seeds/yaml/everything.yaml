@@ -1,0 +1,20 @@
+? [complex, key]
+: v
+"quoted\tkey": 'single ''q'''
+plain: multi
+  line # comment
+lit: |2-
+    two
+fold: >+
+  a
+  b
+
+flow: {a: [1, 2, {b: c}], ? d : e, f}
+tagged: !!float 1
+verbatim: !<tag:yaml.org,2002:str> 12
+merge:
+  <<: [{x: 1}, {y: 2}]
+  z: 3
+times: [2001-12-14t21:59:43.10-05:00, 2001-12-14 21:59:43.10 -5, 2002-12-14]
+numbers: [0b1010_0111, 0o14, 0x_0A_74_AE, 685_230.15, 6.8523015e+5, +12_345, 190:20:30.15, -.inf]
+- bad

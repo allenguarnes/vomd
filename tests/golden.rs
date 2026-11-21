@@ -235,6 +235,37 @@ const CASES: &[Case] = &[
         view: None,
         select: None,
     },
+    // YAML front matter as GitHub's table, and invalid front matter under its error.
+    #[cfg(feature = "front-matter")]
+    Case {
+        name: "frontmatter-light",
+        fixture: "frontmatter.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+        select: None,
+    },
+    #[cfg(feature = "front-matter")]
+    Case {
+        name: "frontmatter-dark",
+        fixture: "frontmatter.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &DARK,
+        view: None,
+        select: None,
+    },
+    #[cfg(feature = "front-matter")]
+    Case {
+        name: "frontmatter-error",
+        fixture: "frontmatter-error.md",
+        width: 760.0,
+        scale: 1.0,
+        theme: &LIGHT,
+        view: None,
+        select: None,
+    },
 ];
 
 /// `formats.md` with its images decoded by the viewer's own code: SVG drawn at the box (sharp

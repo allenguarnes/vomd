@@ -446,8 +446,17 @@ impl TextCursor {
             let mut piece = String::new();
             let base = list[i].spans.start as usize;
             text_of(&doc, spans_of(&doc, &list[i]), base, sel.span(), &mut piece);
-            let plain = |c| if matches!(c, '\n' | '\t') { ' ' } else { c };
-            self.pending.extend(piece.chars().map(plain));
+            // Breaks and tabs are spaces; the no-break spaces that indent a line after a break
+            // (front matter's outline) are left out.
+            let mut indent = false;
+            for c in piece.chars() {
+                if c == '\u{a0}' && indent {
+                    continue;
+                }
+                indent = c == '\n';
+                self.pending
+                    .push(if matches!(c, '\n' | '\t') { ' ' } else { c });
+            }
         }
         row.frag += 1;
         if row.frag > row.last {

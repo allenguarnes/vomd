@@ -1,0 +1,24 @@
+octal: 0755
+octal2: 0o17
+hex: 0x1F
+sexa: 1:30
+sexa2: 190:20:30
+commas: 1,000
+float: 4.50
+exp: 1e3
+inf: .inf
+nan: .NaN
+bools: [yes, No, ON, off, y, n, True, FALSE]
+nulls: [~, null, Null]
+empty:
+date: 2024-03-05
+time_zoned: 2024-03-05 10:20:30 +02:00
+time_utc: 2024-03-05T10:20:30Z
+time_plain: 2024-03-05 10:20:30
+quoted: "yes"
+single: 'it''s'
+strtag: !!str 0755
+html: "<b>bold</b> & <i>x</i>"
+url: https://example.com/a
+md: "**not bold** `code`"
+unicode: "café ☕"

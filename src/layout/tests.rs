@@ -1150,6 +1150,40 @@ fn horizontal_rules(c: &BlockBox) -> usize {
         .count()
 }
 
+#[cfg(feature = "front-matter")]
+#[test]
+fn front_matter_is_a_table_without_a_header() {
+    // GitHub's front matter table has no header row: its rows are striped from the second one
+    // (`tr:nth-child(2n)`), and its first row has the table's top rule. A Markdown table after
+    // it is a table of its own.
+    let fonts = Fonts::new().unwrap();
+    let doc = Doc::parse(
+        "---\ntitle: A title longer than any of the keys\ntags: [a, b]\nnested:\n  k: v\n  l: w\nlast: x\n---\n\
+         | h |\n|---|\n| 1 |\n| 2 |\n",
+    );
+    let mut l = Layout::new(&doc, params(900.0, 1.0));
+    l.ensure(&doc, &fonts, Anchor::TOP, 1.0e9);
+    let striped: Vec<bool> = l
+        .geoms()
+        .iter()
+        .map(|g| {
+            let c = g.content.as_ref().unwrap();
+            c.rects.iter().any(|r| r.role == Role::TableStripe)
+        })
+        .collect();
+    assert_eq!(striped, [false, true, false, true, false, false, true]);
+    let rules: Vec<usize> = l
+        .geoms()
+        .iter()
+        .map(|g| horizontal_rules(g.content.as_ref().unwrap()))
+        .collect();
+    assert_eq!(rules, [2, 1, 1, 1, 2, 1, 1]);
+    // The key column is narrower than the values'; the nested value is two lines.
+    let cols = l.table_cols[0].clone().unwrap();
+    assert!(cols[0] < cols[1]);
+    assert!(l.geoms()[2].h > l.geoms()[0].h * 1.5);
+}
+
 #[test]
 fn row_fragments_share_stripes_borders_and_parity() {
     let fonts = Fonts::new().unwrap();

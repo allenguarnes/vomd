@@ -1,0 +1,22 @@
+layout: splash
+permalink: /
+title: "Minimal Mistakes Jekyll Theme"
+date: 2016-05-02T10:20:30-07:00
+published: yes
+version: 4.50
+header:
+  overlay_color: "#5e616c"
+  overlay_image: /assets/images/mm-home-page-feature.jpg
+  actions:
+    - label: "<i class='fas fa-download'></i> Install now"
+      url: "/docs/quick-start-guide/"
+excerpt: >
+  A flexible two-column Jekyll theme. Perfect for building personal sites, blogs, and
+  portfolios.<br />
+tags: [jekyll, theme, "front matter"]
+feature_row:
+  - image_path: /assets/images/mm-customizable-feature.png
+    title: "Super customizable"
+  - title: "Responsive layouts"
+    url: https://mmistakes.github.io/minimal-mistakes/
+empty:

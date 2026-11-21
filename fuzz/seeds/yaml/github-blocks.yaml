@@ -1,0 +1,26 @@
+literal: |
+  line one
+  line two
+
+  after blank
+folded: >
+  folded one
+  folded two
+keep: |+
+  kept
+
+strip: |-
+  stripped
+long: This is a fairly long value that goes on and on to see how GitHub wraps long text inside the table cell of the front matter rendering
+nested:
+  a: 1
+  b:
+    c: deep
+    d: [1, 2]
+listofmaps:
+  - name: one
+    v: 1
+  - name: two
+listoflists: [[1, 2], [3]]
+emptylist: []
+emptymap: {}

@@ -1,0 +1,5 @@
+base: &b {x: 1}
+use: *b
+merged: {<<: *b, y: 2}
+sym: :foo
+tagged: !custom v

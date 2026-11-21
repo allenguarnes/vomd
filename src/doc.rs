@@ -16,10 +16,14 @@ use unicase::UniCase;
 use crate::image::MAX_SIDE;
 
 mod autolink;
+#[cfg(feature = "front-matter")]
+mod front;
 #[cfg(feature = "math")]
 mod math;
 mod pipeline;
 mod segment;
+#[cfg(feature = "front-matter")]
+mod yaml;
 
 fn options() -> Options {
     let mut opts = Options::ENABLE_TABLES
@@ -35,9 +39,10 @@ fn options() -> Options {
 
 /// Length of the YAML front matter at the very start of `src`, BOM included (0 if there is
 /// none): a line `---` (trailing spaces and tabs allowed) with text on the next line, up to the
-/// first line that is `---` or `...`, which is part of it. Like GitHub, only the start of the
-/// document counts, so one forward scan settles it; a `---` anywhere else (or one that is never
-/// closed) is an ordinary thematic break or setext underline for pulldown-cmark.
+/// next line that is `---`, which is part of it (GitHub doesn't take YAML's `...` for the end).
+/// Like GitHub, only the start of the document counts, so one forward scan settles it; a `---`
+/// anywhere else (or one that is never closed) is an ordinary thematic break or setext underline
+/// for pulldown-cmark.
 fn front_matter_len(src: &str) -> usize {
     fn line_at(src: &str, pos: usize) -> (&str, usize) {
         let end = src[pos..].find('\n').map_or(src.len(), |i| pos + i);
@@ -58,20 +63,39 @@ fn front_matter_len(src: &str) -> usize {
     }
     // An empty first line or an immediate closer: a rule, not front matter.
     let first = line_at(src, pos).0;
-    if first.bytes().all(|b| b == b' ' || b == b'\t')
-        || is_fence(first, "---")
-        || is_fence(first, "...")
-    {
+    if first.bytes().all(|b| b == b' ' || b == b'\t') || is_fence(first, "---") {
         return 0;
     }
     while pos < src.len() {
         let (line, next) = line_at(src, pos);
-        if is_fence(line, "---") || is_fence(line, "...") {
+        if is_fence(line, "---") {
             return next;
         }
         pos = next;
     }
     0
+}
+
+/// The events that stand for the front matter at the start of `src`, and where the Markdown
+/// after it starts. The events are the front matter's table, or GitHub's error and the front
+/// matter's source; front matter that YAML reads as something other than a map (nothing, a
+/// scalar, a list) isn't front matter, and the whole text (but a BOM) is Markdown, as on GitHub.
+#[cfg(feature = "front-matter")]
+fn front_matter(src: &str) -> (Vec<Event<'static>>, usize) {
+    let len = front_matter_len(src);
+    if len == 0 {
+        return (Vec::new(), 0);
+    }
+    match front::events(&src[..len]) {
+        Some(events) => (events, len),
+        None => (Vec::new(), if src.starts_with('\u{feff}') { 3 } else { 0 }),
+    }
+}
+
+/// Without the `front-matter` feature, front matter is hidden: no events.
+#[cfg(not(feature = "front-matter"))]
+fn front_matter(src: &str) -> ([Event<'static>; 0], usize) {
+    ([], front_matter_len(src))
 }
 
 /// Inline style bits carried by each [`Span`].
@@ -329,43 +353,71 @@ pub struct Doc {
 }
 
 impl Doc {
-    /// Parse a document. Large ones go through [`Doc::parse_segments`]; the result is the same.
+    /// Parse a document. Large ones are parsed in segments (see [`Doc::segments`]); the result
+    /// is the same.
     pub fn parse(src: &str) -> Doc {
+        // The front matter is read once, for either way.
+        let (front, start) = front_matter(src);
+        let body = &src[start..];
         if src.len() > SEGMENT_THRESHOLD
-            && let Some(doc) = Doc::parse_segments(src, SEGMENT_BYTES)
+            && let Some(doc) =
+                Doc::segments(&front, body, SEGMENT_BYTES, &pipeline::Config::detect())
         {
             return doc;
         }
-        Doc::parse_whole(src)
+        Doc::whole(&front, body)
     }
 
     /// One parser for the whole text.
+    #[cfg(test)]
     fn parse_whole(src: &str) -> Doc {
-        let src = &src[front_matter_len(src)..];
+        let (front, start) = front_matter(src);
+        Doc::whole(&front, &src[start..])
+    }
+
+    /// One parser for the whole text: the events `front` stand for its front matter, `src` is
+    /// the Markdown after it.
+    fn whole(front: &[Event<'static>], src: &str) -> Doc {
         let mut b = Builder::new(src.len());
+        for event in front {
+            b.event(event.clone());
+        }
         for (event, decoded) in marked(src, parser(src, options(), None)) {
             b.event_marked(event, decoded);
         }
         b.finish()
     }
 
-    /// Parse in segments of about `budget` bytes, all feeding one builder, or `None` when the
-    /// text can't be split safely (see [`segment`]). A parser's tree is never larger than a
-    /// segment, and a few threads parse segments ahead while the builder takes their events in
-    /// order (see [`pipeline`]).
+    /// [`Doc::segments`] for the whole text.
+    #[cfg(test)]
     fn parse_segments(src: &str, budget: usize) -> Option<Doc> {
         Doc::parse_segments_with(src, budget, &pipeline::Config::detect())
     }
 
-    /// [`Doc::parse_segments`] on the given pipeline (no workers: all on this thread).
+    /// [`Doc::segments`] for the whole text, on the given pipeline.
+    #[cfg(test)]
+    fn parse_segments_with(src: &str, budget: usize, pipeline: &pipeline::Config) -> Option<Doc> {
+        let (front, start) = front_matter(src);
+        Doc::segments(&front, &src[start..], budget, pipeline)
+    }
+
+    /// Parse the Markdown `src` (after the front matter that the events `front` stand for) in
+    /// segments of about `budget` bytes, all feeding one builder, or `None` when the text can't
+    /// be split safely (see [`segment`]). A parser's tree is never larger than a segment, and a
+    /// few threads parse segments ahead while the builder takes their events in order (see
+    /// [`pipeline`]; no workers: all on this thread).
     ///
     /// Link reference definitions and footnote definitions may lie in another segment than their
     /// use, so a first pass parses every segment that could hold one (see
     /// [`segment::Plan::definitions`]) and the second pass gives each segment's parser what it
     /// found: the link definitions through the broken-link callback, the footnote definitions as
     /// stubs in front of the segment's text.
-    fn parse_segments_with(src: &str, budget: usize, pipeline: &pipeline::Config) -> Option<Doc> {
-        let src = &src[front_matter_len(src)..];
+    fn segments(
+        front: &[Event<'static>],
+        src: &str,
+        budget: usize,
+        pipeline: &pipeline::Config,
+    ) -> Option<Doc> {
         let plan = segment::plan(src, budget)?;
         let opts = options();
         let defs = plan.definitions(src, opts)?;
@@ -375,6 +427,9 @@ impl Doc {
             src_len: src.len(),
             spent: 0,
         };
+        for event in front {
+            feed.b.event(event.clone());
+        }
         let total = plan.segments.len();
         let stubs_and_text = |n: usize| {
             let stubs = defs.footnote_stubs(&src[plan.segments[n].range.clone()]);
@@ -425,8 +480,28 @@ impl Doc {
     /// must be the same.
     #[doc(hidden)]
     pub fn fuzz_segments(src: &str, budget: usize) -> Option<(Doc, Doc)> {
-        let parts = Doc::parse_segments_with(src, budget, &pipeline::Config::new(0, 1))?;
-        Some((Doc::parse_whole(src), parts))
+        let (front, start) = front_matter(src);
+        let body = &src[start..];
+        let parts = Doc::segments(&front, body, budget, &pipeline::Config::new(0, 1))?;
+        Some((Doc::whole(&front, body), parts))
+    }
+
+    /// For the `yaml` fuzz target (`fuzz/`): front matter whose lines between the fences are
+    /// `yaml`, read and turned into its table (or its error): how many bytes of text that is,
+    /// `None` when it isn't front matter.
+    #[doc(hidden)]
+    #[cfg(feature = "front-matter")]
+    pub fn fuzz_front_matter(yaml: &str) -> Option<usize> {
+        let events = front::events(&format!("---\n{yaml}---\n"))?;
+        Some(
+            events
+                .iter()
+                .map(|e| match e {
+                    Event::Text(t) => t.len(),
+                    _ => 0,
+                })
+                .sum(),
+        )
     }
 
     pub fn span_text(&self, span: &Span) -> &str {

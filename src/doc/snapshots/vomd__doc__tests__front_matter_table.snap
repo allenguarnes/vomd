@@ -1,0 +1,13 @@
+---
+source: src/doc/tests.rs
+expression: "parse(\"---\\ntitle: Secret *not em*\\ndate: 2024-03-05T10:20:30Z\\ntags: [a, b]\\nauthor:\\n  \\\n         name: A\\n  site: https://a.example\\nempty:\\nposts:\\n  - id: 0x1F\\n    ok: yes\\n  - x\\n---\\n\\n\\\n         # Title\\n\")"
+---
+Row(t0) | [ [B]"title" ] [ "Secret *not em*" ]
+Row(t0) | [ [B]"date" ] [ "2024-03-05 10:20:30 UTC" ]
+Row(t0) | [ [B]"tags" ] [ "a, b" ]
+Row(t0) | [ [B]"author" ] [ [B]"name" ": A\n" [B]"site" ": " [L1]"https://a.example" ]
+Row(t0) | [ [B]"empty" ] [ ]
+Row(t0) | [ [B]"posts" ] [ "• " [B]"id" ": 31\n\u{a0}\u{a0}" [B]"ok" ": true\n• x" ]
+H1 | "Title"
+link 1: https://a.example
+anchor #title -> 6

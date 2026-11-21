@@ -14,7 +14,8 @@
 //! at its closing tag (CommonMark types 1–5). Those are tracked line by line with the same rules
 //! as pulldown-cmark (case-sensitive end tags included, and its whitespace: tab, VT and FF blank
 //! a line too). (YAML front matter is not a block pulldown-cmark knows: `Doc` cuts it off the
-//! start of the text before parsing, so a `---` here is only ever a rule or a setext underline.)
+//! start of the text before planning, and its table goes into the builder first, so a `---` here
+//! is only ever a rule or a setext underline.)
 //!
 //! **Ambiguity.** Some lines open one of those blocks only in some contexts: a fence inside a
 //! list item or an HTML block. The scan can't always tell, so it follows every reading at once

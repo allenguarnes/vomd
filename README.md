@@ -44,7 +44,7 @@
 ## Features
 
 - **GitHub-style Markdown:** CommonMark and GFM, with tables, task lists, footnotes, alerts
-  (`> [!NOTE]`), autolinks and hidden YAML front matter.
+  (`> [!NOTE]`) and autolinks. YAML front matter is shown as a table, as on GitHub.
 - **Light and dark themes** that follow your system (on Omarchy, its current theme's colors),
   zoom from 50% to 300%, and sharp text on HiDPI screens.
 - **Math:** LaTeX formulas, written as on GitHub: `$…$` and `` $`…`$ `` in the text, `$$…$$`
@@ -321,6 +321,11 @@ VOMD makes no network requests of its own.
   whose closing `$` is followed right away by a digit stays text, so a price range like
   `$5-$10` isn't read as math.
 - AVIF, HEIC, BMP, TIFF and ICO images show their alt text.
+- YAML front matter: nested maps and lists are shown as an indented outline inside their row,
+  not as tables inside the table as on GitHub. Front matter over 1 MiB, nested more than 32
+  levels deep or with more than 100,000 values is shown as an error. A time without a zone is
+  shown in Los Angeles time, as on GitHub, using the US daylight-saving rules of 1987 and later
+  (earlier dates get the 1987 rules).
 - Drag and drop doesn't work on Wayland; use `Ctrl+O` there.
 - On network drives and some FUSE file systems, changes show when you come back to the window
   rather than right away.

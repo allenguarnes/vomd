@@ -183,6 +183,19 @@ fn tables() {
     ]));
 }
 
+#[cfg(feature = "front-matter")]
+#[test]
+fn front_matter_copies_as_a_table() {
+    let src = "---\ntitle: Secret\nauthor:\n  name: A\n  url: https://a.example\n\
+               tags: [a, b]\n---\n\n# Body\n";
+    insta::assert_snapshot!(all_of(&[src]));
+    assert_eq!(between(src, "title", "Secret"), "title\tSecret");
+    assert_eq!(between(src, "Secret", "name"), "Secret\nauthor\tname");
+    // The outline's indentation (no-break spaces) stays out of the copy.
+    let nested = "---\na:\n  b:\n    c: 1\n  d: [x, {e: 2}]\n---\n";
+    assert_eq!(all(nested), "a\tb:  c: 1 d:  • x • e: 2");
+}
+
 #[test]
 fn a_split_row_is_one_line_cell_by_cell() {
     let big = "word ".repeat(10_000);

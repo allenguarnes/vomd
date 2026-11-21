@@ -449,8 +449,83 @@ fn images_and_links() {
 }
 
 #[test]
-fn front_matter_hidden() {
-    insta::assert_snapshot!(parse("---\ntitle: Secret\ntags: [a]\n---\n\n# Title\n"));
+fn front_matter_table() {
+    // As on GitHub: a header-less table, a row per key, the key in bold; values typed as Ruby's
+    // Psych types them; nested values as an outline in their cell; URLs autolinked.
+    #[cfg(feature = "front-matter")]
+    insta::assert_snapshot!(parse(
+        "---\ntitle: Secret *not em*\ndate: 2024-03-05T10:20:30Z\ntags: [a, b]\nauthor:\n  \
+         name: A\n  site: https://a.example\nempty:\nposts:\n  - id: 0x1F\n    ok: yes\n  - x\n---\n\n\
+         # Title\n"
+    ));
+    // Without the feature, front matter is hidden.
+    #[cfg(not(feature = "front-matter"))]
+    assert_eq!(
+        parse("---\ntitle: Secret\n---\n\n# Title\n"),
+        "H1 | \"Title\"\nanchor #title -> 0\n"
+    );
+}
+
+#[cfg(feature = "front-matter")]
+#[test]
+fn front_matter_error_shows_the_source() {
+    // GitHub's error box (a Caution alert here), then the front matter as YAML code, fences
+    // included.
+    insta::assert_snapshot!(parse("---\ntitle: [unclosed\nkey: : :\n---\n\n# Title\n"));
+    let doc = Doc::parse("---\na: &x 1\nb: *x\n---\nBody\n");
+    check_invariants(&doc);
+    assert_eq!(kinds(&doc), "APCP");
+    assert!(
+        doc.text
+            .starts_with("Error in user YAML: Alias parsing is not enabled.---\na: &x")
+    );
+    assert!(matches!(
+        doc.blocks[0].kind,
+        BlockKind::AlertTitle(Alert::Caution)
+    ));
+    #[cfg(feature = "highlight")]
+    assert!(matches!(doc.blocks[2].kind, BlockKind::Code(hl) if hl.lang != 0));
+}
+
+#[cfg(feature = "front-matter")]
+#[test]
+fn front_matter_that_is_not_a_map_is_markdown() {
+    // GitHub reads these as Markdown: a scalar, a list, a comment, nothing.
+    for (src, expected) in [
+        ("---\nSome text\n---\n\nBody\n", "RHP"),
+        ("---\n- a\n- b\n---\n\nBody\n", "RPPRP"),
+        ("---\n# only a comment\n---\n\nBody\n", "RHRP"),
+        ("---\n[a, b]\n---\nBody\n", "RHP"),
+        ("\u{feff}---\n~\n---\nBody\n", "RHP"),
+    ] {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        assert_eq!(kinds(&doc), expected, "{src:?}");
+    }
+}
+
+#[cfg(feature = "front-matter")]
+#[test]
+fn front_matter_and_a_table_after_it_are_two_tables() {
+    insta::assert_snapshot!(parse(
+        "---\na: 1\nb: 2\n---\n| x | y |\n|---|---|\n| 1 | 2 |\n"
+    ));
+}
+
+#[cfg(feature = "front-matter")]
+#[test]
+fn front_matter_in_front_of_segments() {
+    let filler = "Some filler text to make the document longer.\n\n".repeat(20);
+    let long = "word ".repeat(5000);
+    for front in [
+        "---\ntitle: x\ntags: [a, b]\nnested:\n  k: https://example.com\n---\n".to_owned(),
+        format!("---\nlong: {long}\n---\n"),
+        "---\nbad: [\n---\n".to_owned(),
+        format!("---\nbad: [\n{}---\n", "x\n".repeat(20_000)),
+    ] {
+        let src = format!("{front}| t |\n|---|\n| 1 |\n\n{filler}# Heading\n\n{filler}");
+        assert!(assert_same("front matter", &src, 400) > 3);
+    }
 }
 
 #[test]
@@ -2772,7 +2847,8 @@ fn a_list_fence_does_not_stop_segmentation() {
     assert_same("fence after the item", &src, 4096);
 }
 
-/// Kinds of the blocks, one letter each: P(aragraph), H(eading), R(ule).
+/// Kinds of the blocks, one letter each: P(aragraph), H(eading), R(ule), T(able row),
+/// A(lert title), C(ode).
 fn kinds(doc: &Doc) -> String {
     doc.blocks
         .iter()
@@ -2780,7 +2856,11 @@ fn kinds(doc: &Doc) -> String {
             BlockKind::Paragraph => 'P',
             BlockKind::Heading(_) => 'H',
             BlockKind::Rule => 'R',
-            _ => '?',
+            BlockKind::TableRow { .. } => 'T',
+            BlockKind::AlertTitle(_) => 'A',
+            BlockKind::Code(_) => 'C',
+            #[cfg(feature = "math")]
+            BlockKind::Math => '?',
         })
         .collect()
 }
@@ -2796,9 +2876,14 @@ fn unclosed_metadata_candidates_parse_in_linear_time() {
         assert_eq!(doc.blocks.len(), 1 + 2 * n, "{n}");
         assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(n)), "{n}");
     });
-    // At the very start the first `---\t` opens front matter that the second closes.
+    // At the very start the first `---\t` opens front matter that the second closes; YAML reads
+    // it as a scalar, which isn't front matter (as on GitHub), so it is Markdown too.
     let doc = Doc::parse(&"---\t\nx\n\n".repeat(1000));
-    assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(998)));
+    if cfg!(feature = "front-matter") {
+        assert_eq!(kinds(&doc), "RP".repeat(1000));
+    } else {
+        assert_eq!(kinds(&doc), format!("P{}", "RP".repeat(998)));
+    }
     // With a closing line at the end the metadata option would swallow all of it as one block.
     let src = format!("intro\n\n{}...\n", "---\t\nx\n\n".repeat(1000));
     let doc = Doc::parse(&src);
@@ -2808,19 +2893,28 @@ fn unclosed_metadata_candidates_parse_in_linear_time() {
 
 #[test]
 fn front_matter_is_found_only_at_the_start() {
-    let hidden = [
-        "---\ntitle: x\n---\n# T\n",
-        "---  \t\ntitle: x\n---\t \n# T\n",
-        "---\ntitle: x\n...\n# T\n",
-        "---\r\ntitle: x\r\n\r\nk: v\r\n---\r\n# T\r\n",
-        "\u{feff}---\ntitle: x\n---\n# T\n",
-        "---\ntitle: x\n---\n\n# T\n",
+    // Front matter: shown as a table (a row per key) with the feature, hidden without it.
+    let front = cfg!(feature = "front-matter");
+    let found = [
+        ("---\ntitle: x\n---\n# T\n", 1),
+        ("---  \t\ntitle: x\n---\t \n# T\n", 1),
+        ("---\r\ntitle: x\r\n\r\nk: v\r\n---\r\n# T\r\n", 2),
+        ("\u{feff}---\ntitle: x\n---\n# T\n", 1),
+        ("---\ntitle: x\n---\n\n# T\n", 1),
     ];
-    for src in hidden {
+    for (src, rows) in found {
         let doc = Doc::parse(src);
         check_invariants(&doc);
-        assert_eq!(kinds(&doc), "H", "{src:?}");
-        assert_eq!(doc.text, "T", "{src:?}");
+        if front {
+            assert_eq!(kinds(&doc), format!("{}H", "T".repeat(rows)), "{src:?}");
+            assert!(
+                doc.text.starts_with("titlex") && doc.text.ends_with('T'),
+                "{src:?}"
+            );
+        } else {
+            assert_eq!(kinds(&doc), "H", "{src:?}");
+            assert_eq!(doc.text, "T", "{src:?}");
+        }
         assert!(front_matter_len(src) > 0, "{src:?}");
         assert!(
             src[front_matter_len(src)..].trim_start().starts_with('#'),
@@ -2828,13 +2922,16 @@ fn front_matter_is_found_only_at_the_start() {
         );
     }
     // Front matter that runs to the end of the text, with and without a final newline.
-    for src in ["---\na: b\n---", "---\na: b\n---\n", "---\na: b\n...\n"] {
+    for src in ["---\na: b\n---", "---\na: b\n---\n"] {
         assert_eq!(front_matter_len(src), src.len(), "{src:?}");
-        assert!(Doc::parse(src).blocks.is_empty());
+        assert_eq!(Doc::parse(src).blocks.len(), front as usize);
     }
     // Not front matter: no closing line, a blank or closing line right after the opener, text on
-    // the opener's line, indentation, a BOM-less lookalike after other text, or a longer rule.
+    // the opener's line, indentation, a BOM-less lookalike after other text, a longer rule, or
+    // YAML's `...` for the closing line (GitHub doesn't take it).
     let shown = [
+        ("---\ntitle: x\n...\n# T\n", "RPH"),
+        ("---\ntitle: b\n...\n", "RP"),
         ("---\ntitle: x\n", "RP"),
         ("---\n\ntitle: x\n---\n", "RH"),
         ("---\n---\ntext\n", "RRP"),

@@ -11,6 +11,19 @@ and versions follow [Semantic Versioning](https://semver.org/).
   on the theme's background keeps GitHub's. Open windows follow a theme switch at once; the
   other mode (`T`) keeps GitHub's colors. Elsewhere nothing changes.
 
+### Changed
+- YAML front matter is shown as a table at the top of the document, as on GitHub, instead of
+  being hidden: a row per key, with the key in bold. Values read as GitHub reads them (`yes` is
+  `true`, `0755` is `493`, `4.50` is `4.5`, a time is shown with its zone), and nested maps and
+  lists show as an indented outline in their row. Find, selection and copy work on it as on any
+  table.
+  - Front matter that isn't valid YAML is shown as it is written, under GitHub's error message
+    (with the line and column). As on GitHub, YAML aliases (`*name`) are an error.
+  - As on GitHub, front matter that isn't a list of keys and values (just text, a list, or only
+    comments) and front matter closed by `...` instead of `---` are shown as ordinary Markdown.
+  - The `front-matter` Cargo feature (on by default) holds it; without it, front matter is hidden
+    as before (but a `...` line no longer closes it, in either build).
+
 ### Fixed
 - On macOS, a file opened from Finder (a double-click, Open With, a drop on the Dock icon) while
   VOMD isn't running shows at once, without an empty window first. macOS hands the file over just

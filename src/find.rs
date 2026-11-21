@@ -1,14 +1,15 @@
 //! Find in page: the matches of a query in a document's rendered text.
 //!
-//! The search runs over [`Doc::text`], so markup, URLs and the front matter the parser dropped
-//! never match, one block at a time: a match never spans two blocks, except the chunks of one
-//! that was split for size (see [`Block::joined`]). A table cell is a text of its own. Letters
-//! match whatever their case, by the simple lowercase of each character (one that lowercases to
-//! several, like `İ`, to all of them), and a match is reported as the byte range of the original
-//! characters it covers. The scan is one pass over the text with a Knuth–Morris–Pratt automaton,
-//! so it takes time in the size of the document, whatever the query. Every match is counted, but
-//! only a window of them around the point the search is for is kept (see [`Found`]): a query of
-//! one common letter in a large document would otherwise keep a match for every one.
+//! The search runs over [`Doc::text`], so markup and URLs never match (front matter does, as
+//! its table shows it), one block at a time: a match never spans two blocks, except the chunks
+//! of one that was split for size (see [`Block::joined`]). A table cell is a text of its own.
+//! Letters match whatever their case, by the simple lowercase of each character (one that
+//! lowercases to several, like `İ`, to all of them), and a match is reported as the byte range
+//! of the original characters it covers. The scan is one pass over the text with a
+//! Knuth–Morris–Pratt automaton, so it takes time in the size of the document, whatever the
+//! query. Every match is counted, but only a window of them around the point the search is for
+//! is kept (see [`Found`]): a query of one common letter in a large document would otherwise
+//! keep a match for every one.
 
 use std::collections::VecDeque;
 use std::ops::Range;
