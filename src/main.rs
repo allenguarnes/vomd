@@ -159,6 +159,11 @@ enum Fresh {
     Gone,
 }
 
+/// How long the first frame of a launch to open a file waits for the file at most (macOS: see
+/// [`App::holding`]). It comes about 50 ms after the window is made, 70 ms on a cold launch.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const HOLD_FIRST: Duration = Duration::from_millis(500);
+
 /// How long the first window waits for the portal's dark preference before painting with
 /// what winit or `GTK_THEME` say (a later answer still applies). It usually takes ~1 ms.
 const PORTAL_WAIT: Duration = Duration::from_millis(50);
@@ -388,6 +393,13 @@ struct App {
     /// The theme given to the window's title bar (`None` inside: the system's), once given.
     #[cfg(target_os = "macos")]
     title_theme: Option<Option<Theme>>,
+    /// The first frame's wait for a handed file (see [`App::holding`]).
+    #[cfg(target_os = "macos")]
+    hold: Hold,
+    /// The Apple event handled while the window was made was kAEOpenApplication (see
+    /// [`platform::opening_plainly`]).
+    #[cfg(target_os = "macos")]
+    opening_plainly: bool,
     exit_code: i32,
 }
 
@@ -398,6 +410,71 @@ struct App {
 fn declined(pending: &Cell<bool>, view: &mut View) {
     view.discard_damage();
     pending.set(true);
+}
+
+/// Whether the first frame waits for a handed file (see [`App::holding`]): only for a launch
+/// AppKit called a non-default one (`default_launch`; `None`: it didn't say) that wasn't started
+/// with kAEOpenApplication (`opening_plainly`: the Dock, a shell, and a launch with saved state,
+/// which AppKit also calls non-default), with nothing to show yet. A file in the command line is
+/// a default launch.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn hold_first_frame(default_launch: Option<bool>, opening_plainly: bool, input: &Input) -> bool {
+    default_launch == Some(false) && !opening_plainly && *input == Input::None
+}
+
+/// The first frame's wait for a handed file (macOS: see [`App::holding`]).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Hold {
+    /// Not decided yet: no frame was asked for.
+    #[default]
+    Undecided,
+    /// Waiting since the first frame was asked for, until the document comes or the time.
+    Waiting { since: Instant, until: Instant },
+    /// Over (or never begun): how long the first frame waited.
+    Over(Duration),
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl Hold {
+    /// Whether the frame asked for `now` waits. The first time, `wanted` says whether to wait at
+    /// all, for [`HOLD_FIRST`] at most; the wait ends sooner once there is a document (`doc`).
+    fn waits(&mut self, wanted: impl FnOnce() -> bool, doc: bool, now: Instant) -> bool {
+        if *self == Hold::Undecided {
+            *self = if wanted() {
+                Hold::Waiting {
+                    since: now,
+                    until: now + HOLD_FIRST,
+                }
+            } else {
+                Hold::Over(Duration::ZERO)
+            };
+        }
+        match *self {
+            Hold::Waiting { since, until } if doc || now >= until => {
+                *self = Hold::Over(now.saturating_duration_since(since));
+                false
+            }
+            Hold::Waiting { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// When the wait runs out, while it lasts: the loop wakes then to paint.
+    fn deadline(&self) -> Option<Instant> {
+        match *self {
+            Hold::Waiting { until, .. } => Some(until),
+            _ => None,
+        }
+    }
+
+    /// How long the first frame waited (zero until it was painted).
+    fn held(&self) -> Duration {
+        match *self {
+            Hold::Over(held) => held,
+            _ => Duration::ZERO,
+        }
+    }
 }
 
 impl App {
@@ -438,7 +515,33 @@ impl App {
         }
     }
 
+    /// The first frame waits for the file a launch was for (macOS). Finder, Open With and
+    /// `open -a VOMD file.md` hand the file over as an Apple event, which (with the macOS 26 SDK)
+    /// comes about 50 ms after the window is made: painted at once, the window would show empty
+    /// first. So for such a launch ([`hold_first_frame`]) with no document yet, the window stays
+    /// hidden until the file comes ([`UserEvent::OpenFiles`]: the first frame shows it) or for
+    /// [`HOLD_FIRST`] at most (`about_to_wait` wakes then: it shows empty, as before). Dock,
+    /// Launchpad and shell launches don't wait.
+    #[cfg(target_os = "macos")]
+    fn holding(&mut self) -> bool {
+        if self.shown || self.gfx.is_none() {
+            return false;
+        }
+        let doc = self.input != Input::None;
+        let (input, plainly) = (&self.input, self.opening_plainly);
+        self.hold.waits(
+            || hold_first_frame(platform::default_launch(), plainly, input),
+            doc,
+            Instant::now(),
+        )
+    }
+
     fn paint(&mut self, event_loop: &ActiveEventLoop) {
+        // (Before the redraw asked for is taken: the frame isn't painted.)
+        #[cfg(target_os = "macos")]
+        if self.holding() {
+            return;
+        }
         #[cfg_attr(not(feature = "images"), allow(unused_mut, unused_variables))]
         let mut asked = self.redraw_pending.replace(false);
         let (Some(gfx), Some(view)) = (self.gfx.as_mut(), self.view.as_mut()) else {
@@ -543,11 +646,17 @@ impl App {
                 );
                 #[cfg(target_os = "macos")]
                 eprintln!(
-                    "vomd-bench first_frame_ms={:.2} own_ms={:.2} rss_kb={}",
+                    "vomd-bench first_frame_ms={:.2} own_ms={:.2} rss_kb={} first={} held_ms={:.2}",
                     self.start.elapsed().as_secs_f64() * 1e3,
                     self.window_made
                         .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3),
-                    platform::peak_rss_kb()
+                    platform::peak_rss_kb(),
+                    if self.input == Input::None {
+                        "empty"
+                    } else {
+                        "doc"
+                    },
+                    self.hold.held().as_secs_f64() * 1e3
                 );
                 quit(event_loop, &self.proxy);
             }
@@ -1269,6 +1378,7 @@ impl ApplicationHandler<UserEvent> for App {
             #[cfg(target_os = "macos")]
             Ok(w) => {
                 self.window_made = Some(Instant::now());
+                self.opening_plainly = platform::opening_plainly();
                 Arc::new(w)
             }
             #[cfg(not(target_os = "macos"))]
@@ -1831,6 +1941,16 @@ impl ApplicationHandler<UserEvent> for App {
         };
         #[cfg(not(feature = "images"))]
         let save = self.store.deadline();
+        // The first frame's wait for a handed file ran out: it is painted (empty).
+        #[cfg(target_os = "macos")]
+        let save = match self.hold.deadline().filter(|_| !self.shown) {
+            Some(t) if now >= t => {
+                self.redraw();
+                save
+            }
+            Some(t) => Some(save.map_or(t, |s| s.min(t))),
+            None => save,
+        };
         if matches!(self.bench, Some(Bench::Idle | Bench::IdleAtEnd))
             && self.shown
             && !self.idle_reported
@@ -1977,6 +2097,10 @@ fn main() {
         window_made: None,
         #[cfg(target_os = "macos")]
         title_theme: None,
+        #[cfg(target_os = "macos")]
+        hold: Hold::default(),
+        #[cfg(target_os = "macos")]
+        opening_plainly: false,
         exit_code: 0,
     };
     // Files handed over by the system come as events (the one VOMD was started for too, while
@@ -1987,6 +2111,7 @@ fn main() {
         platform::on_open_files(move |paths| {
             let _ = proxy.send_event(UserEvent::OpenFiles(paths));
         });
+        platform::watch_launch();
     }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("vomd: {e}");
@@ -2058,8 +2183,8 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_message, font_notice, gone_note, is_wayland, leave, parent_name, pop, same_family,
-        system_dark,
+        HOLD_FIRST, Hold, empty_message, font_notice, gone_note, hold_first_frame, is_wayland,
+        leave, parent_name, pop, same_family, system_dark,
     };
     use std::ptr::NonNull;
     use std::time::Instant;
@@ -2127,6 +2252,64 @@ mod tests {
             );
             assert_eq!(empty_message(true), "Press Ctrl+O to open a Markdown file");
         }
+    }
+
+    /// The first frame waits for a handed file only in a launch AppKit called a non-default one
+    /// without kAEOpenApplication (Finder's), with nothing to show yet: not a Dock or shell
+    /// launch, not one with saved state, not a file from the command line, and not when AppKit
+    /// hasn't said.
+    #[test]
+    fn only_a_launch_for_a_file_without_one_holds_the_first_frame() {
+        let file = Input::File("a.md".into());
+        let none = &Input::None;
+        assert!(hold_first_frame(Some(false), false, none), "Finder");
+        assert!(!hold_first_frame(Some(true), true, none), "the Dock");
+        assert!(!hold_first_frame(Some(false), true, none), "saved state");
+        assert!(!hold_first_frame(None, false, none), "not said");
+        assert!(
+            !hold_first_frame(Some(false), false, &file),
+            "the file came first"
+        );
+        assert!(
+            !hold_first_frame(Some(true), true, &file),
+            "the command line"
+        );
+    }
+
+    /// The wait is decided once, on the first frame asked for; it ends when the document comes
+    /// or at its time, whichever is first, and says how long it lasted.
+    #[test]
+    fn the_first_frame_waits_until_the_document_or_the_time() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + std::time::Duration::from_millis(n);
+        // Not wanted: never waits, even if asked again later.
+        let mut hold = Hold::default();
+        assert!(!hold.waits(|| false, false, t0));
+        assert!(!hold.waits(|| true, false, ms(1)), "decided once");
+        assert_eq!(hold.deadline(), None);
+        assert_eq!(hold.held(), std::time::Duration::ZERO);
+        // The document comes 11 ms in.
+        let mut hold = Hold::default();
+        assert!(hold.waits(|| true, false, t0));
+        assert_eq!(hold.deadline(), Some(t0 + HOLD_FIRST));
+        assert!(hold.waits(|| unreachable!(), false, ms(5)), "still waiting");
+        assert!(
+            !hold.waits(|| unreachable!(), true, ms(11)),
+            "the document came"
+        );
+        assert_eq!(hold.held(), std::time::Duration::from_millis(11));
+        assert_eq!(hold.deadline(), None, "nothing to wake for");
+        assert!(!hold.waits(|| true, false, ms(12)), "over for good");
+        // No document: the time runs out.
+        let mut hold = Hold::default();
+        assert!(hold.waits(|| true, false, t0));
+        assert!(hold.waits(
+            || true,
+            false,
+            t0 + HOLD_FIRST - std::time::Duration::from_millis(1)
+        ));
+        assert!(!hold.waits(|| true, false, t0 + HOLD_FIRST));
+        assert_eq!(hold.held(), HOLD_FIRST);
     }
 
     /// The file gone is named as the title names it: its name, not its path.

@@ -11,6 +11,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
   on the theme's background keeps GitHub's. Open windows follow a theme switch at once; the
   other mode (`T`) keeps GitHub's colors. Elsewhere nothing changes.
 
+### Fixed
+- On macOS, a file opened from Finder (a double-click, Open With, a drop on the Dock icon) while
+  VOMD isn't running shows at once, without an empty window first. macOS hands the file over just
+  after the window is ready: the window now waits for it, half a second at most. A launch from
+  the Dock, Launchpad or a terminal doesn't wait.
+
 ## [1.10.0] - 2026-11-14
 
 ### Added

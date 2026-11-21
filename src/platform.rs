@@ -65,7 +65,7 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "macos")]
-pub use macos::on_open_files;
+pub use macos::{default_launch, on_open_files, opening_plainly, watch_launch};
 
 /// The command key as the labels of shortcuts name it, joined to `key`, as one literal: `⌘O` on
 /// macOS, `Ctrl+O` elsewhere. (Ctrl works on macOS too: the keys take either.)

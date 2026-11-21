@@ -3,12 +3,19 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
-use objc2::{ffi, sel};
-use objc2_app_kit::{NSApplication, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSView};
-use objc2_foundation::{MainThreadMarker, NSArray, NSString, NSURL};
+use objc2::{ffi, msg_send, sel};
+use objc2_app_kit::{
+    NSApplication, NSApplicationDidFinishLaunchingNotification,
+    NSApplicationLaunchIsDefaultLaunchKey, NSModalResponse, NSModalResponseOK, NSOpenPanel, NSView,
+};
+use objc2_foundation::{
+    MainThreadMarker, NSAppleEventManager, NSArray, NSNotification, NSNotificationCenter, NSNumber,
+    NSString, NSURL,
+};
 use winit::raw_window_handle::RawWindowHandle;
 
 /// What files handed over are given to.
@@ -18,6 +25,8 @@ thread_local! {
     /// Where [`open_urls`] sends the files it is given (set on the main thread, where AppKit
     /// calls it).
     static DELIVER: RefCell<Option<Deliver>> = const { RefCell::new(None) };
+    /// Whether AppKit called the launch a default one (see [`default_launch`]).
+    static DEFAULT_LAUNCH: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Send the files the system hands over to `deliver`, on the main thread: Finder's Open With, a
@@ -50,6 +59,72 @@ pub fn on_open_files(deliver: impl Fn(Vec<PathBuf>) + 'static) {
             Some(std::mem::transmute::<Imp, unsafe extern "C" fn()>(imp)),
             c"v@:@@".as_ptr(),
         );
+    }
+}
+
+/// Whether this is a default launch, as AppKit said when it finished launching: `Some(true)` for
+/// one from the Dock, Launchpad or `open -a VOMD`, `Some(false)` for one to open a file (Finder,
+/// `open -a VOMD file.md`), whose file comes as an Apple event after the window is made (with the
+/// macOS 26 SDK, after its first frame could be painted), but also for any launch while AppKit
+/// has saved state ("Close windows when quitting an app" off; see [`opening_plainly`]). `None`
+/// before AppKit said, or if it didn't. Main thread only (`None` elsewhere).
+pub fn default_launch() -> Option<bool> {
+    DEFAULT_LAUNCH.with(Cell::get)
+}
+
+/// Note what NSApplicationDidFinishLaunchingNotification says of the launch, for
+/// [`default_launch`]. Call before the event loop runs: the notification comes while it starts,
+/// next to winit's `resumed` (before or after it), and before the first redraw is handled.
+pub fn watch_launch() {
+    if MainThreadMarker::new().is_none() {
+        return;
+    }
+    let block = block2::RcBlock::new(|note: NonNull<NSNotification>| {
+        // SAFETY: AppKit passes a live notification, on the main thread (no queue is given); the
+        // value of NSApplicationLaunchIsDefaultLaunchKey is an NSNumber.
+        let default = unsafe {
+            note.as_ref()
+                .userInfo()
+                .and_then(|info| info.objectForKey(NSApplicationLaunchIsDefaultLaunchKey))
+                .map(|v| Retained::cast::<NSNumber>(v).boolValue())
+        };
+        DEFAULT_LAUNCH.with(|d| d.set(default));
+    });
+    // SAFETY: the name is AppKit's constant. The center copies the block and keeps the observer
+    // it returns until it is removed, which it never is (the notification comes once): the
+    // returned token is only needed to remove it, so it is dropped.
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(NSApplicationDidFinishLaunchingNotification),
+            None,
+            None,
+            &block,
+        );
+    }
+}
+
+/// The Apple event AppKit is handling is kAEOpenApplication (`aevt`/`oapp`): so it is in a launch
+/// from the Dock, Launchpad, `open -a VOMD` or a shell, including one AppKit calls a non-default
+/// launch because it has saved state (windows kept at quit). A launch to open a file has none while
+/// winit's `resumed` runs (its `odoc` event comes later), which is where this is read. Main thread
+/// only (`false` elsewhere).
+pub fn opening_plainly() -> bool {
+    /// `kCoreEventClass` and `kAEOpenApplication`.
+    const AEVT: u32 = u32::from_be_bytes(*b"aevt");
+    const OAPP: u32 = u32::from_be_bytes(*b"oapp");
+    if MainThreadMarker::new().is_none() {
+        return false;
+    }
+    // SAFETY: called on the main thread; `eventClass` and `eventID` return four-character codes
+    // (`AEEventClass` and `AEEventID`, both 32-bit unsigned).
+    unsafe {
+        NSAppleEventManager::sharedAppleEventManager()
+            .currentAppleEvent()
+            .is_some_and(|event| {
+                let class: u32 = msg_send![&event, eventClass];
+                let id: u32 = msg_send![&event, eventID];
+                (class, id) == (AEVT, OAPP)
+            })
     }
 }
 
