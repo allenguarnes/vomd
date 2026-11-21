@@ -290,6 +290,11 @@ fn xdg_paths() {
         Some("/home/u/.config/vomd/settings.ini".into()),
         "a relative XDG_CONFIG_HOME is ignored (XDG spec)"
     );
+    assert_eq!(
+        path_from(env(&[("HOME", "rel")])),
+        None,
+        "nor a relative HOME"
+    );
     assert_eq!(path_from(env(&[])), None);
 }
 
@@ -379,6 +384,7 @@ fn template_is_all_defaults() {
         "wide",
         "animations",
         "live_reload",
+        "recent_files",
         "primary_selection",
         "font_sans",
         "font_mono",
@@ -663,6 +669,17 @@ fn live_reload_is_on_by_default() {
         assert_eq!(p.live_reload, want, "{v}");
     }
     assert!(TEMPLATE.contains("# live_reload = on"));
+}
+
+/// `recent_files` is on without a line for it, and `off` turns it off.
+#[test]
+fn recent_files_are_on_by_default() {
+    assert!(Prefs::default().recent_files);
+    for (v, want) in [("off", false), ("no", false), ("on", true), ("maybe", true)] {
+        let p = Prefs::from_settings(&Settings::parse(&format!("recent_files = {v}")));
+        assert_eq!(p.recent_files, want, "{v}");
+    }
+    assert!(TEMPLATE.contains("# recent_files = on"));
 }
 
 /// `animations` is off without a line for it, takes `on`/`off` like the other switches, and is

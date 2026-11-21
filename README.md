@@ -60,6 +60,8 @@
   copy button on code blocks.
 - **Live reload:** when the file changes on disk, VOMD shows the new version at the same place,
   so it works as a live preview beside your editor.
+- **Recent files:** with no file open, the window lists the last ones you opened: click one, or
+  press its number. On macOS they're also in File ▸ Open Recent and the Dock icon's menu.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
@@ -228,6 +230,11 @@ vomd --no-settings   Ignore the settings file
 Each window is its own process. The toolbar at the top has buttons for most of the keys below,
 and ⚙ opens the settings file.
 
+With no file, VOMD shows the files you opened recently (up to 8, newest first): click one, or
+press its number. `↑` `↓` pick one for `Enter` to open and `Delete` to take off the list, and
+*Clear list* empties it. Files opened from the command line, Open, a drop or Finder count; links
+followed inside a document don't.
+
 ## Keys
 
 | Key | Action |
@@ -247,6 +254,7 @@ and ⚙ opens the settings file.
 | `R`, `F5` | Reload |
 | `Backspace`, `Alt+←` | Back |
 | `Ctrl+O` | Open a file |
+| `1`–`8`; `↑` `↓` (`j` `k`), `Enter`, `Delete` | In the empty window: open a recent file; pick one, open it, take it off the list (`Backspace` too) |
 | `Ctrl+A`, `Ctrl+C` | Select all, copy |
 | `Esc` | Close what's open (menu, find bar, panel), else quit |
 | `Q`, `Ctrl+W` | Quit |
@@ -287,6 +295,7 @@ every option listed and commented out. Changes apply as soon as you switch back 
 | `toc` | `false`, `true` (contents panel) |
 | `animations` | `off`, `on` |
 | `live_reload` | `on`, `off` (show changes to the file as soon as it's saved) |
+| `recent_files` | `on`, `off` (list recently opened files when no file is open; `off` also forgets them) |
 | `remote_images` | `ask`, `never`, `always` |
 | `primary_selection` | `on`, `off` (Linux: middle-click paste of selected text) |
 | `font_sans`, `font_mono` | `default` (built in), or an installed font such as `Noto Sans` |
@@ -308,6 +317,11 @@ VOMD makes no network requests of its own.
   `<b>`, `<img>`, `<picture>` and `<a>`, are shown the way GitHub shows them.
 - **SVGs** never load other files or URLs. Each one is drawn in a separate, short-lived process
   that is stopped if it takes too long.
+- **Recent files:** VOMD keeps the paths of the last 20 files you opened, and nothing else about
+  them, in `~/.local/state/vomd/recent` (or `$XDG_STATE_HOME/vomd/recent`;
+  `%LOCALAPPDATA%\vomd\recent` on Windows, `~/Library/Application Support/vomd/recent` on
+  macOS, where the Dock's recent items get them too). Clear it from the empty window, or set
+  `recent_files = off`, which also deletes the file. `--no-settings` neither reads nor writes it.
 
 ## Limitations
 

@@ -34,6 +34,7 @@ use vomd::doc::Doc;
 use vomd::fonts::Fonts;
 use vomd::nav::{self, BackStack, Target};
 use vomd::platform;
+use vomd::recent::{self, Recent};
 use vomd::settings::{self, FontPaths, Prefs, Store};
 use vomd::text::fallback::{self, Family, Found};
 use vomd::toolbar::Command;
@@ -149,6 +150,11 @@ enum UserEvent {
     /// Files the system handed over (Finder's Open With, the Dock, `open -a`): the first opens.
     #[cfg(target_os = "macos")]
     OpenFiles(Vec<std::path::PathBuf>),
+    /// An item of the File menu was chosen.
+    #[cfg(target_os = "macos")]
+    Menu(platform::MenuCommand),
+    /// The recent list was looked at (see [`App::show_recent`]).
+    Recent,
     /// Only wakes the loop after `quit` asked it to end (see there).
     Quit,
 }
@@ -251,6 +257,31 @@ fn load(input: &Input, origin: Origin) -> Loaded {
     }
 }
 
+/// How a document came to be opened, which says whether it goes on the recent list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Via {
+    /// The command line, or the file a macOS launch was for (Finder, Open With, the Dock).
+    Start,
+    /// Open's dialog (or File ▸ Open… on macOS).
+    Dialog,
+    /// Dropped on the window.
+    Drop,
+    /// Handed over by macOS to a window that has one already.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Handed,
+    /// The recent list itself (the empty window's, or File ▸ Open Recent): it moves to the top.
+    Recent,
+    /// A link followed in a document, or Back.
+    Link,
+}
+
+/// Whether the document `loaded` by way of `via` goes on the recent list: one the reader chose,
+/// not one a link led to, and read whole from a regular file (not stdin or a pipe, which have no
+/// stamp, and not an error).
+fn recorded(via: Via, loaded: &Loaded) -> bool {
+    via != Via::Link && loaded.message.is_none() && loaded.stamp.is_some()
+}
+
 /// What `VOMD_BENCH` asks for (budget measurement).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Bench {
@@ -312,6 +343,13 @@ struct App {
     redraw_pending: Cell<bool>,
     stamp: Option<Stamp>,
     store: Store,
+    /// The files opened lately (`recent_files`).
+    recent: Recent,
+    /// The startup document, recorded once the first frame is out (off the startup path).
+    record_later: Option<std::path::PathBuf>,
+    /// The looks at which recent files are there, and where their answers go.
+    looks: recent::Looks,
+    recent_slot: RecentSlot,
     /// The `font_sans` and `font_mono` families applied to the view (`None`: embedded faces).
     families: [Option<String>; 2],
     /// Families (by `mono`) waiting for a lookup of their files.
@@ -668,6 +706,9 @@ impl App {
         self.scan_fonts();
         self.resolve_families();
         self.start_watch();
+        if let Some(path) = self.record_later.take() {
+            self.remember(&path);
+        }
         // The caret has moved when the query has.
         #[cfg(feature = "find")]
         self.sync_ime();
@@ -734,9 +775,164 @@ impl App {
             self.start_watch();
             self.retarget();
         }
+        // (Off deletes the list, at every look at the setting: nothing is kept while it is off.)
+        // (A failure is left quiet: it would say so again at every focus.)
+        let listed = self.recent.on();
+        let _ = self.recent.set_on(prefs.recent_files);
+        if listed && !self.recent.on() {
+            // Gone at once, whatever a look still running finds (and the Dock's: off keeps
+            // nothing anywhere).
+            self.emptied();
+            #[cfg(target_os = "macos")]
+            platform::clear_recent_documents();
+        } else if listed != self.recent.on() {
+            self.show_recent();
+        }
         #[cfg(target_os = "macos")]
         self.sync_title_theme();
         self.redraw();
+    }
+
+    /// Put `path` first on the recent list (and, on macOS, in the Dock's and File ▸ Open
+    /// Recent): a document the reader chose was read from it (see [`recorded`]). Never in a bench.
+    /// A failure is left quiet, as it would be at every open.
+    fn remember(&mut self, path: &std::path::Path) {
+        if self.bench.is_some() {
+            return;
+        }
+        let _recorded = self.recent.record(path);
+        #[cfg(target_os = "macos")]
+        if matches!(_recorded, Ok(true)) {
+            platform::note_recent(path);
+            self.show_recent();
+        }
+    }
+
+    /// Give the empty window the recent list as it is now (other windows may have changed it),
+    /// and the Mac's File ▸ Open Recent. Which files are there is looked at on a thread of its
+    /// own (a stale network mount can hang a look), and only for the empty window: the list
+    /// comes as [`UserEvent::Recent`]. With a document open the Mac's menu takes the list as it
+    /// is, unlooked at.
+    fn show_recent(&mut self) {
+        if self.input != Input::None {
+            #[cfg(target_os = "macos")]
+            {
+                let mut list = self.recent.list();
+                list.truncate(recent::SHOWN);
+                sync_menu(&list);
+            }
+            return;
+        }
+        // No list (off, `--no-settings`): nothing to look at.
+        let Some(file) = self.recent.file_path() else {
+            self.publish(Vec::new());
+            return;
+        };
+        // One look at a time: the one running looks again when it is done.
+        let Some(generation) = self.looks.start() else {
+            return;
+        };
+        let (slot, proxy, main) = (
+            self.recent_slot.clone(),
+            self.proxy.clone(),
+            std::thread::current(),
+        );
+        let theirs = file.clone();
+        let looking = std::thread::Builder::new().spawn(move || {
+            let list = recent::shown(recent::read(&theirs));
+            if let Ok(mut s) = slot.lock() {
+                *s = Some((generation, list));
+            }
+            main.unpark();
+            let _ = proxy.send_event(UserEvent::Recent);
+        });
+        // No thread to be had: the list as it is, unlooked at.
+        if looking.is_err() {
+            self.looks.done(generation);
+            let mut list = recent::read(&file);
+            list.truncate(recent::SHOWN);
+            self.publish(list);
+        }
+    }
+
+    /// Show `list` in the empty window (and the Mac's menu).
+    fn publish(&mut self, list: Vec<std::path::PathBuf>) {
+        #[cfg(target_os = "macos")]
+        sync_menu(&list);
+        if self.input == Input::None
+            && let Some(view) = self.view.as_mut()
+        {
+            view.set_recent(list, recent::home().as_deref());
+            self.redraw();
+        }
+    }
+
+    /// The list was emptied (Clear, off): it goes from the window and the menu at once, and what
+    /// a look still running finds is thrown away.
+    fn emptied(&mut self) {
+        self.looks.invalidate();
+        self.publish(Vec::new());
+    }
+
+    /// The empty window's next frame waits for its list (start, Back to it), unless looking
+    /// takes long (a stale mount): then the list comes later, as [`UserEvent::Recent`].
+    fn wait_recent(&mut self) {
+        if self.input != Input::None {
+            return;
+        }
+        let until = Instant::now() + RECENT_WAIT;
+        while !self.take_recent() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::park_timeout(left);
+        }
+    }
+
+    /// Take the list [`App::show_recent`] asked for, if it came: shown if it is still the list's
+    /// (not from before a Clear, and the list still on). Returns whether it was shown.
+    fn take_recent(&mut self) -> bool {
+        let Some((generation, list)) = self.recent_slot.lock().ok().and_then(|mut s| s.take())
+        else {
+            return false;
+        };
+        let (current, again) = self.looks.done(generation);
+        let shown = current && self.recent.on();
+        if shown {
+            self.publish(list);
+        }
+        if again {
+            self.show_recent();
+        }
+        shown
+    }
+
+    /// "Clear list" (or File ▸ Open Recent ▸ Clear Menu): the list is emptied.
+    fn clear_recent(&mut self) {
+        let cleared = self.recent.clear();
+        if cleared.is_ok() {
+            self.emptied();
+        }
+        self.recent_changed(cleared);
+        #[cfg(target_os = "macos")]
+        platform::clear_recent_documents();
+    }
+
+    /// Take row `i` of the empty window's list off the recent list.
+    fn forget_recent(&mut self, i: u8) {
+        if let Some(path) = self.view.as_ref().and_then(|v| v.recent_path(i)) {
+            let removed = self.recent.remove(&path);
+            self.recent_changed(removed);
+        }
+    }
+
+    /// The list was changed from the window: shown again, and a failure said in a toast.
+    fn recent_changed(&mut self, result: std::io::Result<()>) {
+        if let Err(e) = result {
+            self.toast(format!("Can't change the recent files: {e}"));
+        }
+        self.show_recent();
     }
 
     /// The title bar follows VOMD's theme (`T`, `theme =`): a forced one is the window's own
@@ -958,9 +1154,11 @@ impl App {
         self.redraw();
     }
 
-    /// Open a document in place of the current one (the back stack is the caller's business).
-    fn open(&mut self, input: Input) {
+    /// Open a document in place of the current one (the back stack is the caller's business),
+    /// come to by way of `via`.
+    fn open(&mut self, input: Input, via: Via) {
         let loaded = load(&input, Origin::Navigation);
+        let record = recorded(via, &loaded);
         let message = self.message(&input, loaded.message);
         self.input = input;
         self.stamp = loaded.stamp;
@@ -973,12 +1171,22 @@ impl App {
         if let Some(g) = &self.gfx {
             g.window.set_title(&view::title(&self.input));
         }
+        if let Input::File(path) = &self.input
+            && record
+        {
+            self.remember(&path.clone());
+        }
+        // Back to the empty window: its list, as it is now, in its first frame.
+        if self.input == Input::None {
+            self.show_recent();
+            self.wait_recent();
+        }
         self.redraw();
     }
 
     /// Go to another document, leaving the current place on the back stack (see
     /// [`BackStack::leave`]).
-    fn go_to(&mut self, input: Input) {
+    fn go_to(&mut self, input: Input, via: Via) {
         if let Some(view) = self.view.as_mut() {
             let here = nav::Entry {
                 input: self.input.clone(),
@@ -986,7 +1194,7 @@ impl App {
             };
             leave(view, &mut self.back, here, &input);
         }
-        self.open(input);
+        self.open(input, via);
     }
 
     /// A file the system handed over (Finder, the Dock): the window's first document if it has
@@ -994,9 +1202,9 @@ impl App {
     #[cfg(target_os = "macos")]
     fn open_handed(&mut self, input: Input) {
         if self.view.is_some() && (self.input != Input::None || !self.back.is_empty()) {
-            self.go_to(input);
+            self.go_to(input, Via::Handed);
         } else if self.view.is_some() {
-            self.open(input);
+            self.open(input, Via::Start);
         } else {
             // (Before the window: read in its place, a second handed file in place of the first,
             // so that the input and what is shown are the same.)
@@ -1026,7 +1234,7 @@ impl App {
                 }
             }
             Target::Doc { path, fragment } => {
-                self.go_to(Input::File(path));
+                self.go_to(Input::File(path), Via::Link);
                 if let (Some(view), Some(fragment)) = (self.view.as_mut(), fragment) {
                     view.jump_to_anchor(&fragment, now);
                 }
@@ -1068,7 +1276,7 @@ impl App {
             return;
         };
         if entry.input != self.input {
-            self.open(entry.input);
+            self.open(entry.input, Via::Link);
         }
         if let Some(view) = self.view.as_mut() {
             view.set_anchor(entry.anchor);
@@ -1136,6 +1344,7 @@ impl App {
         let hand = view.hovered().is_some() || view.over_force();
         #[cfg(feature = "toc")]
         let hand = hand || view.over_toc();
+        let hand = hand || view.over_recent();
         let update = view::hover_change(self.pointer, hand, changed);
         #[cfg(any(feature = "clipboard", feature = "find"))]
         let text = self.cursor_in && view.text_cursor(self.cursor.x, self.cursor.y);
@@ -1215,6 +1424,7 @@ impl App {
             let proxy = self.proxy.clone();
             let window = self.gfx.as_ref();
             let handle = window.and_then(|g| g.window.window_handle().ok().map(|h| h.as_raw()));
+            platform::set_open_enabled(false);
             platform::choose_file_panel(handle, folder.as_deref(), move |chosen| {
                 let _ = proxy.send_event(UserEvent::Chosen(chosen));
             });
@@ -1299,6 +1509,13 @@ impl App {
             Outcome::Reload => self.reload(),
             Outcome::Back => self.go_back(),
             Outcome::Open => self.choose_file(),
+            Outcome::OpenRecent(i) => {
+                if let Some(path) = self.view.as_ref().and_then(|v| v.recent_path(i)) {
+                    self.go_to(Input::File(path), Via::Recent);
+                }
+            }
+            Outcome::ForgetRecent(i) => self.forget_recent(i),
+            Outcome::ClearRecent => self.clear_recent(),
             #[cfg(feature = "clipboard")]
             Outcome::Selected => {
                 self.redraw();
@@ -1442,6 +1659,11 @@ impl ApplicationHandler<UserEvent> for App {
                 notice: None,
             },
         };
+        if let Input::File(path) = &self.input
+            && recorded(Via::Start, &loaded)
+        {
+            self.record_later = Some(path.clone());
+        }
         self.stamp = loaded.stamp;
         let message = self.message(&self.input, loaded.message);
         let px = window.inner_size();
@@ -1481,6 +1703,15 @@ impl ApplicationHandler<UserEvent> for App {
         self.view = Some(view);
         self.gfx = Some(Gfx { window, surface });
         self.apply(&prefs);
+        #[cfg(target_os = "macos")]
+        {
+            let proxy = self.proxy.clone();
+            platform::add_file_menu(move |command| {
+                let _ = proxy.send_event(UserEvent::Menu(command));
+            });
+        }
+        self.show_recent();
+        self.wait_recent();
         // The window shows once its first frame is painted (see `paint`). Windows never sends a
         // hidden window the paint a redraw asks for, so there the first frame is painted now.
         #[cfg(windows)]
@@ -1536,12 +1767,23 @@ impl ApplicationHandler<UserEvent> for App {
                 self.resolve_families();
             }
             UserEvent::Quit => {}
+            UserEvent::Recent => {
+                self.take_recent();
+            }
             #[cfg(target_os = "macos")]
             UserEvent::OpenFiles(paths) => {
                 if let Some(path) = paths.into_iter().next() {
                     self.open_handed(Input::File(path));
                 }
             }
+            #[cfg(target_os = "macos")]
+            UserEvent::Menu(command) => match command {
+                platform::MenuCommand::Open => self.choose_file(),
+                platform::MenuCommand::OpenRecent(path) => {
+                    self.go_to(Input::File(path), Via::Recent);
+                }
+                platform::MenuCommand::Clear => self.clear_recent(),
+            },
             UserEvent::Reloaded(generation, fresh) => {
                 let stamp = match &fresh {
                     Fresh::Doc(_, stamp) => *stamp,
@@ -1577,8 +1819,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenFailed(why) => self.toast(why),
             UserEvent::Chosen(chosen) => {
                 self.choosing = false;
+                #[cfg(target_os = "macos")]
+                platform::set_open_enabled(true);
                 match chosen {
-                    Ok(Some(path)) => self.go_to(Input::File(path)),
+                    Ok(Some(path)) => self.go_to(Input::File(path), Via::Dialog),
                     Ok(None) => {}
                     Err(why) => self.toast(format!("Can't open a file: {why}")),
                 }
@@ -1700,8 +1944,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(prefs) = self.store.refresh() {
                     self.apply(&prefs);
                 }
+                // Other windows may have opened files meanwhile.
+                self.show_recent();
             }
-            WindowEvent::DroppedFile(path) => self.go_to(Input::File(path)),
+            WindowEvent::DroppedFile(path) => self.go_to(Input::File(path), Via::Drop),
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
                 #[cfg(any(feature = "clipboard", feature = "find"))]
@@ -1729,6 +1975,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let typed = typed.or_else(|| {
                     view.find_key(&event.logical_key, event.text.as_deref(), self.mods, now)
                 });
+                // The empty window's recent list: digits, arrows, Enter, Delete.
+                let typed = typed.or_else(|| view.recent_key(&event.logical_key, self.mods));
                 let outcome = typed.or_else(|| {
                     let action = view::key_action(&event.logical_key, self.mods)?;
                     Some(view.apply(action, now))
@@ -2018,6 +2266,8 @@ fn main() {
     });
     // Settings come first: they size the window and set theme and zoom.
     let store = Store::open(if no_settings { None } else { settings::path() });
+    // No list without settings either: `--no-settings` is a clean VOMD that leaves nothing.
+    let recent = Recent::new(store.path().and_then(|_| recent::path()));
     // Read and parse in parallel with creating the window.
     let parse = {
         let input = input.clone();
@@ -2048,6 +2298,10 @@ fn main() {
         redraw_pending: Cell::new(false),
         stamp: None,
         store,
+        recent,
+        record_later: None,
+        looks: recent::Looks::default(),
+        recent_slot: RecentSlot::default(),
         families: [None, None],
         unresolved: Vec::new(),
         resolving: false,
@@ -2129,6 +2383,20 @@ fn bench_size() -> Option<(f64, f64)> {
     (w >= 1.0 && h >= 1.0 && w <= 16384.0 && h <= 16384.0).then_some((w, h))
 }
 
+/// File ▸ Open Recent lists `list`.
+#[cfg(target_os = "macos")]
+fn sync_menu(list: &[std::path::PathBuf]) {
+    let titles = recent::menu_titles(list, recent::home().as_deref());
+    platform::set_recent_menu(list, &titles);
+}
+
+/// The empty window's recent list as a look found it, with the look's generation (see
+/// [`App::show_recent`]).
+type RecentSlot = Arc<Mutex<Option<(u32, Vec<std::path::PathBuf>)>>>;
+
+/// How long the first frame of the empty window waits for its recent list at most.
+const RECENT_WAIT: Duration = Duration::from_millis(50);
+
 /// What the toast says when a live reload finds the document's file gone.
 fn gone_note(input: &Input) -> String {
     format!(
@@ -2183,8 +2451,8 @@ fn same_family(a: Option<&str>, b: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HOLD_FIRST, Hold, empty_message, font_notice, gone_note, hold_first_frame, is_wayland,
-        leave, parent_name, pop, same_family, system_dark,
+        HOLD_FIRST, Hold, Via, empty_message, font_notice, gone_note, hold_first_frame, is_wayland,
+        leave, load, parent_name, pop, recorded, same_family, system_dark,
     };
     use std::ptr::NonNull;
     use std::time::Instant;
@@ -2193,6 +2461,7 @@ mod tests {
     use vomd::fonts::Fonts;
     use vomd::nav::{BackStack, Entry};
     use vomd::toolbar::Command;
+    use vomd::view::Origin;
     use vomd::view::{Action, View};
     use winit::raw_window_handle::{
         RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
@@ -2310,6 +2579,34 @@ mod tests {
         ));
         assert!(!hold.waits(|| true, false, t0 + HOLD_FIRST));
         assert_eq!(hold.held(), HOLD_FIRST);
+    }
+
+    /// A document goes on the recent list when the reader chose it and it was read from a
+    /// regular file: not one a link (or Back) led to, not an error, not the empty window, not a
+    /// pipe or a device.
+    #[test]
+    fn only_documents_the_reader_chose_go_on_the_recent_list() {
+        let dir = std::env::temp_dir().join(format!("vomd-recorded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# A\n").unwrap();
+        let read = load(&Input::File(file), Origin::Navigation);
+        for via in [Via::Start, Via::Dialog, Via::Drop, Via::Handed, Via::Recent] {
+            assert!(recorded(via, &read), "{via:?}");
+        }
+        assert!(!recorded(Via::Link, &read), "a link followed");
+        let gone = load(&Input::File(dir.join("none.md")), Origin::Navigation);
+        assert!(!recorded(Via::Dialog, &gone), "an error");
+        let none = load(&Input::None, Origin::Argument);
+        assert!(!recorded(Via::Start, &none), "the empty window");
+        // A device named on the command line is read, but has no stamp: not a file to go back to.
+        #[cfg(unix)]
+        {
+            let dev = load(&Input::File("/dev/null".into()), Origin::Argument);
+            assert!(dev.message.is_none());
+            assert!(!recorded(Via::Start, &dev));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The file gone is named as the title names it: its name, not its path.

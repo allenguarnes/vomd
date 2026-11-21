@@ -19,6 +19,7 @@ pub mod nav;
 pub mod platform;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 pub mod portal;
+pub mod recent;
 #[cfg(feature = "remote-images")]
 pub mod remote;
 pub mod render;

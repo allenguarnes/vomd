@@ -10,6 +10,17 @@ and versions follow [Semantic Versioning](https://semver.org/).
   text, links, borders, selection, code highlighting and alert colors. A color that wouldn't read
   on the theme's background keeps GitHub's. Open windows follow a theme switch at once; the
   other mode (`T`) keeps GitHub's colors. Elsewhere nothing changes.
+- With no file open, the window lists the last files you opened (up to 8, newest first): click
+  one, press its number, or pick one with the arrow keys and press `Enter` (`Delete` takes it off
+  the list). Files opened from the command line, the Open dialog, a drop or Finder count; links
+  followed inside a document don't. Files that aren't there (deleted, or on a drive that is out)
+  are left out but kept, up to 20.
+  - The list is a file of its own, `~/.local/state/vomd/recent` (`%LOCALAPPDATA%\vomd\recent` on
+    Windows, next to the settings file on macOS), with the files' paths and nothing else.
+    *Clear list* empties it; `recent_files = off` turns it off and deletes it; `--no-settings`
+    neither reads nor writes it.
+  - On macOS, a File menu has Open… (`⌘O`) and Open Recent with the same files, and the Dock
+    icon's menu lists them too.
 
 ### Changed
 - YAML front matter is shown as a table at the top of the document, as on GitHub, instead of

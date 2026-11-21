@@ -190,6 +190,8 @@ pub struct Prefs {
     pub animations: bool,
     /// The document is shown again as soon as its file is saved (else when the window gets focus).
     pub live_reload: bool,
+    /// The empty window lists the files opened lately (`crate::recent`); off, none are kept.
+    pub recent_files: bool,
 }
 
 /// What `primary_selection` is without a line for it: on where there is a primary selection (X11
@@ -221,6 +223,7 @@ impl Default for Prefs {
             primary_selection: DEFAULT_PRIMARY,
             animations: false,
             live_reload: true,
+            recent_files: true,
         }
     }
 }
@@ -314,6 +317,10 @@ impl Prefs {
                 .get("live_reload")
                 .and_then(parse_bool)
                 .unwrap_or(d.live_reload),
+            recent_files: s
+                .get("recent_files")
+                .and_then(parse_bool)
+                .unwrap_or(d.recent_files),
         }
     }
 }
@@ -408,11 +415,13 @@ pub fn path() -> Option<PathBuf> {
 }
 
 pub fn path_from(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let nonempty = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    // (A relative one would put the file under whatever folder VOMD was started in.)
+    let nonempty = |k: &str| {
+        let v = env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        v.filter(|p| p.is_absolute())
+    };
     #[cfg(all(unix, not(target_os = "macos")))]
-    let base = nonempty("XDG_CONFIG_HOME")
-        .filter(|p| p.is_absolute())
-        .or_else(|| nonempty("HOME").map(|h| h.join(".config")));
+    let base = nonempty("XDG_CONFIG_HOME").or_else(|| nonempty("HOME").map(|h| h.join(".config")));
     #[cfg(target_os = "macos")]
     let base = nonempty("HOME").map(|h| h.join("Library/Application Support"));
     #[cfg(windows)]
@@ -484,33 +493,55 @@ fn resolve(path: &Path) -> PathBuf {
 
 /// The file has no write permission (a config frozen on purpose): saving would replace it all
 /// the same, so it is left alone.
-fn frozen(path: &Path) -> bool {
+pub(crate) fn frozen(path: &Path) -> bool {
     std::fs::metadata(resolve(path)).is_ok_and(|m| m.permissions().readonly())
 }
 
 /// Write atomically: a temporary file next to the (resolved) file, with its permissions, then
 /// rename over it. A read-only file is not replaced (`PermissionDenied`). Returns the new stamp.
 pub fn save(path: &Path, settings: &Settings) -> io::Result<Option<Stamp>> {
+    write_atomic(path, settings.text().as_bytes(), false)?;
+    Ok(stamp(path))
+}
+
+/// [`save`]'s write, of any text: a temporary file next to the (resolved) file, with its
+/// permissions, renamed over it. A read-only file is not replaced (`PermissionDenied`).
+/// `private` (the recent list): on Unix, folders made for it are the owner's only (0700) and a
+/// new file is too (0600).
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     if frozen(path) {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     let target = resolve(path);
     let dir = target.parent().ok_or(io::ErrorKind::InvalidInput)?;
-    std::fs::create_dir_all(dir)?;
+    let mut make = std::fs::DirBuilder::new();
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        make.mode(0o700);
+        open.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    make.recursive(true).create(dir)?;
     let mut tmp = target.as_os_str().to_owned();
     tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+    // One left by a process of the same number that crashed would keep its permissions.
+    let _ = std::fs::remove_file(&tmp);
+    let written = open.open(&tmp).and_then(|mut f| {
         if let Ok(m) = std::fs::metadata(&target) {
             f.set_permissions(m.permissions())?;
         }
-        f.write_all(settings.text().as_bytes())
+        f.write_all(bytes)
     });
     if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &target)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    Ok(stamp(path))
+    Ok(())
 }
 
 /// Debounced saving: changes mark the settings dirty, and they are written [`SAVE_DELAY`] after
@@ -870,6 +901,9 @@ macro_rules! template {
 # Show the document again as soon as its file is saved: on or off (then it is reloaded when
 # the window gets focus, or with R).
 # live_reload = on
+
+# List the files you opened lately in the empty window: on or off. Off also forgets the list.
+# recent_files = on
 ",
             $primary,
             "

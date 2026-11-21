@@ -38,6 +38,7 @@ mod copybtn;
 mod find;
 #[cfg(feature = "clipboard")]
 mod gesture;
+mod recent;
 #[cfg(feature = "toc")]
 mod toc;
 #[cfg(feature = "images")]
@@ -144,6 +145,10 @@ pub enum Action {
     /// Minimize the window (`⌘M`: winit's menu has no Window menu to give it).
     #[cfg(target_os = "macos")]
     Minimize,
+    /// Open the file of this row of the empty window's recent list (a click on it).
+    OpenRecent(u8),
+    /// Empty the recent list ("Clear list").
+    ClearRecent,
     Quit,
 }
 
@@ -177,6 +182,12 @@ pub enum Outcome {
     /// Minimize the window.
     #[cfg(target_os = "macos")]
     Minimize,
+    /// Open the file of this row of the recent list ([`View::recent_path`]), recording it.
+    OpenRecent(u8),
+    /// Take the file of this row off the recent list, and give the view the list again.
+    ForgetRecent(u8),
+    /// Empty the recent list.
+    ClearRecent,
     Quit,
 }
 
@@ -623,6 +634,8 @@ pub struct View {
     /// The find bar: whether it is open, the query and the matches.
     #[cfg(feature = "find")]
     find: find::Bar,
+    /// The empty window's recent files.
+    recent: recent::Screen,
     /// The image viewer, while it is open.
     #[cfg(feature = "images")]
     viewer: Option<Box<crate::viewer::Viewer>>,
@@ -727,6 +740,7 @@ impl View {
             toc: toc::Panel::default(),
             #[cfg(feature = "find")]
             find: find::Bar::default(),
+            recent: recent::Screen::default(),
             #[cfg(feature = "images")]
             viewer: None,
         };
@@ -1232,6 +1246,8 @@ impl View {
             Action::Settings => return Outcome::Settings,
             #[cfg(target_os = "macos")]
             Action::Minimize => return Outcome::Minimize,
+            Action::OpenRecent(i) => return Outcome::OpenRecent(i),
+            Action::ClearRecent => return Outcome::ClearRecent,
             Action::ToggleWide => self.set_wide(!self.wide),
             #[cfg(feature = "toc")]
             Action::ToggleToc => self.set_toc(!self.toc.open),
@@ -1330,6 +1346,13 @@ impl View {
         // The find bar's: its buttons, its field, and the rest of it, which does nothing.
         #[cfg(feature = "find")]
         if self.press_find(x, y, now) {
+            self.pressed = None;
+            #[cfg(feature = "clipboard")]
+            self.cancel_select();
+            return true;
+        }
+        // The empty window's recent list: a row, or "Clear list".
+        if self.press_recent(x, y) {
             self.pressed = None;
             #[cfg(feature = "clipboard")]
             self.cancel_select();
@@ -1593,6 +1616,7 @@ impl View {
         let bar = bar | self.toc_pointer(Some((x, y)), free);
         #[cfg(feature = "toc")]
         let free = free && !self.toc_covers(x, y);
+        let bar = bar | self.recent_pointer(free.then_some((x, y)));
         let link = if free { self.link_at(x, y) } else { None };
         let moved = self.pointer.replace((x, y)).is_some_and(|p| p != (x, y));
         let bar = bar | self.set_over_bar(free && self.bar_column(x, y).is_some(), moved, now);
@@ -1637,6 +1661,7 @@ impl View {
         let bar = bar | self.find_pointer(None, Instant::now());
         #[cfg(feature = "toc")]
         let bar = bar | self.toc_pointer(None, false);
+        let bar = bar | self.recent_pointer(None);
         #[cfg(feature = "clipboard")]
         let note = note | self.copy_pointer(None);
         self.hover.take().is_some() | self.toolbar.leave() | note | bar
@@ -1673,6 +1698,10 @@ impl View {
         #[cfg(feature = "toc")]
         if let Some(row) = self.toc.pressed.take() {
             self.click_toc(row, x, y);
+            return None;
+        }
+        if let Some(hit) = self.recent.pressed.take() {
+            self.click_recent(hit, x, y);
             return None;
         }
         #[cfg(feature = "images")]
@@ -1808,7 +1837,11 @@ impl View {
         let w = self.width as usize;
         let theme = &self.palette();
         if let Some(text) = self.message.clone() {
-            self.paint_message(frame, &text, theme);
+            if self.recent_showing() {
+                self.paint_recent(frame, &text, theme);
+            } else {
+                self.paint_message(frame, &text, theme);
+            }
         } else {
             self.ensure();
             let vp = self.viewport();
@@ -2586,6 +2619,7 @@ impl View {
             self.clear_selection();
             self.forget_copy();
         }
+        self.forget_recent();
         self.kept = None;
         self.hover = None;
         self.hover_note = None;

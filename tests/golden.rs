@@ -292,6 +292,31 @@ const VIEWER_CASES: &[(&str, f32, bool, bool)] = &[
     ("viewer-zoom", 1.0, false, true),
 ];
 
+/// The empty window with a recent list ([`RECENT_FILES`]) under the toolbar: the eight rows (the
+/// second picked with the keys, the fourth's folder cut at its start), "Clear list"; and in a
+/// small window, what fits. Name, logical size, scale, dark. Unix only: the folders' separators
+/// and `~` are Windows' own there.
+#[cfg(unix)]
+const RECENT_CASES: &[(&str, (f32, f32), f32, bool)] = &[
+    ("recent-light", (760.0, 560.0), 1.0, false),
+    ("recent-dark", (760.0, 560.0), 1.0, true),
+    ("recent-small", (360.0, 300.0), 1.0, false),
+    ("recent-2x", (480.0, 420.0), 2.0, false),
+];
+
+#[cfg(unix)]
+const RECENT_FILES: [&str; 9] = [
+    "/home/reader/notes/todo.md",
+    "/home/reader/Projects/vomd/README.md",
+    "/home/reader/Projects/vomd/CHANGELOG.md",
+    "/home/reader/archive/2019/clients/northwind/proposals/drafts/final/reviewed/v3/summary.md",
+    "/srv/docs/handbook/onboarding.md",
+    "/home/reader/meeting-notes-2026-11-22.md",
+    "/home/reader/Projects/site/content/blog/why-markdown.md",
+    "/tmp/scratch.md",
+    "/home/reader/ninth-is-not-shown.md",
+];
+
 /// What the pointer is doing at a code block's copy button.
 #[cfg(feature = "clipboard")]
 #[derive(Clone, Copy)]
@@ -801,6 +826,36 @@ fn render_find(case: &FindCase) -> Rendered {
     (w as usize, h as usize, px)
 }
 
+/// A recent case painted (see [`RECENT_CASES`]).
+#[cfg(unix)]
+fn render_recent((w, h): (f32, f32), scale: f32, dark: bool) -> Rendered {
+    use winit::keyboard::{Key, ModifiersState, NamedKey};
+    let (w, h) = ((w * scale).round() as u32, (h * scale).round() as u32);
+    let mut view = vomd::view::View::new(
+        Fonts::new().unwrap(),
+        Doc::default(),
+        Some("Press Ctrl+O to open a Markdown file, or drop one here".into()),
+        (w, h),
+        f64::from(scale),
+    );
+    view.set_theme_mode(if dark {
+        vomd::view::ThemeMode::Dark
+    } else {
+        vomd::view::ThemeMode::Light
+    });
+    view.set_toolbar(true);
+    let files = RECENT_FILES.iter().map(PathBuf::from).collect();
+    view.set_recent(files, Some(Path::new("/home/reader")));
+    let mut px = vec![0; w as usize * h as usize];
+    let now = Instant::now();
+    view.paint(&mut px, w as usize, now);
+    for _ in 0..2 {
+        view.recent_key(&Key::Named(NamedKey::ArrowDown), ModifiersState::empty());
+    }
+    view.paint(&mut px, w as usize, now);
+    (w as usize, h as usize, px)
+}
+
 /// The caret before (`end` false) or after the first `needle` of the document's text.
 #[cfg(feature = "clipboard")]
 fn pos_of(doc: &Doc, needle: &str, end: bool) -> Pos {
@@ -923,6 +978,12 @@ fn goldens() {
         VIEWER_CASES
             .iter()
             .map(|&(name, scale, dark, zoom)| (name, render_viewer(scale, dark, zoom))),
+    );
+    #[cfg(unix)]
+    let cases = cases.chain(
+        RECENT_CASES
+            .iter()
+            .map(|&(name, size, scale, dark)| (name, render_recent(size, scale, dark))),
     );
     #[cfg(feature = "svg")]
     let cases = cases.chain(

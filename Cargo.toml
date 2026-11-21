@@ -45,7 +45,8 @@ wayland-protocols = { version = "0.32", optional = true, default-features = fals
 
 # macOS: the Objective-C runtime and AppKit bindings winit already builds, at its versions, for
 # the clipboard (NSPasteboard), Open's panel (NSOpenPanel), the files Finder hands over and the
-# kind of launch (NSNotification, NSAppleEventManager). Only features of the same crates are
+# kind of launch (NSNotification, NSAppleEventManager), the File menu and the Dock's recent items
+# (NSMenu, NSMenuItem, NSDocumentController). Only features of the same crates are
 # added (bindings: nothing is built that isn't called).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
@@ -55,8 +56,8 @@ objc2-foundation = { version = "0.2", features = [
     "NSNotification", "NSOperation", "NSString", "NSThread", "NSURL", "NSValue",
 ] }
 objc2-app-kit = { version = "0.2", features = [
-    "block2", "NSApplication", "NSOpenPanel", "NSPanel", "NSPasteboard", "NSResponder",
-    "NSSavePanel", "NSView", "NSWindow",
+    "block2", "NSApplication", "NSDocumentController", "NSMenu", "NSMenuItem", "NSOpenPanel",
+    "NSPanel", "NSPasteboard", "NSResponder", "NSSavePanel", "NSView", "NSWindow",
 ] }
 
 # A requestor and a clipboard manager for scripts/clipboard-check.sh.
