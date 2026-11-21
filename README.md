@@ -45,8 +45,8 @@
 
 - **GitHub-style Markdown:** CommonMark and GFM, with tables, task lists, footnotes, alerts
   (`> [!NOTE]`), autolinks and hidden YAML front matter.
-- **Light and dark themes** that follow your system, zoom from 50% to 300%, and sharp text on
-  HiDPI screens.
+- **Light and dark themes** that follow your system (on Omarchy, its current theme's colors),
+  zoom from 50% to 300%, and sharp text on HiDPI screens.
 - **Math:** LaTeX formulas, written as on GitHub: `$…$` and `` $`…`$ `` in the text, `$$…$$`
   and ```` ```math ```` blocks centred on a line of their own. VOMD lays them out itself, with a
   built-in math font.

@@ -638,7 +638,7 @@ impl View {
     /// button, the full resolution button for an image that has more pixels than the detail,
     /// the zoom label and the alt text while they show.
     pub(super) fn paint_viewer(&mut self, frame: &mut Frame, now: Instant, whole: bool) {
-        let theme = self.palette();
+        let theme = &self.palette();
         let (w, h) = (frame.width() as i32, frame.height() as i32);
         frame.fill_rect(0, 0, w, h, theme.bg);
         if whole {

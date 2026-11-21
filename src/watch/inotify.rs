@@ -152,6 +152,43 @@ impl State {
     }
 }
 
+/// See `watch::moved_in`. The thread blocks in `read`, and ends if the watch goes.
+pub(super) fn moved_in(
+    dir: &Path,
+    name: &'static str,
+    changed: impl Fn() + Send + 'static,
+) -> bool {
+    // SAFETY: plain integers in and out.
+    let fd = unsafe { inotify_init1(IN_CLOEXEC) };
+    let mut path = dir.as_os_str().as_bytes().to_vec();
+    path.push(0);
+    // SAFETY: a NUL-terminated path, read during the call.
+    if fd < 0
+        || unsafe { inotify_add_watch(fd, path.as_ptr().cast(), IN_MOVED_TO | IN_ONLYDIR) } < 0
+    {
+        return false;
+    }
+    std::thread::spawn(move || {
+        let mut buf = [0u64; 512];
+        loop {
+            // SAFETY: a buffer of the length given, which the call fills.
+            let n = unsafe { read(fd, buf.as_mut_ptr().cast(), size_of_val(&buf)) };
+            let Ok(n) = usize::try_from(n) else {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            };
+            // SAFETY: the `n` bytes the read filled.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+            if events(bytes).any(|(_, _, n)| n == name.as_bytes()) {
+                changed();
+            }
+        }
+    });
+    true
+}
+
 /// Where `path` is seen from: its directory and name, and the directory and name of the file it
 /// ends at, which for a symlink are others. (For a plain file they are the same directory, whose
 /// watch is the same descriptor: matching twice costs nothing.)
@@ -320,6 +357,30 @@ mod tests {
         // A link to a link: the file at the end.
         std::os::unix::fs::symlink(dir.join("doc.md"), dir.join("again.md")).unwrap();
         assert_eq!(places(&dir.join("again.md"))[1].1, "real.md");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_theme_moved_in_is_reported_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("vomd-moved-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("next-theme")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        assert!(moved_in(&dir, "theme", move || tx
+            .lock()
+            .unwrap()
+            .send(())
+            .unwrap()));
+        std::fs::write(dir.join("theme.generation"), "1").unwrap();
+        std::fs::rename(dir.join("next-theme"), dir.join("theme")).unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        rx.recv_timeout(wait).unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(!moved_in(&dir.join("missing"), "theme", || {}));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

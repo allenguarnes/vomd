@@ -546,6 +546,9 @@ pub struct View {
     wide: bool,
     theme: ThemeMode,
     system_dark: bool,
+    /// Omarchy's current theme (whether it is dark, and its palette): it stands in for
+    /// GitHub's palette of that mode.
+    omarchy: Option<(bool, Theme)>,
     fade: ScrollbarFade,
     drag: Option<Drag>,
     /// The pointer is over the scrollbar's column.
@@ -686,6 +689,7 @@ impl View {
             wide: false,
             theme: ThemeMode::System,
             system_dark: false,
+            omarchy: None,
             fade: ScrollbarFade::default(),
             drag: None,
             over_bar: false,
@@ -770,8 +774,20 @@ impl View {
         }
     }
 
-    fn palette(&self) -> &'static Theme {
-        if self.dark() { &DARK } else { &LIGHT }
+    fn palette(&self) -> Theme {
+        let dark = self.dark();
+        match self.omarchy {
+            Some((d, theme)) if d == dark => theme,
+            _ if dark => DARK,
+            _ => LIGHT,
+        }
+    }
+
+    /// Omarchy's theme was (re)read. Returns true if the colors on screen change.
+    pub fn set_omarchy(&mut self, omarchy: Option<(bool, Theme)>) -> bool {
+        let before = self.palette();
+        self.omarchy = omarchy;
+        self.palette() != before
     }
 
     /// The OS theme changed (or was first read). Returns true if the colors on screen change.
@@ -1790,7 +1806,7 @@ impl View {
             return self.paint_viewer(frame, now, whole);
         }
         let w = self.width as usize;
-        let theme = self.palette();
+        let theme = &self.palette();
         if let Some(text) = self.message.clone() {
             self.paint_message(frame, &text, theme);
         } else {

@@ -361,6 +361,13 @@ pub fn start(report: impl Report) -> Option<Watch> {
     }
 }
 
+/// Call `changed`, from a thread of its own, each time an entry named `name` is moved into
+/// `dir` (how Omarchy swaps its current theme in). False if `dir` can't be watched.
+#[cfg(target_os = "linux")]
+pub fn moved_in(dir: &Path, name: &'static str, changed: impl Fn() + Send + 'static) -> bool {
+    inotify::moved_in(dir, name, changed)
+}
+
 impl Watch {
     /// Watch `path` from now on (`None`: nothing), whose version shown is stamped `shown` (and
     /// `empty` or not), and return the generation its reports carry. The same path again keeps

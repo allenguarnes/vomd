@@ -15,6 +15,24 @@ pub fn fallback_dark() -> bool {
     }
 }
 
+/// Where Omarchy keeps its current theme (as `theme/`): `None` off Omarchy.
+#[cfg(target_os = "linux")]
+pub fn omarchy_dir() -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new(&std::env::var_os("HOME")?).join(".local/state/omarchy/current");
+    dir.is_dir().then_some(dir)
+}
+
+/// Omarchy's current theme as a palette, and whether it is dark (`None`: not Omarchy).
+pub fn omarchy_theme() -> Option<(bool, crate::theme::Theme)> {
+    #[cfg(target_os = "linux")]
+    {
+        let toml = std::fs::read_to_string(omarchy_dir()?.join("theme/colors.toml")).ok()?;
+        crate::theme::omarchy(&toml)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 /// `GTK_THEME` is `name[:variant]`; the variant decides.
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 fn gtk_theme_dark(value: Option<&str>) -> bool {

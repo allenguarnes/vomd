@@ -34,7 +34,7 @@ pub enum Role {
 /// `0x00RRGGBB`, the softbuffer pixel format.
 pub type Rgb = u32;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Theme {
     pub bg: Rgb,
     pub text: Rgb,
@@ -140,5 +140,130 @@ impl Theme {
             #[cfg(feature = "highlight")]
             Role::Syntax(t) => self.syntax[t as usize - 1],
         }
+    }
+}
+
+/// An Omarchy theme's `colors.toml` (`key = "#rrggbb"` lines) as a palette, and whether it is
+/// dark. Colours it doesn't name, and accents that wouldn't read on its background, keep
+/// GitHub's for that mode. `None` without a background and a foreground.
+pub fn omarchy(toml: &str) -> Option<(bool, Theme)> {
+    let value = |key: &str| {
+        toml.lines().find_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            (k.trim() == key).then(|| v.trim().trim_matches('"'))
+        })
+    };
+    let color = |key: &str| {
+        let hex = value(key)?.strip_prefix('#').filter(|h| h.len() == 6)?;
+        Rgb::from_str_radix(hex, 16).ok()
+    };
+    let (bg, text) = (color("background")?, color("foreground")?);
+    let dark = value("mode").map_or(luminance(bg) < 0.18, |m| m != "light");
+    let base = if dark { DARK } else { LIGHT };
+    let ink = |key: &str| color(key).filter(|&c| contrast(c, bg) >= 3.0);
+    let or = |key: &str, fallback: Rgb| ink(key).unwrap_or(fallback);
+    let muted = mix(text, bg, 0.4);
+    let code_bg = color("dark_background").unwrap_or(base.code_bg);
+    let border = color("muted").unwrap_or(base.border);
+    #[cfg(feature = "highlight")]
+    let s = base.syntax;
+    Some((
+        dark,
+        Theme {
+            bg,
+            text,
+            muted,
+            link: or("accent", base.link),
+            code_bg,
+            border,
+            border_muted: border,
+            quote_bar: border,
+            table_stripe: code_bg,
+            alerts: [
+                or("blue", base.alerts[0]),
+                or("green", base.alerts[1]),
+                or("magenta", base.alerts[2]),
+                or("yellow", base.alerts[3]),
+                or("red", base.alerts[4]),
+            ],
+            #[cfg(any(feature = "clipboard", feature = "find"))]
+            selection: color("selection").unwrap_or(base.selection),
+            // By `Tok`, Comment to Meta, as GitHub's roles: orange is in only some themes.
+            #[cfg(feature = "highlight")]
+            syntax: [
+                muted,
+                or("red", s[1]),
+                or("cyan", s[2]),
+                or("blue", s[3]),
+                or("magenta", s[4]),
+                or("green", s[5]),
+                ink("orange").or_else(|| ink("yellow")).unwrap_or(s[6]),
+                or("green", s[7]),
+                or("red", s[8]),
+                or("magenta", s[9]),
+            ],
+            // GitHub's washes: they are made to keep any text on its page readable.
+            #[cfg(feature = "find")]
+            find_match: base.find_match,
+            #[cfg(feature = "find")]
+            find_current: base.find_current,
+        },
+    ))
+}
+
+/// `a` moved toward `b` by `t` (0..=1), per channel.
+fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    [16, 8, 0].iter().fold(0, |out, &s| {
+        let (x, y) = (((a >> s) & 0xff) as f32, ((b >> s) & 0xff) as f32);
+        out | ((x + (y - x) * t).round() as Rgb) << s
+    })
+}
+
+/// WCAG relative luminance.
+fn luminance(c: Rgb) -> f32 {
+    let ch = |s: u32| {
+        let v = ((c >> s) & 0xff) as f32 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
+}
+
+/// WCAG contrast ratio, 1 to 21.
+fn contrast(a: Rgb, b: Rgb) -> f32 {
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omarchy_colors_become_the_palette_of_their_mode() {
+        let toml = "mode = \"light\"\naccent = \"#1e66f5\"\nbackground = \"#eff1f5\"\n\
+                    foreground = \"#4c4f69\"\nyellow = \"#df8e1d\"\nred = \"#d20f39\"\nbogus\n";
+        let (dark, t) = omarchy(toml).unwrap();
+        assert!(!dark);
+        assert_eq!((t.bg, t.text, t.link), (0xeff1f5, 0x4c4f69, 0x1e66f5));
+        assert_eq!(t.alerts[4], 0xd20f39);
+        // Yellow on near-white doesn't read: GitHub's stays.
+        assert_eq!(t.alerts[3], LIGHT.alerts[3]);
+        // Not named: GitHub's light ones.
+        assert_eq!(t.code_bg, LIGHT.code_bg);
+        assert_eq!(t.alerts[1], LIGHT.alerts[1]);
+    }
+
+    #[test]
+    fn omarchy_mode_defaults_to_the_backgrounds_and_needs_both_ends() {
+        let dark = "background = \"#101315\"\nforeground = \"#cacccc\"";
+        assert!(omarchy(dark).unwrap().0);
+        assert!(omarchy("background = \"#101315\"").is_none());
+        assert!(omarchy("background = \"#1013\"\nforeground = \"#cacccc\"").is_none());
+        assert_eq!(mix(0x000000, 0xffffff, 0.5), 0x808080);
+        assert!((contrast(0x000000, 0xffffff) - 21.0).abs() < 0.01);
     }
 }

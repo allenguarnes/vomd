@@ -132,6 +132,9 @@ enum UserEvent {
         allow(dead_code)
     )]
     SystemDark(Option<bool>),
+    /// Omarchy switched themes.
+    #[cfg(target_os = "linux")]
+    OmarchyTheme,
     /// The settings file couldn't be opened in an editor: why, for a toast.
     OpenFailed(String),
     /// Open's dialog closed: the file picked (`None`: nothing), or why there was no dialog.
@@ -189,6 +192,19 @@ fn watch_dark(proxy: EventLoopProxy<UserEvent>) -> Option<FirstDark> {
     {
         drop(proxy);
         None
+    }
+}
+
+/// Follow Omarchy's theme switches (it moves the new theme in as `theme`).
+#[cfg(target_os = "linux")]
+fn watch_omarchy(proxy: EventLoopProxy<UserEvent>) {
+    let proxy = Mutex::new(proxy);
+    if let Some(dir) = platform::omarchy_dir() {
+        watch::moved_in(&dir, "theme", move || {
+            if let Ok(p) = proxy.lock() {
+                let _ = p.send_event(UserEvent::OmarchyTheme);
+            }
+        });
     }
 }
 
@@ -1350,6 +1366,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         });
         self.portal = portal;
+        view.set_omarchy(platform::omarchy_theme());
         view.set_system_dark(system_dark(portal, window.theme(), platform::fallback_dark));
         self.view = Some(view);
         self.gfx = Some(Gfx { window, surface });
@@ -1463,6 +1480,14 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw();
                 }
                 self.sync_ime();
+            }
+            #[cfg(target_os = "linux")]
+            UserEvent::OmarchyTheme => {
+                if let Some(view) = self.view.as_mut()
+                    && view.set_omarchy(platform::omarchy_theme())
+                {
+                    self.redraw();
+                }
             }
             UserEvent::SystemDark(dark) => {
                 self.portal = dark;
@@ -1886,6 +1911,8 @@ fn main() {
         }
     };
     event_loop.set_control_flow(ControlFlow::Wait);
+    #[cfg(target_os = "linux")]
+    watch_omarchy(event_loop.create_proxy());
     let mut app = App {
         start,
         bench,

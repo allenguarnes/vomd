@@ -3,6 +3,14 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- On Omarchy, the page takes the current Omarchy theme's colors, light or dark: its background,
+  text, links, borders, selection, code highlighting and alert colors. A color that wouldn't read
+  on the theme's background keeps GitHub's. Open windows follow a theme switch at once; the
+  other mode (`T`) keeps GitHub's colors. Elsewhere nothing changes.
+
 ## [1.10.0] - 2026-11-14
 
 ### Added
@@ -389,7 +397,7 @@ The first release, for Linux (x86-64; Windows and macOS compile but are unsuppor
   idle CPU, 4K scroll frame time. CI gates size, memory and idle CPU and reports the times
   (`--timings-advisory`). Fuzz targets for the parser, layout and settings.
 
-[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/allenguarnes/vomd/compare/v1.10.0...HEAD
 [1.10.0]: https://github.com/allenguarnes/vomd/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/allenguarnes/vomd/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/allenguarnes/vomd/compare/v1.7.0...v1.8.0
