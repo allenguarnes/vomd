@@ -22,9 +22,9 @@ mod pkg;
 const SIZE_BUDGET: [u64; 2] = [5_400_000, 2_650_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
-// The default budget with highlighting: 4,698,112 B measured on Windows, plus 20 KB, rounded up
-// to 10 KB.
-const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_720_000, 2_000_000];
+// The default budget: 4,768,256 B measured on Windows with front matter, recent files, sections
+// and HTML tables (1.11.0), plus about 30 KB, rounded to 0.1 MB.
+const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_800_000, 2_000_000];
 /// The size budgets of the macOS (Apple Silicon) builds: Mach-O, signed ad hoc by the linker.
 // With the macOS code (clipboard, Open panel, files from Finder, SVG processes, live reload):
 // 3,752,432 B and 1,642,704 B measured. The default budget keeps about 150 KB of room for the
