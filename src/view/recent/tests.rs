@@ -380,8 +380,12 @@ fn edge(v: &View, buf: &[u32], hit: Hit) -> u32 {
 #[test]
 fn invisible_characters_are_shown() {
     let mut v = empty(900, 1000, 0);
-    v.set_recent(vec![PathBuf::from("/d/a\u{202E}b/x.md")], None);
-    assert_eq!(v.recent.entries[0].folder, "/d/a\\u{202E}b/");
+    #[cfg(not(windows))]
+    let (path, folder) = ("/d/a\u{202E}b/x.md", "/d/a\\u{202E}b/");
+    #[cfg(windows)]
+    let (path, folder) = ("C:\\d\\a\u{202E}b\\x.md", "C:\\d\\a\\u{202E}b\\");
+    v.set_recent(vec![PathBuf::from(path)], None);
+    assert_eq!(v.recent.entries[0].folder, folder);
 }
 
 /// A folder too long for the row keeps its end: the most specific part.

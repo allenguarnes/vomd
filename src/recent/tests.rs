@@ -18,6 +18,12 @@ fn files(dir: &Path, n: usize) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `paths` as the list keeps them ([`storable`]): in their canonical folder, which on Windows is
+/// a verbatim path (`\\?\C:\…`) and on macOS may be another (`/var` is `/private/var`).
+fn kept(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths.iter().map(|p| storable(p).unwrap()).collect()
+}
+
 #[test]
 fn the_file_is_kept_in_the_state_folder() {
     let env = |vars: &'static [(&'static str, &'static str)]| {
@@ -106,7 +112,18 @@ fn only_paths_that_read_back_are_stored() {
     assert!(p.ends_with("x.md"));
     assert_eq!(storable(Path::new("bad\nname.md")), None);
     assert_eq!(storable(Path::new("bad\rname.md")), None);
+    // A trailing space isn't kept. Windows drops it when making the path absolute (as it does
+    // when opening it: the file opened is the one without), so that one is kept there; spelled
+    // verbatim, it is another file, and isn't.
+    #[cfg(not(windows))]
     assert_eq!(storable(&abs("trailing.md ")), None);
+    #[cfg(windows)]
+    {
+        let without = storable(&abs("trailing.md"));
+        assert!(without.is_some());
+        assert_eq!(storable(&abs("trailing.md ")), without);
+        assert_eq!(storable(Path::new(r"\\?\C:\d\trailing.md ")), None);
+    }
     // Not UTF-8: can't be a line of the file.
     #[cfg(unix)]
     {
@@ -123,20 +140,21 @@ fn recording_puts_the_file_first_once_and_keeps_twenty() {
     let mut r = Recent::new(Some(file.clone()));
     assert!(r.list().is_empty(), "no file yet");
     let fs = files(&dir, 25);
+    let ks = kept(&fs);
     for f in &fs[..3] {
         assert!(r.record(f).unwrap());
     }
-    assert_eq!(r.list(), [fs[2].clone(), fs[1].clone(), fs[0].clone()]);
+    assert_eq!(r.list(), [ks[2].clone(), ks[1].clone(), ks[0].clone()]);
     // Again: moves to the top, not twice.
     r.record(&fs[0]).unwrap();
-    assert_eq!(r.list(), [fs[0].clone(), fs[2].clone(), fs[1].clone()]);
+    assert_eq!(r.list(), [ks[0].clone(), ks[2].clone(), ks[1].clone()]);
     for f in &fs {
         r.record(f).unwrap();
     }
     let list = r.list();
     assert_eq!(list.len(), KEPT);
-    assert_eq!(list[0], fs[24]);
-    assert_eq!(list[KEPT - 1], fs[5]);
+    assert_eq!(list[0], ks[24]);
+    assert_eq!(list[KEPT - 1], ks[5]);
     // The file is what it says it is.
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(text.starts_with(HEADER));
@@ -149,6 +167,7 @@ fn missing_files_are_hidden_but_kept() {
     let dir = temp_dir("missing");
     let mut r = Recent::new(Some(dir.join("recent")));
     let fs = files(&dir, 12);
+    let ks = kept(&fs);
     for f in &fs {
         r.record(f).unwrap();
     }
@@ -156,14 +175,14 @@ fn missing_files_are_hidden_but_kept() {
     std::fs::remove_file(&fs[9]).unwrap();
     let on = shown(r.list());
     assert_eq!(on.len(), SHOWN);
-    assert_eq!(on[0], fs[10]);
-    assert_eq!(on[1], fs[8]);
-    assert!(!on.contains(&fs[9]));
+    assert_eq!(on[0], ks[10]);
+    assert_eq!(on[1], ks[8]);
+    assert!(!on.contains(&ks[9]));
     // Still in the file: the drive may come back.
     assert_eq!(r.list().len(), 12);
     // A folder isn't a file to show either.
     r.record(&dir).unwrap();
-    assert_eq!(shown(r.list())[0], fs[10]);
+    assert_eq!(shown(r.list())[0], ks[10]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -175,15 +194,17 @@ fn two_windows_share_the_file() {
     let file = dir.join("recent");
     let (mut one, mut two) = (Recent::new(Some(file.clone())), Recent::new(Some(file)));
     let fs = files(&dir, 4);
+    let ks = kept(&fs);
     one.record(&fs[0]).unwrap();
     two.record(&fs[1]).unwrap();
     one.record(&fs[2]).unwrap();
     two.record(&fs[3]).unwrap();
-    let want = [fs[3].clone(), fs[2].clone(), fs[1].clone(), fs[0].clone()];
+    let want = [ks[3].clone(), ks[2].clone(), ks[1].clone(), ks[0].clone()];
     assert_eq!(one.list(), want);
     assert_eq!(two.list(), want);
-    one.remove(&fs[2]).unwrap();
-    assert_eq!(two.list(), [fs[3].clone(), fs[1].clone(), fs[0].clone()]);
+    // (A row is taken off by the path the list has, as the window does.)
+    one.remove(&ks[2]).unwrap();
+    assert_eq!(two.list(), [ks[3].clone(), ks[1].clone(), ks[0].clone()]);
     two.clear().unwrap();
     assert!(one.list().is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
@@ -247,7 +268,7 @@ fn a_corrupt_or_huge_file_reads_as_what_parses() {
     let fs = files(&dir, 1);
     let mut r = Recent::new(Some(file.clone()));
     r.record(&fs[0]).unwrap();
-    assert_eq!(r.list(), [fs[0].clone(), good]);
+    assert_eq!(r.list(), [kept(&fs).remove(0), good]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -317,8 +338,28 @@ fn removing_the_last_row_deletes_the_file() {
     r.record(&fs[0]).unwrap();
     r.remove(&dir.join("not-there.md")).unwrap();
     assert!(file.exists(), "nothing removed: left as it is");
-    r.remove(&fs[0]).unwrap();
+    r.remove(&kept(&fs)[0]).unwrap();
     assert!(!file.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Windows: a file given plainly (`C:\…`, as on a command line) is recorded as the verbatim
+/// path the list keeps (`\\?\C:\…`), so the two spellings are one entry.
+#[cfg(windows)]
+#[test]
+fn plain_and_verbatim_spellings_are_one_entry() {
+    let dir = temp_dir("spellings");
+    let file = dir.join("recent");
+    let fs = files(&dir, 1);
+    let verbatim = kept(&fs).remove(0);
+    let plain = PathBuf::from(unverbatim(verbatim.to_str().unwrap()).unwrap());
+    let mut r = Recent::new(Some(file.clone()));
+    r.record(&plain).unwrap();
+    assert_eq!(r.list(), std::slice::from_ref(&verbatim));
+    r.record(&verbatim).unwrap();
+    assert_eq!(r.list(), std::slice::from_ref(&verbatim));
+    r.remove(&verbatim).unwrap();
+    assert!(!file.exists(), "the last row taken off");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
