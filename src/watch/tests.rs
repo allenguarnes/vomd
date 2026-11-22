@@ -374,7 +374,13 @@ fn the_polling_watcher_reports_saves_and_a_file_gone() {
     // just before the write.)
     std::thread::sleep(poll::TICK * 9 / 10);
     std::fs::write(&doc, "# Three, made again").unwrap();
-    let stamp = text("# Three, made again");
+    // (On a slow machine the look in that gap can also come late enough to report it gone
+    // first, as the window then shows: the next report is the new text all the same.)
+    let stamp = match rx.recv_timeout(wait).expect("# Three, made again") {
+        (got, Reread::Gone) if got == g => text("# Three, made again"),
+        (got, Reread::Text(t, stamp)) if got == g && t == "# Three, made again" => stamp,
+        other => panic!("# Three, made again: {other:?}"),
+    };
     w.target(Some(&doc), stamp, false);
     std::fs::remove_file(&doc).unwrap();
     let gone = rx.recv_timeout(wait).expect("gone");
