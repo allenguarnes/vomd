@@ -283,12 +283,20 @@ pub fn refused(src: &str, why: &str) -> bool {
 // ---- Text widths ---------------------------------------------------------------------------
 
 /// The advances of the face diagram text is drawn in (body text's bold face: no label is
-/// wider in it than measured), in em: Latin and its punctuation; others are estimated.
+/// wider in it than measured), in em: Latin and its punctuation; and for one diagram, those of
+/// the other characters and sequences its source has (an emoji with its modifiers and joiners
+/// is one advance) in the face that draws them ([`scan`]). Others are estimated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Metrics {
     pub adv: Vec<f32>,
     pub fallback: f32,
+    /// A diagram's sequences and their advances, sorted, at most [`MAX_SEQ`].
+    pub seq: Vec<(String, f32)>,
 }
+
+/// A diagram's measured sequences, at most; and the bytes of one, at most.
+const MAX_SEQ: usize = 4096;
+const MAX_SEQ_BYTES: usize = 64;
 
 /// The characters [`Metrics::adv`] has: U+0000 to U+024F, then U+2000 to U+206F.
 const LATIN: u32 = 0x250;
@@ -300,6 +308,7 @@ impl Default for Metrics {
         Metrics {
             adv: Vec::new(),
             fallback: 7.5 / 14.0,
+            seq: Vec::new(),
         }
     }
 }
@@ -320,7 +329,16 @@ impl Metrics {
             .chain(PUNCT)
             .map(|c| adv_of(c).unwrap_or(fallback))
             .collect();
-        Metrics { adv, fallback }
+        Metrics {
+            adv,
+            fallback,
+            seq: Vec::new(),
+        }
+    }
+
+    /// Whether [`Metrics::adv`] has `c`'s advance.
+    fn in_table(c: char) -> bool {
+        (c as u32) < LATIN || PUNCT.contains(&(c as u32))
     }
 
     fn advance(&self, c: char) -> f32 {
@@ -345,16 +363,50 @@ impl Metrics {
 
     /// What tells these metrics from others (a diagram made with other metrics is made again).
     pub fn key(&self) -> u64 {
+        let seq = self.seq.iter().flat_map(|(s, a)| {
+            (s.len() as u32)
+                .to_le_bytes()
+                .into_iter()
+                .chain(s.bytes())
+                .chain(a.to_bits().to_le_bytes())
+        });
         fnv(self
             .adv
             .iter()
             .chain([&self.fallback])
-            .flat_map(|a| a.to_bits().to_le_bytes()))
+            .flat_map(|a| a.to_bits().to_le_bytes())
+            .chain(seq))
     }
 
-    /// The width of `s` in em.
+    /// The width of `s` in em: at each place the longest sequence measured that starts there,
+    /// or the character's advance.
     pub fn measure(&self, s: &str) -> f64 {
-        s.chars().map(|c| f64::from(self.advance(c))).sum()
+        if self.seq.is_empty() {
+            return s.chars().map(|c| f64::from(self.advance(c))).sum();
+        }
+        let mut width = 0.0;
+        let mut rest = s;
+        while let Some(c) = rest.chars().next() {
+            let (len, advance) = self
+                .longest(rest, c)
+                .unwrap_or((c.len_utf8(), self.advance(c)));
+            width += f64::from(advance);
+            rest = &rest[len..];
+        }
+        width
+    }
+
+    /// The longest sequence measured that `rest` (its first character `c`) starts with: its
+    /// length and advance.
+    fn longest(&self, rest: &str, c: char) -> Option<(usize, f32)> {
+        let first = &rest[..c.len_utf8()];
+        let from = self.seq.partition_point(|(k, _)| k.as_str() < first);
+        self.seq[from..]
+            .iter()
+            .take_while(|(k, _)| k.starts_with(first))
+            .filter(|(k, _)| rest.starts_with(k.as_str()))
+            .max_by_key(|(k, _)| k.len())
+            .map(|(k, a)| (k.len(), *a))
     }
 
     fn put(&self, out: &mut Vec<u8>) {
@@ -363,6 +415,13 @@ impl Metrics {
             out.extend_from_slice(&a.to_le_bytes());
         }
         out.extend_from_slice(&self.fallback.to_le_bytes());
+        let seq = &self.seq[..self.seq.len().min(MAX_SEQ)];
+        out.extend_from_slice(&(seq.len() as u32).to_le_bytes());
+        for (s, a) in seq {
+            out.push(s.len().min(MAX_SEQ_BYTES) as u8);
+            out.extend_from_slice(&s.as_bytes()[..s.len().min(MAX_SEQ_BYTES)]);
+            out.extend_from_slice(&a.to_le_bytes());
+        }
     }
 
     fn get(r: &mut &[u8]) -> Option<Metrics> {
@@ -375,8 +434,92 @@ impl Metrics {
             adv.push(sane(f32::from_le_bytes(take(r)?)));
         }
         let fallback = sane(f32::from_le_bytes(take(r)?));
-        Some(Metrics { adv, fallback })
+        let n = u32::from_le_bytes(take(r)?) as usize;
+        if n > MAX_SEQ {
+            return None;
+        }
+        let mut seq: Vec<(String, f32)> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = usize::from(take::<1>(r)?[0]);
+            if len == 0 || len > MAX_SEQ_BYTES || r.len() < len {
+                return None;
+            }
+            let (s, rest) = r.split_at(len);
+            *r = rest;
+            let s = std::str::from_utf8(s).ok()?.to_owned();
+            seq.push((s, sane(f32::from_le_bytes(take(r)?))));
+        }
+        // (Sorted, for the search: a job that isn't is refused.)
+        if !seq.is_sorted_by(|a, b| a.0 < b.0) {
+            return None;
+        }
+        Some(Metrics { adv, fallback, seq })
     }
+}
+
+/// What the text of a diagram's `source` has outside the table of [`Metrics::adv`], measured in
+/// `fonts`: each sequence (a character with what attaches to it: marks, variation selectors,
+/// skin tones, joiners and the emoji after them, a flag's second letter) and its advance in em,
+/// shaped as body text's bold is, in the faces it would be drawn in (sorted, at most
+/// [`MAX_SEQ`]); and the characters that no face has, for a fallback scan (their sequences are
+/// estimated).
+pub fn scan(source: &str, fonts: &crate::fonts::Fonts) -> (Vec<(String, f32)>, Vec<char>) {
+    use crate::text::{Para, TextCtx, TextStyle, attaches_to_previous};
+    /// The size sequences are shaped at, in pixels.
+    const SIZE: f32 = 64.0;
+    if source.is_ascii() {
+        return (Vec::new(), Vec::new());
+    }
+    let ri = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+    let style = TextStyle {
+        bold: true,
+        italic: false,
+        mono: false,
+        size: SIZE,
+        role: crate::theme::Role::Text,
+        deco: 0,
+        shift: 0.0,
+        link: 0,
+    };
+    // (Kept sorted as it is made: a sequence is measured once, and found by a binary search.)
+    let mut seq: Vec<(String, f32)> = Vec::new();
+    let mut missing: Vec<char> = Vec::new();
+    let mut ctx = TextCtx::default();
+    let mut para = Para::default();
+    let mut chars = source.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let mut end = at + c.len_utf8();
+        let mut last = c;
+        while let Some(&(i, n)) = chars.peek() {
+            let joined = last == '\u{200D}' && !n.is_whitespace() && !n.is_control();
+            let flag = ri(c) && ri(n) && i == at + c.len_utf8();
+            if !(attaches_to_previous(n) || joined || flag) {
+                break;
+            }
+            end = i + n.len_utf8();
+            last = n;
+            chars.next();
+        }
+        let s = &source[at..end];
+        if s.chars().all(Metrics::in_table) || s.len() > MAX_SEQ_BYTES || seq.len() >= MAX_SEQ {
+            continue;
+        }
+        let Err(place) = seq.binary_search_by(|(k, _)| k.as_str().cmp(s)) else {
+            continue;
+        };
+        para.clear();
+        para.push_text(s, 0, style);
+        let shaped = ctx.shape(fonts, &para);
+        if shaped.missing.is_empty() {
+            let advance: f32 = shaped.clusters.iter().map(|c| c.advance).sum();
+            seq.insert(place, (s.to_owned(), sane(advance / SIZE)));
+        } else {
+            missing.extend(shaped.missing);
+        }
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    (seq, missing)
 }
 
 fn sane(a: f32) -> f32 {
@@ -441,10 +584,11 @@ const TEST_EAT: u8 = 2;
 #[doc(hidden)]
 pub const TEST_PANIC: u8 = 3;
 
-/// The job a making process reads: `VMM1`, a test mode, the theme, the metrics, the source.
+/// The job a making process reads: `VMM2`, a test mode, the theme, the metrics (with the
+/// diagram's sequences), the source.
 fn put_job(source: &str, dark: bool, metrics: &Metrics, test: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(source.len() + 4096);
-    out.extend_from_slice(b"VMM1");
+    out.extend_from_slice(b"VMM2");
     out.push(test);
     out.push(u8::from(dark));
     metrics.put(&mut out);
@@ -454,7 +598,7 @@ fn put_job(source: &str, dark: bool, metrics: &Metrics, test: u8) -> Vec<u8> {
 }
 
 fn get_job(mut r: &[u8]) -> Option<(String, bool, Metrics, u8)> {
-    if take::<4>(&mut r)? != *b"VMM1" {
+    if take::<4>(&mut r)? != *b"VMM2" {
         return None;
     }
     let test = take::<1>(&mut r)?[0];
@@ -466,6 +610,9 @@ fn get_job(mut r: &[u8]) -> Option<(String, bool, Metrics, u8)> {
     }
     Some((String::from_utf8(r.to_vec()).ok()?, dark, metrics, test))
 }
+
+/// A job's bytes besides its source, at most: the table, and the sequences.
+const MAX_JOB_EXTRA: usize = (64 << 10) + MAX_SEQ * (MAX_SEQ_BYTES + 5);
 
 /// The result a making process writes: 0 and the SVG, or 1 and why not.
 fn put_result(r: &Result<String, String>) -> Vec<u8> {
@@ -506,7 +653,7 @@ pub fn child_job(bad: i32) -> i32 {
     let mut input = Vec::new();
     if std::io::stdin()
         .lock()
-        .take((MAX_SOURCE + (64 << 10)) as u64)
+        .take((MAX_SOURCE + MAX_JOB_EXTRA) as u64)
         .read_to_end(&mut input)
         .is_err()
     {
@@ -622,7 +769,10 @@ struct Job {
     key: u64,
     source: Arc<str>,
     dark: bool,
+    /// The diagram's metrics: the base's and its own sequences.
     metrics: Arc<Metrics>,
+    /// The metrics of the faces it was asked for with ([`Shared::metrics`]).
+    base: Arc<Metrics>,
 }
 
 /// What a maker shares with its thread.
@@ -652,6 +802,9 @@ pub struct Maker {
     id: usize,
     tx: Option<Sender<Job>>,
     shared: Arc<Shared>,
+    /// The metrics of each diagram the document shows ([`scan`]), and the faces' generation
+    /// they were worked out at ([`crate::fonts::Fonts::generation`]).
+    scans: HashMap<u64, (u64, Arc<Metrics>)>,
 }
 
 /// Jobs whose source has one of these are held back (tests: each holds its own).
@@ -673,6 +826,7 @@ impl Default for Maker {
             id,
             tx: None,
             shared,
+            scans: HashMap::new(),
         }
     }
 }
@@ -712,13 +866,35 @@ impl Maker {
             return false;
         }
         *m = Arc::new(metrics);
+        self.scans.clear();
         true
     }
 
     /// Make the diagrams of `doc` that it shows now (each image's current `src`) and that
     /// aren't made or being made, in the document's order. These are kept while the document
     /// shows them; jobs still waiting for diagrams it doesn't show any more are dropped.
+    /// Their text is measured with the metrics alone (see [`Maker::request_with`]).
     pub fn request(&mut self, doc: &crate::doc::Doc) {
+        self.request_in(doc, None);
+    }
+
+    /// [`Maker::request`], each diagram's text outside the metrics' table measured in `fonts`
+    /// ([`scan`]): a diagram made with other widths (a fallback added since has some of its
+    /// characters) is made again. The characters of the diagrams' text that no face has (for
+    /// a fallback scan), and whether a diagram made is made again.
+    pub fn request_with(
+        &mut self,
+        doc: &crate::doc::Doc,
+        fonts: &crate::fonts::Fonts,
+    ) -> (Vec<char>, bool) {
+        self.request_in(doc, Some(fonts))
+    }
+
+    fn request_in(
+        &mut self,
+        doc: &crate::doc::Doc,
+        fonts: Option<&crate::fonts::Fonts>,
+    ) -> (Vec<char>, bool) {
         let mut wanted: Vec<(u64, &Arc<str>, bool)> = Vec::new();
         let shown: HashSet<u64> = doc
             .images
@@ -733,19 +909,47 @@ impl Maker {
                 Some(key)
             })
             .collect();
-        let metrics = lock(&self.shared.metrics).clone();
-        let metrics_key = metrics.key();
+        let base = lock(&self.shared.metrics).clone();
+        let mut missing: Vec<char> = Vec::new();
+        let mut remade = false;
+        // Each diagram's metrics: worked out once for the faces there are.
+        self.scans.retain(|k, _| shown.contains(k));
+        let mut metrics_of = |key: u64, source: &str| -> Arc<Metrics> {
+            let Some(fonts) = fonts else {
+                return base.clone();
+            };
+            let generation = fonts.generation();
+            if let Some((g, m)) = self.scans.get(&key)
+                && *g == generation
+            {
+                return m.clone();
+            }
+            let (seq, uncovered) = scan(source, fonts);
+            missing.extend(uncovered);
+            let m = if seq.is_empty() {
+                base.clone()
+            } else {
+                Arc::new(Metrics {
+                    seq,
+                    ..(*base).clone()
+                })
+            };
+            self.scans.insert(key, (generation, m.clone()));
+            m
+        };
         let mut jobs = Vec::new();
         {
             let mut s = store();
             s.shown.insert(self.id, shown);
             for (key, source, dark) in wanted {
-                // Made with other faces (before a font change, for another document): made
-                // again.
+                let metrics = metrics_of(key, source);
+                // Made with other faces (before a font change, for another document, before a
+                // fallback that has some of its characters): made again.
                 if let Some((State::Done(_, made_with), _)) = s.map.get(&key)
-                    && *made_with != metrics_key
+                    && *made_with != metrics.key()
                 {
                     s.remove(key);
+                    remade = true;
                 }
                 if s.map.contains_key(&key) {
                     continue;
@@ -755,7 +959,8 @@ impl Maker {
                     key,
                     source: source.clone(),
                     dark,
-                    metrics: metrics.clone(),
+                    metrics,
+                    base: base.clone(),
                 });
             }
         }
@@ -770,6 +975,9 @@ impl Maker {
                 self.tx = Some(tx);
             }
         }
+        missing.sort_unstable();
+        missing.dedup();
+        (missing, remade)
     }
 
     /// Forget the diagrams `doc` shows, made or being made, so the next [`Maker::request`]
@@ -853,7 +1061,7 @@ fn spawn(id: usize, shared: Arc<Shared>) -> Sender<Job> {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 let result = make_apart(&job.source, job.dark, &job.metrics, &never);
-                let current = Arc::ptr_eq(&job.metrics, &lock(&shared.metrics));
+                let current = Arc::ptr_eq(&job.base, &lock(&shared.metrics));
                 finish(
                     &mut store(),
                     id,

@@ -936,7 +936,13 @@ impl View {
     pub fn set_family(&mut self, mono: bool, faces: Option<&[Option<(PathBuf, u32)>; 4]>) -> bool {
         let ok = self.fonts.set_family(mono, faces);
         #[cfg(feature = "svg")]
-        self.images.set_svg_fonts(self.fonts.svg_sources());
+        {
+            self.images.set_svg_fonts(self.fonts.svg_sources());
+            // (The viewer's SVG: decoded again in the new family.)
+            if self.images.take_redecode() {
+                self.viewer_redecode(Instant::now());
+            }
+        }
         #[cfg(feature = "mermaid")]
         self.remake_diagrams();
         #[cfg(feature = "toc")]
@@ -2413,6 +2419,8 @@ impl View {
     pub fn take_missing(&mut self) -> Vec<char> {
         let mut missing = self.layout.take_missing();
         missing.extend(std::mem::take(&mut self.msg_missing));
+        // Pictures' text: SVGs' (what their drawing found) and diagrams' (their sources).
+        missing.extend(self.images.take_missing());
         missing.retain(|&c| self.tried.insert(c));
         missing
     }
@@ -2420,6 +2428,11 @@ impl View {
     /// Faces already loaded from disk, for a fallback scan to skip.
     pub fn font_sources(&self) -> Vec<(PathBuf, u32)> {
         self.fonts.sources()
+    }
+
+    /// The embedded families a fallback scan looks for first ([`Fonts::own_families`]).
+    pub fn own_families(&self) -> Vec<String> {
+        self.fonts.own_families()
     }
 
     /// Add the faces a fallback scan found and relayout what they cover. Returns true if any
@@ -2431,7 +2444,20 @@ impl View {
         }
         if added {
             #[cfg(feature = "svg")]
-            self.images.set_svg_fonts(self.fonts.svg_sources());
+            {
+                self.images.set_svg_fonts(self.fonts.svg_sources());
+                // (The viewer's SVG had characters no face had: drawn again with the new faces.)
+                if self.images.take_redecode() {
+                    self.viewer_redecode(Instant::now());
+                }
+            }
+            // Diagrams with text the new faces have are measured and made again.
+            // (Asked for again by the attach, which finds them being made.)
+            #[cfg(feature = "mermaid")]
+            if self.request_diagrams() {
+                self.attach_images();
+                self.images_dirty = true;
+            }
             #[cfg(feature = "toc")]
             self.toc.forget_rows();
             self.layout.invalidate_missing(&self.doc);
@@ -2490,14 +2516,31 @@ impl View {
         }
     }
 
+    /// Ask for the document's diagrams, their text measured in the faces there are now; the
+    /// characters of their text that no face has wait for a fallback scan. Returns true if a
+    /// diagram is made again (its text measures otherwise now).
+    #[cfg(feature = "mermaid")]
+    fn request_diagrams(&mut self) -> bool {
+        let (missing, remade) = self.diagrams.request_with(&self.doc, &self.fonts);
+        self.msg_missing.extend(missing);
+        remade
+    }
+
     /// Hand the document and its new layout to the images: local sizes come from their files,
     /// remote ones from whether they're on.
     fn attach_images(&mut self) {
         // The diagrams the document shows now (the theme's), made if they aren't: asked for
         // first, so the images see them as being made (loading) rather than missing.
         #[cfg(feature = "mermaid")]
-        self.diagrams.request(&self.doc);
+        self.request_diagrams();
         self.images.attach(&self.doc, &mut self.layout);
+        // (The attach stopped what the image viewer was decoding: it is asked for again.)
+        #[cfg(feature = "images")]
+        if let Some(v) = self.viewer.as_mut()
+            && v.asked.take().is_some()
+        {
+            self.viewer_decode(Instant::now());
+        }
         self.remote_count = if self.images.policy() == RemoteImages::Never {
             0
         } else {

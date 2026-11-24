@@ -37,6 +37,9 @@ pub struct Face {
     pub color: bool,
     /// Source file and collection index for faces loaded from disk.
     pub source: Option<(PathBuf, u32)>,
+    /// The family names the face answers to, case-folded: read the first time a fallback is
+    /// chosen by family ([`Fonts::select`]), not at startup.
+    families: std::sync::OnceLock<Vec<String>>,
 }
 
 impl Face {
@@ -62,7 +65,20 @@ impl Face {
             italic: attrs.style() != swash::Style::Normal,
             data,
             source,
+            families: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The family names the face answers to (name IDs 1 and 16), case-folded.
+    pub fn families(&self) -> &[String] {
+        self.families
+            .get_or_init(|| crate::text::fallback::family_names(&self.font()))
+    }
+
+    /// Whether this face and `other` share a family name.
+    fn kin(&self, other: &Face) -> bool {
+        let mine = self.families();
+        other.families().iter().any(|f| mine.contains(f))
     }
 
     pub fn font(&self) -> FontRef<'_> {
@@ -165,6 +181,9 @@ pub struct Fonts {
     icons: FaceId,
     /// Fallback faces in the order they were added.
     fallbacks: Vec<FaceId>,
+    /// Counts the changes to what covers what (a fallback added, a family set): what was worked
+    /// out from the faces (a diagram's text widths) is worked out again when it moves.
+    generation: u64,
     /// The math face: not looked for yet (`None`), or what was found (see [`Fonts::load_math`]).
     #[cfg(feature = "math")]
     math: Option<Option<FaceId>>,
@@ -223,6 +242,7 @@ impl Fonts {
             slots,
             defaults: slots,
             fallbacks: Vec::new(),
+            generation: 0,
             #[cfg(feature = "math")]
             math: None,
         })
@@ -279,6 +299,7 @@ impl Fonts {
             defaults: [FaceId(0); 6],
             icons: FaceId(0),
             fallbacks: Vec::new(),
+            generation: 0,
             #[cfg(feature = "math")]
             math: None,
         };
@@ -410,15 +431,50 @@ impl Fonts {
         s
     }
 
-    /// First face covering `ch`: the primary, then fallbacks. `None` if nothing covers it.
+    /// First face covering `ch`: the primary, then fallbacks (those of the primary's family
+    /// first). `None` if nothing covers it.
     pub fn select(&self, primary: FaceId, ch: char) -> Option<FaceId> {
         if self.face(primary).glyph(ch) != 0 {
             return Some(primary);
         }
-        self.fallbacks
-            .iter()
-            .copied()
+        self.fallbacks_for(primary)
             .find(|&id| self.face(id).glyph(ch) != 0)
+    }
+
+    /// The fallbacks in the order they are tried for text in `primary`: those of its family (an
+    /// installed Inter for the embedded subset's missing scripts) first, then the others, each
+    /// in the order they were added.
+    fn fallbacks_for(&self, primary: FaceId) -> impl Iterator<Item = FaceId> + '_ {
+        let face = self.face(primary);
+        let kin = move |id: &FaceId| self.face(*id).kin(face);
+        let first = self.fallbacks.iter().copied().filter(kin);
+        let rest = self.fallbacks.iter().copied().filter(move |id| !kin(id));
+        first.chain(rest)
+    }
+
+    /// Counts the changes to which face covers what ([`Fonts::add_fallback`],
+    /// [`Fonts::set_family`]).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The families of the embedded faces body text and code are set in, case-folded, while the
+    /// slots are those faces (not a family the settings chose): a fallback scan looks for their
+    /// installed files first, for the scripts the subsets leave out. Empty otherwise, or
+    /// without embedded faces.
+    pub fn own_families(&self) -> Vec<String> {
+        if !cfg!(feature = "embed-fonts") || self.slots != self.defaults {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        for slot in [Slot::Regular, Slot::Mono] {
+            for f in self.face(self.slot(slot)).families() {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
     }
 
     /// First face drawing `base` with all of `marks`: the primary, then fallbacks. `loose`
@@ -432,7 +488,7 @@ impl Fonts {
         loose: &[char],
     ) -> Option<FaceId> {
         std::iter::once(primary)
-            .chain(self.fallbacks.iter().copied())
+            .chain(self.fallbacks_for(primary))
             .find(|&id| {
                 let face = self.face(id);
                 face.covers_sequence(base, marks) && loose.iter().all(|&m| face.glyph(m) != 0)
@@ -515,6 +571,7 @@ impl Fonts {
             return None;
         }
         self.fallbacks.push(id);
+        self.generation += 1;
         Some(id)
     }
 
@@ -531,6 +588,7 @@ impl Fonts {
         let range = if mono { 4..6 } else { 0..4 };
         let old: Vec<FaceId> = self.slots[range.clone()].to_vec();
         let ok = self.replace_family(mono, faces);
+        self.generation += 1;
         for id in old {
             if !self.defaults.contains(&id)
                 && !self.slots[range.clone()].contains(&id)
@@ -631,6 +689,58 @@ mod tests {
                 .join(name),
             0,
         ))
+    }
+
+    /// Both embedded families installed with a script their subsets lack: a scan finds each,
+    /// whatever the order of the files, and text takes Inter's, code JetBrains Mono's.
+    #[test]
+    fn each_slot_takes_its_own_familys_installed_file() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fonts/kin");
+        let inter = dir.join("Inter-Regular.ttf");
+        let mono = dir.join("JetBrainsMono-Regular.ttf");
+        for files in [[inter.clone(), mono.clone()], [mono.clone(), inter.clone()]] {
+            let mut fonts = Fonts::new().unwrap();
+            let found = crate::text::fallback::find_in_kin(
+                &files,
+                &['Ж'],
+                &|_, _| false,
+                &fonts.own_families(),
+            );
+            for f in &found {
+                assert!(fonts.add_fallback(&f.path, f.index).is_some());
+            }
+            for (slot, family) in [(Slot::Regular, "inter"), (Slot::Mono, "jetbrains mono")] {
+                let id = fonts.select(fonts.slot(slot), 'Ж').unwrap();
+                assert_eq!(fonts.face(id).families(), [family], "{files:?}");
+            }
+        }
+    }
+
+    /// A fallback of the primary's family is tried before the others, whatever the order they
+    /// were added in; and the embedded families are named for a scan while the slots are theirs.
+    #[test]
+    fn fallbacks_of_the_primarys_family_come_first() {
+        let mut fonts = Fonts::new().unwrap();
+        assert_eq!(fonts.own_families(), ["inter", "jetbrains mono"]);
+        let emoji =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fonts/test-emoji-colr.ttf");
+        let g = fonts.generation();
+        let colr = fonts.add_fallback(&emoji, 0).unwrap();
+        let (path, i) = asset("Inter-Bold.ttf").unwrap();
+        let inter = fonts.add_fallback(&path, i).unwrap();
+        assert_eq!(fonts.generation(), g + 2);
+        let regular = fonts.slot(Slot::Regular);
+        let mono = fonts.slot(Slot::Mono);
+        assert_eq!(
+            fonts.fallbacks_for(regular).collect::<Vec<_>>(),
+            [inter, colr]
+        );
+        assert_eq!(fonts.fallbacks_for(mono).collect::<Vec<_>>(), [colr, inter]);
+        assert_eq!(fonts.select(regular, '\u{1F680}'), Some(colr));
+        // A family of the settings' own: no scan for the embedded ones.
+        let (jb, _) = asset("JetBrainsMono-Regular.ttf").unwrap();
+        assert!(fonts.set_family(false, Some(&[Some((jb, 0)), None, None, None])));
+        assert!(fonts.own_families().is_empty());
     }
 
     #[test]

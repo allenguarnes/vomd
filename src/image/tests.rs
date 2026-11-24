@@ -1365,6 +1365,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
         protect: false,
         admitted: false,
         file: None,
+        missing: false,
     };
     assert_eq!(
         slot(Data::Bytes(Arc::new(loose))).cost(),
@@ -1386,6 +1387,7 @@ fn a_slot_costs_its_allocation_and_its_bookkeeping() {
             protect: false,
             admitted: false,
             file: None,
+            missing: false,
         }
         .cost(),
         400 + SLOT_OVERHEAD
@@ -2967,6 +2969,8 @@ fn a_decoded_result_evicts_a_body_let_in_earlier_in_the_poll() {
             need: None,
             refused: None,
             skipped: false,
+            missing: Vec::new(),
+            fonts_gen: 0,
             anim: None,
             stamp: None,
             cancelled: false,
@@ -10085,4 +10089,55 @@ fn the_viewer_fetches_nothing_the_document_hasnt_allowed() {
     images.detail(1, (32, 24), None).unwrap();
     assert!(detail_done(&doc2, &mut layout, &mut images).1.is_some());
     assert_eq!(fetches.load(Ordering::Relaxed), fetched + 2);
+}
+
+/// The image viewer's decode of an image it has left (its serial is not the last) has no say
+/// in whether the one it shows is decoded again: its characters no face has are looked for,
+/// only. One of the current decode, drawn with faces older than those there are, is decoded
+/// again; one drawn with the faces there are waits for a face to be added.
+#[cfg(feature = "svg")]
+#[test]
+fn only_the_viewers_current_decode_asks_for_it_again() {
+    let mut images = Images::default();
+    let detail = |serial, fonts_gen| Done::Detail {
+        serial,
+        bitmap: None,
+        body: None,
+        missing: vec!['\u{1F680}'],
+        fonts_gen,
+        svg: true,
+    };
+    images.detail_serial = 2;
+    images.take_done(detail(1, 0), None);
+    assert!(!images.detail_missing && !images.redecode);
+    assert_eq!(images.take_missing(), vec!['\u{1F680}']);
+    images.take_done(detail(2, 0), None);
+    assert!(images.detail_missing && !images.redecode);
+    images.detail_missing = false;
+    images.fonts_gen = 1;
+    images.take_done(detail(1, 0), None);
+    assert!(!images.take_redecode());
+    images.take_done(detail(2, 0), None);
+    assert!(images.take_redecode());
+    // A family switched (not a face added): the current decode's SVG drawn before it is decoded
+    // again, nothing missing in its text; a raster image's isn't, nor an SVG's drawn after it.
+    images.fonts_gen = 2;
+    images.fonts_switched = 2;
+    let drawn = |fonts_gen, svg| Done::Detail {
+        serial: 2,
+        bitmap: None,
+        body: None,
+        missing: Vec::new(),
+        fonts_gen,
+        svg,
+    };
+    images.take_done(drawn(1, false), None);
+    assert!(!images.take_redecode());
+    images.take_done(drawn(2, true), None);
+    assert!(!images.take_redecode());
+    images.take_done(drawn(1, true), None);
+    assert!(images.take_redecode());
+    // (A load past the limits takes the same rule.)
+    assert!(images.stale(1, &[], true) && !images.stale(1, &[], false));
+    assert!(!images.stale(2, &[], true));
 }

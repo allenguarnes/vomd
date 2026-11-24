@@ -1991,6 +1991,8 @@ struct Budget {
     css: usize,
     shaping: usize,
     caps: Caps,
+    /// Characters of its text that no face has ([`select_fallback`]), at most [`MAX_MISSING`].
+    missing: std::collections::BTreeSet<char>,
 }
 
 impl Budget {
@@ -2007,6 +2009,7 @@ impl Budget {
             skipped: false,
             css: 0,
             shaping: 0,
+            missing: std::collections::BTreeSet::new(),
         })
     }
 }
@@ -2122,11 +2125,16 @@ fn parse(
         }
         Err(why) => return refuse(why),
     };
+    // Each color glyph drawn is kept by usvg as an image (a PNG, or a COLR glyph's tree).
+    let color = fonts.map_or(0, |f| color_glyphs(&doc, f));
     {
         let mut b = budget.lock().unwrap_or_else(|e| e.into_inner());
         b.css = b.css.saturating_add(extra.css);
         b.shaping = b.shaping.saturating_add(extra.shaping);
-        b.parse = b.parse.saturating_add(extra.cost(&s));
+        b.parse = b
+            .parse
+            .saturating_add(extra.cost(&s))
+            .saturating_add(color.saturating_mul(COLOR_GLYPH_COST));
         if b.parse > b.room {
             b.over = true;
             return None;
@@ -2142,6 +2150,13 @@ fn parse(
 /// How many `href`s that aren't `data:` URLs were asked for (and refused), for the tests.
 #[cfg(test)]
 static RESOLVED_STRINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread's text asked for a fallback face ([`select_fallback`]), for the
+    /// tests.
+    static FALLBACK_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// usvg's options: no file is read and nothing fetched (`href`s that aren't `data:` URLs are
 /// dropped, there is no resources directory or style sheet), and an SVG in a `data:` URL is
@@ -2175,7 +2190,10 @@ fn options<'a>(
         fontdb,
         font_resolver: usvg::FontResolver {
             select_font: Box::new(select_font),
-            select_fallback: usvg::FontResolver::default_fallback_selector(),
+            select_fallback: Box::new(move |c, used, db| {
+                let order = fonts.map_or(&[][..], |f| &f.order[..]);
+                select_fallback(c, used, db, order, budget)
+            }),
         },
         default_size: usvg::Size::from_wh(DEFAULT_SIDE, DEFAULT_SIDE).unwrap(),
         image_href_resolver: usvg::ImageHrefResolver {
@@ -2385,12 +2403,56 @@ pub(crate) const FONTDB_COST: usize = 2 << 10;
 pub(crate) struct Fonts {
     sources: Option<Arc<SvgFonts>>,
     built: Option<(Arc<SvgFonts>, Arc<Built>)>,
+    /// The characters the last drawing's text had that no face has (sorted, at most
+    /// [`MAX_MISSING`]): a fallback scan looks for them, and the SVG is drawn again if it finds
+    /// a face. Set by each drawing that makes pixels, empty for any other.
+    pub(crate) missing: Vec<char>,
 }
 
 /// A font database, and the family of body text.
 pub(crate) struct Built {
     db: Arc<usvg::fontdb::Database>,
     sans: String,
+    /// The face of each source, in the sources' order (the slots, then the fallbacks in the
+    /// order they were added): the order a fallback is chosen in, as body text's is.
+    order: Vec<usvg::fontdb::ID>,
+    /// The faces with color glyphs (CBDT, sbix, COLR).
+    color: Vec<usvg::fontdb::ID>,
+}
+
+/// Characters a drawing reports no face has, at most.
+pub(crate) const MAX_MISSING: usize = 256;
+
+/// What a color glyph that a drawing's text may show holds, at most, kept by usvg while the SVG
+/// is (one for each distinct glyph): an Apple sbix PNG at its 160 ppem strike, or a COLRv1
+/// glyph's tree. To be tuned once measured on macOS and Windows.
+const COLOR_GLYPH_COST: usize = 64 << 10;
+
+/// Distinct characters counted as color glyphs, at most: 6.4 MB at [`COLOR_GLYPH_COST`].
+const MAX_COLOR_GLYPHS: usize = 100;
+
+/// How many distinct characters of `doc`'s text a color face of `fonts` has (at most
+/// [`MAX_COLOR_GLYPHS`]): each may be drawn as a color glyph. None but for a color face.
+fn color_glyphs(doc: &roxmltree::Document, fonts: &Built) -> usize {
+    if fonts.color.is_empty() {
+        return 0;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut n = 0;
+    for t in doc.descendants().filter_map(|n| n.text()) {
+        for c in t.chars().filter(|&c| c >= '\u{2000}') {
+            if !seen.insert(c) {
+                continue;
+            }
+            if fonts.color.iter().any(|&id| has_char(&fonts.db, id, c)) {
+                n += 1;
+                if n >= MAX_COLOR_GLYPHS {
+                    return n;
+                }
+            }
+        }
+    }
+    n
 }
 
 /// How many font databases were made, for the tests.
@@ -2417,11 +2479,34 @@ impl Fonts {
         BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut db = usvg::fontdb::Database::new();
         let (mut sans, mut mono) = (String::new(), String::new());
+        let (mut order, mut color) = (Vec::new(), Vec::new());
         for (i, (data, index)) in sources.sources.iter().enumerate() {
             let ids = db.load_font_source(usvg::fontdb::Source::Binary(data.clone()));
-            let family = ids
-                .get(*index as usize)
-                .and_then(|&id| db.face(id))
+            // Only the face of the file that is the source's: the other faces of a collection
+            // (a CJK file's other languages) would be found as fallbacks first.
+            let face = ids.get(*index as usize).copied();
+            for &id in &ids {
+                if Some(id) != face {
+                    db.remove_face(id);
+                }
+            }
+            if let Some(id) = face {
+                order.push(id);
+                let colored = db
+                    .with_face_data(id, |data, i| {
+                        swash::FontRef::from_index(data, i as usize).is_some_and(|f| {
+                            [b"CBDT", b"sbix", b"COLR"]
+                                .iter()
+                                .any(|t| f.table(swash::tag_from_bytes(t)).is_some())
+                        })
+                    })
+                    .unwrap_or(false);
+                if colored {
+                    color.push(id);
+                }
+            }
+            let family = face
+                .and_then(|id| db.face(id))
                 .and_then(|f| f.families.first())
                 .map(|f| f.0.clone());
             if let Some(family) = family {
@@ -2442,6 +2527,8 @@ impl Fonts {
         let built = Arc::new(Built {
             db: Arc::new(db),
             sans,
+            order,
+            color,
         });
         self.built = Some((sources.clone(), built.clone()));
         Some(built)
@@ -2502,6 +2589,55 @@ fn select_font(
         stretch,
         style,
     })
+}
+
+/// Whether face `id` of `db` has a glyph for `c`.
+fn has_char(db: &usvg::fontdb::Database, id: usvg::fontdb::ID, c: char) -> bool {
+    db.with_face_data(id, |data, i| {
+        swash::FontRef::from_index(data, i as usize).is_some_and(|f| f.charmap().map(c) != 0)
+    })
+    .unwrap_or(false)
+}
+
+/// The face for `c`, which the faces in `used` (the span's own first) don't have: the first in
+/// `order` (the sources' order, as body text's fallbacks) that has it, those of the span's
+/// family first. None has it (nor any in `used`): `c` is noted in `budget`'s missing characters,
+/// for a fallback scan to look for.
+fn select_fallback(
+    c: char,
+    used: &[usvg::fontdb::ID],
+    db: &mut Arc<usvg::fontdb::Database>,
+    order: &[usvg::fontdb::ID],
+    budget: &Mutex<Budget>,
+) -> Option<usvg::fontdb::ID> {
+    #[cfg(test)]
+    FALLBACK_LOOKUPS.with(|n| n.set(n.get() + 1));
+    let families = |id: usvg::fontdb::ID| db.face(id).map_or(&[][..], |f| &f.families[..]);
+    let base = used.first().map_or(&[][..], |&id| families(id));
+    let kin = |id: usvg::fontdb::ID| {
+        families(id)
+            .iter()
+            .any(|f| base.iter().any(|b| b.0.eq_ignore_ascii_case(&f.0)))
+    };
+    let open = order.iter().copied().filter(|id| !used.contains(id));
+    let found = open
+        .clone()
+        .filter(|&id| kin(id))
+        .chain(open.filter(|&id| !kin(id)))
+        .find(|&id| has_char(db, id, c));
+    // (A character a face used has is not missing: what no face draws whole is a sequence of
+    // them, which body text doesn't report either.)
+    if found.is_none()
+        && !c.is_control()
+        && !crate::text::is_default_ignorable(c)
+        && !used.iter().any(|&id| has_char(db, id, c))
+    {
+        let mut b = budget.lock().unwrap_or_else(|e| e.into_inner());
+        if b.missing.len() < MAX_MISSING {
+            b.missing.insert(c);
+        }
+    }
+    found
 }
 
 // ---- Rendering ------------------------------------------------------------------------------
@@ -2595,6 +2731,7 @@ pub(super) fn render_part(
     fonts: &mut Fonts,
 ) -> Rendered {
     let svg = known(svg);
+    fonts.missing.clear();
     // What parsing may hold: the charge, less the rest of it.
     let rest = cost(&svg, w, h) - svg.parse;
     let mut inflated = Vec::new();
@@ -2605,9 +2742,11 @@ pub(super) fn render_part(
     let budget = Budget::new(charge.saturating_sub(rest), copy, *caps);
     // The font database is made for text only (an SVG in this one may have some).
     let text = scan_in(xml, caps).is_ok_and(|s| s.has_text) || find(xml, b"svg+xml").is_some();
-    let fonts = if text { fonts.get() } else { None };
-    let tree = parse(xml, &budget, 0, cancel, fonts.as_deref());
-    let b = budget.into_inner().unwrap_or_else(|e| e.into_inner());
+    let built = if text { fonts.get() } else { None };
+    let tree = parse(xml, &budget, 0, cancel, built.as_deref());
+    drop(built);
+    let mut b = budget.into_inner().unwrap_or_else(|e| e.into_inner());
+    let missing: Vec<char> = std::mem::take(&mut b.missing).into_iter().collect();
     if cancelled(cancel) {
         return Rendered::Cancelled;
     }
@@ -2694,6 +2833,7 @@ pub(super) fn render_part(
         height: h,
         data,
     };
+    fonts.missing = missing;
     Rendered::Pixels(bitmap, b.skipped || refused.get())
 }
 

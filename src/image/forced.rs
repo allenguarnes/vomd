@@ -121,6 +121,15 @@ pub(crate) struct Loaded {
     pub body: Option<Bytes>,
     /// The pixels are an animation's first frame ([`super::anim::detect`]).
     pub anim: Option<super::AnimInfo>,
+    /// An SVG's characters that no face has.
+    #[cfg(feature = "svg")]
+    pub missing: Vec<char>,
+    /// The generation of the faces it was drawn with (`Images::fonts_gen`).
+    #[cfg(feature = "svg")]
+    pub fonts_gen: u64,
+    /// The pixels are of an SVG.
+    #[cfg(feature = "svg")]
+    pub svg: bool,
 }
 
 /// What a remote image is fetched with (`Remote::forced_fetch`).
@@ -139,6 +148,10 @@ struct Queue {
     /// Loads whose result is sent and not yet taken ([`Forced::taken`]): it isn't in `kept` until
     /// it is, so without this a request in between would load the image again.
     delivered: Vec<Delivered>,
+    /// The faces SVG text is set in, from the next load on, and their generation
+    /// ([`Forced::set_fonts`]).
+    #[cfg(feature = "svg")]
+    fonts: (Option<Arc<crate::fonts::SvgFonts>>, u64),
 }
 
 /// A load whose result is on its way: what it was for (see [`Job`]) and its document.
@@ -175,9 +188,6 @@ pub(crate) struct Forced {
     pub cap: usize,
     /// The ceiling of the next loads (`None`: [`ceiling`], read when one is asked for).
     pub ceiling: Option<usize>,
-    /// The faces SVG text is set in.
-    #[cfg(feature = "svg")]
-    pub fonts: Option<Arc<crate::fonts::SvgFonts>>,
     /// How remote images are fetched.
     #[cfg(feature = "remote-images")]
     pub fetch: Option<Fetch>,
@@ -199,8 +209,6 @@ impl Default for Forced {
             naturals: Vec::new(),
             cap: KEPT_BYTES,
             ceiling: None,
-            #[cfg(feature = "svg")]
-            fonts: None,
             #[cfg(feature = "remote-images")]
             fetch: None,
             loads: 0,
@@ -390,8 +398,6 @@ impl Forced {
             let ceiling = self.ceiling;
             #[cfg(test)]
             let hold = self.hold.clone();
-            #[cfg(feature = "svg")]
-            let fonts = self.fonts.clone();
             #[cfg(feature = "remote-images")]
             let fetch = self.fetch.clone();
             let spawned = std::thread::Builder::new()
@@ -403,11 +409,11 @@ impl Forced {
                         ceiling,
                         #[cfg(feature = "svg")]
                         fonts: Default::default(),
+                        #[cfg(feature = "svg")]
+                        fonts_gen: 0,
                         #[cfg(feature = "remote-images")]
                         fetch,
                     };
-                    #[cfg(feature = "svg")]
-                    env.fonts.set(fonts);
                     work(&shared, &tx, &wake, &mut env);
                 });
             if spawned.is_err() {
@@ -525,6 +531,23 @@ impl Forced {
         self.kept.clear();
     }
 
+    /// `origin`'s pixels are drawn with old fonts: it is drawn again.
+    #[cfg(feature = "svg")]
+    pub(crate) fn forget(&mut self, origin: &Origin) {
+        self.kept.retain(|k| k.origin != *origin);
+    }
+
+    /// The faces SVG text is set in from the next load on (a load running keeps its own), and
+    /// their generation.
+    #[cfg(feature = "svg")]
+    pub(crate) fn set_fonts(&mut self, fonts: Option<Arc<crate::fonts::SvgFonts>>, fonts_gen: u64) {
+        self.shared
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fonts = (fonts, fonts_gen);
+    }
+
     /// What the choices cost to keep, for the bookkeeping of the budget (their pixels and bodies
     /// are outside it).
     pub(crate) fn bookkeeping(&self) -> usize {
@@ -547,6 +570,9 @@ struct Env {
     ceiling: Option<usize>,
     #[cfg(feature = "svg")]
     fonts: super::svg::Fonts,
+    /// The generation of `fonts`.
+    #[cfg(feature = "svg")]
+    fonts_gen: u64,
     #[cfg(feature = "remote-images")]
     fetch: Option<Fetch>,
 }
@@ -564,6 +590,12 @@ fn work(shared: &Shared, tx: &Sender<Done>, wake: &Wake, env: &mut Env) {
             };
             let detail = job.detail.is_some();
             q.running = Some((job.origin.clone(), job.size, job.cancel.clone(), detail));
+            // (Each load's faces are those set when it starts.)
+            #[cfg(feature = "svg")]
+            {
+                env.fonts.set(q.fonts.0.clone());
+                env.fonts_gen = q.fonts.1;
+            }
             job
         };
         let result = load(&job, env);
@@ -576,14 +608,24 @@ fn work(shared: &Shared, tx: &Sender<Done>, wake: &Wake, env: &mut Env) {
             // A body just fetched goes back with the pixels, for the viewer to keep (the next
             // size doesn't fetch it again).
             let fetched = job.body.is_none();
-            let (bitmap, body) = match result {
-                Ok(l) => (l.bitmap, l.body.filter(|_| fetched)),
-                Err(_) => (None, None),
+            let (bitmap, body, missing, svg) = match result {
+                #[cfg(feature = "svg")]
+                Ok(l) => (l.bitmap, l.body.filter(|_| fetched), l.missing, l.svg),
+                #[cfg(not(feature = "svg"))]
+                Ok(l) => (l.bitmap, l.body.filter(|_| fetched), Vec::new(), false),
+                Err(_) => (None, None, Vec::new(), false),
             };
+            #[cfg(feature = "svg")]
+            let fonts_gen = env.fonts_gen;
+            #[cfg(not(feature = "svg"))]
+            let fonts_gen = 0;
             let done = Done::Detail {
                 serial: d.serial,
                 bitmap,
                 body,
+                missing,
+                fonts_gen,
+                svg,
             };
             if tx.send(done).is_err() {
                 lock.lock().unwrap_or_else(|e| e.into_inner()).alive = false;
@@ -653,6 +695,12 @@ fn load(job: &Job, env: &mut Env) -> Result<Loaded, Refusal> {
             natural,
             body,
             anim: None,
+            #[cfg(feature = "svg")]
+            missing: Vec::new(),
+            #[cfg(feature = "svg")]
+            fonts_gen: env.fonts_gen,
+            #[cfg(feature = "svg")]
+            svg: false,
         });
     };
     let (w, h) = super::clamp_box(w, h);
@@ -688,6 +736,8 @@ fn load(job: &Job, env: &mut Env) -> Result<Loaded, Refusal> {
     };
     #[cfg(feature = "svg")]
     let fonts = &mut env.fonts;
+    #[cfg(feature = "svg")]
+    fonts.missing.clear();
     #[cfg(not(feature = "svg"))]
     let fonts = &mut ();
     match super::decode_why(&bytes, w, h, sampling, &limits, &job.cancel, fonts) {
@@ -696,6 +746,12 @@ fn load(job: &Job, env: &mut Env) -> Result<Loaded, Refusal> {
             natural,
             body,
             anim: super::anim::detect(&bytes),
+            #[cfg(feature = "svg")]
+            missing: std::mem::take(&mut fonts.missing),
+            #[cfg(feature = "svg")]
+            fonts_gen: env.fonts_gen,
+            #[cfg(feature = "svg")]
+            svg: super::is_svg(&header),
         }),
         Err(Some(Refusal::Memory(n))) if n > 0 => Err(Refusal::Ceiling(n)),
         Err(_) => Err(Refusal::Failed),

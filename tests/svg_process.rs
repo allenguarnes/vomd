@@ -759,3 +759,65 @@ mod mermaid {
         no_children_within(SANE);
     }
 }
+
+/// A child says which characters of its SVG's text no face has: they wait for a fallback scan,
+/// and once a face is added for them only that SVG is drawn again, with them.
+#[test]
+fn characters_no_face_has_come_back_from_the_child() {
+    let _s = serial();
+    let dir = scratch("missing");
+    std::fs::write(
+        dir.join("emoji.svg"),
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40"><rect width="120" height="40" fill="#fff"/><text x="4" y="32" font-size="30">a&#x1F680;b</text></svg>"##,
+    )
+    .unwrap();
+    std::fs::write(dir.join("badge.svg"), fixture("badge.svg")).unwrap();
+    let doc = Doc::parse("![e](emoji.svg) ![b](badge.svg)");
+    let mut layout = Layout::new(&doc, Params::default());
+    let mut images = Images::default();
+    images.set_base(Some(dir.clone()));
+    let mut fonts = vomd::fonts::Fonts::new().unwrap();
+    images.set_svg_fonts(fonts.svg_sources());
+    images.attach(&doc, &mut layout);
+    let drawn = |images: &mut Images, layout: &mut Layout| {
+        let t = Instant::now();
+        while images.pixels(1, 120, 40).is_none() || images.pixels(2, 90, 20).is_none() {
+            assert!(t.elapsed() < Duration::from_secs(20), "timed out");
+            images.request(&[(1, 120, 40), (2, 90, 20)], 2);
+            std::thread::sleep(Duration::from_millis(2));
+            images.poll(&doc, layout);
+        }
+    };
+    drawn(&mut images, &mut layout);
+    let red = |p: &u32| (p >> 16) & 0xFF > 200 && (p >> 8) & 0xFF < 60 && p & 0xFF < 60;
+    assert_eq!(
+        images
+            .pixels(1, 120, 40)
+            .unwrap()
+            .data
+            .iter()
+            .filter(|p| red(p))
+            .count(),
+        0
+    );
+    assert_eq!(images.take_missing(), vec!['\u{1F680}']);
+    assert!(images.take_missing().is_empty());
+    let badge = images.pixels(2, 90, 20).cloned();
+    // The scan found the test's color font: the emoji's SVG is drawn again, the badge kept.
+    let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fonts/test-emoji-colr.ttf");
+    assert!(fonts.add_fallback(&font, 0).is_some());
+    images.set_svg_fonts(fonts.svg_sources());
+    assert!(images.pixels(1, 120, 40).is_none());
+    assert_eq!(images.pixels(2, 90, 20).cloned(), badge);
+    drawn(&mut images, &mut layout);
+    let n = images
+        .pixels(1, 120, 40)
+        .unwrap()
+        .data
+        .iter()
+        .filter(|p| red(p))
+        .count();
+    assert!(n > 100, "{n}");
+    assert!(images.take_missing().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

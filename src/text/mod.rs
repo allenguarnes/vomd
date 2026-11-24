@@ -19,8 +19,12 @@ use crate::fonts::{FaceId, Fonts};
 use crate::theme::Role;
 
 pub use lines::LineBreak;
+#[cfg(feature = "mermaid")]
+pub(crate) use shape::attaches_to_previous;
 #[cfg(feature = "clipboard")]
 pub use shape::is_combining_mark;
+#[cfg(feature = "svg")]
+pub(crate) use shape::is_default_ignorable;
 pub use shape::{Cluster, Glyph, Shaped};
 
 /// Text decorations drawn by the painter from [`PRect`]s.

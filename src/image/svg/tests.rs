@@ -379,7 +379,9 @@ fn with_fonts(svg: &[u8], fonts: &mut Fonts) -> Bitmap {
     let h = info_of(svg).unwrap();
     match render(svg, &h.svg, (h.w, h.h), CACHE_BYTES, &NO_CANCEL, fonts) {
         Rendered::Pixels(b, _) => b,
-        _ => panic!("not drawn"),
+        Rendered::Need(c) => panic!("not drawn: need {c:?}"),
+        Rendered::Refused(r) => panic!("not drawn: {r:?}"),
+        Rendered::Cancelled => panic!("not drawn: cancelled"),
     }
 }
 
@@ -2672,4 +2674,339 @@ fn a_big_curve_costs_a_stroke_its_own_subpath_only() {
     .unwrap();
     let b = decode(&svg, 9000, 40).unwrap();
     assert_eq!(b.data.iter().filter(|p| **p != 0).count(), 459);
+}
+
+// ---- Text in faces found on the system (emoji, scripts the embedded faces lack) --------------
+
+/// A test font of `fixtures/fonts` (`scripts/make-test-emoji-fonts.sh`).
+fn test_font(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/fonts")
+        .join(name)
+}
+
+/// VOMD's faces with the test fonts `names` added as fallbacks, as a scan adds them.
+fn fonts_with(names: &[&str]) -> Fonts {
+    let mut vomd = crate::fonts::Fonts::new().unwrap();
+    for name in names {
+        assert!(vomd.add_fallback(&test_font(name), 0).is_some(), "{name}");
+    }
+    let mut fonts = Fonts::default();
+    fonts.set(Some(Arc::new(vomd.svg_sources())));
+    fonts
+}
+
+/// An SVG of 400 × 100 on white, `text` at 60 px.
+fn text_svg(text: &str) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100"><rect width="400" height="100" fill="#fff"/><text x="10" y="75" font-size="60">{text}</text></svg>"##
+    )
+}
+
+/// The pixels of `b` near `rgb` (the test font's colors), and the columns they span.
+fn colored(b: &Bitmap, rgb: [u32; 3]) -> (usize, usize) {
+    let near = |p: u32| {
+        let c = rgba(p);
+        (0..3).all(|i| c[i].abs_diff(rgb[i]) < 40)
+    };
+    let mut n = 0;
+    let (mut lo, mut hi) = (usize::MAX, 0);
+    for (i, &p) in b.data.iter().enumerate() {
+        if near(p) {
+            n += 1;
+            let x = i % b.width as usize;
+            lo = lo.min(x);
+            hi = hi.max(x);
+        }
+    }
+    (n, if n == 0 { 0 } else { hi - lo + 1 })
+}
+
+const RED: [u32; 3] = [255, 0, 0];
+const GREEN: [u32; 3] = [0, 153, 0];
+const BLUE: [u32; 3] = [0, 0, 255];
+
+#[test]
+fn an_emoji_is_drawn_in_a_color_fallback_and_reported_without_one() {
+    let svg = text_svg("A\u{1F680}B");
+    // No face has it: nothing red, and the character is reported for a scan.
+    let mut plain = vomd_fonts();
+    let b = with_fonts(svg.as_bytes(), &mut plain);
+    assert_eq!(colored(&b, RED).0, 0);
+    assert_eq!(plain.missing, vec!['\u{1F680}']);
+    // With the COLR fallback: drawn in its color, and nothing is missing.
+    let mut fonts = fonts_with(&["test-emoji-colr.ttf"]);
+    let b = with_fonts(svg.as_bytes(), &mut fonts);
+    assert!(colored(&b, RED).0 > 1000, "{:?}", colored(&b, RED));
+    assert!(fonts.missing.is_empty(), "{:?}", fonts.missing);
+    // Text with nothing missing reports nothing (what an earlier drawing found is cleared).
+    with_fonts(&fixture("badge.svg"), &mut plain);
+    assert!(plain.missing.is_empty());
+}
+
+/// A combining mark no face has, on a base the span's face has: shaping makes them one cluster,
+/// which starts at the base, yet the mark is what is reported (for a scan to look for), not the
+/// base. With a fallback that has both, the cluster is drawn in it and nothing is missing.
+#[test]
+fn an_uncovered_mark_on_a_covered_base_is_what_is_reported() {
+    let svg = text_svg("A\u{1AB0}");
+    let mut plain = vomd_fonts();
+    with_fonts(svg.as_bytes(), &mut plain);
+    assert_eq!(plain.missing, vec!['\u{1AB0}']);
+    // Two marks, one base: both reported (and the same once more after a covered base).
+    with_fonts(
+        text_svg("A\u{1AB0}\u{1AB1} x\u{1AB0}").as_bytes(),
+        &mut plain,
+    );
+    assert_eq!(plain.missing, vec!['\u{1AB0}', '\u{1AB1}']);
+    // The fallback a scan would find for it: drawn, nothing missing.
+    let mut fonts = fonts_with(&["test-marks.ttf"]);
+    with_fonts(svg.as_bytes(), &mut fonts);
+    assert!(fonts.missing.is_empty(), "{:?}", fonts.missing);
+}
+
+/// Thousands of one combining mark no face has, on a base the face has, are one cluster of
+/// thousands of missing glyphs: it is looked through once, not once for each of its glyphs
+/// (16,000 marks took 5.7 s, against 28 ms without the fallback's patch), and each mark is
+/// looked for once. Counted in usvg's steps (where debug assertions are on), with a resolver
+/// that finds nothing, as Inter alone has neither mark.
+#[test]
+fn a_cluster_of_thousands_of_missing_marks_is_looked_through_once() {
+    use std::sync::Mutex;
+    let inter = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/Inter-Regular.ttf"
+    ))
+    .unwrap();
+    let shape = |text: &str| {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_data(inter.clone());
+        let mut opts = usvg::Options {
+            fontdb: Arc::new(db),
+            font_family: "Inter".into(),
+            ..usvg::Options::default()
+        };
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        opts.font_resolver.select_fallback = Box::new(move |c, _, _| {
+            log.lock().unwrap().push(c);
+            None
+        });
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><text y="20">{text}</text></svg>"#
+        );
+        let steps = usvg::layout::vomd_work::fallback_steps();
+        let t = Instant::now();
+        assert!(usvg::Tree::from_str(&svg, &opts).is_ok());
+        let took = t.elapsed();
+        let steps = usvg::layout::vomd_work::fallback_steps() - steps;
+        let asked = asked.lock().unwrap().clone();
+        (steps, asked, took)
+    };
+    let cases = [
+        (format!("A{}", "\u{1AB0}".repeat(16_000)), vec!['\u{1AB0}']),
+        (
+            format!("A{}", "\u{1AB0}\u{1AB1}".repeat(8_000)),
+            vec!['\u{1AB0}', '\u{1AB1}'],
+        ),
+        ("A\u{1AB0}".repeat(8_000), vec!['\u{1AB0}']),
+        (
+            format!("A{} x\u{1AB2}", "\u{1AB0}".repeat(8_000)),
+            vec!['\u{1AB0}', '\u{1AB2}'],
+        ),
+    ];
+    for (text, want) in cases {
+        let chars = text.chars().count();
+        let (steps, asked, took) = shape(&text);
+        assert_eq!(asked, want);
+        // (A step for each glyph, a few for each of a cluster's: the old search took one pass
+        // over the cluster for each of its glyphs, 16,000² steps.)
+        if cfg!(debug_assertions) {
+            assert!((chars..=6 * chars).contains(&steps), "{steps} for {chars}");
+        }
+        assert!(took < SANE, "{took:?}");
+    }
+}
+
+/// A sequence that is one glyph in the fallback and two in the face before it (a skin tone, a
+/// variation selector, a joiner) is replaced as a whole: usvg merged glyph by glyph, and gave up
+/// on a span whose counts differ (VOMD's patch, `vendor/usvg/VOMD-PATCH.md`).
+#[test]
+fn a_skin_tone_sequence_is_drawn_as_one_glyph() {
+    let mut fonts = fonts_with(&["test-emoji-colr.ttf"]);
+    let thumb = with_fonts(text_svg("\u{1F44D}").as_bytes(), &mut fonts);
+    let toned = with_fonts(text_svg("\u{1F44D}\u{1F3FD}").as_bytes(), &mut fonts);
+    // The ligature: one glyph, its blue layer over the green one (two glyphs would be a green
+    // thumb beside a blue tone, twice as wide).
+    let (green, _) = colored(&toned, GREEN);
+    let (blue, width) = colored(&toned, BLUE);
+    assert!(green == 0 && blue > 1000, "{green} {blue}");
+    assert_eq!(width, colored(&thumb, GREEN).1);
+    assert!(fonts.missing.is_empty());
+    // Emoji in a span with other text, each one of several: every one drawn.
+    let mixed = with_fonts(
+        text_svg("x \u{1F680} y \u{1F44D}\u{1F3FD} z \u{1F680}").as_bytes(),
+        &mut fonts,
+    );
+    assert!(colored(&mixed, RED).1 > colored(&thumb, GREEN).1 * 2);
+    assert!(colored(&mixed, BLUE).0 > 1000);
+}
+
+/// A character no face has doesn't stop the fallback for the ones after it in the span (usvg
+/// stopped at the first), and is reported.
+#[test]
+fn a_character_no_face_has_leaves_the_rest_of_the_span_drawn() {
+    let mut fonts = fonts_with(&["test-emoji-colr.ttf"]);
+    let b = with_fonts(
+        text_svg("\u{0F00} \u{1F680} \u{0F01}").as_bytes(),
+        &mut fonts,
+    );
+    assert!(colored(&b, RED).0 > 1000);
+    assert_eq!(fonts.missing, vec!['\u{0F00}', '\u{0F01}']);
+    // Right-to-left text with an emoji in it: the emoji is drawn, the Hebrew (no face here)
+    // reported.
+    let b = with_fonts(
+        text_svg("\u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{1F680} \u{05D0}").as_bytes(),
+        &mut fonts,
+    );
+    assert!(colored(&b, RED).0 > 1000);
+    assert!(fonts.missing.contains(&'\u{05E9}') && fonts.missing.contains(&'\u{05D0}'));
+    assert!(!fonts.missing.contains(&'\u{1F680}'));
+}
+
+/// Thousands of different characters no face has in one span cost a lookup each for the first
+/// 256 only, the rest of the span left as it is (looking for each, from the span's start each
+/// time, took half a second for 2000 in a release build), and what came before them is drawn.
+#[test]
+fn many_characters_no_face_has_are_looked_for_up_to_a_cap() {
+    let many: String = (0..2000u32)
+        .filter_map(|i| char::from_u32(0xF0000 + i))
+        .collect();
+    let mut fonts = fonts_with(&["test-emoji-colr.ttf"]);
+    FALLBACK_LOOKUPS.with(|n| n.set(0));
+    let t = Instant::now();
+    // (Small: 2000 boxes at 60 px are more to draw than VOMD draws.)
+    let svg = text_svg(&format!("\u{1F680}{many}\u{1F680}"))
+        .replace(r#"font-size="60""#, r#"font-size="12""#);
+    let b = with_fonts(svg.as_bytes(), &mut fonts);
+    let lookups = FALLBACK_LOOKUPS.with(std::cell::Cell::get);
+    assert!(colored(&b, RED).0 > 30);
+    // The emoji (before the others: one shaping replaces both), then 256 characters no face has.
+    assert!((256..=260).contains(&lookups), "{lookups}");
+    assert_eq!(fonts.missing.len(), MAX_MISSING);
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
+}
+
+/// A fallback that replaces thousands of clusters of a span merges them at once: each emoji is
+/// drawn, and the characters no face has after them are still looked for.
+#[test]
+fn a_fallback_for_thousands_of_clusters_merges_them() {
+    let rockets = "\u{1F680}a".repeat(2000);
+    let mut fonts = fonts_with(&["test-emoji-colr.ttf"]);
+    FALLBACK_LOOKUPS.with(|n| n.set(0));
+    let t = Instant::now();
+    let b = with_fonts(
+        text_svg(&format!("{rockets}\u{F0000}")).as_bytes(),
+        &mut fonts,
+    );
+    assert!(colored(&b, RED).0 > 1000);
+    assert_eq!(fonts.missing, vec!['\u{F0000}']);
+    assert_eq!(FALLBACK_LOOKUPS.with(std::cell::Cell::get), 2);
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
+}
+
+/// The characters reported are at most [`MAX_MISSING`], and never an invisible one.
+#[test]
+fn missing_characters_are_capped() {
+    let many: String = (0..600u32)
+        .filter_map(|i| char::from_u32(0x4E00 + i))
+        .collect();
+    let mut fonts = vomd_fonts();
+    with_fonts(
+        text_svg(&format!("{many}\u{FE0F}\u{200D}")).as_bytes(),
+        &mut fonts,
+    );
+    assert_eq!(fonts.missing.len(), MAX_MISSING);
+    assert!(fonts.missing.iter().all(|&c| c >= '\u{4E00}'));
+}
+
+/// A bitmap color font (CBDT, Noto Color Emoji's kind) is drawn through VOMD's raster hook.
+#[test]
+fn a_bitmap_color_glyph_is_drawn() {
+    let mut fonts = fonts_with(&["test-emoji-cbdt.ttf"]);
+    let b = with_fonts(
+        text_svg("\u{2764}\u{FE0F} \u{1F680}").as_bytes(),
+        &mut fonts,
+    );
+    let painted = b
+        .data
+        .iter()
+        .filter(|&&p| {
+            let c = rgba(p);
+            c[0] > 150 && c[1] < 100 && c[2] < 100
+        })
+        .count();
+    assert!(painted > 500, "{painted}");
+    assert!(fonts.missing.is_empty(), "{:?}", fonts.missing);
+}
+
+/// Only the face of a source is in the database (a collection's others would be found first),
+/// and the faces are in the sources' order.
+#[test]
+fn the_database_holds_each_source_once_in_order() {
+    let mut fonts = fonts_with(&["test-emoji-colr.ttf", "test-emoji-cbdt.ttf"]);
+    let built = fonts.get().unwrap();
+    let n = fonts.sources.as_ref().unwrap().sources.len();
+    assert_eq!(built.order.len(), n);
+    assert_eq!(built.db.len(), n);
+    assert_eq!(built.color.len(), 2);
+    assert_eq!(&built.order[n - 2..], &built.color[..]);
+}
+
+/// `font-family="Inter"` is the embedded face even when an installed Inter of the same style is
+/// a fallback (fontdb takes the first of equals: the embedded faces are loaded first).
+#[test]
+fn a_named_family_is_the_embedded_face_beside_an_installed_one() {
+    let mut vomd = crate::fonts::Fonts::new().unwrap();
+    let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+    assert!(
+        vomd.add_fallback(&assets.join("Inter-Regular.ttf"), 0)
+            .is_some()
+    );
+    assert!(
+        vomd.add_fallback(&assets.join("Inter-Bold.ttf"), 0)
+            .is_some()
+    );
+    let sources = vomd.svg_sources();
+    let (sans, n) = (sources.sans, sources.sources.len());
+    let mut fonts = Fonts::default();
+    fonts.set(Some(Arc::new(sources)));
+    let built = fonts.get().unwrap();
+    use usvg::fontdb::{Family, Query, Weight};
+    let query = |weight| Query {
+        families: &[Family::Name("Inter")],
+        weight: Weight(weight),
+        ..Query::default()
+    };
+    assert_eq!(built.db.query(&query(400)), Some(built.order[sans]));
+    let bold = built.db.query(&query(700)).unwrap();
+    assert!(built.order[..n - 2].contains(&bold));
+    assert_ne!(bold, built.order[n - 1]);
+}
+
+/// Each distinct character a color face has is charged as a color glyph; none without a color
+/// face.
+#[test]
+fn color_glyphs_are_counted_once_each() {
+    let text = text_svg("\u{1F680}\u{1F680} \u{1F44D}\u{1F3FD} abc \u{4E2D}");
+    let doc = roxmltree::Document::parse(&text).unwrap();
+    let mut fonts = fonts_with(&["test-emoji-colr.ttf"]);
+    assert_eq!(color_glyphs(&doc, &fonts.get().unwrap()), 3);
+    assert_eq!(color_glyphs(&doc, &vomd_fonts().get().unwrap()), 0);
+    let many: String = (0..300u32)
+        .map(|i| char::from_u32(0x1F680 + (i % 3)).unwrap())
+        .collect();
+    let text = text_svg(&many);
+    let doc = roxmltree::Document::parse(&text).unwrap();
+    assert_eq!(color_glyphs(&doc, &fonts.get().unwrap()), 1);
 }

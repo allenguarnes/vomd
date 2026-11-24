@@ -143,7 +143,7 @@ fn split_cluster(
 
 /// Characters that must stay in the face of the character before them: joiners, variation
 /// selectors, emoji modifiers and tags, combining marks.
-fn attaches_to_previous(c: char) -> bool {
+pub(crate) fn attaches_to_previous(c: char) -> bool {
     matches!(c,
         '\u{200C}' | '\u{200D}' | '\u{20E3}'
         | '\u{FE00}'..='\u{FE0F}'
@@ -166,7 +166,7 @@ pub fn is_combining_mark(c: char) -> bool {
 
 /// Default-ignorable code points (formatting characters, bidi controls, variation selectors):
 /// never drawn, so they never count as missing and take the face of their neighbors.
-fn is_default_ignorable(c: char) -> bool {
+pub(crate) fn is_default_ignorable(c: char) -> bool {
     // Unicode's Default_Ignorable_Code_Point, all of it: swash leaves out the glyphs of the
     // same characters, unless they were turned into others (see `shape`). None is below
     // U+00AD, which keeps ASCII to one comparison.

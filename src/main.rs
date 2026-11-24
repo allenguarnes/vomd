@@ -1120,12 +1120,13 @@ impl App {
             return;
         }
         let sources = view.font_sources();
+        let families = view.own_families();
         let proxy = self.proxy.clone();
         self.scanning = true;
         std::thread::spawn(move || {
             let skip =
                 |p: &std::path::Path, i: u32| sources.iter().any(|(sp, si)| sp == p && *si == i);
-            let found = fallback::find_fallbacks(&missing, &skip);
+            let found = fallback::find_fallbacks_kin(&missing, &skip, &families);
             let _ = proxy.send_event(UserEvent::Fonts(found));
         });
     }

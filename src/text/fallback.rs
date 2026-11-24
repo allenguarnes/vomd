@@ -314,7 +314,7 @@ fn style_distance(slot: usize, (weight, italic, normal_width): (u16, bool, bool)
 }
 
 /// The family names a face answers to (name IDs 1 and 16, every language), case-folded.
-fn family_names(font: &swash::FontRef) -> Vec<String> {
+pub(crate) fn family_names(font: &swash::FontRef) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in font.localized_strings() {
         if matches!(
@@ -336,6 +336,11 @@ fn fold(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// `files` with the upright regular ones first ([`style_penalty`]), the order kept otherwise.
+fn by_penalty(files: &mut [&PathBuf]) {
+    files.sort_by_key(|p| style_penalty(p));
 }
 
 /// Style words that make a file a poor fallback (prefer upright regular weights).
@@ -366,7 +371,62 @@ fn style_penalty(path: &Path) -> u8 {
 /// Faces covering `missing`, in the order they should be added as fallbacks. `skip` reports
 /// faces that are already loaded. Characters nothing covers are simply not returned.
 pub fn find_fallbacks(missing: &[char], skip: &dyn Fn(&Path, u32) -> bool) -> Vec<Found> {
-    find_in(&list_files(&font_dirs()), missing, skip)
+    find_fallbacks_kin(missing, skip, &[])
+}
+
+/// [`find_fallbacks`], the installed files of `families` (case-folded names: the embedded faces'
+/// own, [`crate::fonts::Fonts::own_families`]) tried first, before the script's preferences.
+pub fn find_fallbacks_kin(
+    missing: &[char],
+    skip: &dyn Fn(&Path, u32) -> bool,
+    families: &[String],
+) -> Vec<Found> {
+    find_in_kin(&list_files(&font_dirs()), missing, skip, families)
+}
+
+/// [`find_in`] with `families` first (see [`find_fallbacks_kin`]).
+pub fn find_in_kin(
+    files: &[PathBuf],
+    missing: &[char],
+    skip: &dyn Fn(&Path, u32) -> bool,
+    families: &[String],
+) -> Vec<Found> {
+    find_with_kin(
+        files,
+        missing,
+        skip,
+        families,
+        &mut coverage,
+        &mut file_families,
+    )
+}
+
+/// The family names of each face of the font file at `path`, case-folded (none if it can't be
+/// read).
+fn file_families(path: &Path) -> Vec<Vec<String>> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    // SAFETY: read-only mapping of a font file; see `Fonts::load`.
+    let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
+        return Vec::new();
+    };
+    let Some(data) = FontDataRef::new(&map) else {
+        return Vec::new();
+    };
+    data.fonts().map(|f| family_names(&f)).collect()
+}
+
+/// A file named for `family` (its folded name without blanks, at the start of the file's name:
+/// `Inter-Regular.ttf`, `Inter_VariableFont_opsz,wght.ttf`, `JetBrainsMono-Regular.ttf`).
+fn named_for(path: &Path, family: &str) -> bool {
+    let key: String = file_key(path)
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    let family: String = family.chars().filter(|c| c.is_alphanumeric()).collect();
+    !family.is_empty() && key.starts_with(&family)
 }
 
 pub fn find_in(
@@ -374,16 +434,31 @@ pub fn find_in(
     missing: &[char],
     skip: &dyn Fn(&Path, u32) -> bool,
 ) -> Vec<Found> {
-    find_with(files, missing, skip, &mut coverage)
+    find_in_kin(files, missing, skip, &[])
 }
 
 /// [`find_in`] with the reading of font files (`read`) in the caller's hands. A file is read at
 /// most once, however many characters are missing.
+#[cfg(test)]
 fn find_with<'a>(
     files: &'a [PathBuf],
     missing: &[char],
     skip: &dyn Fn(&Path, u32) -> bool,
     read: &mut dyn FnMut(&Path, &[char]) -> Coverage,
+) -> Vec<Found> {
+    find_with_kin(files, missing, skip, &[], read, &mut |_| Vec::new())
+}
+
+/// [`find_with`], the files of `families` first: those named for one of them whose name table
+/// says so (`names`: each face's family names), so that a Nerd Font's variant
+/// (`JetBrainsMonoNerdFont-Regular.ttf`, "JetBrainsMono Nerd Font") is not one.
+fn find_with_kin<'a>(
+    files: &'a [PathBuf],
+    missing: &[char],
+    skip: &dyn Fn(&Path, u32) -> bool,
+    families: &[String],
+    read: &mut dyn FnMut(&Path, &[char]) -> Coverage,
+    names: &mut dyn FnMut(&Path) -> Vec<Vec<String>>,
 ) -> Vec<Found> {
     let mut all: Vec<char> = missing.to_vec();
     all.sort_unstable();
@@ -433,6 +508,24 @@ fn find_with<'a>(
             *faces = Vec::new();
         }
     };
+    // The embedded families' own files, regular styles first, each family for all that is
+    // missing (text and code each take their own family's: one doesn't stand in for the other).
+    let mut by_kin: BTreeSet<char> = remaining.clone();
+    for family in families {
+        let mut kin: Vec<&PathBuf> = files.iter().filter(|p| named_for(p, family)).collect();
+        by_penalty(&mut kin);
+        let mut left = remaining.clone();
+        for path in kin {
+            if left.is_empty() {
+                break;
+            }
+            if names(path).iter().flatten().any(|n| n == family) {
+                take(path, &mut left, true);
+            }
+        }
+        by_kin.retain(|c| left.contains(c));
+    }
+    remaining = by_kin;
     let by_name: HashMap<String, &PathBuf> = files
         .iter()
         .filter_map(|p| Some((file_key(p)?, p)))
@@ -459,7 +552,7 @@ fn find_with<'a>(
     }
     if !remaining.is_empty() {
         let mut ordered: Vec<&PathBuf> = files.iter().collect();
-        ordered.sort_by_key(|p| style_penalty(p));
+        by_penalty(&mut ordered);
         for path in ordered {
             if remaining.is_empty() {
                 break;
@@ -706,5 +799,86 @@ mod tests {
         // Faces that add nothing new are not taken, whatever the order.
         let found = find_with(&files, &['中'], &|_, _| false, &mut read);
         assert_eq!(indexes(&found, "NotoSansCJK-Regular.ttc"), [0]);
+    }
+
+    /// The installed files of the embedded families come first, before the script's
+    /// preferences, when their name table says they are the family: not a Nerd Font's variant,
+    /// nor a file that only starts with the name.
+    #[test]
+    fn the_embedded_families_files_are_tried_first() {
+        let files: Vec<PathBuf> = [
+            "DejaVuSans.ttf",
+            "Interstate-Regular.ttf",
+            "JetBrainsMonoNerdFont-Regular.ttf",
+            "Inter_VariableFont_opsz,wght.ttf",
+            "Inter-Italic.ttf",
+        ]
+        .iter()
+        .map(|n| PathBuf::from("/fonts").join(n))
+        .collect();
+        let mut read = |_: &Path, chars: &[char]| -> Coverage { vec![(0, chars.to_vec())] };
+        let mut names = |p: &Path| -> Vec<Vec<String>> {
+            let family = match p.file_name().unwrap().to_str().unwrap() {
+                "Interstate-Regular.ttf" => "interstate",
+                "JetBrainsMonoNerdFont-Regular.ttf" => "jetbrainsmono nerd font",
+                n if n.starts_with("Inter") => "inter",
+                _ => "dejavu sans",
+            };
+            vec![vec![family.to_owned()]]
+        };
+        let families = ["inter".to_owned(), "jetbrains mono".to_owned()];
+        let found = find_with_kin(
+            &files,
+            &['Ж'],
+            &|_, _| false,
+            &families,
+            &mut read,
+            &mut names,
+        );
+        // The upright variable file before the italic one; the others are never needed.
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("Inter_VariableFont_opsz,wght.ttf"));
+        // Without the families, the script's preference (DejaVu Sans for Cyrillic).
+        let found = find_with_kin(&files, &['Ж'], &|_, _| false, &[], &mut read, &mut names);
+        assert!(found[0].path.ends_with("DejaVuSans.ttf"));
+        // A Nerd Font isn't JetBrains Mono.
+        let only = [files[2].clone(), files[0].clone()];
+        let found = find_with_kin(
+            &only,
+            &['Ж'],
+            &|_, _| false,
+            &families,
+            &mut read,
+            &mut names,
+        );
+        assert!(found[0].path.ends_with("DejaVuSans.ttf"));
+    }
+
+    /// Both embedded families installed, each covering what is missing: each is found, whatever
+    /// the order of the files (text and code each take their own family's).
+    #[test]
+    fn each_embedded_family_is_found_for_what_both_cover() {
+        let inter = PathBuf::from("/fonts/Inter-Regular.ttf");
+        let mono = PathBuf::from("/fonts/JetBrainsMono-Regular.ttf");
+        let mut read = |_: &Path, chars: &[char]| -> Coverage { vec![(0, chars.to_vec())] };
+        let mut names = |p: &Path| -> Vec<Vec<String>> {
+            let inter = p.to_string_lossy().contains("Inter-");
+            vec![vec![
+                if inter { "inter" } else { "jetbrains mono" }.to_owned(),
+            ]]
+        };
+        let families = ["inter".to_owned(), "jetbrains mono".to_owned()];
+        for files in [[inter.clone(), mono.clone()], [mono.clone(), inter.clone()]] {
+            let found = find_with_kin(
+                &files,
+                &['Ж'],
+                &|_, _| false,
+                &families,
+                &mut read,
+                &mut names,
+            );
+            let paths: Vec<_> = found.iter().map(|f| f.path.clone()).collect();
+            assert_eq!(paths, [inter.clone(), mono.clone()]);
+        }
     }
 }

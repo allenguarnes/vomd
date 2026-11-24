@@ -501,6 +501,15 @@ const MERMAID_CASES: &[(&str, f32, f32, bool)] = &[
     ("mermaid-dark", 760.0, 1.0, true),
 ];
 
+/// `mermaid-emoji.md` (a flowchart with emoji in its labels, a skin tone and a variation
+/// selector among them), the test's color fonts added as fallbacks (no scan: the same on every
+/// machine): name, logical width, scale, dark.
+#[cfg(feature = "mermaid")]
+const MERMAID_EMOJI_CASES: &[(&str, f32, f32, bool)] = &[
+    ("mermaid-emoji-light", 760.0, 1.0, false),
+    ("mermaid-emoji-dark", 760.0, 1.0, true),
+];
+
 /// An image: width, height and pixels.
 type Rendered = (usize, usize, Vec<u32>);
 
@@ -736,10 +745,34 @@ fn render_anim(scale: f32, dark: bool) -> Rendered {
 /// A [`MERMAID_CASES`] case painted: the whole document, once its diagrams are made and drawn.
 #[cfg(feature = "mermaid")]
 fn render_mermaid(width: f32, scale: f32, dark: bool) -> Rendered {
-    let src = std::fs::read_to_string(root().join("fixtures/mermaid.md")).unwrap();
+    render_diagrams("mermaid.md", 2, Fonts::new().unwrap(), width, scale, dark)
+}
+
+/// A [`MERMAID_EMOJI_CASES`] case painted.
+#[cfg(feature = "mermaid")]
+fn render_mermaid_emoji(width: f32, scale: f32, dark: bool) -> Rendered {
+    let mut fonts = Fonts::new().unwrap();
+    for name in ["test-emoji-colr.ttf", "test-emoji-cbdt.ttf"] {
+        let path = root().join("fixtures/fonts").join(name);
+        assert!(fonts.add_fallback(&path, 0).is_some(), "{name}");
+    }
+    render_diagrams("mermaid-emoji.md", 1, fonts, width, scale, dark)
+}
+
+/// The fixture `file` painted whole, in `fonts`, once its `diagrams` are made and drawn.
+#[cfg(feature = "mermaid")]
+fn render_diagrams(
+    file: &str,
+    diagrams: usize,
+    fonts: Fonts,
+    width: f32,
+    scale: f32,
+    dark: bool,
+) -> Rendered {
+    let src = std::fs::read_to_string(root().join("fixtures").join(file)).unwrap();
     let w = (width * scale).round() as u32;
     let mut view = View::new(
-        Fonts::new().unwrap(),
+        fonts,
         Doc::parse(&src),
         None,
         (w, MAX_H as u32),
@@ -752,8 +785,8 @@ fn render_mermaid(width: f32, scale: f32, dark: bool) -> Rendered {
     });
     let mut px = vec![0; w as usize * MAX_H];
     let t = Instant::now();
-    // Two diagrams drawn (the third is code).
-    while view.image_stats().decoded < 2 {
+    // The diagrams drawn (`mermaid.md`'s third is code).
+    while view.image_stats().decoded < diagrams {
         assert!(t.elapsed() < Duration::from_secs(60), "never drawn");
         view.ensure();
         view.paint(&mut px, w as usize, Instant::now());
@@ -773,7 +806,7 @@ fn render_mermaid(width: f32, scale: f32, dark: bool) -> Rendered {
         view.paint(&mut px, w as usize, Instant::now());
         let now = Instant::now();
         view.tick(now, Some(now));
-        if !view.poll_images(Instant::now()) && view.image_stats().decoded >= 2 {
+        if !view.poll_images(Instant::now()) && view.image_stats().decoded >= diagrams {
             break;
         }
         assert!(t.elapsed() < Duration::from_secs(60), "never settled");
@@ -1110,6 +1143,12 @@ fn goldens() {
         MERMAID_CASES
             .iter()
             .map(|&(name, width, scale, dark)| (name, render_mermaid(width, scale, dark))),
+    );
+    #[cfg(feature = "mermaid")]
+    let cases = cases.chain(
+        MERMAID_EMOJI_CASES
+            .iter()
+            .map(|&(name, width, scale, dark)| (name, render_mermaid_emoji(width, scale, dark))),
     );
     #[cfg(unix)]
     let cases = cases.chain(

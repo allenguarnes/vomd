@@ -2119,6 +2119,9 @@ struct Slot {
     /// a reload (or a theme's other `<picture>`) that finds the same file keeps them
     /// ([`Images::carry`]). `None`: never kept.
     file: Option<crate::view::Stamp>,
+    /// SVG pixels whose text had characters no face has: drawn again when a fallback is added
+    /// ([`Images::set_svg_fonts`]).
+    missing: bool,
 }
 
 /// Marks the key of local pixels kept for the next document ([`Images::carry`]) while the last
@@ -2478,6 +2481,7 @@ impl Cache {
             protect: false,
             admitted: false,
             file: None,
+            missing: false,
         };
         // Room is made before the slot is in, so it can't be the one evicted.
         let anim = Cache::anim_cost(&slot);
@@ -2896,6 +2900,10 @@ pub(crate) enum Done {
         refused: Option<Refusal>,
         /// An SVG drawn without some of its embedded images, for VOMD's limits.
         skipped: bool,
+        /// An SVG's characters that no face has ([`svg::Fonts::missing`]).
+        missing: Vec<char>,
+        /// The generation of the faces it was drawn with ([`Images::fonts_gen`]).
+        fonts_gen: u64,
         /// The pixels are an animation's first frame ([`anim::detect`]).
         #[cfg(feature = "images")]
         anim: Option<AnimInfo>,
@@ -2922,6 +2930,12 @@ pub(crate) enum Done {
         bitmap: Option<Bitmap>,
         /// A remote image's body, if this decode fetched it: the viewer keeps it.
         body: Option<Bytes>,
+        /// An SVG's characters that no face has.
+        missing: Vec<char>,
+        /// The generation of the faces it was drawn with ([`Images::fonts_gen`]).
+        fonts_gen: u64,
+        /// The pixels are of an SVG.
+        svg: bool,
     },
     /// The anim thread did job `serial` ([`anim::Job`]).
     #[cfg(feature = "images")]
@@ -2943,6 +2957,9 @@ pub(crate) struct Queue {
     /// The faces SVG text is set in ([`Images::set_svg_fonts`]).
     #[cfg(feature = "svg")]
     fonts: Option<Arc<crate::fonts::SvgFonts>>,
+    /// Their generation ([`Images::fonts_gen`]).
+    #[cfg(feature = "svg")]
+    fonts_gen: u64,
     /// When the worker started the job in `busy`, while it runs.
     since: Option<std::time::Instant>,
     /// The job being decoded, and then its result until the main thread takes it
@@ -2951,6 +2968,12 @@ pub(crate) struct Queue {
     /// is in the cache, and not queued again while it is here.
     busy: Option<(Key, u32, u32, usize)>,
     quit: bool,
+    /// Set, a job waits once its faces are chosen, until it is cleared (the tests).
+    #[cfg(all(test, feature = "svg"))]
+    hold: bool,
+    /// A job waits for `hold` (the tests).
+    #[cfg(all(test, feature = "svg"))]
+    held: bool,
 }
 
 /// What a worker holds besides its jobs: its queue and condition variable, the thread's own
@@ -3000,7 +3023,7 @@ impl Worker {
     fn work(theirs: &Shared, tx: &Sender<Done>, wake: &Wake, mut state: WorkerState) {
         let (lock, cv) = &**theirs;
         loop {
-            let job = {
+            let (job, fonts_gen) = {
                 let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
                 // The last result still waits to be taken: its memory isn't free yet.
                 while (q.jobs.is_empty() || q.busy.is_some()) && !q.quit {
@@ -3014,7 +3037,20 @@ impl Worker {
                 q.since = Some(std::time::Instant::now());
                 #[cfg(feature = "svg")]
                 state.fonts.set(q.fonts.clone());
-                job
+                #[cfg(feature = "svg")]
+                let fonts_gen = q.fonts_gen;
+                #[cfg(not(feature = "svg"))]
+                let fonts_gen = 0;
+                #[cfg(all(test, feature = "svg"))]
+                while q.hold && !q.quit {
+                    q.held = true;
+                    q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+                #[cfg(all(test, feature = "svg"))]
+                {
+                    q.held = false;
+                }
+                (job, fonts_gen)
             };
             // (Before the file is read: a write meanwhile makes it another stamp, never the same.)
             #[cfg(feature = "images")]
@@ -3046,6 +3082,8 @@ impl Worker {
                 need: made.need,
                 refused: made.refused,
                 skipped: made.skipped,
+                missing: made.missing,
+                fonts_gen,
                 #[cfg(feature = "images")]
                 anim: made.anim,
                 #[cfg(feature = "images")]
@@ -3122,11 +3160,29 @@ impl Worker {
         q.jobs.is_empty() && q.busy.is_none()
     }
 
-    /// The faces SVG text is set in from the next job on.
+    /// The faces SVG text is set in from the next job on, and their generation.
     #[cfg(feature = "svg")]
-    fn set_fonts(&self, fonts: Option<Arc<crate::fonts::SvgFonts>>) {
+    fn set_fonts(&self, fonts: Option<Arc<crate::fonts::SvgFonts>>, fonts_gen: u64) {
         let (lock, _) = &*self.shared;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).fonts = fonts;
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        q.fonts = fonts;
+        q.fonts_gen = fonts_gen;
+    }
+
+    /// Hold each job once its faces are chosen, or let it go on (the tests).
+    #[cfg(all(test, feature = "svg"))]
+    fn hold(&self, on: bool) {
+        let (lock, cv) = &*self.shared;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).hold = on;
+        cv.notify_all();
+    }
+
+    /// Whether a job waits to be let go on (the tests).
+    #[cfg(all(test, feature = "svg"))]
+    #[cfg_attr(not(feature = "embed-fonts"), allow(dead_code))]
+    fn held(&self) -> bool {
+        let (lock, _) = &*self.shared;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).held
     }
 
     /// What the largest job of this worker holds, queued, being decoded, or decoded and not taken.
@@ -3200,6 +3256,8 @@ struct Made {
     need: Option<SvgCost>,
     refused: Option<Refusal>,
     skipped: bool,
+    /// An SVG's characters that no face has.
+    missing: Vec<char>,
     #[cfg(feature = "images")]
     anim: Option<AnimInfo>,
     /// The job was told to stop ([`Images::expire`]) and made nothing: the image was given up
@@ -3255,6 +3313,7 @@ fn decode_in(bytes: &[u8], job: &Job, room: usize, state: &mut WorkerState) -> M
             svg::Rendered::Pixels(b, skipped) => Made {
                 bitmap: Some(b),
                 skipped,
+                missing: std::mem::take(&mut state.fonts.missing),
                 ..Made::default()
             },
             svg::Rendered::Need(need) => Made {
@@ -3477,6 +3536,34 @@ pub struct Images {
     /// The faces SVG text is set in, for the workers ([`Images::set_svg_fonts`]).
     #[cfg(feature = "svg")]
     svg_fonts: Option<Arc<crate::fonts::SvgFonts>>,
+    /// The generation of `svg_fonts`, one more each time they change: a result drawn with
+    /// older faces that had characters no face had is drawn again (a face added since may have
+    /// them, and the scan that added it took them already: [`Images::stale`]).
+    #[cfg(feature = "svg")]
+    fonts_gen: u64,
+    /// The generation at which the faces were last switched, not only added to (a family
+    /// changed): an SVG drawn with older faces is drawn again, whatever its text had.
+    #[cfg(feature = "svg")]
+    fonts_switched: u64,
+    /// The worker's jobs wait once their faces are chosen ([`Images::hold_svg_jobs`]).
+    #[cfg(all(test, feature = "svg"))]
+    hold_jobs: bool,
+    /// Characters SVGs' text had that no face has, until the view takes them for a fallback
+    /// scan ([`Images::take_missing`]): at most [`MAX_PENDING_MISSING`].
+    missing: std::collections::BTreeSet<char>,
+    /// A load past the limits drew an SVG with characters no face has: its pixels are drawn
+    /// again when a fallback is added.
+    #[cfg(feature = "svg")]
+    forced_missing: bool,
+    /// The image viewer's decodes drew an SVG with characters no face has, and whether a face
+    /// added since asks for them to be made again ([`Images::take_redecode`]).
+    #[cfg(feature = "svg")]
+    detail_missing: bool,
+    /// The image viewer's current decode was of an SVG: a family switch decodes it again.
+    #[cfg(feature = "svg")]
+    detail_svg: bool,
+    #[cfg(feature = "svg")]
+    redecode: bool,
     /// A worker let go because its SVG took too long ([`Images::expire`]), drawn in VOMD's own
     /// process: while it is still drawing, no other SVG is (raster images are). One drawn apart
     /// is killed, and nothing waits for it.
@@ -3734,6 +3821,21 @@ impl Default for Images {
             #[cfg(feature = "svg")]
             svg_fonts: None,
             #[cfg(feature = "svg")]
+            fonts_gen: 0,
+            #[cfg(feature = "svg")]
+            fonts_switched: 0,
+            #[cfg(all(test, feature = "svg"))]
+            hold_jobs: false,
+            missing: std::collections::BTreeSet::new(),
+            #[cfg(feature = "svg")]
+            forced_missing: false,
+            #[cfg(feature = "svg")]
+            detail_missing: false,
+            #[cfg(feature = "svg")]
+            detail_svg: false,
+            #[cfg(feature = "svg")]
+            redecode: false,
+            #[cfg(feature = "svg")]
             stuck: None,
             #[cfg(feature = "svg")]
             svg_deadline: SVG_DEADLINE,
@@ -3886,15 +3988,34 @@ impl Images {
             .svg_fonts
             .as_ref()
             .is_some_and(|old| !same_fonts(old, &fonts));
+        // Faces only added after the others (fallbacks found by a scan) change the text of no
+        // character that was drawn already (a fallback is the first that has it): only the SVGs
+        // that had characters no face had are drawn again.
+        let added = changed
+            && self
+                .svg_fonts
+                .as_ref()
+                .is_some_and(|old| fonts_added(old, &fonts));
+        if changed {
+            self.fonts_gen += 1;
+        }
         let fonts = Some(Arc::new(fonts));
         if let Some(w) = &self.worker {
-            w.set_fonts(fonts.clone());
+            w.set_fonts(fonts.clone(), self.fonts_gen);
         }
-        self.forced.fonts = fonts.clone();
+        self.forced.set_fonts(fonts.clone(), self.fonts_gen);
         self.svg_fonts = fonts;
         // The SVGs drawn are drawn again, their text in the new faces, when they are next asked
         // for.
-        if changed {
+        if added {
+            self.cache.retain(|s| !(s.missing && s.pixels().is_some()));
+            if std::mem::take(&mut self.forced_missing) {
+                self.forced.forget_pixels();
+            }
+            if std::mem::take(&mut self.detail_missing) {
+                self.redecode = true;
+            }
+        } else if changed {
             let mut svgs: Vec<Key> = Vec::new();
             for s in &self.cache.slots {
                 if s.pixels().is_some() && self.is_svg(&s.key) && !svgs.contains(&s.key) {
@@ -3906,6 +4027,68 @@ impl Images {
                     .retain(|s| s.pixels().is_none() || !svgs.contains(&s.key));
             }
             self.forced.forget_pixels();
+            self.forced_missing = false;
+            // (And the results still being drawn with the old faces: [`Images::stale`].)
+            self.fonts_switched = self.fonts_gen;
+            if self.detail_svg {
+                self.redecode = true;
+            }
+        }
+    }
+
+    /// Whether a result drawn with the faces of generation `fonts_gen`, whose text had
+    /// `missing`, characters no face had, is to be drawn again: the faces changed since it
+    /// started. (The scan that added a face for them took them already, from another result:
+    /// they aren't looked for again, and nothing else draws it again.) An SVG's (`svg`) is
+    /// drawn again too, whatever its text had, if a family was switched since it started: its
+    /// pixels were forgotten before they came. Drawn again, it has the faces there are, so it
+    /// is drawn again at most once for each change.
+    #[cfg(feature = "svg")]
+    fn stale(&self, fonts_gen: u64, missing: &[char], svg: bool) -> bool {
+        (!missing.is_empty() && fonts_gen != self.fonts_gen)
+            || (svg && fonts_gen < self.fonts_switched)
+    }
+
+    /// Hold the jobs of the worker and of the forced thread (the image viewer's) once their
+    /// faces are chosen, or let them go on (the tests).
+    #[cfg(all(test, feature = "svg"))]
+    #[cfg_attr(not(feature = "embed-fonts"), allow(dead_code))]
+    pub(crate) fn hold_svg_jobs(&mut self, on: bool) {
+        self.hold_jobs = on;
+        if let Some(w) = &self.worker {
+            w.hold(on);
+        }
+        self.forced.hold.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether a job waits to be let go on ([`Images::hold_svg_jobs`]).
+    #[cfg(all(test, feature = "svg"))]
+    #[cfg_attr(not(feature = "embed-fonts"), allow(dead_code))]
+    pub(crate) fn svg_job_held(&self) -> bool {
+        self.worker.as_ref().is_some_and(Worker::held) || self.forced.running()
+    }
+
+    /// Whether the image viewer's pixels are to be decoded again: they are of an SVG with
+    /// characters no face had, and a face was added since ([`Images::set_svg_fonts`]), or they
+    /// were drawn with faces older than those ([`Images::stale`]).
+    #[cfg(feature = "svg")]
+    pub fn take_redecode(&mut self) -> bool {
+        std::mem::take(&mut self.redecode)
+    }
+
+    /// Characters SVGs' text had that no face has, since this was last called: for a fallback
+    /// scan (each SVG that had one is drawn again if the scan adds a face).
+    pub fn take_missing(&mut self) -> Vec<char> {
+        std::mem::take(&mut self.missing).into_iter().collect()
+    }
+
+    /// Note `chars`, characters an SVG's text had that no face has.
+    fn note_missing(&mut self, chars: &[char]) {
+        for &c in chars {
+            if self.missing.len() >= MAX_PENDING_MISSING {
+                break;
+            }
+            self.missing.insert(c);
         }
     }
 
@@ -5003,7 +5186,9 @@ impl Images {
         if !jobs.is_empty() && self.worker.is_none() {
             let worker = Worker::spawn(self.tx.clone(), self.wake.clone());
             #[cfg(feature = "svg")]
-            worker.set_fonts(self.svg_fonts.clone());
+            worker.set_fonts(self.svg_fonts.clone(), self.fonts_gen);
+            #[cfg(all(test, feature = "svg"))]
+            worker.hold(self.hold_jobs);
             self.worker = Some(worker);
         }
         if let Some(w) = &self.worker {
@@ -5435,6 +5620,8 @@ impl Images {
                 need,
                 refused,
                 skipped,
+                missing,
+                fonts_gen,
                 #[cfg(feature = "images")]
                 anim,
                 #[cfg(feature = "images")]
@@ -5461,6 +5648,15 @@ impl Images {
                     Worker::taken(&worker);
                     return;
                 }
+                // Drawn with faces older than a face added for its text: dropped, and asked for
+                // again (by the paint that follows), as a result with no room is.
+                #[cfg(feature = "svg")]
+                if bitmap.is_some() && self.stale(fonts_gen, &missing, self.is_svg(&key)) {
+                    Worker::taken(&worker);
+                    return;
+                }
+                #[cfg(not(feature = "svg"))]
+                let _ = fonts_gen;
                 match bitmap {
                     Some(b) => {
                         // (Kept, as any body, for an animation that is to play: it is played
@@ -5497,6 +5693,12 @@ impl Images {
                             #[cfg(feature = "images")]
                             if !skipped && let Some(s) = self.cache.slots.last_mut() {
                                 s.file = stamp;
+                            }
+                            if !missing.is_empty()
+                                && let Some(s) = self.cache.slots.last_mut()
+                            {
+                                s.missing = true;
+                                self.note_missing(&missing);
                             }
                             if page.is_some() {
                                 // (Kept to the end of the poll that took it: the window paints
@@ -5538,7 +5740,23 @@ impl Images {
                 serial,
                 bitmap,
                 body,
+                missing,
+                fonts_gen,
+                svg,
             } => {
+                // (Only the viewer's current decode: one for an image it has left is of no use.)
+                #[cfg(feature = "svg")]
+                if serial == self.detail_serial {
+                    self.detail_svg = svg;
+                    if self.stale(fonts_gen, &missing, svg) {
+                        self.redecode = true;
+                    } else if !missing.is_empty() {
+                        self.detail_missing = true;
+                    }
+                }
+                #[cfg(not(feature = "svg"))]
+                let _ = (fonts_gen, svg);
+                self.note_missing(&missing);
                 if let (Some(body), true, Some((url, _))) =
                     (body, serial == self.detail_serial, &self.detail_body)
                 {
@@ -6934,7 +7152,19 @@ impl Images {
                         }
                     }
                 }
+                #[cfg(feature = "svg")]
+                let stale = self.stale(loaded.fonts_gen, &loaded.missing, loaded.svg);
+                #[cfg(feature = "svg")]
+                if !loaded.missing.is_empty() {
+                    self.note_missing(&loaded.missing);
+                    self.forced_missing = true;
+                }
                 self.forced.loaded(origin.clone(), loaded, self.cache.frame);
+                // (Drawn with faces older than a face added for its text: drawn again.)
+                #[cfg(feature = "svg")]
+                if stale {
+                    self.forced.forget(&origin);
+                }
                 ImageSize::Pixels(w, h)
             }
             // (Only the body of an animation whose still is the cache's was fetched past the
@@ -7128,6 +7358,12 @@ impl Images {
     pub fn release_detail(&mut self) {
         self.cancel_detail();
         self.detail_body = None;
+        #[cfg(feature = "svg")]
+        {
+            self.detail_missing = false;
+            self.detail_svg = false;
+            self.redecode = false;
+        }
     }
 
     /// Whether the remote image `id` is blocked (remote images are off but could be turned on):
@@ -7209,6 +7445,26 @@ fn forced_origin(img: &ImageRef, base: Option<&Path>) -> Option<forced::Origin> 
     } else {
         local_path(&img.src, base).map(forced::Origin::File)
     }
+}
+
+/// Characters waiting for a fallback scan ([`Images::take_missing`]), at most: the view takes
+/// them after each frame.
+const MAX_PENDING_MISSING: usize = 4096;
+
+/// Whether `new` is the faces of `old` with faces added after them (and the same regular and
+/// mono faces).
+#[cfg(feature = "svg")]
+fn fonts_added(old: &crate::fonts::SvgFonts, new: &crate::fonts::SvgFonts) -> bool {
+    (old.sans, old.mono) == (new.sans, new.mono)
+        && old.sources.len() < new.sources.len()
+        && old
+            .sources
+            .iter()
+            .zip(&new.sources)
+            .all(|((a, i), (b, j))| {
+                let (a, b) = ((**a).as_ref(), (**b).as_ref());
+                (a.as_ptr(), a.len(), i) == (b.as_ptr(), b.len(), j)
+            })
 }
 
 /// Whether two sets of faces for SVG text are the same faces.

@@ -215,3 +215,106 @@ fn a_child_dies_with_its_job() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// What `bytes`, written by a stand-in for the child (`cat` of a file), are read as for a box of
+/// 2 × 1: the result, and the characters said missing.
+#[cfg(unix)]
+fn read_back(bytes: &[u8]) -> (Rendered, Vec<char>) {
+    use std::sync::atomic::AtomicUsize;
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "vomd-svg-result-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let mut child = Command::new("cat")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let mut missing = vec!['x'];
+    let r = read_result(&mut out, (2, 1), &AtomicBool::new(false), &mut missing);
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+    match r {
+        Ok(r) => (r, missing),
+        Err(_) => (Rendered::Cancelled, missing),
+    }
+}
+
+/// Pixels of 2 × 1, then `tail`.
+#[cfg(unix)]
+fn pixels_then(tail: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    write_result(
+        &mut b,
+        &Rendered::Pixels(
+            Bitmap {
+                width: 2,
+                height: 1,
+                data: vec![0xFF00_00FF, 0],
+            },
+            false,
+        ),
+        &[],
+    )
+    .unwrap();
+    // (What `write_result` wrote for no characters is replaced by `tail`.)
+    b.truncate(b.len() - 2);
+    b.extend_from_slice(tail);
+    b
+}
+
+/// The characters a child says no face had come back with its pixels; a count over the cap,
+/// a number that isn't a character or a result cut short is refused, with no character kept.
+#[cfg(unix)]
+#[test]
+fn the_characters_missing_come_back_and_a_bad_list_is_refused() {
+    let mut b = Vec::new();
+    let pixels = Rendered::Pixels(
+        Bitmap {
+            width: 2,
+            height: 1,
+            data: vec![1, 2],
+        },
+        true,
+    );
+    write_result(&mut b, &pixels, &['\u{1F680}', '中']).unwrap();
+    let (r, missing) = read_back(&b);
+    assert!(matches!(r, Rendered::Pixels(ref p, true) if p.data == [1, 2]));
+    assert_eq!(missing, ['\u{1F680}', '中']);
+    // More than the cap are cut to it by the child.
+    let many: Vec<char> = (0..1000)
+        .filter_map(|i| char::from_u32(0x4E00 + i))
+        .collect();
+    let mut b = Vec::new();
+    write_result(&mut b, &pixels, &many).unwrap();
+    assert_eq!(read_back(&b).1.len(), MAX_MISSING);
+    // A count over the cap.
+    let over = (MAX_MISSING as u16 + 1).to_le_bytes();
+    let mut tail = over.to_vec();
+    tail.extend(std::iter::repeat_n(0x41u8, 4 * (MAX_MISSING + 1)));
+    let (r, missing) = read_back(&pixels_then(&tail));
+    assert!(matches!(r, Rendered::Refused(Refusal::Broken)));
+    assert!(missing.is_empty());
+    // A surrogate, and a number past the last character.
+    for bad in [0xD800u32, 0x11_0000] {
+        let mut tail = 2u16.to_le_bytes().to_vec();
+        tail.extend_from_slice(&0x41u32.to_le_bytes());
+        tail.extend_from_slice(&bad.to_le_bytes());
+        let (r, missing) = read_back(&pixels_then(&tail));
+        assert!(matches!(r, Rendered::Refused(Refusal::Broken)), "{bad:x}");
+        assert!(missing.is_empty());
+    }
+    // Cut short: in the count, and in the list.
+    for tail in [&[1u8][..], &[2, 0, 0x41, 0, 0, 0, 0x42][..]] {
+        let (r, _) = read_back(&pixels_then(tail));
+        assert!(matches!(r, Rendered::Cancelled), "{tail:?}");
+    }
+    // None.
+    let (r, missing) = read_back(&pixels_then(&[0, 0]));
+    assert!(matches!(r, Rendered::Pixels(..)));
+    assert!(missing.is_empty());
+}

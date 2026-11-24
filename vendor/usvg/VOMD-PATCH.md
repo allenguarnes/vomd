@@ -3,12 +3,14 @@
 The library's sources (`src/`, without `main.rs`) and licenses of usvg 0.46.0 from crates.io
 (git b8e58f5a, `crates/usvg`), used through `[patch.crates-io]` in VOMD's `Cargo.toml` and
 `fuzz/Cargo.toml`. Its `Cargo.toml` drops the binary (and with it `pico-args`) and the
-dev-dependencies. The changes, marked `VOMD` in the code, are of two kinds. All but the last
-are about numbers too large for an `f32` (a size, a position, a stroke width, a transform): they
+dev-dependencies. The changes, marked `VOMD` in the code, are of three kinds. All but the last
+two are about numbers too large for an `f32` (a size, a position, a stroke width, a transform): they
 made a rectangle or a size that upstream then unwraps, a panic in the process that draws the SVG
 (the `svg` fuzz target found the first). Each now leaves out what it can't make, as upstream
-does for the size it checks (the last of them is an assertion on such a number). The final one
-is about a pattern that paints with itself, which recursed until the stack overflowed.
+does for the size it checks (the last of them is an assertion on such a number). The
+next-to-last is about a pattern that paints with itself, which recursed until the stack
+overflowed; the last is about text in a fallback face, which an emoji sequence or a character no
+face has left undrawn.
 
 - **An image far from zero** (`parser/image.rs`, `convert_inner`): an image much taller than it
   is wide, aligned inside a tall rectangle, sits at a position where an `f32` has no room for
@@ -65,8 +67,40 @@ is about a pattern that paints with itself, which recursed until the stack overf
   once, not once for each way round the cycle (a chain of patterns that each paint two shapes
   with the next, the last with the first, would take twice as long for each link).
 
+- **Fallback faces replace clusters, and pass over a character no face has**
+  (`text/layout.rs`, `shape_text`): upstream copied a fallback's glyphs over the missing ones by
+  index, and gave up on the whole span when the two shapings had different numbers of glyphs.
+  An emoji sequence (❤️ with its variation selector, 👍🏽 with a skin tone, a joiner's family, a
+  flag, a keycap) is one glyph in an emoji font and several in the face before it, so every
+  emoji of such a span was drawn as a missing glyph (upstream's TODO: "Replace clusters and not
+  glyphs"). Now each cluster of the fallback's shaping (its glyphs with the same start) whose
+  glyphs are all found, and which overlaps a missing glyph, replaces every glyph of the span it
+  overlaps, in visual order; a fallback that replaces nothing is passed over like one that
+  covers nothing. And a character for which the fallback selector finds no face (`None`)
+  stopped the fallback for the rest of the span (`break 'outer`): it is remembered (in a set)
+  and passed over, and the next missing character is looked for from where the last search
+  stopped, for at most 256 such characters a span; after them the rest of the span stays as it
+  is, as upstream left it after the first. The rounds that shape are still at most one for each
+  face, and the merge of a round is linear in the glyphs (with a binary search for the clusters
+  that overlap), so a span of 4000 different characters no face has is drawn in tens of
+  milliseconds, not seconds. The character looked for is the first of the missing glyph's
+  cluster that no face used has (upstream took the cluster's first: a combining mark shapes into
+  its base's cluster, so the base was looked for, and reported, while the mark was what no face
+  had), or the first if each has one. A cluster's glyphs and characters are looked at once a
+  search, where it was found (and how far its characters were checked) kept between lookups, and
+  a cluster with nothing left to look for is passed over whole: one base with 16,000 of a mark no
+  face has is one cluster of 16,000 missing glyphs, which looked through the whole cluster for
+  each glyph took 5.7 s. Where debug assertions are on (tests), the search's steps are counted
+  (`layout::vomd_work::fallback_steps`, hidden from the docs); a release build counts nothing.
+
 To upgrade: copy the new version's `src/` (without `main.rs`) and licenses here, apply the same
 changes, and run VOMD's SVG tests (`cargo test --lib image::svg`), whose
 `extreme_numbers_in_shapes_are_drawn_or_refused` draws each of the cases above except the last,
 which `a_pattern_that_paints_with_itself_by_inheritance_is_drawn_without_it` and
-`a_cycle_of_patterns_that_fans_out_is_converted_once_each` draw.
+`a_cycle_of_patterns_that_fans_out_is_converted_once_each` draw, and the fallback's, which
+`a_skin_tone_sequence_is_drawn_as_one_glyph`,
+`an_uncovered_mark_on_a_covered_base_is_what_is_reported`,
+`a_cluster_of_thousands_of_missing_marks_is_looked_through_once`,
+`a_character_no_face_has_leaves_the_rest_of_the_span_drawn`,
+`many_characters_no_face_has_are_looked_for_up_to_a_cap`,
+`a_fallback_for_thousands_of_clusters_merges_them` and `a_bitmap_color_glyph_is_drawn` draw (with the fonts of `fixtures/fonts`).

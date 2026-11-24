@@ -31,8 +31,9 @@
 //! [`set_test`]), the SVG's record (`SvgCost`), the faces (none, or the regular and mono faces'
 //! places and each face's index and origin: an embedded face's place, or a file's path), and
 //! the SVG's bytes. The result: pixels (whether
-//! embedded images were left out, the box, and `0xAARRGGBB` per pixel), what it needs (an
-//! `SvgCost`), or why it is refused.
+//! embedded images were left out, the box, `0xAARRGGBB` per pixel, then the characters its text
+//! had that no face has: a `u16` count, at most `MAX_MISSING`, and each as a `u32`), what it
+//! needs (an `SvgCost`), or why it is refused.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -41,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use super::{Caps, Fonts, Part, Refusal, Rendered, render_part};
+use super::{Caps, Fonts, MAX_MISSING, Part, Refusal, Rendered, render_part};
 use crate::fonts::{FontOrigin, SvgFonts};
 use crate::image::{Bitmap, Limits, SvgCost, cancelled};
 
@@ -226,7 +227,7 @@ pub(super) fn draw(
     let Some(mut out) = child.0.stdout.take() else {
         return Rendered::Refused(Refusal::Broken);
     };
-    match read_result(&mut out, (w, h), cancel) {
+    match read_result(&mut out, (w, h), cancel, &mut fonts.missing) {
         Ok(rendered) => rendered,
         Err(Stop::Cancelled) => Rendered::Cancelled,
         Err(Stop::Ended) => match child.status(cancel) {
@@ -404,12 +405,15 @@ enum Stop {
     Cancelled,
 }
 
-/// The result the child writes on `out`, for a box of `size`.
+/// The result the child writes on `out`, for a box of `size`; for pixels, the characters its
+/// text had that no face has go in `missing` (cleared first).
 fn read_result(
     out: &mut ChildStdout,
     size: (u32, u32),
     cancel: &AtomicBool,
+    missing: &mut Vec<char>,
 ) -> Result<Rendered, Stop> {
+    missing.clear();
     let mut kind = [0u8; 1];
     fill(out, &mut kind, cancel)?;
     match kind[0] {
@@ -431,6 +435,26 @@ fn read_result(
                 let (words, _) = chunk[..n * 4].as_chunks::<4>();
                 data.extend(words.iter().map(|&b| u32::from_le_bytes(b)));
                 left -= n;
+            }
+            // Then the characters no face had: a count and each one. A count over the cap, or a
+            // number that isn't a character, is a child gone wrong: nothing it drew is used.
+            let mut n = [0u8; 2];
+            fill(out, &mut n, cancel)?;
+            let n = u16::from_le_bytes(n) as usize;
+            if n > MAX_MISSING {
+                return Ok(Rendered::Refused(Refusal::Broken));
+            }
+            let mut chars = vec![0u8; n * 4];
+            fill(out, &mut chars, cancel)?;
+            let (words, _) = chars.as_chunks::<4>();
+            for &w in words {
+                match char::from_u32(u32::from_le_bytes(w)) {
+                    Some(c) => missing.push(c),
+                    None => {
+                        missing.clear();
+                        return Ok(Rendered::Refused(Refusal::Broken));
+                    }
+                }
             }
             let bitmap = Bitmap {
                 width,
@@ -800,18 +824,18 @@ fn draw_job() -> i32 {
         .stack_size(stack)
         .spawn(move || run(job))
         .and_then(|t| t.join().map_err(|_| std::io::ErrorKind::Other.into()));
-    let Ok(result) = drawn else {
+    let Ok((result, missing)) = drawn else {
         return EXIT_PANIC;
     };
     let mut out = std::io::stdout().lock();
-    match write_result(&mut out, &result).and_then(|()| out.flush()) {
+    match write_result(&mut out, &result, &missing).and_then(|()| out.flush()) {
         Ok(()) => 0,
         Err(_) => EXIT_INPUT,
     }
 }
 
-/// Draw `job`, as VOMD's own process would.
-fn run(job: Job) -> Rendered {
+/// Draw `job`, as VOMD's own process would: the result, and the characters no face had.
+fn run(job: Job) -> (Rendered, Vec<char>) {
     match job.test {
         SPIN => loop {
             std::hint::black_box(());
@@ -829,12 +853,14 @@ fn run(job: Job) -> Rendered {
     fonts.set(job.fonts.map(Arc::new));
     let caps = Caps::of(&job.limits);
     let never = AtomicBool::new(false);
-    render_part(
+    let rendered = render_part(
         &job.bytes, &job.svg, job.size, job.crop, job.charge, &caps, &never, &mut fonts,
-    )
+    );
+    (rendered, std::mem::take(&mut fonts.missing))
 }
 
-fn write_result(out: &mut impl Write, r: &Rendered) -> std::io::Result<()> {
+/// The result `r`; after pixels, the characters of `missing` (at most [`MAX_MISSING`]).
+fn write_result(out: &mut impl Write, r: &Rendered, missing: &[char]) -> std::io::Result<()> {
     match r {
         Rendered::Pixels(b, skipped) => {
             out.write_all(&[PIXELS, u8::from(*skipped)])?;
@@ -845,6 +871,11 @@ fn write_result(out: &mut impl Write, r: &Rendered) -> std::io::Result<()> {
                 chunk.clear();
                 chunk.extend(words.iter().flat_map(|w| w.to_le_bytes()));
                 out.write_all(&chunk)?;
+            }
+            let missing = &missing[..missing.len().min(MAX_MISSING)];
+            out.write_all(&(missing.len() as u16).to_le_bytes())?;
+            for &c in missing {
+                out.write_all(&u32::from(c).to_le_bytes())?;
             }
             Ok(())
         }

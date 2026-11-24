@@ -1,0 +1,5 @@
+sequenceDiagram
+  participant A as 🚀 Rocket
+  participant B as שלום 👍🏽
+  A->>B: hello ❤️‍
+  B-->>A: 🏽🏽‍‍

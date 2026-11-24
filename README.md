@@ -36,7 +36,7 @@
 ## Why VOMD
 
 - **Fast.** Opens in milliseconds; a 5 MB document opens in under 100 ms.
-- **Small.** One file with its fonts built in: about 5.8 MB on Linux, 5.3 MB on Windows and
+- **Small.** One file with its fonts built in: about 5.8 MB on Linux, 5.4 MB on Windows and
   4.3 MB on macOS. No web engine, no GUI toolkit, nothing else to install.
 - **Private.** Never touches the network unless you ask it to, and never runs a document's HTML.
 - **Just a viewer.** No editor, no workspace, no accounts. Open a file, read it, close it.
@@ -54,12 +54,13 @@
   built-in math font.
 - **Mermaid diagrams:** ```` ```mermaid ```` blocks drawn as diagrams, in GitHub's colours:
   flowcharts, sequence, class, state and ER diagrams, Gantt charts, pie charts, mind maps,
-  timelines, git graphs, user journeys, quadrant charts and XY charts. Click one to see it
-  larger.
+  timelines, git graphs, user journeys, quadrant charts and XY charts. Emoji and other scripts
+  in labels are drawn in your installed fonts, as in the text. Click one to see it larger.
 - **Syntax highlighting** in code blocks, in GitHub's colours, for 26 languages and their usual
   aliases.
-- **Images:** PNG, JPEG, GIF, WebP and SVG, local or remote. Click one to see it as large as the
-  window allows, then zoom and pan. Animated GIFs and WebPs can play (off by default, press `A`).
+- **Images:** PNG, JPEG, GIF, WebP and SVG, local or remote (an SVG's text uses VOMD's fonts, and
+  your installed ones for emoji and other scripts). Click one to see it as large as the window
+  allows, then zoom and pan. Animated GIFs and WebPs can play (off by default, press `A`).
 - **Links:** `#anchors` scroll, links to other `.md` files open in the same window (with Back),
   and web links open in your browser.
 - **Find in page** (`Ctrl+F`), a **contents panel** (`C`), and **text selection** with copy, plus a

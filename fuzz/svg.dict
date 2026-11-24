@@ -91,3 +91,17 @@
 "mm"
 "pt"
 "1e9"
+# Text in the fallback faces: the test fonts' emoji, a skin tone, a joiner, a variation selector,
+# a keycap, a flag's letter, Hebrew, and a character no face has.
+"\xF0\x9F\x9A\x80"
+"\xF0\x9F\x91\x8D"
+"\xF0\x9F\x8F\xBD"
+"\xE2\x9D\xA4"
+"\xEF\xB8\x8F"
+"\xE2\x80\x8D"
+"\xE2\x83\xA3"
+"\xF0\x9F\x87\xAB"
+"\xD7\xA9"
+"\xEE\x80\x80"
+"<tspan>"
+"direction=\"rtl\""

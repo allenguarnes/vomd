@@ -148,7 +148,7 @@ impl View {
     }
 
     /// Ask for the decode the viewer wants next, if any.
-    fn viewer_decode(&mut self, now: Instant) {
+    pub(super) fn viewer_decode(&mut self, now: Instant) {
         let Some(v) = self.viewer.as_mut() else {
             return;
         };
@@ -608,6 +608,21 @@ impl View {
         self.viewer_decode(now);
     }
 
+    /// The viewer's image is decoded again, at the same zoom and place: an SVG whose text had
+    /// characters no face had, a face for which was added. What it shows stays until the new
+    /// pixels come.
+    #[cfg(feature = "svg")]
+    pub(super) fn viewer_redecode(&mut self, now: Instant) {
+        let Some(v) = self.viewer.as_mut() else {
+            return;
+        };
+        v.fresh = false;
+        v.crop = None;
+        v.asked = None;
+        v.failed = None;
+        self.viewer_decode(now);
+    }
+
     // ---- Time -----------------------------------------------------------------------------
 
     /// When the viewer next needs the event loop.
@@ -638,6 +653,12 @@ impl View {
             return false;
         };
         let shown = v.took(serial, bitmap);
+        // (Its SVG was drawn with faces older than a face added for its text: drawn again.)
+        #[cfg(feature = "svg")]
+        if self.images.take_redecode() {
+            self.viewer_redecode(now);
+            return shown;
+        }
         self.viewer_decode(now);
         shown
     }

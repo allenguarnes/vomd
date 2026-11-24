@@ -126,7 +126,7 @@ incremental = false
 image-webp = { path = "vendor/image-webp" } # 0.2.4, its lossless decoder's Huffman codes bounded
 resvg = { path = "vendor/resvg" } # 0.46.0, raster images drawn by a hook, and a cancel flag
 simplecss = { path = "vendor/simplecss" } # 0.2.2, an error's position made in constant time
-usvg = { path = "vendor/usvg" } # 0.46.0, numbers too large for an f32 leave out what they would unwrap
+usvg = { path = "vendor/usvg" } # 0.46.0, numbers too large for an f32 leave out what they would unwrap; fallback by cluster
 mermaid-svg = { path = "vendor/mermaid-svg" } # 0.7.0, graphs laid out by dugong, VOMD's entry point
 dugong = { path = "vendor/dugong" } # 0.11.0, no serde
 dugong-graphlib = { path = "vendor/dugong-graphlib" } # 0.11.0, no serde

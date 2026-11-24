@@ -2534,6 +2534,300 @@ mod with_fonts {
         }
     }
 
+    /// Text in an SVG that no face has is looked for once; the face a scan finds draws it, in
+    /// that SVG only (the other is not drawn again), and a reload or a theme switch keeps it.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn svg_text_no_face_has_is_scanned_for_and_drawn_again() {
+        use crate::text::fallback::Found;
+        let dir = std::env::temp_dir().join(format!("vomd-view-svg-emoji-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg = |text: &str| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="60"><rect width="160" height="60" fill="#fff"/><text x="4" y="45" font-size="40">{text}</text></svg>"##
+            )
+        };
+        std::fs::write(dir.join("a.svg"), svg("&#x1F680;&#xE000;")).unwrap();
+        std::fs::write(dir.join("b.svg"), svg("Hi")).unwrap();
+        let src = "![a](a.svg) ![b](b.svg)";
+        let mut v = view(src, 600, 300);
+        v.set_image_base(Some(dir.clone()));
+        settle_images(&mut v);
+        let red = |v: &mut View| {
+            let mut buf = vec![0u32; 600 * 300];
+            v.paint(&mut buf, 600, Instant::now());
+            buf.iter()
+                .filter(|&&p| (p >> 16) & 0xFF > 200 && (p >> 8) & 0xFF < 60 && p & 0xFF < 60)
+                .count()
+        };
+        assert_eq!(red(&mut v), 0);
+        // Asked for once, whatever happens after (U+E000: no face anywhere).
+        assert_eq!(v.take_missing(), vec!['\u{E000}', '\u{1F680}']);
+        assert!(v.take_missing().is_empty());
+        let decodes = v.image_stats().decodes;
+        let font = Found {
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/fonts/test-emoji-colr.ttf"),
+            index: 0,
+        };
+        assert!(v.add_fallbacks(&[font]));
+        settle_images(&mut v);
+        assert_eq!(
+            v.image_stats().decodes,
+            decodes + 1,
+            "only the SVG it was for"
+        );
+        assert!(red(&mut v) > 500);
+        // U+E000 is still missing, but not asked for again: no scan, and no drawing again.
+        assert!(v.take_missing().is_empty());
+        settle_images(&mut v);
+        assert_eq!(v.image_stats().decodes, decodes + 1);
+        v.replace(Doc::parse(src), None);
+        settle_images(&mut v);
+        assert!(red(&mut v) > 500);
+        v.set_theme_mode(ThemeMode::Dark);
+        settle_images(&mut v);
+        assert!(red(&mut v) > 500);
+        assert!(v.take_missing().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The image viewer's SVG, whose text had a character no face had, is decoded again when a
+    /// scan adds a face for it; one whose text had none isn't.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn the_viewers_svg_is_drawn_again_with_a_face_added() {
+        use crate::text::fallback::Found;
+        let dir =
+            std::env::temp_dir().join(format!("vomd-viewer-svg-emoji-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="60"><rect width="160" height="60" fill="#fff"/><text x="4" y="45" font-size="40">&#x1F680;</text></svg>"##,
+        )
+        .unwrap();
+        let mut v = view("![a](a.svg)", 600, 300);
+        v.set_image_base(Some(dir.clone()));
+        settle_images(&mut v);
+        assert!(v.open_image(1, Instant::now()));
+        settle_viewer(&mut v);
+        let red = |v: &View| {
+            let d = v.viewer.as_ref().unwrap().detail.as_ref().expect("decoded");
+            d.data
+                .iter()
+                .filter(|&&p| (p >> 16) & 0xFF > 200 && (p >> 8) & 0xFF < 60 && p & 0xFF < 60)
+                .count()
+        };
+        assert_eq!(red(&v), 0);
+        assert_eq!(v.take_missing(), vec!['\u{1F680}']);
+        let font = |name: &str| Found {
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/fonts")
+                .join(name),
+            index: 0,
+        };
+        assert!(v.add_fallbacks(&[font("test-emoji-colr.ttf")]));
+        assert!(v.viewer_waiting(), "decoded again");
+        settle_viewer(&mut v);
+        assert!(red(&v) > 500, "{}", red(&v));
+        // Nothing is missing now: another face added doesn't decode it again.
+        assert!(v.add_fallbacks(&[font("test-emoji-cbdt.ttf")]));
+        assert!(!v.viewer_waiting());
+        v.close_viewer();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wait until a decode holds ([`crate::image::Images::hold_svg_jobs`]), its faces chosen.
+    #[cfg(feature = "svg")]
+    fn wait_held(v: &mut View) {
+        let t = Instant::now();
+        while !v.images.svg_job_held() {
+            assert!(t.elapsed() < Duration::from_secs(30), "never held");
+            frame(v, Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// An SVG decoding as a scan adds a face for its text (another SVG's result asked for it) is
+    /// drawn with the faces it started with: it is drawn again with the face, once.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn an_svg_drawn_as_a_face_is_added_is_drawn_again() {
+        use crate::text::fallback::Found;
+        let dir = std::env::temp_dir().join(format!("vomd-view-svg-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="60"><rect width="160" height="60" fill="#fff"/><text x="4" y="45" font-size="40">&#x1F680;</text></svg>"##,
+        )
+        .unwrap();
+        let mut v = view("![a](a.svg)", 600, 300);
+        v.set_image_base(Some(dir.clone()));
+        settle_images(&mut v);
+        assert_eq!(v.take_missing(), vec!['\u{1F680}']);
+        // Drawn again at another zoom: held once its faces are chosen, as a scan for its first
+        // drawing's 🚀 (or another SVG's) adds a face.
+        v.images.hold_svg_jobs(true);
+        v.apply(Action::ZoomIn, Instant::now());
+        wait_held(&mut v);
+        let font = Found {
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/fonts/test-emoji-colr.ttf"),
+            index: 0,
+        };
+        assert!(v.add_fallbacks(&[font]));
+        v.images.hold_svg_jobs(false);
+        settle_images(&mut v);
+        let red = |v: &mut View| {
+            let mut buf = vec![0u32; 600 * 300];
+            v.paint(&mut buf, 600, Instant::now());
+            buf.iter()
+                .filter(|&&p| (p >> 16) & 0xFF > 200 && (p >> 8) & 0xFF < 60 && p & 0xFF < 60)
+                .count()
+        };
+        assert!(red(&mut v) > 500, "{}", red(&mut v));
+        assert!(v.take_missing().is_empty());
+        // Drawn once more, not again and again.
+        let decodes = v.image_stats().decodes;
+        settle_images(&mut v);
+        assert_eq!(v.image_stats().decodes, decodes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The image viewer's SVG decoding as a scan adds a face for its text (its thumbnail asked
+    /// for it) is decoded again with the face, once.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn the_viewers_svg_decoding_as_a_face_is_added_is_drawn_again() {
+        use crate::text::fallback::Found;
+        let dir =
+            std::env::temp_dir().join(format!("vomd-viewer-svg-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="60"><rect width="160" height="60" fill="#fff"/><text x="4" y="45" font-size="40">&#x1F680;</text></svg>"##,
+        )
+        .unwrap();
+        let mut v = view("![a](a.svg)", 600, 300);
+        v.set_image_base(Some(dir.clone()));
+        settle_images(&mut v);
+        assert_eq!(v.take_missing(), vec!['\u{1F680}']);
+        v.images.hold_svg_jobs(true);
+        assert!(v.open_image(1, Instant::now()));
+        wait_held(&mut v);
+        let font = Found {
+            path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/fonts/test-emoji-colr.ttf"),
+            index: 0,
+        };
+        assert!(v.add_fallbacks(&[font]));
+        v.images.hold_svg_jobs(false);
+        settle_viewer(&mut v);
+        let red = |v: &View| {
+            let d = v.viewer.as_ref().unwrap().detail.as_ref().expect("decoded");
+            d.data
+                .iter()
+                .filter(|&&p| (p >> 16) & 0xFF > 200 && (p >> 8) & 0xFF < 60 && p & 0xFF < 60)
+                .count()
+        };
+        assert!(red(&v) > 500, "{}", red(&v));
+        assert!(v.take_missing().is_empty());
+        assert!(!v.viewer_waiting(), "decoded once more, not again");
+        v.close_viewer();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder with `a.svg`, Latin text every face has (no character missing), for `name`.
+    #[cfg(feature = "svg")]
+    fn latin_svg_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vomd-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="60"><rect width="160" height="60" fill="#fff"/><text x="4" y="45" font-size="40">Wim</text></svg>"##,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// An SVG decoding as body text's family is switched (nothing missing in its text) is drawn
+    /// with the faces it started with: it is drawn again in the new family, once. (With Mermaid
+    /// the switch attaches the document again, which drops it anyway: the build without it
+    /// shows the rule, [`crate::image::Images::stale`].)
+    #[cfg(feature = "svg")]
+    #[test]
+    fn an_svg_drawn_as_the_family_is_switched_is_drawn_again() {
+        let dir = latin_svg_dir("view-svg-switch");
+        let paint = |v: &mut View| {
+            let mut buf = vec![0u32; 600 * 300];
+            v.paint(&mut buf, 600, Instant::now());
+            buf
+        };
+        // What it looks like drawn in JetBrains Mono from the start.
+        let mut want = view("![a](a.svg)", 600, 300);
+        assert!(want.set_family(false, Some(&jb_family())));
+        want.set_image_base(Some(dir.clone()));
+        settle_images(&mut want);
+        want.apply(Action::ZoomIn, Instant::now());
+        settle_images(&mut want);
+        let mut v = view("![a](a.svg)", 600, 300);
+        v.set_image_base(Some(dir.clone()));
+        settle_images(&mut v);
+        v.images.hold_svg_jobs(true);
+        v.apply(Action::ZoomIn, Instant::now());
+        wait_held(&mut v);
+        assert!(v.set_family(false, Some(&jb_family())));
+        v.images.hold_svg_jobs(false);
+        settle_images(&mut v);
+        assert!(paint(&mut v) == paint(&mut want), "drawn in the old family");
+        // Drawn once more, not again and again.
+        let decodes = v.image_stats().decodes;
+        settle_images(&mut v);
+        assert_eq!(v.image_stats().decodes, decodes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The image viewer's SVG decoding as body text's family is switched is decoded again in
+    /// the new family, once; and one decoded already is decoded again when it is switched back.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn the_viewers_svg_is_drawn_again_as_the_family_is_switched() {
+        let dir = latin_svg_dir("viewer-svg-switch");
+        let detail = |v: &View| {
+            let d = v.viewer.as_ref().unwrap().detail.as_ref().expect("decoded");
+            d.data.clone()
+        };
+        let mut want = [None, None];
+        for (i, jb) in [false, true].into_iter().enumerate() {
+            let mut r = view("![a](a.svg)", 600, 300);
+            if jb {
+                assert!(r.set_family(false, Some(&jb_family())));
+            }
+            r.set_image_base(Some(dir.clone()));
+            settle_images(&mut r);
+            assert!(r.open_image(1, Instant::now()));
+            settle_viewer(&mut r);
+            want[i] = Some(detail(&r));
+        }
+        assert!(want[0] != want[1], "the families draw it the same");
+        let mut v = view("![a](a.svg)", 600, 300);
+        v.set_image_base(Some(dir.clone()));
+        settle_images(&mut v);
+        v.images.hold_svg_jobs(true);
+        assert!(v.open_image(1, Instant::now()));
+        wait_held(&mut v);
+        assert!(v.set_family(false, Some(&jb_family())));
+        v.images.hold_svg_jobs(false);
+        settle_viewer(&mut v);
+        assert!(Some(detail(&v)) == want[1], "decoded in the old family");
+        assert!(!v.viewer_waiting(), "decoded once more, not again");
+        assert!(v.set_family(false, None));
+        settle_viewer(&mut v);
+        assert!(Some(detail(&v)) == want[0], "not decoded again");
+        v.close_viewer();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A local image is decoded after the first frame and painted in its box.
     #[cfg(feature = "images")]
     #[test]

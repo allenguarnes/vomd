@@ -13,13 +13,22 @@ and versions follow [Semantic Versioning](https://semver.org/).
   charts and XY charts. A diagram loads like an image, scales to the column, and opens in the
   image viewer with a click; copying one copies its block. One that can't be drawn (a mistake
   in it, a type VOMD doesn't draw, over 50 KB, past a document's first 100 diagrams or its first
-  64 MB of them, too large to draw) shows as its code, with a line that says why.
-  Diagrams are made in a process of their own, as SVGs are drawn. The `mermaid` Cargo feature
-  (on by default) holds it; the binary is about 1 MB larger.
+  64 MB of them, too large to draw) shows as its code, with a line that says why. Labels in
+  any script, emoji included, are drawn and sized in the fonts the document's text uses
+  (installed fonts are found for them as for the text). Diagrams are made in a process of their
+  own, as SVGs are drawn. The `mermaid` Cargo feature (on by default) holds it; the binary is
+  about 1 MB larger.
 
 ### Changed
 - A smaller binary, with nothing changed in what it does: about 550 KB smaller on Linux (code
   VOMD never runs is left out).
+
+### Fixed
+- Text in SVG images shows emoji (with skin tones, joined sequences and the like) and
+  characters VOMD's fonts don't have, in installed fonts, as the document's text does; they
+  showed as empty boxes. On a machine with Inter or JetBrains Mono installed, characters their
+  built-in copies leave out (Cyrillic and Greek, for example) are shown in the installed copy
+  first, in the document's text too.
 
 ## [1.11.0] - 2026-11-22
 

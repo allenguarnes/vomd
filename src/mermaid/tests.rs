@@ -788,3 +788,170 @@ fn each_maker_hears_of_its_own_diagrams() {
     assert!(b.take_finished());
     assert!(!c.take_finished());
 }
+
+// ---- Text outside the table: emoji, CJK, measured in the faces that draw them ----------------
+
+/// VOMD's faces, with the test's COLR emoji font added as a fallback when `emoji`.
+fn fonts_with_emoji(emoji: bool) -> crate::fonts::Fonts {
+    let mut fonts = crate::fonts::Fonts::new().unwrap();
+    if emoji {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/fonts/test-emoji-colr.ttf");
+        assert!(fonts.add_fallback(&path, 0).is_some());
+    }
+    fonts
+}
+
+/// A combining mark no face has, on a base that is in the table: the mark is reported (not the
+/// base), and with a fallback that has both the sequence is measured in it.
+#[test]
+fn an_uncovered_mark_on_a_covered_base_is_what_a_diagram_reports() {
+    let src = "flowchart LR\n  A[A\u{1AB0}] --> B[ok]\n";
+    let (seq, missing) = scan(src, &crate::fonts::Fonts::new().unwrap());
+    assert_eq!(missing, ['\u{1AB0}']);
+    assert!(seq.is_empty());
+    let mut fonts = crate::fonts::Fonts::new().unwrap();
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fonts/test-marks.ttf");
+    assert!(fonts.add_fallback(&path, 0).is_some());
+    let (seq, missing) = scan(src, &fonts);
+    assert!(missing.is_empty(), "{missing:?}");
+    assert_eq!(seq, [("A\u{1AB0}".to_owned(), 0.6)]);
+}
+
+#[test]
+fn a_job_carries_the_diagrams_sequences() {
+    let mut m = metrics();
+    m.seq = vec![("\u{1F44D}\u{1F3FD}".into(), 1.2), ("中".into(), 1.0)];
+    m.seq.sort_by(|a, b| a.0.cmp(&b.0));
+    let job = put_job("pie\n  \"a\" : 1\n", false, &m, 0);
+    let (_, _, back, _) = get_job(&job).unwrap();
+    assert_eq!(back, m);
+    assert_ne!(m.key(), metrics().key());
+    // Out of order, empty, or not UTF-8: refused.
+    let mut bad = m.clone();
+    bad.seq.reverse();
+    assert!(get_job(&put_job("pie", false, &bad, 0)).is_none());
+    for s in [String::new(), "\u{FFFD}".into()] {
+        let mut bad = metrics();
+        bad.seq = vec![(s.clone(), 1.0)];
+        let mut job = put_job("pie", false, &bad, 0);
+        if !s.is_empty() {
+            // (The replacement character's last byte made one that isn't UTF-8.)
+            let at = job
+                .windows(3)
+                .position(|w| w == "\u{FFFD}".as_bytes())
+                .unwrap();
+            job[at + 2] = 0xFF;
+        }
+        assert!(get_job(&job).is_none(), "{s:?}");
+    }
+    // An advance that isn't sane is made one.
+    let mut wild = metrics();
+    wild.seq = vec![("中".into(), f32::NAN)];
+    let (_, _, back, _) = get_job(&put_job("pie", false, &wild, 0)).unwrap();
+    assert!(back.seq[0].1.is_finite());
+}
+
+/// A sequence (a skin tone with its emoji, one glyph in the emoji font) is measured as one
+/// advance in the face that draws it; characters no face has are reported, and estimated.
+#[test]
+fn a_diagrams_sequences_are_measured_in_the_faces_that_draw_them() {
+    let src =
+        "flowchart LR\n  A[Go \u{1F680}] --> B[\u{1F44D}\u{1F3FD} ok]\n  B --> C[x\u{0F00}]\n";
+    let (seq, missing) = scan(src, &fonts_with_emoji(false));
+    assert!(seq.iter().all(|(s, _)| !s.contains('\u{1F680}')));
+    // (As body text reports them: the skin tone goes with its emoji's face.)
+    assert_eq!(missing, ['\u{0F00}', '\u{1F44D}', '\u{1F680}']);
+    let (seq, missing) = scan(src, &fonts_with_emoji(true));
+    assert_eq!(missing, ['\u{0F00}']);
+    // 1,200 units of 1,000 a glyph: the ligature is one.
+    let of = |s: &str| seq.iter().find(|(k, _)| k == s).map(|e| e.1);
+    assert_eq!(of("\u{1F680}"), Some(1.2));
+    assert_eq!(of("\u{1F44D}\u{1F3FD}"), Some(1.2));
+    // Measured: the sequence once, the rest from the table.
+    let m = Metrics { seq, ..metrics() };
+    let base = metrics();
+    let w = m.measure("Go \u{1F680}");
+    assert!((w - (base.measure("Go ") + 1.2)).abs() < 1e-6, "{w}");
+    let w = m.measure("\u{1F44D}\u{1F3FD} ok");
+    assert!((w - (base.measure(" ok") + 1.2)).abs() < 1e-6, "{w}");
+    // ASCII only: nothing to scan.
+    assert_eq!(
+        scan("flowchart LR\n  a --> b", &fonts_with_emoji(true)),
+        (vec![], vec![])
+    );
+}
+
+/// A label's box is as wide as its text's real advances: an emoji measured wider makes a wider
+/// box than the estimate did.
+#[test]
+fn a_label_is_as_wide_as_its_measured_text() {
+    let src = "flowchart LR\n  A[\u{1F680}\u{1F680}\u{1F680}\u{1F680}]\n";
+    let width = |m: &Metrics| {
+        let m = m.clone();
+        mermaid_svg::vomd::set_measure(Some(Box::new(move |s| m.measure(s))));
+        let g = mermaid_svg::vomd::flowchart_geometry(src).unwrap();
+        mermaid_svg::vomd::set_measure(None);
+        g.nodes[0].1[2] - g.nodes[0].1[0]
+    };
+    let estimated = width(&metrics());
+    let mut wide = metrics();
+    wide.seq = vec![("\u{1F680}".into(), 3.0)];
+    // Four emoji 2 em wider each, at the diagrams' 16 px.
+    assert!(
+        width(&wide) - estimated >= 4.0 * 2.0 * 14.0,
+        "{estimated} {}",
+        width(&wide)
+    );
+}
+
+/// A fallback added for some diagram's characters makes that diagram again, and only it.
+#[test]
+fn a_fallback_remakes_only_the_diagrams_it_draws_text_of() {
+    let emoji = "flowchart TD\n  remake --> x[\u{1F680} launch]";
+    let plain = "flowchart TD\n  remake --> y[\u{00FE}\u{2192} plain \u{4E2D}]";
+    let src = format!("```mermaid\n{emoji}\n```\n\n```mermaid\n{plain}\n```\n");
+    let doc = crate::doc::Doc::parse(&src);
+    let (ke, kp) = (key(emoji, false), key(plain, false));
+    let mut fonts = fonts_with_emoji(false);
+    let mut maker = Maker::default();
+    maker.set_metrics(Metrics::of(&fonts));
+    let (missing, remade) = maker.request_with(&doc, &fonts);
+    assert!(!remade);
+    assert_eq!(missing, ['\u{4E2D}', '\u{1F680}']);
+    let wait = |doc: &crate::doc::Doc| {
+        let t = Instant::now();
+        while doc.images.iter().any(|i| pending(&i.src)) {
+            assert!(t.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait(&doc);
+    let made = |k| match store().map.get(&k) {
+        Some((State::Done(svg, made_with), _)) => (svg.clone(), *made_with),
+        _ => panic!("not made"),
+    };
+    let (svg_e, with_e) = made(ke);
+    let (svg_p, with_p) = made(kp);
+    // (The plain one's arrow is measured in the bold face: a sequence of its own.)
+    assert_ne!(with_p, metrics().key());
+    assert_eq!(with_e, metrics().key());
+    // Asked again with nothing new: the scans are kept, nothing is made again.
+    assert_eq!(maker.request_with(&doc, &fonts), (vec![], false));
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/fonts/test-emoji-colr.ttf");
+    assert!(fonts.add_fallback(&path, 0).is_some());
+    let (missing, remade) = maker.request_with(&doc, &fonts);
+    assert!(remade);
+    // (Scanned again for the new faces: what is still missing is said again, and the view's
+    // `tried` keeps it from a second scan.)
+    assert_eq!(missing, ['\u{4E2D}']);
+    wait(&doc);
+    let (svg_e2, with_e2) = made(ke);
+    let (svg_p2, with_p2) = made(kp);
+    assert_ne!(with_e2, with_e);
+    assert!(!Arc::ptr_eq(&svg_e2, &svg_e));
+    assert_eq!(with_p2, with_p);
+    assert!(Arc::ptr_eq(&svg_p2, &svg_p), "the other diagram is kept");
+}

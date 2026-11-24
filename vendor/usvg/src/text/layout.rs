@@ -1275,6 +1275,36 @@ impl DatabaseExt for Database {
     }
 }
 
+/// VOMD: the work of `shape_text`'s search for missing characters (each glyph and character it
+/// looks at), counted for the thread where debug assertions are on, for VOMD's tests to bound.
+#[doc(hidden)]
+pub mod vomd_work {
+    #[cfg(debug_assertions)]
+    std::thread_local! {
+        static STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[inline]
+    pub(crate) fn step() {
+        steps(1);
+    }
+
+    #[inline]
+    pub(crate) fn steps(n: usize) {
+        #[cfg(debug_assertions)]
+        STEPS.with(|s| s.set(s.get() + n));
+        let _ = n;
+    }
+
+    /// The steps counted on this thread so far: always 0 without debug assertions.
+    pub fn fallback_steps() -> usize {
+        #[cfg(debug_assertions)]
+        return STEPS.with(std::cell::Cell::get);
+        #[cfg(not(debug_assertions))]
+        0
+    }
+}
+
 /// Text shaping with font fallback.
 pub(crate) fn shape_text(
     text: &str,
@@ -1291,13 +1321,92 @@ pub(crate) fn shape_text(
     let mut used_fonts = vec![font.id];
 
     // Loop until all glyphs become resolved or until no more fonts are left.
+    // VOMD: characters no font has, passed over (the next missing one is looked for), at most
+    // `MAX_NONE_HAS` of them: after that the rest of the span stays as it is (upstream stopped
+    // at the first). The glyphs before `from` were looked at already: none of them is missing,
+    // or each one is of a character no font has. (They change only when a fallback replaces
+    // some, and the search starts again from the first.)
+    const MAX_NONE_HAS: usize = 256;
+    let mut none_has: HashSet<char> = HashSet::new();
+    let mut from = 0;
+    // VOMD: the cluster of the glyph at `from`, once found: its text (`start..end`), the end of
+    // its run of glyphs, how far its characters were looked at (each one before `pos` is one a
+    // font used has, or one no font has), and whether one of those is one no font has. Each
+    // glyph and character of a cluster is looked at once a search, however many of its glyphs
+    // are missing (thousands of a combining mark are one cluster) and however many lookups it
+    // takes.
+    struct Cluster {
+        start: usize,
+        end: usize,
+        run_end: usize,
+        pos: usize,
+        known: bool,
+    }
+    let mut cluster: Option<Cluster> = None;
     'outer: loop {
         let mut missing = None;
-        for glyph in &glyphs {
-            if glyph.is_missing() {
-                missing = Some(glyph.byte_idx.char_from(text));
+        while from < glyphs.len() {
+            let glyph = &glyphs[from];
+            vomd_work::step();
+            if !glyph.is_missing() {
+                from += 1;
+                continue;
+            }
+            // VOMD: the character looked for is the first of the glyph's cluster that no font
+            // used has and that isn't known to be in no font (a combining mark shapes into its
+            // base's cluster, which starts at the base: the base is not what is missing), or, if
+            // each has one, its first (a sequence no font used draws whole). A cluster with a
+            // character no font has, and none other to look for, is passed over whole.
+            let at = glyph.byte_idx;
+            let start = at.value();
+            let first = at.char_from(text);
+            let current = cluster
+                .as_ref()
+                .is_some_and(|k| k.start == start && from < k.run_end);
+            if !current {
+                let same = |g: &&Glyph| g.byte_idx == at;
+                let after = glyphs[from..].iter().take_while(same);
+                let before = glyphs[..from].iter().rev().take_while(same);
+                let mut end = start;
+                let mut run = 0;
+                for g in after {
+                    run += 1;
+                    end = end.max(start + g.cluster_len);
+                }
+                for g in before {
+                    end = end.max(start + g.cluster_len);
+                }
+                vomd_work::steps(2 * run);
+                if text.get(start..end).is_none_or(str::is_empty) {
+                    end = start + first.len_utf8();
+                }
+                cluster = Some(Cluster {
+                    start,
+                    end,
+                    run_end: from + run,
+                    pos: start,
+                    known: false,
+                });
+            }
+            let k = cluster.as_mut().expect("the glyph's cluster");
+            let mut uncovered = None;
+            while k.pos < k.end {
+                vomd_work::step();
+                let c = text[k.pos..].chars().next().expect("a character");
+                if none_has.contains(&c) {
+                    k.known = true;
+                } else if !used_fonts.iter().any(|&id| fontdb.has_char(id, c)) {
+                    uncovered = Some(c);
+                    break;
+                }
+                k.pos += c.len_utf8();
+            }
+            let c = uncovered.or_else(|| (!k.known).then_some(first));
+            if c.is_some() {
+                missing = c;
                 break;
             }
+            from = k.run_end;
         }
 
         if let Some(c) = missing {
@@ -1305,7 +1414,19 @@ pub(crate) fn shape_text(
                 .and_then(|id| fontdb.load_font(id))
             {
                 Some(v) => Arc::new(v),
-                None => break 'outer,
+                None => {
+                    // (The same glyph is looked at again: its cluster is passed over now, or
+                    // another of its characters is looked for, after this one: `c` is one of
+                    // its cluster's.)
+                    none_has.insert(c);
+                    if let Some(k) = cluster.as_mut() {
+                        k.known = true;
+                    }
+                    if none_has.len() >= MAX_NONE_HAS {
+                        break 'outer;
+                    }
+                    continue 'outer;
+                }
             };
 
             // Shape again, using a new font.
@@ -1325,20 +1446,90 @@ pub(crate) fn shape_text(
                 break 'outer;
             }
 
-            // We assume, that shaping with an any font will produce the same amount of glyphs.
-            // This is incorrect, but good enough for now.
-            if glyphs.len() != fallback_glyphs.len() {
-                break 'outer;
+            // VOMD: replace clusters, not glyphs. Each cluster of the fallback's shaping
+            // (a run of its glyphs with the same start) whose glyphs are all found and which
+            // overlaps a missing glyph's replaces every glyph it overlaps: an emoji sequence
+            // (a variation selector, a skin tone, a joiner) is one glyph in an emoji font and
+            // several in the font before it.
+            let range = |g: &Glyph| g.byte_idx.value()..g.byte_idx.value() + g.cluster_len.max(1);
+            let overlaps = |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| {
+                a.start < b.end && b.start < a.end
+            };
+            // (The missing glyphs' spans sorted, with the furthest end of each and those before
+            // it: a cluster overlaps one if the furthest end of those that start before it ends
+            // is past its start.)
+            let mut missing: Vec<_> = glyphs
+                .iter()
+                .filter(|g| g.is_missing())
+                .map(range)
+                .collect();
+            missing.sort_unstable_by_key(|m| m.start);
+            let mut furthest = 0;
+            let ends: Vec<usize> = missing
+                .iter()
+                .map(|m| {
+                    furthest = furthest.max(m.end);
+                    furthest
+                })
+                .collect();
+            let overlaps_missing = |r: &std::ops::Range<usize>| {
+                let k = missing.partition_point(|m| m.start < r.end);
+                k > 0 && ends[k - 1] > r.start
+            };
+            let mut chosen: Vec<(std::ops::Range<usize>, Vec<Glyph>)> = Vec::new();
+            let mut i = 0;
+            while i < fallback_glyphs.len() {
+                let start = fallback_glyphs[i].byte_idx;
+                let mut j = i;
+                while j < fallback_glyphs.len() && fallback_glyphs[j].byte_idx == start {
+                    j += 1;
+                }
+                let cluster = &fallback_glyphs[i..j];
+                let r = cluster.iter().map(range).fold(range(&cluster[0]), |a, b| {
+                    a.start.min(b.start)..a.end.max(b.end)
+                });
+                if cluster.iter().all(|g| !g.is_missing()) && overlaps_missing(&r) {
+                    chosen.push((r, cluster.to_vec()));
+                }
+                i = j;
             }
-
-            // TODO: Replace clusters and not glyphs. This should be more accurate.
-
-            // Copy new glyphs.
-            for i in 0..glyphs.len() {
-                if glyphs[i].is_missing() && !fallback_glyphs[i].is_missing() {
-                    glyphs[i] = fallback_glyphs[i].clone();
+            if chosen.is_empty() {
+                used_fonts.push(fallback_font.id);
+                continue 'outer;
+            }
+            // (The chosen clusters by their start. They don't overlap each other, as a shaping's
+            // clusters don't; if they did, each glyph would look through all of them, in order.)
+            let mut by_start: Vec<usize> = (0..chosen.len()).collect();
+            by_start.sort_unstable_by_key(|&k| chosen[k].0.start);
+            let apart = by_start
+                .windows(2)
+                .all(|w| chosen[w[0]].0.end <= chosen[w[1]].0.start);
+            let cluster_of = |r: &std::ops::Range<usize>| {
+                if apart {
+                    let k = by_start.partition_point(|&k| chosen[k].0.end <= r.start);
+                    by_start
+                        .get(k)
+                        .copied()
+                        .filter(|&k| chosen[k].0.start < r.end)
+                } else {
+                    chosen.iter().position(|(c, _)| overlaps(c, r))
+                }
+            };
+            let mut merged = Vec::with_capacity(glyphs.len());
+            let mut emitted = vec![false; chosen.len()];
+            for g in glyphs.drain(..) {
+                match cluster_of(&range(&g)) {
+                    Some(k) => {
+                        if !std::mem::replace(&mut emitted[k], true) {
+                            merged.extend(chosen[k].1.iter().cloned());
+                        }
+                    }
+                    None => merged.push(g),
                 }
             }
+            glyphs = merged;
+            from = 0;
+            cluster = None;
 
             // Remember this font.
             used_fonts.push(fallback_font.id);

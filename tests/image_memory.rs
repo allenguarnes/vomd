@@ -4900,6 +4900,11 @@ fn svg_mix() -> Vec<(String, Vec<u8>)> {
     ));
     let text = "<text x=\"1\" y=\"10\">Some text, in no font at all.</text>".repeat(2_000);
     out.push(("text".into(), svg(&text, size)));
+    // Emoji: one glyph of a color font each (the test fonts', with fonts), kept by usvg as a
+    // PNG or a tree for each one that differs.
+    let emoji = "<text x=\"1\" y=\"30\" font-size=\"28\">\u{1F680}\u{1F44D}\u{1F3FD} \u{2764}\u{FE0F}\u{1F44D}</text>"
+        .repeat(500);
+    out.push(("emoji".into(), svg(&emoji, size)));
     let uses = format!(
         "<defs><g id=\"g\">{}</g></defs>{}",
         "<rect width=\"1\" height=\"1\"/>".repeat(10),
@@ -5000,18 +5005,31 @@ fn svg_jobs_hold_what_they_are_charged() {
     let _serial = serial();
     let mut least = (usize::MAX, String::new());
     let fonts = vomd::fonts::Fonts::new().unwrap();
+    // VOMD's faces and the tests' color fonts, as a scan adds them.
+    let mut color = vomd::fonts::Fonts::new().unwrap();
+    for name in ["test-emoji-colr.ttf", "test-emoji-cbdt.ttf"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/fonts")
+            .join(name);
+        assert!(color.add_fallback(&path, 0).is_some());
+    }
     let mix = svg_mix();
-    // The ones with text, again with fonts to set it in.
-    let with_text: Vec<_> = mix
-        .iter()
-        .filter(|(what, _)| what.starts_with("badge") || what == "text")
+    // The ones with text, again with fonts to set it in (and with color fonts).
+    let texts = || {
+        mix.iter()
+            .filter(|(what, _)| what.starts_with("badge") || what == "text" || what == "emoji")
+    };
+    let with_text: Vec<_> = texts()
         .map(|(what, bytes)| (format!("{what} with fonts"), bytes.clone()))
+        .chain(texts().map(|(what, bytes)| (format!("{what} with color fonts"), bytes.clone())))
         .collect();
     for (what, bytes) in mix.into_iter().chain(with_text) {
         let Some(job) = vomd::image::SvgJob::of(&bytes) else {
             panic!("{what}: not an SVG");
         };
-        let mut job = if what.ends_with("with fonts") {
+        let mut job = if what.ends_with("with color fonts") {
+            job.with_fonts(&color)
+        } else if what.ends_with("with fonts") {
             job.with_fonts(&fonts)
         } else {
             job
