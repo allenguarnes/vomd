@@ -1,9 +1,9 @@
 //! Render [Mermaid](https://mermaid.js.org/) diagrams to SVG in pure Rust.
 //!
 //! Supported diagram types: pie, sequence, flowchart, state, class, ER,
-//! gantt, journey, timeline, sankey, quadrantChart, xychart, radar, packet,
-//! mindmap, gitGraph, requirementDiagram, C4 (Context/Container/Component/
-//! Dynamic/Deployment), block, architecture, kanban, treemap, zenuml.
+//! gantt, journey, timeline, quadrantChart, xychart, mindmap, gitGraph, zenuml.
+//! (VOMD: sankey, radar, packet, requirementDiagram, C4, block, architecture,
+//! kanban and treemap are left out: they parse to `ParseError::Unsupported`.)
 //!
 //! ```
 //! let svg = mermaid_svg::render("pie\n\"A\" : 1\n\"B\" : 2\n").unwrap();

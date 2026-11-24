@@ -130,6 +130,8 @@ usvg = { path = "vendor/usvg" } # 0.46.0, numbers too large for an f32 leave out
 mermaid-svg = { path = "vendor/mermaid-svg" } # 0.7.0, graphs laid out by dugong, VOMD's entry point
 dugong = { path = "vendor/dugong" } # 0.11.0, no serde
 dugong-graphlib = { path = "vendor/dugong-graphlib" } # 0.11.0, no serde
+swash = { path = "vendor/swash" } # 0.2.10, no hinting
+x11-dl = { path = "vendor/x11-dl" } # 2.21.0, only the functions winit calls (Linux)
 
 [dev-dependencies]
 insta = "1"

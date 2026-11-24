@@ -3,6 +3,7 @@
 //! Dagre uses the Brandes & Köpf (BK) algorithm for horizontal compaction. Mermaid relies on this
 //! for Dagre-based layouts. This module is a parity-oriented port of Dagre's positioning code.
 
+use crate::dsort::DSort;
 use crate::graphlib::Graph;
 use crate::{EdgeLabel, GraphLabel, NodeLabel};
 use std::collections::BTreeMap;
@@ -31,7 +32,7 @@ pub fn position(g: &mut Graph<NodeLabel, EdgeLabel, GraphLabel>) {
 
     // Within each rank, order by `order` if present, otherwise keep insertion order.
     for ids in ranks.values_mut() {
-        ids.sort_by_key(|id| g.node(id).and_then(|n| n.order).unwrap_or(usize::MAX));
+        ids.dsort_by_key(|id| g.node(id).and_then(|n| n.order).unwrap_or(usize::MAX));
     }
 
     let rank_sep = g.graph().ranksep;

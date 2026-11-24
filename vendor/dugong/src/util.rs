@@ -4,6 +4,7 @@
 //! behavior (no panics on user-controlled input) so downstream libraries can render diagrams
 //! without crashing.
 
+use crate::dsort::DSort;
 use crate::graphlib::{Graph, GraphOptions};
 use crate::{EdgeLabel, GraphLabel, NodeLabel, Point};
 use std::collections::BTreeMap;
@@ -213,7 +214,7 @@ where
     layers
         .into_iter()
         .map(|mut layer| {
-            layer.sort_by_key(|(o, _)| *o);
+            layer.dsort_by_key(|(o, _)| *o);
             layer.into_iter().map(|(_, id)| id).collect()
         })
         .collect()
@@ -263,7 +264,7 @@ pub fn remove_empty_ranks(g: &mut Graph<NodeLabel, EdgeLabel, GraphLabel>) {
         let idx = u64::try_from(i64::from(rank) - i64::from(offset)).unwrap_or(0);
         ranked_nodes.push((idx, id.to_string()));
     });
-    ranked_nodes.sort_by_key(|(rank, _id)| *rank);
+    ranked_nodes.dsort_by_key(|(rank, _id)| *rank);
 
     fn multiples_in_range(start: u64, end: u64, factor: u64) -> u64 {
         if start > end {

@@ -689,8 +689,10 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
             self.animation = saved;
             result?;
         } else if let Some(range) = self.chunks.get(&WebPRiffChunk::VP8L) {
-            let mut decoder = LosslessDecoder::new(range_reader(&mut self.r, range.clone())?)
-                .with_huffman_limit(self.huffman_limit);
+            // VOMD: `&mut` the reader, as `read_alpha_chunk` gives it: one decoder type, not two.
+            let mut reader = range_reader(&mut self.r, range.clone())?;
+            let mut decoder =
+                LosslessDecoder::new(&mut reader).with_huffman_limit(self.huffman_limit);
 
             if self.has_alpha {
                 decoder.decode_frame(self.width, self.height, false, buf)?;
@@ -817,9 +819,9 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 (rgb_frame, false)
             }
             WebPRiffChunk::VP8L => {
-                let reader = (&mut self.r).take(chunk_size);
+                let mut reader = (&mut self.r).take(chunk_size);
                 let mut lossless_decoder =
-                    LosslessDecoder::new(reader).with_huffman_limit(self.huffman_limit);
+                    LosslessDecoder::new(&mut reader).with_huffman_limit(self.huffman_limit);
                 let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];
                 lossless_decoder.decode_frame(frame_width, frame_height, false, &mut rgba_frame)?;
                 (rgba_frame, true)

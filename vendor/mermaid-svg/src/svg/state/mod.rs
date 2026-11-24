@@ -379,10 +379,14 @@ fn region_dividers(
     regions: &[(f64, f64, f64, f64)],
 ) -> Vec<(f64, f64, f64, f64)> {
     let mut out = Vec::new();
-    let mut by_y: Vec<_> = regions.to_vec();
-    by_y.sort_by(|p, q| p.1.total_cmp(&q.1));
-    let mut by_x: Vec<_> = regions.to_vec();
-    by_x.sort_by(|p, q| p.0.total_cmp(&q.0));
+    // VOMD: one sort for both (the key a function pointer: one copy of std's sort, not two).
+    let sorted = |key: fn(&(f64, f64, f64, f64)) -> f64| {
+        let mut v = regions.to_vec();
+        v.sort_by(|p, q| key(p).total_cmp(&key(q)));
+        v
+    };
+    let by_y = sorted(|r| r.1);
+    let by_x = sorted(|r| r.0);
     for w in by_y.windows(2) {
         if w[1].1 >= w[0].3 {
             let y = (w[0].3 + w[1].1) / 2.0;

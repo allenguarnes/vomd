@@ -4,6 +4,7 @@
 //! re-inserts them via dummy `"selfedge"` nodes during BK positioning. This keeps the ranker
 //! constraints valid and makes self-loops deterministic.
 
+use crate::dsort::DSort;
 use rustc_hash::FxHashSet;
 
 use crate::graphlib::Graph;
@@ -70,7 +71,7 @@ fn compact_public_layering(g: &Graph<NodeLabel, EdgeLabel, GraphLabel>) -> Vec<V
     });
 
     // Rust's stable sort preserves pinned Graphlib Object.keys order when rank and order tie.
-    entries.sort_by_key(|&(rank, order, _graph_ix)| (rank, order));
+    entries.dsort_by_key(|&(rank, order, _graph_ix)| (rank, order));
 
     let mut layers: Vec<Vec<usize>> = Vec::new();
     let mut previous_rank = None;
@@ -556,7 +557,7 @@ mod tests {
                 (node.rank == Some(rank)).then(|| (node.order.unwrap_or(0), id.to_string()))
             })
             .collect::<Vec<_>>();
-        members.sort_by_key(|(order, _id)| *order);
+        members.dsort_by_key(|(order, _id)| *order);
         members.into_iter().map(|(_order, id)| id).collect()
     }
 

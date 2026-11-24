@@ -127,17 +127,17 @@ All features are on by default. Turning some off makes a smaller binary:
 | `mermaid` | Mermaid diagrams, with the vendored mermaid-svg and dugong (needs `svg`; without it, a diagram shows as code) |
 
 Sizes are of these plain builds. The release files (`cargo xtask dist`, and `cargo xtask size`)
-are about 0.6 MB smaller on Linux: the binary is linked without the unwind tables it never uses
+are 0.3 to 0.8 MB smaller on Linux: the binary is linked without the unwind tables it never uses
 (see `release_link_args` in `xtask/src/main.rs`).
 
 ```sh
-# Without SVG (SVGs show their alt text), about 4.5 MB on Linux:
+# Without SVG (SVGs show their alt text), about 4.4 MB on Linux:
 cargo build --release --no-default-features --features images,remote-images,embed-fonts,clipboard,toc,find,math,highlight,front-matter,details,html-tables
-# Without Mermaid (diagrams show as code), about 6.0 MB on Linux:
+# Without Mermaid (diagrams show as code), about 5.8 MB on Linux:
 cargo build --release --no-default-features --features images,remote-images,svg,embed-fonts,clipboard,toc,find,math,highlight,front-matter,details,html-tables
-# Without math (formulas show as their source), about 6.6 MB on Linux:
+# Without math (formulas show as their source), about 6.3 MB on Linux:
 cargo build --release --no-default-features --features images,remote-images,svg,embed-fonts,clipboard,toc,find,highlight,front-matter,details,html-tables,mermaid
-# The smallest build: no images and system fonts only, about 3.0 MB on Linux and 1.9 MB on Windows:
+# The smallest build: no images and system fonts only, about 2.8 MB on Linux and 1.8 MB on Windows:
 cargo build --release --no-default-features
 ```
 
@@ -171,7 +171,7 @@ layout. The app icon and the window's background are made once and committed:
 
 ## Vendored crates
 
-`vendor/` holds seven crates VOMD patches, used through `[patch.crates-io]` in `Cargo.toml`:
+`vendor/` holds nine crates VOMD patches, used through `[patch.crates-io]` in `Cargo.toml`:
 
 - **resvg 0.46:** its raster images go through VOMD's decoders, and drawing can be cancelled.
 - **usvg 0.46:** numbers too large to draw (a huge size, position or transform) leave that part
@@ -180,8 +180,12 @@ layout. The app icon and the window's background are made once and committed:
 - **simplecss 0.2.2:** an error's position found in constant time (a style sheet with many rules
   used to take time quadratic in its length).
 - **mermaid-svg 0.7.0:** graphs laid out by dugong as Mermaid lays them out (subgraphs as
-  compound nodes), text measured by VOMD's font, a work budget, and VOMD's entry point.
+  compound nodes), text measured by VOMD's font, a work budget, VOMD's entry point, and
+  without the diagram types VOMD doesn't draw.
 - **dugong 0.11.0** and **dugong-graphlib 0.11.0:** Dagre's layout, without serde.
+- **swash 0.2.10:** without hinting, which VOMD never uses (smaller).
+- **x11-dl 2.21.0:** only the Xlib functions winit calls (smaller, and fewer symbols looked up
+  at start on X11). A winit upgrade that calls another one fails to build until it is added back.
 
 Each one's `VOMD-PATCH.md` lists the changes and how to upgrade the crate.
 

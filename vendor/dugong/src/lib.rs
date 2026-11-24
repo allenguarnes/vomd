@@ -6,7 +6,7 @@ pub use dugong_graphlib as graphlib;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-
+mod dsort;
 mod model;
 pub use model::{EdgeLabel, GraphLabel, LabelPos, NodeLabel, Point, RankDir, SelfEdge};
 
@@ -19,7 +19,6 @@ pub use work::{NoopWorkControl, WorkControl, WorkError};
 pub mod acyclic;
 pub mod add_border_segments;
 pub mod coordinate_system;
-pub mod greedy_fas;
 pub mod nesting_graph;
 pub mod normalize;
 pub mod order;

@@ -17,6 +17,10 @@ and versions follow [Semantic Versioning](https://semver.org/).
   Diagrams are made in a process of their own, as SVGs are drawn. The `mermaid` Cargo feature
   (on by default) holds it; the binary is about 1 MB larger.
 
+### Changed
+- A smaller binary, with nothing changed in what it does: about 550 KB smaller on Linux (code
+  VOMD never runs is left out).
+
 ## [1.11.0] - 2026-11-22
 
 ### Added

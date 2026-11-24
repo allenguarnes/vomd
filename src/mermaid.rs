@@ -19,8 +19,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use mermaid_svg::Diagram;
-
 /// The largest source made a diagram (larger: its code, and a note).
 pub const MAX_SOURCE: usize = 50 << 10;
 /// The work one diagram's layouts may do (dugong's units): far past a few hundred nodes, well
@@ -48,35 +46,6 @@ const WHY_SLOW: &str = "the diagram took too long to make";
 const WHY_BROKEN: &str = "the diagram couldn't be made";
 
 const PREFIX: &str = "vomd-mermaid:";
-
-/// The diagram types shown; the others are shown as code, with a note.
-fn supported(d: &Diagram) -> Result<(), &'static str> {
-    match d {
-        Diagram::Flowchart(_)
-        | Diagram::Sequence(_)
-        | Diagram::Class(_)
-        | Diagram::State(_)
-        | Diagram::Er(_)
-        | Diagram::Gantt(_)
-        | Diagram::Pie(_)
-        | Diagram::Mindmap(_)
-        | Diagram::Timeline(_)
-        | Diagram::GitGraph(_)
-        | Diagram::Journey(_)
-        | Diagram::Quadrant(_)
-        | Diagram::XyChart(_) => Ok(()),
-        Diagram::Sankey(_) => Err("sankey"),
-        Diagram::Radar(_) => Err("radar"),
-        Diagram::Packet(_) => Err("packet"),
-        Diagram::Requirement(_) => Err("requirement"),
-        Diagram::C4(_) => Err("C4"),
-        Diagram::Block(_) => Err("block"),
-        Diagram::Architecture(_) => Err("architecture"),
-        Diagram::Kanban(_) => Err("kanban"),
-        Diagram::Treemap(_) => Err("treemap"),
-        _ => Err("these"),
-    }
-}
 
 // ---- Names ---------------------------------------------------------------------------------
 
@@ -441,11 +410,10 @@ pub fn make(source: &str, dark: bool, metrics: &Metrics) -> Result<String, Strin
             let t: String = t.chars().take(40).collect();
             format!("unknown diagram type “{t}”")
         }
+        // The diagram types mermaid-svg leaves out (see its VOMD-PATCH.md).
+        mermaid_svg::ParseError::Unsupported(kind) => format!("{kind} diagrams aren't supported"),
         _ => "the diagram is empty".into(),
     })?;
-    if let Err(kind) = supported(&d) {
-        return Err(format!("{kind} diagrams aren't supported"));
-    }
     let m = metrics.clone();
     mermaid_svg::vomd::set_measure(Some(Box::new(move |s| m.measure(s))));
     let svg = mermaid_svg::vomd::render(&d, &meta, dark, BUDGET);

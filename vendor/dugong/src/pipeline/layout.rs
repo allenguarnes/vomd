@@ -3,6 +3,7 @@
 //! This pipeline follows upstream Dagre's structure more closely (ranking, normalization,
 //! ordering, BK positioning, translation).
 
+use crate::dsort::DSort;
 use rustc_hash::FxHashSet;
 
 use crate::graphlib;
@@ -89,7 +90,7 @@ pub(crate) fn rank_plan_controlled(
         ));
     }
     work_control.charge(checked_n_log_n(reversed_edges.len())?)?;
-    reversed_edges.sort_by(|left, right| {
+    reversed_edges.dsort_by(|left, right| {
         (left.v.as_str(), left.w.as_str(), left.name.as_deref()).cmp(&(
             right.v.as_str(),
             right.w.as_str(),
@@ -135,14 +136,7 @@ fn run_rank_phases(
     g.for_each_node(|id, _node| {
         has_compound_structure |= g.parent(id).is_some() || g.children_iter(id).next().is_some();
     });
-    let uses_network_simplex = !matches!(
-        g.graph().ranker.as_deref(),
-        Some("longest-path" | "tight-tree")
-    );
-    let tiny_simple_chain = g.node_count() == 2
-        && g.edge_count() == 1
-        && !has_compound_structure
-        && uses_network_simplex;
+    let tiny_simple_chain = g.node_count() == 2 && g.edge_count() == 1 && !has_compound_structure;
     let first_edge = if tiny_simple_chain {
         g.edges().next().cloned()
     } else {
@@ -257,8 +251,6 @@ fn build_layout_graph(
         marginx: graph.marginx,
         marginy: graph.marginy,
         align: graph.align.clone(),
-        ranker: graph.ranker.clone(),
-        acyclicer: graph.acyclicer.clone(),
         ..GraphLabel::default()
     });
     layout.set_default_node_label(NodeLabel::default);
@@ -548,7 +540,7 @@ fn run_layout(
         work_control.charge(node_snapshot_work_units(g)?)?;
         let mut nodes: Vec<(i32, String)> = Vec::with_capacity(g.node_count());
         g.for_each_node(|id, n| nodes.push((n.rank.unwrap_or(0), id.to_string())));
-        nodes.sort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
+        nodes.dsort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
 
         let mut cur_rank: Option<i32> = None;
         let mut next_order: usize = 0;

@@ -61,29 +61,6 @@ fn classifies_malformed_statement() {
 }
 
 #[test]
-fn packet_config_overlays_from_frontmatter() {
-    let src = "---\nconfig:\n  packet:\n    bitsPerRow: 16\n    rowHeight: 24\n    showBits: false\n---\npacket-beta\n0-15: \"Src\"\n";
-    let (d, _) = parse_with_meta(src).unwrap();
-    let Diagram::Packet(p) = d else {
-        panic!("expected packet diagram")
-    };
-    assert_eq!(p.config.bits_per_row, 16);
-    assert_eq!(p.config.row_height, 24.0);
-    assert!(!p.config.show_bits);
-    // Unset knobs keep their defaults.
-    assert_eq!(p.config.bit_width, 32.0);
-}
-
-#[test]
-fn packet_config_defaults_when_absent() {
-    let (d, _) = parse_with_meta("packet-beta\n0-15: \"Src\"\n").unwrap();
-    let Diagram::Packet(p) = d else {
-        panic!("expected packet diagram")
-    };
-    assert_eq!(p.config, ast::PacketConfig::default());
-}
-
-#[test]
 fn flowchart_config_curve_reaches_diagram() {
     let src = "%%{init: {\"flowchart\": {\"curve\": \"linear\"}}}%%\nflowchart TD\nA --> B\n";
     let (d, _) = parse_with_meta(src).unwrap();

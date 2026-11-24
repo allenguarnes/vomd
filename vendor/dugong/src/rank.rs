@@ -83,18 +83,8 @@ pub(crate) fn rank_controlled(
     g: &mut crate::graphlib::Graph<crate::NodeLabel, crate::EdgeLabel, crate::GraphLabel>,
     work_control: &mut dyn crate::WorkControl,
 ) -> Result<(), RankError> {
-    let ranker = g.graph().ranker.clone();
-    match ranker.as_deref() {
-        Some("network-simplex") => network_simplex::network_simplex_controlled(g, work_control)?,
-        Some("tight-tree") => {
-            util::longest_path_controlled(g, work_control)?;
-            let _ = feasible_tree::feasible_tree_controlled(g, work_control)?;
-        }
-        Some("longest-path") => {
-            util::longest_path_controlled(g, work_control)?;
-        }
-        _ => network_simplex::network_simplex_controlled(g, work_control)?,
-    }
+    // VOMD: network simplex only, Dagre's default (Mermaid never sets `ranker`).
+    network_simplex::network_simplex_controlled(g, work_control)?;
     Ok(())
 }
 
@@ -114,61 +104,15 @@ pub(crate) fn validate_rank_arithmetic(
 mod tests {
     use super::*;
     use crate::graphlib::{Graph, GraphOptions};
-    use crate::{EdgeLabel, GraphLabel, NodeLabel, WorkControl, WorkError};
+    use crate::{EdgeLabel, GraphLabel, NodeLabel};
 
-    #[derive(Default)]
-    struct RecordingWorkControl {
-        charges: Vec<usize>,
-    }
-
-    impl WorkControl for RecordingWorkControl {
-        fn charge(&mut self, units: usize) -> Result<(), WorkError> {
-            self.charges.push(units);
-            Ok(())
-        }
-    }
-
-    fn chain(ranker: &str) -> Graph<NodeLabel, EdgeLabel, GraphLabel> {
-        let mut graph = Graph::new(GraphOptions::default());
-        graph.set_graph(GraphLabel {
-            ranker: Some(ranker.to_string()),
-            ..GraphLabel::default()
-        });
-        graph.set_default_node_label(NodeLabel::default);
-        graph.set_default_edge_label(|| EdgeLabel {
-            minlen: 1,
-            weight: 1.0,
-            ..EdgeLabel::default()
-        });
-        graph.set_path(&["a", "b", "c"]);
-        graph
-    }
-
-    #[test]
-    fn rankers_share_one_longest_path_owner_tranche() {
-        let mut longest_graph = chain("longest-path");
-        let mut longest_control = RecordingWorkControl::default();
-        rank_controlled(&mut longest_graph, &mut longest_control)
-            .expect("longest-path ranking succeeds");
-        assert_eq!(longest_control.charges.len(), 1);
-
-        let mut tight_graph = chain("tight-tree");
-        let mut tight_control = RecordingWorkControl::default();
-        rank_controlled(&mut tight_graph, &mut tight_control).expect("tight-tree ranking succeeds");
-        assert!(tight_control.charges.len() > 1);
-        assert_eq!(tight_control.charges[0], longest_control.charges[0]);
-    }
-
-    fn rank_plan_graph(ranker: &str) -> Graph<NodeLabel, EdgeLabel, GraphLabel> {
+    fn rank_plan_graph() -> Graph<NodeLabel, EdgeLabel, GraphLabel> {
         let mut graph = Graph::new(GraphOptions {
             directed: true,
             multigraph: true,
             compound: true,
         });
-        graph.set_graph(GraphLabel {
-            ranker: Some(ranker.to_string()),
-            ..GraphLabel::default()
-        });
+        graph.set_graph(GraphLabel::default());
         graph.set_default_node_label(NodeLabel::default);
         graph.set_default_edge_label(|| EdgeLabel {
             minlen: 1,
@@ -187,9 +131,9 @@ mod tests {
     }
 
     #[test]
-    fn rank_plan_preserves_semantic_minlen_for_every_ranker() {
-        for ranker in ["network-simplex", "tight-tree", "longest-path"] {
-            let mut graph = rank_plan_graph(ranker);
+    fn rank_plan_preserves_semantic_minlen() {
+        {
+            let mut graph = rank_plan_graph();
             graph.set_node("a", NodeLabel::default());
             graph.set_node("b", NodeLabel::default());
             graph.set_node("c", NodeLabel::default());
@@ -212,7 +156,7 @@ mod tests {
 
     #[test]
     fn rank_plan_connects_disconnected_components_and_keeps_all_nodes_ranked() {
-        let mut graph = rank_plan_graph("network-simplex");
+        let mut graph = rank_plan_graph();
         graph.set_edge_named("a", "b", Some("ab"), None);
         graph.set_edge_named("c", "d", Some("cd"), None);
 
@@ -223,7 +167,7 @@ mod tests {
 
     #[test]
     fn rank_plan_restores_feedback_arc_identity() {
-        let mut graph = rank_plan_graph("network-simplex");
+        let mut graph = rank_plan_graph();
         graph.set_edge_named("a", "b", Some("ab"), None);
         graph.set_edge_named("b", "c", Some("bc"), None);
         graph.set_edge_named("c", "a", Some("ca"), None);
@@ -238,37 +182,8 @@ mod tests {
     }
 
     #[test]
-    fn rank_plan_greedy_cycle_breaking_honors_weights_and_restores_original_identity() {
-        let mut graph = rank_plan_graph("network-simplex");
-        graph.graph_mut().acyclicer = Some("greedy".to_string());
-        for (from, to, name, weight) in [
-            ("a", "b", "ab", 10.0),
-            ("b", "c", "bc", 10.0),
-            ("c", "a", "ca", 1.0),
-        ] {
-            graph.set_edge_named(
-                from,
-                to,
-                Some(name),
-                Some(EdgeLabel {
-                    minlen: 1,
-                    weight,
-                    ..EdgeLabel::default()
-                }),
-            );
-        }
-
-        let plan = plan(&graph).expect("weighted cyclic rank plan should succeed");
-        assert_eq!(
-            plan.reversed_edges,
-            vec![crate::graphlib::EdgeKey::new("c", "a", Some("ca"))]
-        );
-        assert!(plan.nodes.iter().all(|node| node.rank.is_some()));
-    }
-
-    #[test]
     fn rank_plan_ignores_self_loops_without_mutating_caller_edge_ownership() {
-        let mut graph = rank_plan_graph("network-simplex");
+        let mut graph = rank_plan_graph();
         graph.set_edge_named("a", "a", Some("self"), None);
 
         let plan = plan(&graph).expect("self-loop rank plan should succeed");
@@ -280,7 +195,7 @@ mod tests {
 
     #[test]
     fn rank_plan_exposes_compound_rank_spans_without_assigning_cluster_leaf_ranks() {
-        let mut graph = rank_plan_graph("network-simplex");
+        let mut graph = rank_plan_graph();
         graph.set_node("outer", NodeLabel::default());
         graph.set_node("cluster", NodeLabel::default());
         graph.set_node("a", NodeLabel::default());

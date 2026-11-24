@@ -35,6 +35,16 @@ documentation), and adds `dugong` (vendored too). The changes, marked `VOMD` in 
     from above or below its room, round its notes, and a self-loop on it is drawn on a side
     without notes (the canvas grows for it). Notes take the theme's note colours (they were
     always light yellow). `state_note_boxes` (in `vomd.rs`) gives their boxes to VOMD's tests.
+- **Nine diagram types left out** (VOMD doesn't draw them; about 230 KB of code): sankey,
+  radar, packet, requirement, C4, block, architecture, kanban and treemap. Their parsers
+  (`parse/`), renderers (`svg/`, with `sankey_layout.rs`), AST types and `Diagram` variants, the
+  frontmatter settings applied to them (`apply_packet_config`, `apply_radar_config`) and the now
+  unused `token::split_top_level` are deleted; `parse::dispatch` returns
+  `ParseError::Unsupported(kind)` (new) for their header keywords, without reading the rest, and
+  VOMD's note says "kind diagrams aren't supported". `DiagramMeta` still reads their
+  frontmatter keys (unused). On an upgrade, delete the same modules again.
+- **One sort for two** (size): `state::region_dividers` sorts its regions by y and by x with one
+  `sort_by` (the key a function pointer), not two closures that were each a copy of std's sort.
 - **Text is measured by VOMD's font** (`vomd::set_measure`; `svg/metrics.rs`, `text_width`):
   a renderer's estimate for wider text (bold) stays wider in proportion.
 - **VOMD's entry point** (`src/vomd.rs`): `render` (a parsed diagram in Mermaid's `default` or

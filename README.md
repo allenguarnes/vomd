@@ -36,8 +36,8 @@
 ## Why VOMD
 
 - **Fast.** Opens in milliseconds; a 5 MB document opens in under 100 ms.
-- **Small.** One file with its fonts built in: about 6.4 MB on Linux, 5.8 MB on Windows and
-  4.6 MB on macOS. No web engine, no GUI toolkit, nothing else to install.
+- **Small.** One file with its fonts built in: about 5.8 MB on Linux, 5.3 MB on Windows and
+  4.3 MB on macOS. No web engine, no GUI toolkit, nothing else to install.
 - **Private.** Never touches the network unless you ask it to, and never runs a document's HTML.
 - **Just a viewer.** No editor, no workspace, no accounts. Open a file, read it, close it.
 

@@ -4,22 +4,23 @@
 xtask = "run --quiet --package xtask --"
 
 # Packed relative relocations (RELR): −260 to −340 KB, keeps PIE/ASLR. Needs glibc ≥ 2.36.
-# An explicit LLVM inline threshold of 10 (opt-level "z" alone uses 5 with other limits): −27 KB
-# in the smallest build, −33 KB in the default one; 25 and up is larger, 100 is +300 KB. The flag
+# An explicit LLVM inline threshold of 15 (opt-level "z" alone uses 5 with other limits): measured
+# for 1.12.0 on Linux, −14 KB in the default build against 10 (12 to 15 are one setting, LLVM's
+# costs step by 5) and +9 KB in the smallest; 20 is +29 KB, 25 and up larger still. The flag
 # also applies to test builds (about 7% slower; stable cargo has no per-profile rustflags), and
 # xtask repeats it for release builds.
 # (Identical code folding is added by xtask's release builds only: see `RELEASE_FLAGS` there.)
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=10"]
+rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=15"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=10"]
+rustflags = ["-C", "link-arg=-Wl,-z,pack-relative-relocs", "-C", "llvm-args=-inline-threshold=15"]
 
 # Windows: the C runtime linked in (no VCRUNTIME140.dll to install), and the same inline threshold.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "llvm-args=-inline-threshold=10"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "llvm-args=-inline-threshold=15"]
 
-# macOS (Apple Silicon): the same inline threshold (−33 KB). Apple's linker has no RELR (Mach-O
+# macOS (Apple Silicon): the same inline threshold. Apple's linker has no RELR (Mach-O
 # has chained fixups instead) and strips dead code already.
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "llvm-args=-inline-threshold=10"]
+rustflags = ["-C", "llvm-args=-inline-threshold=15"]

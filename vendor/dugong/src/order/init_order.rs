@@ -1,4 +1,5 @@
 use super::OrderNodeRange;
+use crate::dsort::DSort;
 use crate::graphlib::Graph;
 use rustc_hash::FxHashSet as HashSet;
 
@@ -35,7 +36,7 @@ where
     // `simple_nodes` already follows pinned Graphlib's JavaScript object-key enumeration.
     // Rust's stable `sort_by_key` therefore preserves the official relative order within a rank
     // without a second ID vector or an auxiliary String-keyed position map.
-    ordered_vs.sort_by_key(|v| g.node(v).and_then(|n| n.rank()).unwrap_or(i32::MAX));
+    ordered_vs.dsort_by_key(|v| g.node(v).and_then(|n| n.rank()).unwrap_or(i32::MAX));
     for v in ordered_vs {
         let mut stack = vec![v];
         while let Some(v) = stack.pop() {

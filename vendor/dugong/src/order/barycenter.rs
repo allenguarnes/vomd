@@ -3,6 +3,7 @@
 //! Ported from Dagre's `barycenter`, `resolveConflicts`, and `sortSubgraph` helpers.
 
 use super::{OrderEdgeWeight, OrderNodeLabel};
+use crate::dsort::DSort;
 use crate::graphlib::Graph;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -292,9 +293,9 @@ pub fn sort(entries: &[SortEntry], bias_right: bool) -> SortResult {
         }
     }
 
-    unsortable.sort_by(|&a, &b| entries[b].i.cmp(&entries[a].i));
+    unsortable.dsort_by(|&a, &b| entries[b].i.cmp(&entries[a].i));
 
-    sortable.sort_by(|&a, &b| {
+    sortable.dsort_by(|&a, &b| {
         let a_entry = &entries[a];
         let b_entry = &entries[b];
         let a_bc = a_entry.barycenter.unwrap_or(0.0);
@@ -377,9 +378,9 @@ pub(crate) fn sort_ix(entries: &[SortEntryIx], bias_right: bool) -> SortResultIx
         }
     }
 
-    unsortable.sort_by(|&a, &b| entries[b].i.cmp(&entries[a].i));
+    unsortable.dsort_by(|&a, &b| entries[b].i.cmp(&entries[a].i));
 
-    sortable.sort_by(|&a, &b| {
+    sortable.dsort_by(|&a, &b| {
         let a_entry = &entries[a];
         let b_entry = &entries[b];
         let a_bc = a_entry.barycenter.unwrap_or(0.0);

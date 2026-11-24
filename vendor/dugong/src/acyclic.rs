@@ -1,10 +1,10 @@
 //! Break cycles by reversing a feedback arc set (FAS).
 //!
-//! This mirrors Dagre's `acyclic.js`. Mermaid uses the default (DFS-based) variant by default,
-//! but can opt into the greedy strategy.
+//! This mirrors Dagre's `acyclic.js`, its default (DFS-based) variant: VOMD leaves out the greedy
+//! one, which Mermaid never asks for.
 
 use crate::graphlib::{EdgeKey, Graph};
-use crate::work::{ceil_log2, checked_add, checked_mul, checked_n_log_n};
+use crate::work::{checked_add, checked_mul};
 use crate::{EdgeLabel, GraphLabel, NodeLabel};
 use crate::{NoopWorkControl, WorkControl, WorkError};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -45,20 +45,8 @@ pub(crate) fn run_controlled(
     g: &mut Graph<NodeLabel, EdgeLabel, GraphLabel>,
     work_control: &mut dyn WorkControl,
 ) -> Result<(), WorkError> {
-    let fas = if g
-        .graph()
-        .acyclicer
-        .as_deref()
-        .is_some_and(|s| s == "greedy")
-    {
-        work_control.charge(greedy_work_units(g)?)?;
-        crate::greedy_fas::greedy_fas_with_weight(g, |lbl: &EdgeLabel| {
-            if !lbl.weight.is_finite() {
-                return 0;
-            }
-            lbl.weight.round() as i64
-        })
-    } else {
+    // VOMD: the DFS variant only (Mermaid never asks for `acyclicer: greedy`).
+    let fas = {
         let plan = dfs_work_plan(g)?;
         work_control.charge(plan.work_units)?;
         if plan.prepare_adjacency_cache {
@@ -117,26 +105,6 @@ fn dfs_work_plan(g: &Graph<NodeLabel, EdgeLabel, GraphLabel>) -> Result<DfsWorkP
         work_units,
         prepare_adjacency_cache,
     })
-}
-
-fn greedy_work_units(g: &Graph<NodeLabel, EdgeLabel, GraphLabel>) -> Result<usize, WorkError> {
-    let nodes = g.node_count();
-    let edges = g.edge_count();
-    let node_work = checked_mul(checked_n_log_n(nodes)?, 3)?;
-    let edge_steps = checked_add(ceil_log2(nodes).max(1), 6)?;
-    let live_work = checked_add(node_work, checked_mul(edges, edge_steps)?)?;
-    let node_order_tombstones = g
-        .node_order_slot_count()
-        .checked_sub(nodes)
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    let edge_tombstones = g
-        .edge_slot_count()
-        .checked_sub(edges)
-        .ok_or(WorkError::ArithmeticOverflow)?;
-    checked_add(
-        live_work,
-        checked_add(node_order_tombstones, edge_tombstones)?,
-    )
 }
 
 pub fn undo(g: &mut Graph<NodeLabel, EdgeLabel, GraphLabel>) {
@@ -275,18 +243,12 @@ mod tests {
         }
     }
 
-    fn cycle_graph(
-        acyclicer: &str,
-        edge_tombstones: usize,
-    ) -> Graph<NodeLabel, EdgeLabel, GraphLabel> {
+    fn cycle_graph(edge_tombstones: usize) -> Graph<NodeLabel, EdgeLabel, GraphLabel> {
         let mut graph = Graph::new(GraphOptions {
             multigraph: true,
             ..Default::default()
         });
-        graph.set_graph(GraphLabel {
-            acyclicer: Some(acyclicer.to_string()),
-            ..Default::default()
-        });
+        graph.set_graph(GraphLabel::default());
         for id in ["a", "b", "c"] {
             graph.set_node(id, NodeLabel::default());
         }
@@ -338,8 +300,8 @@ mod tests {
     #[test]
     fn dfs_precharges_both_stale_csr_tombstone_scans() {
         let tombstones = 7;
-        let dense = cycle_graph("dfs", 0);
-        let sparse = cycle_graph("dfs", tombstones);
+        let dense = cycle_graph(0);
+        let sparse = cycle_graph(tombstones);
         assert!(!dense.is_adjacency_cache_current());
         assert!(!sparse.is_adjacency_cache_current());
 
@@ -352,8 +314,8 @@ mod tests {
 
     #[test]
     fn dfs_does_not_recharge_an_already_materialized_sparse_cache() {
-        let dense = cycle_graph("dfs", 0);
-        let sparse = cycle_graph("dfs", 7);
+        let dense = cycle_graph(0);
+        let sparse = cycle_graph(7);
         dense.prepare_adjacency_cache();
         sparse.prepare_adjacency_cache();
 
@@ -393,7 +355,7 @@ mod tests {
 
     #[test]
     fn dfs_rejection_precedes_cache_materialization_and_graph_mutation() {
-        let mut graph = cycle_graph("dfs", 3);
+        let mut graph = cycle_graph(3);
         let initial_edges = graph.edge_keys();
         let plan = dfs_work_plan(&graph).unwrap();
         let mut control = RecordingWorkControl {
@@ -410,16 +372,6 @@ mod tests {
         assert_eq!(control.used, 0);
     }
 
-    #[test]
-    fn greedy_precharges_the_complete_edge_slot_scan() {
-        let tombstones = 7;
-        let (dense_work, dense_edges) = run_and_measure(cycle_graph("greedy", 0));
-        let (sparse_work, sparse_edges) = run_and_measure(cycle_graph("greedy", tombstones));
-
-        assert_eq!(sparse_work, dense_work + tombstones);
-        assert_eq!(sparse_edges, dense_edges);
-    }
-
     fn cycle_graph_with_numeric_nodes(
         leave_interior_tombstone: bool,
     ) -> Graph<NodeLabel, EdgeLabel, GraphLabel> {
@@ -427,10 +379,7 @@ mod tests {
             multigraph: true,
             ..Default::default()
         });
-        graph.set_graph(GraphLabel {
-            acyclicer: Some("dfs".to_string()),
-            ..Default::default()
-        });
+        graph.set_graph(GraphLabel::default());
         let node_ids: &[&str] = if leave_interior_tombstone {
             &["0", "1", "2", "3"]
         } else {

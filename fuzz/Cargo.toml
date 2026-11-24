@@ -22,6 +22,8 @@ usvg = { path = "../vendor/usvg" }
 mermaid-svg = { path = "../vendor/mermaid-svg" }
 dugong = { path = "../vendor/dugong" }
 dugong-graphlib = { path = "../vendor/dugong-graphlib" }
+swash = { path = "../vendor/swash" }
+x11-dl = { path = "../vendor/x11-dl" }
 
 [workspace]
 members = ["."]

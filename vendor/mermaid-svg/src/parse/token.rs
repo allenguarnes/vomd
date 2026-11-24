@@ -138,44 +138,6 @@ pub(crate) fn parse_attr_pairs(body: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Split `s` on top-level `delim` occurrences — those at bracket depth zero and
-/// outside any `"…"` quoted run. `(`/`[`/`{` count depth up and their mates
-/// count it down; a quote suppresses both bracket counting and delimiter
-/// matching so a bracket or delimiter inside `"…"` stays literal. Parts are
-/// returned verbatim (untrimmed, quotes retained); the trailing part is always
-/// included, so empty input yields one empty string.
-pub(crate) fn split_top_level(s: &str, delim: char) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0i32;
-    let mut in_quote = false;
-    for c in s.chars() {
-        if c == '"' {
-            in_quote = !in_quote;
-            cur.push(c);
-            continue;
-        }
-        if in_quote {
-            cur.push(c);
-            continue;
-        }
-        match c {
-            '(' | '[' | '{' => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' | ']' | '}' => {
-                depth -= 1;
-                cur.push(c);
-            }
-            d if d == delim && depth == 0 => out.push(std::mem::take(&mut cur)),
-            _ => cur.push(c),
-        }
-    }
-    out.push(cur);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,27 +218,5 @@ mod tests {
         );
         // Keyless fragments are dropped.
         assert!(parse_attr_pairs("nonsense").is_empty());
-    }
-
-    #[test]
-    fn split_top_level_respects_depth_and_quotes() {
-        assert_eq!(
-            split_top_level("a[\"x,y\"], b{1, 2}, c", ','),
-            vec![
-                "a[\"x,y\"]".to_string(),
-                " b{1, 2}".to_string(),
-                " c".to_string()
-            ]
-        );
-        // A bracket inside quotes does not shift the depth.
-        assert_eq!(
-            split_top_level("\"a[b\", c", ','),
-            vec!["\"a[b\"".to_string(), " c".to_string()]
-        );
-        // The trailing part is always present, even when empty.
-        assert_eq!(
-            split_top_level("a,", ','),
-            vec!["a".to_string(), String::new()]
-        );
     }
 }

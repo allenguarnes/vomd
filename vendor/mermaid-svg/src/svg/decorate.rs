@@ -73,19 +73,10 @@ fn aria_roledescription(d: &Diagram) -> &'static str {
         Diagram::Gantt(_) => "gantt",
         Diagram::Journey(_) => "journey",
         Diagram::Timeline(_) => "timeline",
-        Diagram::Sankey(_) => "sankey",
         Diagram::Quadrant(_) => "quadrantChart",
         Diagram::XyChart(_) => "xychart",
-        Diagram::Radar(_) => "radar",
-        Diagram::Packet(_) => "packet",
         Diagram::Mindmap(_) => "mindmap",
         Diagram::GitGraph(_) => "gitGraph",
-        Diagram::Requirement(_) => "requirement",
-        Diagram::C4(_) => "c4",
-        Diagram::Block(_) => "block",
-        Diagram::Architecture(_) => "architecture",
-        Diagram::Kanban(_) => "kanban",
-        Diagram::Treemap(_) => "treemap",
     }
 }
 

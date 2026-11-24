@@ -392,7 +392,14 @@ fn info_of(bytes: &[u8]) -> Option<Header> {
     header_info(&mut Cursor::new(bytes))
 }
 
-fn header_info(r: &mut (impl Read + Seek)) -> Option<Header> {
+/// What [`header_info`] reads from.
+trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek + ?Sized> ReadSeek for T {}
+
+/// The header of the image `r` starts with. Through `dyn`: one copy for files and memory alike
+/// (about 7 KB each).
+fn header_info(mut r: &mut dyn ReadSeek) -> Option<Header> {
+    let r = &mut r;
     let mut start = [0u8; 2];
     r.read_exact(&mut start).ok()?;
     match start {

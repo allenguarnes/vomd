@@ -4,6 +4,7 @@
 //!
 //! Note: this file is being split into submodules to keep individual algorithms focused.
 
+use crate::dsort::DSort;
 use crate::graphlib::{Graph, GraphOptions};
 use crate::work::{ceil_log2, checked_add, checked_mul};
 use crate::{EdgeLabel, GraphLabel, NodeLabel, NoopWorkControl, WorkControl, WorkError};
@@ -247,7 +248,7 @@ where
             if ws.is_empty() {
                 continue;
             }
-            ws.sort_by_key(|w| pos.get(w).copied().unwrap_or(usize::MAX));
+            ws.dsort_by_key(|w| pos.get(w).copied().unwrap_or(usize::MAX));
 
             let mp = (ws.len() - 1) as f64 / 2.0;
             let i0 = mp.floor() as usize;
@@ -406,7 +407,7 @@ impl NeighborOrder {
             Self::StableSortFallback { positions, scratch } => {
                 scratch.clear();
                 scratch.extend_from_slice(neighbors);
-                scratch.sort_by_key(|&neighbor| positions[neighbor]);
+                scratch.dsort_by_key(|&neighbor| positions[neighbor]);
                 let candidate_at = |index: usize| {
                     let neighbor = scratch[index];
                     (neighbor, positions[neighbor])
@@ -877,10 +878,10 @@ impl<'a> BkWorkspace<'a> {
             // Dagre's stable ascending order can therefore be reused directly for left-biased
             // orientations and traversed backwards for right-biased orientations.
             for neighbors in &mut predecessors {
-                neighbors.sort_by_key(|&neighbor| nodes[neighbor].forward_position);
+                neighbors.dsort_by_key(|&neighbor| nodes[neighbor].forward_position);
             }
             for neighbors in &mut successors {
-                neighbors.sort_by_key(|&neighbor| nodes[neighbor].forward_position);
+                neighbors.dsort_by_key(|&neighbor| nodes[neighbor].forward_position);
             }
         }
         let neighbor_order = if can_preorder_neighbors {
@@ -1409,7 +1410,7 @@ impl<'a> BkWorkspace<'a> {
                     self.coords[2][node],
                     self.coords[3][node],
                 ];
-                values.sort_by(f64::total_cmp);
+                values.dsort_by(f64::total_cmp);
                 (values[1] + values[2]) / 2.0
             };
             out.push((self.nodes[node].graph_ix, x));
@@ -1683,7 +1684,7 @@ pub fn balance(
         }
 
         let mut vals: Vec<f64> = xss.values().filter_map(|xs| xs.get(v).copied()).collect();
-        vals.sort_by(|a, b| a.total_cmp(b));
+        vals.dsort_by(|a, b| a.total_cmp(b));
         if vals.len() >= 4 {
             out.insert(v.clone(), (vals[1] + vals[2]) / 2.0);
         }

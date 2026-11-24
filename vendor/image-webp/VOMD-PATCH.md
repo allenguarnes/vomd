@@ -37,6 +37,9 @@ patch, about 100 lines, marked `VOMD` in the code:
 - **An animation frame with alpha of another size than its `ANMF` says** (`decoder.rs`,
   `read_frame`): fails with `InconsistentImageSizes`, as a frame without alpha does, instead
   of panicking on a slice of the wrong length (now by the check above).
+- **One lossless decoder type** (size, about 8 KB): `decoder.rs` makes the `LosslessDecoder` of a
+  `VP8L` still and of an animation frame from `&mut` its reader, as the alpha path does, so
+  `LosslessDecoder` is built for one reader type instead of two.
 
 To upgrade: copy the new version's `src/` and licenses here, apply the same changes, and run
 `cargo test --lib image::webp` and the image memory tests (`cargo xtask images`).

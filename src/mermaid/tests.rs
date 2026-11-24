@@ -193,6 +193,12 @@ fn types_not_shown_say_so() {
         ),
         ("C4Context\n  Person(a, \"A\")\n", "C4"),
         ("block-beta\n  a b\n", "block"),
+        // Not parsed at all (mermaid-svg leaves them out), so a malformed one says the same.
+        ("radar-beta\n  ((\n", "radar"),
+        ("packet-beta\n  0-\n", "packet"),
+        ("architecture-beta\n  service\n", "architecture"),
+        ("kanban\n", "kanban"),
+        ("treemap-beta\n\"A\": x\n", "treemap"),
     ] {
         assert_eq!(
             make(src, false, &m),

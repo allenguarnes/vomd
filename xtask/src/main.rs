@@ -21,14 +21,19 @@ mod pkg;
 // about 45 KB (1.7%), rounded up to 10 KB.
 // Raised for Mermaid diagrams (mermaid-svg and dugong, 1.12.0): 6,374,832 B measured, 1,000 KB
 // more than 1.11.0; the budget is that plus about 75 KB.
-const SIZE_BUDGET: [u64; 2] = [6_450_000, 2_650_000];
+// Lowered for 1.12.0's size pass (no hinting, the Mermaid types not drawn left out, x11-dl
+// trimmed, inline threshold 15): 5,822,128 B measured, 554 KB less; the budget is that plus
+// about 100 KB. (The smallest build, 2,416,760 B, keeps its budget.)
+const SIZE_BUDGET: [u64; 2] = [5_920_000, 2_650_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
 // The default budget: 4,768,256 B measured on Windows with front matter, recent files, sections
 // and HTML tables (1.11.0), plus about 30 KB, rounded to 0.1 MB.
 // Raised for Mermaid diagrams (1.12.0): 5,797,888 B measured on Windows, 1,029 KB more than
 // 1.11.0; the budget is that plus about 100 KB.
-const WINDOWS_SIZE_BUDGET: [u64; 2] = [5_900_000, 2_000_000];
+// Lowered for 1.12.0's size pass: 5,331,456 B measured on Windows, 466 KB less; the budget is
+// that plus about 100 KB.
+const WINDOWS_SIZE_BUDGET: [u64; 2] = [5_430_000, 2_000_000];
 /// The size budgets of the macOS (Apple Silicon) builds: Mach-O, signed ad hoc by the linker.
 // With the macOS code (clipboard, Open panel, files from Finder, SVG processes, live reload):
 // 3,752,432 B and 1,642,704 B measured. The default budget keeps about 150 KB of room for the
@@ -36,7 +41,9 @@ const WINDOWS_SIZE_BUDGET: [u64; 2] = [5_900_000, 2_000_000];
 // 10 KB.
 // Raised for Mermaid diagrams (1.12.0): 4,585,104 B measured on macOS, 716 KB more than 1.11.0;
 // the budget is that plus about 115 KB.
-const MACOS_SIZE_BUDGET: [u64; 2] = [4_700_000, 1_680_000];
+// Lowered for 1.12.0's size pass: 4,267,440 B measured on macOS, 318 KB less; the budget is
+// that plus about 100 KB.
+const MACOS_SIZE_BUDGET: [u64; 2] = [4_370_000, 1_680_000];
 
 /// The size budgets of the system this runs on.
 fn size_budget() -> [u64; 2] {
@@ -187,19 +194,19 @@ fn baseline_cpu() -> bool {
 /// relies on two of them having distinct addresses.
 const RELEASE_FLAGS: &str = if cfg!(target_arch = "x86_64") {
     "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1flink-arg=-Wl,--icf=all\x1f\
-     -C\x1fllvm-args=-inline-threshold=10"
+     -C\x1fllvm-args=-inline-threshold=15"
 } else {
-    "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1fllvm-args=-inline-threshold=10"
+    "-C\x1flink-arg=-Wl,-z,pack-relative-relocs\x1f-C\x1fllvm-args=-inline-threshold=15"
 };
 
 /// [`RELEASE_FLAGS`] for Windows (MSVC): the C runtime linked in and the inline threshold, as
 /// `.cargo/config.toml` has them.
 const WINDOWS_RELEASE_FLAGS: &str =
-    "-C\x1ftarget-feature=+crt-static\x1f-C\x1fllvm-args=-inline-threshold=10";
+    "-C\x1ftarget-feature=+crt-static\x1f-C\x1fllvm-args=-inline-threshold=15";
 
 /// [`RELEASE_FLAGS`] for macOS: the inline threshold alone. Apple's linker has no RELR (Mach-O
 /// has chained fixups) and strips dead code already; the unwind tables are only about 63 KB there.
-const MACOS_RELEASE_FLAGS: &str = "-C\x1fllvm-args=-inline-threshold=10";
+const MACOS_RELEASE_FLAGS: &str = "-C\x1fllvm-args=-inline-threshold=15";
 
 /// The oldest macOS release builds run on (`LSMinimumSystemVersion` in the app's Info.plist):
 /// Rust's own floor for Apple Silicon.

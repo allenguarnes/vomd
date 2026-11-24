@@ -1,5 +1,5 @@
-//! AST types for the data-oriented chart diagrams: journey, timeline, sankey,
-//! quadrant, xychart, radar, and packet.
+//! AST types for the data-oriented chart diagrams: journey, timeline, quadrant
+//! and xychart. (VOMD: sankey, radar and packet are left out.)
 
 use std::collections::HashMap;
 
@@ -49,42 +49,6 @@ pub struct TimelineSection {
 pub struct TimelinePeriod {
     pub label: String,
     pub events: Vec<String>,
-}
-
-// ---- sankey ----------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SankeyDiagram {
-    pub links: Vec<SankeyLink>,
-    /// `config.sankey.linkColor` — how each link's stroke color is derived:
-    /// `source`/`target` (the node's palette color), `gradient` (source→target
-    /// gradient), or a literal hex. `None` defaults to `gradient` (upstream).
-    pub link_color: Option<String>,
-    /// `config.sankey.nodeAlignment` — `justify`/`center`/`left`/`right`.
-    /// `None` defaults to `justify`.
-    pub node_alignment: Option<String>,
-    /// `config.sankey.showValues` — append each node's throughput value to its
-    /// label. `None` defaults to `true` (upstream).
-    pub show_values: Option<bool>,
-    /// `config.sankey.prefix` — string prepended to a shown value.
-    pub prefix: Option<String>,
-    /// `config.sankey.suffix` — string appended to a shown value.
-    pub suffix: Option<String>,
-    /// `config.sankey.width` — overrides the per-column horizontal spacing.
-    pub width: Option<f64>,
-    /// `config.sankey.height` — overrides the stacking chart height.
-    pub height: Option<f64>,
-    /// `config.sankey.nodeWidth` — node rectangle width (upstream default `10`).
-    pub node_width: Option<f64>,
-    /// `config.sankey.nodePadding` — vertical gap between stacked nodes.
-    pub node_padding: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SankeyLink {
-    pub source: String,
-    pub target: String,
-    pub value: f64,
 }
 
 // ---- quadrant --------------------------------------------------------------
@@ -185,114 +149,4 @@ pub struct XySeries {
 pub enum XySeriesKind {
     Bar,
     Line,
-}
-
-// ---- radar -----------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct RadarDiagram {
-    pub title: Option<String>,
-    pub axes: Vec<RadarAxis>,
-    pub curves: Vec<RadarCurve>,
-    /// Optional explicit min value; defaults to 0.
-    pub min: Option<f64>,
-    /// Optional explicit max value; defaults to max observed.
-    pub max: Option<f64>,
-    /// Number of graticule rings; defaults to 5.
-    pub ticks: Option<u32>,
-    /// Graticule shape (concentric circles vs polygon rings).
-    pub graticule: RadarGraticule,
-    /// Whether to draw the curve legend; `None` defaults to true.
-    pub show_legend: Option<bool>,
-    /// `config.radar.width` — overall SVG width; `None` uses the derived default.
-    pub width: Option<f64>,
-    /// `config.radar.height` — overall SVG height; `None` uses the derived default.
-    pub height: Option<f64>,
-    /// `config.radar.marginTop` — top margin; `None` defaults to `PAD`.
-    pub margin_top: Option<f64>,
-    /// `config.radar.marginBottom` — bottom margin; `None` defaults to `PAD`.
-    pub margin_bottom: Option<f64>,
-    /// `config.radar.marginLeft` — left margin; `None` defaults to `PAD`.
-    pub margin_left: Option<f64>,
-    /// `config.radar.marginRight` — right margin; `None` defaults to `PAD`.
-    pub margin_right: Option<f64>,
-    /// `config.radar.axisScaleFactor` — scales the curve plot radius; `None` = 1.
-    pub axis_scale_factor: Option<f64>,
-    /// `config.radar.curveTension` — cardinal-spline tension for the closed
-    /// curve (circle graticule); `None` defaults to upstream's 0.17.
-    pub curve_tension: Option<f64>,
-}
-
-/// Shape of the radar graticule (background grid rings).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum RadarGraticule {
-    /// Concentric circles (upstream default).
-    #[default]
-    Circle,
-    /// Polygon rings following the axis vertices.
-    Polygon,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RadarAxis {
-    pub id: String,
-    pub label: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RadarCurve {
-    pub id: String,
-    pub label: String,
-    pub values: Vec<f64>,
-}
-
-// ---- packet ----------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PacketDiagram {
-    pub title: Option<String>,
-    pub fields: Vec<PacketField>,
-    /// `config.packet.*` rendering knobs (frontmatter / `%%{init}%%`).
-    pub config: PacketConfig,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PacketField {
-    pub start: u32,
-    pub end: u32,
-    pub label: String,
-}
-
-/// `config.packet.*` layout knobs. Defaults track upstream Mermaid's packet
-/// layout (32px per bit), so a diagram with no config matches the JS reference.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PacketConfig {
-    /// `packet.bitsPerRow` — bits drawn per row before wrapping.
-    pub bits_per_row: u32,
-    /// `packet.bitWidth` — pixel width of one bit cell.
-    pub bit_width: f64,
-    /// `packet.rowHeight` — pixel height of one row.
-    pub row_height: f64,
-    /// `packet.showBits` — draw the per-bit ruler above the block.
-    pub show_bits: bool,
-    /// `packet.paddingX` — horizontal margin around the block.
-    pub padding_x: f64,
-    /// `packet.paddingY` — vertical margin around the block.
-    pub padding_y: f64,
-}
-
-impl Default for PacketConfig {
-    fn default() -> Self {
-        Self {
-            bits_per_row: 32,
-            // 32px per bit (upstream default) so a one-bit flag label fits its
-            // cell instead of smearing into its neighbours (issue #248).
-            bit_width: 32.0,
-            row_height: 40.0,
-            show_bits: true,
-            padding_x: 30.0,
-            padding_y: 30.0,
-        }
-    }
 }

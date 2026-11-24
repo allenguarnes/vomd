@@ -1,5 +1,6 @@
 use super::EMPTY_LAYER_SLOT;
 use super::OrderEdgeWeight;
+use crate::dsort::DSort;
 use crate::graphlib::Graph;
 use crate::work::{ceil_log2, checked_add, checked_mul, checked_n_log_n};
 use crate::{WorkControl, WorkError};
@@ -179,7 +180,7 @@ where
         });
         if entries.len() > 1 {
             // Dagre's per-north stable sort preserves the graph's edge order for equal positions.
-            entries.sort_by_key(|entry| entry.pos);
+            entries.dsort_by_key(|entry| entry.pos);
         }
         accumulate_crossings(&entries, &mut tree, first_index, &mut cc);
     }
@@ -268,7 +269,7 @@ where
         if entries.len() > 1 {
             charge_nonzero(work_control, checked_n_log_n(entries.len())?)?;
             // Dagre's per-north stable sort preserves the graph's edge order for equal positions.
-            entries.sort_by_key(|entry| entry.pos);
+            entries.dsort_by_key(|entry| entry.pos);
         }
         let entry_work = checked_mul(entries.len(), checked_add(tree_depth, 2)?)?;
         charge_nonzero(work_control, entry_work)?;

@@ -12,10 +12,7 @@ use crate::parse::{parse_with_meta, Diagram, ParseError};
 
 pub use self::theme::Theme;
 
-mod architecture;
-mod block;
 mod builder;
-mod c4;
 mod class;
 mod color;
 pub(crate) mod compound;
@@ -28,24 +25,17 @@ mod geometry;
 mod gitgraph;
 mod interact;
 mod journey;
-mod kanban;
 mod label;
 mod markup;
 mod metrics;
 mod mindmap;
-mod packet;
 mod pie;
 mod quadrant;
-mod radar;
-mod requirement;
-mod sankey;
-mod sankey_layout;
 pub(crate) mod sequence;
 pub(crate) mod state;
 mod style;
 mod theme;
 mod timeline;
-mod treemap;
 mod xychart;
 
 #[derive(Debug, Error)]
@@ -118,18 +108,9 @@ fn render_body(d: &Diagram, theme: &Theme) -> String {
         Diagram::Gantt(g) => gantt::render(g, theme),
         Diagram::Journey(j) => journey::render(j, theme),
         Diagram::Timeline(t) => timeline::render(t, theme),
-        Diagram::Sankey(s) => sankey::render(s, theme),
         Diagram::Quadrant(q) => quadrant::render(q, theme),
         Diagram::XyChart(x) => xychart::render(x, theme),
-        Diagram::Radar(r) => radar::render(r, theme),
-        Diagram::Packet(p) => packet::render(p, theme),
         Diagram::Mindmap(m) => mindmap::render(m, theme),
         Diagram::GitGraph(g) => gitgraph::render(g, theme),
-        Diagram::Requirement(r) => requirement::render(r, theme),
-        Diagram::C4(c) => c4::render(c, theme),
-        Diagram::Block(b) => block::render(b, theme),
-        Diagram::Architecture(a) => architecture::render(a, theme),
-        Diagram::Kanban(k) => kanban::render(k, theme),
-        Diagram::Treemap(t) => treemap::render(t, theme),
     }
 }

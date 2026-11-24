@@ -12,8 +12,6 @@
 //! The concrete per-diagram types live in domain submodules and are re-exported
 //! flat here, so every type stays reachable as `ast::<Type>`.
 
-mod block;
-mod c4;
 mod charts;
 mod class;
 mod er;
@@ -23,8 +21,6 @@ mod sequence;
 mod state;
 mod structure;
 
-pub use block::*;
-pub use c4::*;
 pub use charts::*;
 pub use class::*;
 pub use er::*;
@@ -74,32 +70,34 @@ pub struct DiagramMeta {
     pub layout: Option<String>,
     /// `config.securityLevel` — parsed, not yet honored.
     pub security_level: Option<String>,
+    /// (VOMD: the kanban, treemap and sankey fields are read but unused: those diagrams
+    /// are left out.)
     /// `config.kanban.ticketBaseUrl` from frontmatter — copied onto a
-    /// [`KanbanDiagram`] to build per-card ticket links.
+    /// `KanbanDiagram` to build per-card ticket links.
     pub ticket_base_url: Option<String>,
     /// `config.treemap.valueFormat` from frontmatter — copied onto a
-    /// [`TreemapDiagram`] to format leaf values.
+    /// `TreemapDiagram` to format leaf values.
     pub value_format: Option<String>,
     /// `config.treemap.showValues` from frontmatter — copied onto a
-    /// [`TreemapDiagram`]; `Some(false)` hides leaf value text.
+    /// `TreemapDiagram`; `Some(false)` hides leaf value text.
     pub show_values: Option<bool>,
     /// `config.sankey.linkColor` from frontmatter — copied onto a
-    /// [`SankeyDiagram`] to tint links.
+    /// `SankeyDiagram` to tint links.
     pub sankey_link_color: Option<String>,
     /// `config.sankey.nodeAlignment` from frontmatter — copied onto a
-    /// [`SankeyDiagram`] to drive column alignment.
+    /// `SankeyDiagram` to drive column alignment.
     pub sankey_node_alignment: Option<String>,
     /// `config.timeline.disableMulticolor` from frontmatter — copied onto a
     /// [`TimelineDiagram`] to keep a sectionless timeline one flat color.
     pub timeline_disable_multicolor: Option<bool>,
     /// `config.sankey.showValues` from frontmatter — copied onto a
-    /// [`SankeyDiagram`] to toggle the per-node value label.
+    /// `SankeyDiagram` to toggle the per-node value label.
     pub sankey_show_values: Option<bool>,
     /// `config.sankey.prefix`/`suffix` from frontmatter — wrap the shown value.
     pub sankey_prefix: Option<String>,
     pub sankey_suffix: Option<String>,
     /// `config.sankey.{width,height,nodeWidth,nodePadding}` from frontmatter —
-    /// copied onto a [`SankeyDiagram`] to drive geometry.
+    /// copied onto a `SankeyDiagram` to drive geometry.
     pub sankey_width: Option<f64>,
     pub sankey_height: Option<f64>,
     pub sankey_node_width: Option<f64>,
@@ -151,19 +149,10 @@ pub enum Diagram {
     Gantt(GanttDiagram),
     Journey(JourneyDiagram),
     Timeline(TimelineDiagram),
-    Sankey(SankeyDiagram),
     Quadrant(QuadrantDiagram),
     XyChart(XyChartDiagram),
-    Radar(RadarDiagram),
-    Packet(PacketDiagram),
     Mindmap(MindmapDiagram),
     GitGraph(GitGraphDiagram),
-    Requirement(RequirementDiagram),
-    C4(C4Diagram),
-    Block(BlockDiagram),
-    Architecture(ArchitectureDiagram),
-    Kanban(KanbanDiagram),
-    Treemap(TreemapDiagram),
 }
 
 // ---- pie -------------------------------------------------------------------
