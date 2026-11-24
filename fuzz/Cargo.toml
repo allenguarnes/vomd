@@ -1,4 +1,4 @@
-# Fuzz targets: `cargo +nightly fuzz run <doc|image|anim|layout|math|settings|svg|highlight|yaml>`, or on
+# Fuzz targets: `cargo +nightly fuzz run <doc|image|anim|layout|math|settings|svg|highlight|yaml|mermaid>`, or on
 # stable with `just fuzz <target> [seconds]`. Never shipped.
 [package]
 name = "vomd-fuzz"
@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-vomd = { path = "..", default-features = false, features = ["embed-fonts", "images", "svg", "math", "highlight", "front-matter", "details", "html-tables"] }
+vomd = { path = "..", default-features = false, features = ["embed-fonts", "images", "svg", "math", "highlight", "front-matter", "details", "html-tables", "mermaid"] }
 
 # As in ../Cargo.toml.
 [patch.crates-io]
@@ -19,6 +19,9 @@ image-webp = { path = "../vendor/image-webp" }
 resvg = { path = "../vendor/resvg" }
 simplecss = { path = "../vendor/simplecss" }
 usvg = { path = "../vendor/usvg" }
+mermaid-svg = { path = "../vendor/mermaid-svg" }
+dugong = { path = "../vendor/dugong" }
+dugong-graphlib = { path = "../vendor/dugong-graphlib" }
 
 [workspace]
 members = ["."]
@@ -85,6 +88,13 @@ bench = false
 [[bin]]
 name = "yaml"
 path = "fuzz_targets/yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mermaid"
+path = "fuzz_targets/mermaid.rs"
 test = false
 doc = false
 bench = false

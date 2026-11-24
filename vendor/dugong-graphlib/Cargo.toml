@@ -1,0 +1,14 @@
+# dugong-graphlib 0.11.0 from crates.io, with VOMD's patch: see VOMD-PATCH.md. The library's
+# sources and licenses only: no tests or dev-dependencies, and no serde (its JSON module is gone).
+[package]
+name = "dugong-graphlib"
+version = "0.11.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Graph data structure APIs used by dugong (port of dagrejs/graphlib)."
+repository = "https://github.com/Latias94/merman"
+
+[dependencies]
+hashbrown = { version = "0.17.1", default-features = false, features = ["equivalent"] }
+rustc-hash = "2.1.3"

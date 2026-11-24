@@ -1,0 +1,7 @@
+---
+title: Titled
+config:
+  theme: neutral
+---
+flowchart TD
+  a --> b

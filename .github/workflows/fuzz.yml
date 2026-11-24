@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [doc, image, anim, layout, math, settings, svg, highlight, yaml]
+        target: [doc, image, anim, layout, math, settings, svg, highlight, yaml, mermaid]
     steps:
       - uses: actions/checkout@v4
       - name: Nightly and cargo-fuzz
@@ -40,11 +40,12 @@ jobs:
           elif [ "${{ matrix.target }}" = anim ]; then
             cp fixtures/images/*.gif fixtures/images/*.webp fuzz/corpus/anim/
           elif [ "${{ matrix.target }}" != settings ] && [ "${{ matrix.target }}" != math ] &&
-              [ "${{ matrix.target }}" != highlight ] && [ "${{ matrix.target }}" != yaml ]; then
+              [ "${{ matrix.target }}" != highlight ] && [ "${{ matrix.target }}" != yaml ] &&
+              [ "${{ matrix.target }}" != mermaid ]; then
             find fixtures -maxdepth 1 -name '*.md' -size -16k -exec cp {} fuzz/corpus/${{ matrix.target }}/ \;
           fi
           # Sample files (settings, formulas, code, front matter, Markdown with math, sections and
-          # HTML tables) and the inputs of past findings.
+          # HTML tables, diagrams) and the inputs of past findings.
           if [ -d fuzz/seeds/${{ matrix.target }} ]; then
             cp fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
           fi
@@ -54,7 +55,8 @@ jobs:
         run: |
           case ${{ matrix.target }} in
             doc | image | anim | svg | yaml) max_len=65536 ;; layout) max_len=16384 ;;
-            math) max_len=8200 ;; highlight) max_len=16390 ;; *) max_len=4096 ;;
+            math) max_len=8200 ;; highlight) max_len=16390 ;; mermaid) max_len=51201 ;;
+            *) max_len=4096 ;;
           esac
           # An SVG that takes long to draw is what the `svg` target looks for.
           timeout=10; extra=

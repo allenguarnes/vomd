@@ -380,6 +380,20 @@ fn scan(doc: &Doc, needle: &[char], focus: Focus) -> Found {
             i = end;
             continue;
         }
+        // A diagram is a picture: its source isn't searched, unless it is shown as its code.
+        #[cfg(feature = "mermaid")]
+        if let BlockKind::Code(hl) = block.kind
+            && hl.diagram != 0
+            && doc
+                .images
+                .get(hl.diagram as usize - 1)
+                .is_some_and(|i| !crate::mermaid::shown_as_code(&i.src))
+        {
+            scan.cut();
+            prev_end = None;
+            i += 1;
+            continue;
+        }
         if !block.joined {
             prev_end = None;
         }

@@ -1,0 +1,13 @@
+# mermaid-svg 0.7.0 from crates.io, with VOMD's patch: see VOMD-PATCH.md. The library's sources
+# and license only: no binary, examples, benches, gallery or dev-dependencies.
+[package]
+name = "mermaid-svg"
+version = "0.7.0"
+edition = "2021"
+license = "MIT"
+description = "Render Mermaid diagrams to SVG. Pure Rust."
+repository = "https://github.com/xmiksay/mermaid"
+
+[dependencies]
+thiserror = "2.0.18"
+dugong = "0.11.0"

@@ -3,6 +3,20 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Mermaid diagrams: a ```` ```mermaid ```` block is drawn as a diagram, as on GitHub, in
+  Mermaid's own colours for the light and the dark theme (a diagram that names its theme keeps
+  it). Flowcharts (with subgraphs, each with its own direction), sequence, class, state and ER
+  diagrams, Gantt and pie charts, mind maps, timelines, git graphs, user journeys, quadrant
+  charts and XY charts. A diagram loads like an image, scales to the column, and opens in the
+  image viewer with a click; copying one copies its block. One that can't be drawn (a mistake
+  in it, a type VOMD doesn't draw, over 50 KB, past a document's first 100 diagrams or its first
+  64 MB of them, too large to draw) shows as its code, with a line that says why.
+  Diagrams are made in a process of their own, as SVGs are drawn. The `mermaid` Cargo feature
+  (on by default) holds it; the binary is about 1 MB larger.
+
 ## [1.11.0] - 2026-11-22
 
 ### Added

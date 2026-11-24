@@ -324,6 +324,29 @@ impl TextCursor {
                 body.push_str(&doc.text[spans[0].start as usize..spans[0].end as usize]);
                 body.push_str("\n$$");
             }
+            // A diagram pastes back as the block it was written as, whole, whatever part of
+            // it is selected (its first chunk has it all; the others give nothing).
+            // (One shown as its code, because it can't be made, copies as code.)
+            #[cfg(feature = "mermaid")]
+            BlockKind::Code(hl)
+                if hl.diagram != 0
+                    && !self.code
+                    && doc
+                        .images
+                        .get(hl.diagram as usize - 1)
+                        .is_some_and(|i| !crate::mermaid::shown_as_code(&i.src)) =>
+            {
+                let src = doc
+                    .images
+                    .get(hl.diagram as usize - 1)
+                    .and_then(|i| i.diagram.as_deref());
+                let (Some(src), false) = (src, block.joined) else {
+                    return false;
+                };
+                body.push_str("```mermaid\n");
+                body.push_str(src);
+                body.push_str("\n```");
+            }
             _ => text_of(
                 doc,
                 spans,

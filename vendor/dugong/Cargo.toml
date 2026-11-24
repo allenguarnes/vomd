@@ -1,0 +1,14 @@
+# dugong 0.11.0 from crates.io, with VOMD's patch: see VOMD-PATCH.md. The library's sources and
+# licenses only: no tests, benches or dev-dependencies, and no serde or serde_json.
+[package]
+name = "dugong"
+version = "0.11.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Dagre-compatible graph layout algorithms (port of dagrejs/dagre)."
+repository = "https://github.com/Latias94/merman"
+
+[dependencies]
+dugong-graphlib = "0.11.0"
+rustc-hash = "2.1.3"

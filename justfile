@@ -17,6 +17,7 @@ clippy:
     cargo clippy --all-targets --no-default-features --features front-matter -- -D warnings
     cargo clippy --all-targets --no-default-features --features details -- -D warnings
     cargo clippy --all-targets --no-default-features --features html-tables -- -D warnings
+    cargo clippy --all-targets --no-default-features --features mermaid -- -D warnings
 
 test:
     cargo test --workspace
@@ -28,6 +29,7 @@ test:
     cargo test --lib --no-default-features --features front-matter
     cargo test --lib --no-default-features --features details
     cargo test --lib --no-default-features --features html-tables
+    cargo test --lib --no-default-features --features mermaid,embed-fonts
 
 # Portability guard: needs `rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin`.
 check-other:
@@ -45,8 +47,8 @@ budgets:
 images *args:
     cargo xtask images {{args}}
 
-# Fuzz a target (doc, image, anim, layout, math, settings, svg, highlight, yaml) on stable for
-# SECONDS.
+# Fuzz a target (doc, image, anim, layout, math, settings, svg, highlight, yaml, mermaid) on
+# stable for SECONDS.
 fuzz target seconds="60":
     scripts/fuzz.sh {{target}} {{seconds}}
 

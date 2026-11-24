@@ -36,8 +36,8 @@
 ## Why VOMD
 
 - **Fast.** Opens in milliseconds; a 5 MB document opens in under 100 ms.
-- **Small.** One file with its fonts built in: about 5.4 MB on Linux, 4.8 MB on Windows and
-  3.9 MB on macOS. No web engine, no GUI toolkit, nothing else to install.
+- **Small.** One file with its fonts built in: about 6.4 MB on Linux, 5.8 MB on Windows and
+  4.6 MB on macOS. No web engine, no GUI toolkit, nothing else to install.
 - **Private.** Never touches the network unless you ask it to, and never runs a document's HTML.
 - **Just a viewer.** No editor, no workspace, no accounts. Open a file, read it, close it.
 
@@ -52,6 +52,10 @@
 - **Math:** LaTeX formulas, written as on GitHub: `$…$` and `` $`…`$ `` in the text, `$$…$$`
   and ```` ```math ```` blocks centred on a line of their own. VOMD lays them out itself, with a
   built-in math font.
+- **Mermaid diagrams:** ```` ```mermaid ```` blocks drawn as diagrams, in GitHub's colours:
+  flowcharts, sequence, class, state and ER diagrams, Gantt charts, pie charts, mind maps,
+  timelines, git graphs, user journeys, quadrant charts and XY charts. Click one to see it
+  larger.
 - **Syntax highlighting** in code blocks, in GitHub's colours, for 26 languages and their usual
   aliases.
 - **Images:** PNG, JPEG, GIF, WebP and SVG, local or remote. Click one to see it as large as the
@@ -329,7 +333,14 @@ VOMD makes no network requests of its own.
 ## Limitations
 
 - No screen reader support.
-- Mermaid diagrams show as code.
+- Mermaid: sankey, requirement, C4, block, architecture, packet, radar, kanban and treemap
+  diagrams show as code, with a note, as does a diagram that can't be read (the note says
+  where), one over 50 KB, too complex to lay out or too large to draw, those after a
+  document's first 100, and those past 64 MB of diagrams in all. Diagrams are pictures: no
+  clicks, links or tooltips, no FontAwesome icons (`fa:fa-…` shows as text), no Markdown or
+  HTML in labels but `<b>`, `<i>` and `<br>`, and labels don't wrap. Layouts follow
+  Mermaid's (the same layered layout) but aren't identical to GitHub's. Find doesn't search
+  inside a diagram drawn as a picture (it does one shown as code).
 - Math: formulas use a common subset of LaTeX math, about what KaTeX reads. Anything else shows
   its source in red: macros (`\newcommand`, `\def`), `\href`, `\url`, `\ce`, `\verb`,
   `\cancel` and the `CD` environment, for example. `\color` and the colors of `\colorbox` are

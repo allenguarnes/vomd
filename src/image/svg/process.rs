@@ -47,6 +47,10 @@ use crate::image::{Bitmap, Limits, SvgCost, cancelled};
 
 /// The argument that makes `vomd` the drawing process: before anything else in `main`.
 pub const ARG: &str = "--draw-svg";
+/// The argument that makes `vomd` the process that makes a Mermaid diagram's SVG (see
+/// `crate::mermaid`): the same limits and the same end as a drawing process's.
+#[cfg(feature = "mermaid")]
+pub const MERMAID_ARG: &str = "--make-mermaid";
 
 /// What the child may hold beyond its charge, its input and its stack: the binary's own data,
 /// the allocator's slack, the font database's.
@@ -103,6 +107,28 @@ pub fn set_test(mode: u8) {
 /// Give every child `seconds` of CPU instead of the usual (0: the usual), for tests.
 pub fn set_cpu_limit(seconds: u64) {
     CPU_TEST.store(seconds, Ordering::Relaxed);
+}
+
+/// What children are told to do instead of their job ([`set_test`]).
+#[cfg(feature = "mermaid")]
+pub(crate) fn test_mode() -> u8 {
+    TEST.load(Ordering::Relaxed)
+}
+
+/// A child told to wait two seconds before it reads its job (`TEST` [`TEST_STALL`]), for the
+/// test of a deadline that holds while its input is written.
+#[cfg(feature = "mermaid")]
+pub(crate) const MERMAID_STALL: &str = "VOMD_TEST_MERMAID_STALL";
+#[cfg(feature = "mermaid")]
+pub const TEST_STALL: u8 = 4;
+/// Make every diagram's child on Windows go without its job object, as if it couldn't be made,
+/// for tests.
+#[cfg(all(windows, feature = "mermaid"))]
+static TEST_NO_JOB: AtomicBool = AtomicBool::new(false);
+#[cfg(all(windows, feature = "mermaid"))]
+#[doc(hidden)]
+pub fn set_test_no_job(on: bool) {
+    TEST_NO_JOB.store(on, Ordering::Relaxed);
 }
 
 /// How many children are running, for tests.
@@ -243,6 +269,116 @@ impl Drop for Running {
         let _ = self.0.kill();
         let _ = self.0.wait();
         RUNNING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Run `input` through a child started with `arg` ([`MERMAID_ARG`]): its whole output, or why
+/// there is none. It may hold `memory` beyond its input and stack, use [`CPU_SECONDS`] of CPU,
+/// and is killed at `deadline`, or once `cancel` is set (then `Err(None)`), or once it has
+/// written more than `max_out` bytes (then `Complex`).
+#[cfg(feature = "mermaid")]
+pub(crate) fn run_apart(
+    program: &Path,
+    arg: &str,
+    input: &[u8],
+    memory: usize,
+    max_out: usize,
+    deadline: std::time::Instant,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, Option<Refusal>> {
+    #[cfg(target_os = "macos")]
+    if !macos::same_program(program) {
+        return Err(Some(Refusal::Broken));
+    }
+    let cpu = match CPU_TEST.load(Ordering::Relaxed) {
+        0 => CPU_SECONDS,
+        seconds => seconds,
+    };
+    let data = input
+        .len()
+        .saturating_add(memory)
+        .saturating_add(STACK)
+        .saturating_add(HEADROOM);
+    let mut command = Command::new(program);
+    command
+        .arg(arg)
+        .arg(std::process::id().to_string())
+        .arg(data.to_string())
+        .arg(cpu.to_string())
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // (A test's child that waits before it reads its job: see `MERMAID_STALL`.)
+    if TEST.load(Ordering::Relaxed) == TEST_STALL {
+        command.env(MERMAID_STALL, "1");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows::CREATE_NO_WINDOW);
+    }
+    let child = command.spawn().map_err(|_| Some(Refusal::Broken))?;
+    #[cfg(windows)]
+    let job = if TEST_NO_JOB.load(Ordering::Relaxed) {
+        None
+    } else {
+        windows::Job::confine(&child, data, cpu)
+    };
+    let mut child = Running::new(child);
+    // Without its job object a child on Windows has no memory or CPU limit, and outlives VOMD:
+    // it is killed (by `Running`'s drop) before it is given anything to do. (An SVG's child goes
+    // on without one, killed at its deadline; a diagram's is refused.)
+    #[cfg(windows)]
+    {
+        if job.is_none() {
+            return Err(Some(Refusal::Broken));
+        }
+        child.1 = job;
+    }
+    // The input is written by a thread of its own, so that a child that doesn't read it (a pipe
+    // smaller than the job) can't hold this one past the deadline: once the child is killed, the
+    // write fails and the thread ends.
+    if let Some(mut stdin) = child.0.stdin.take() {
+        let input = input.to_vec();
+        let _ = std::thread::Builder::new()
+            .name("vomd-mermaid-input".into())
+            .spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+    }
+    let Some(mut out) = child.0.stdout.take() else {
+        return Err(Some(Refusal::Broken));
+    };
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 16 << 10];
+    loop {
+        if cancelled(cancel) {
+            return Err(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Some(Refusal::Slow));
+        }
+        if !readable(&out, POLL_MS) {
+            continue;
+        }
+        match out.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                output.extend_from_slice(&chunk[..n]);
+                if output.len() > max_out {
+                    return Err(Some(Refusal::Complex));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let never = AtomicBool::new(false);
+    match child.status(&never) {
+        Some(status) if status.success() => Ok(output),
+        Some(status) => Err(Some(refusal_of(status))),
+        None => Err(Some(Refusal::Broken)),
     }
 }
 
@@ -551,18 +687,50 @@ fn get_job(r: &mut Input<impl Read>) -> Option<Job> {
 /// `None` for any other process, which goes on as VOMD.
 pub fn child() -> Option<i32> {
     let mut args = std::env::args_os().skip(1);
-    if args.next()? != ARG {
+    let first = args.next()?;
+    #[cfg(feature = "mermaid")]
+    let kind = if first == MERMAID_ARG {
+        Kind::Mermaid
+    } else if first == ARG {
+        Kind::Svg
+    } else {
         return None;
-    }
+    };
+    #[cfg(not(feature = "mermaid"))]
+    let kind = if first == ARG {
+        Kind::Svg
+    } else {
+        return None;
+    };
     let mut num = || args.next()?.to_str()?.parse::<u64>().ok();
     let (Some(parent), Some(data), Some(cpu)) = (num(), num(), num()) else {
         return Some(EXIT_INPUT);
     };
-    Some(child_run(parent, data, cpu))
+    Some(child_run(parent, data, cpu, kind))
+}
+
+/// What a child was started for.
+#[derive(Clone, Copy)]
+enum Kind {
+    Svg,
+    #[cfg(feature = "mermaid")]
+    Mermaid,
+}
+
+/// Do the child's job: the exit code.
+fn do_job(kind: Kind) -> i32 {
+    match kind {
+        Kind::Svg => draw_job(),
+        #[cfg(feature = "mermaid")]
+        Kind::Mermaid => {
+            std::panic::set_hook(Box::new(|_| std::process::exit(EXIT_PANIC)));
+            crate::mermaid::child_job(EXIT_INPUT)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
+fn child_run(parent: u64, data: u64, cpu: u64, kind: Kind) -> i32 {
     // The limits end a process with a signal that dumps core (a crash in the system's reports,
     // and a core of an SVG's memory on disk): they end it by an exit code instead (`_exit`: it
     // allocates nothing, which is what a failed allocation leaves). Named for what it does, for
@@ -585,13 +753,13 @@ fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
     crate::platform::tune_allocator();
     set_limit(RLIMIT_CPU, cpu, cpu.saturating_add(1));
     set_limit(RLIMIT_DATA, data, data);
-    draw_job()
+    do_job(kind)
 }
 
 /// The child on macOS: Linux's handlers and limits, but its memory is counted by its allocator,
 /// and a thread of its own ends it once its parent is gone.
 #[cfg(target_os = "macos")]
-fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
+fn child_run(parent: u64, data: u64, cpu: u64, kind: Kind) -> i32 {
     // SAFETY: plain integers, and handlers that only exit.
     unsafe {
         signal(SIGABRT, stopped as extern "C" fn(i32) as usize);
@@ -605,15 +773,15 @@ fn child_run(parent: u64, data: u64, cpu: u64) -> i32 {
     macos::watch_parent(parent);
     set_limit(RLIMIT_CPU, cpu, cpu.saturating_add(1));
     macos::limit_memory(data);
-    draw_job()
+    do_job(kind)
 }
 
 /// The child on Windows: its job object (made by the parent) holds its limits and ends it with
 /// VOMD, so only what its allocations do when they fail is set here.
 #[cfg(windows)]
-fn child_run(_parent: u64, _data: u64, _cpu: u64) -> i32 {
+fn child_run(_parent: u64, _data: u64, _cpu: u64, kind: Kind) -> i32 {
     windows::child_setup();
-    draw_job()
+    do_job(kind)
 }
 
 /// Read the job, draw it, write the result: the exit code.

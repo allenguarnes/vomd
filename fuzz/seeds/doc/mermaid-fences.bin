@@ -1,0 +1,59 @@
+# Diagrams
+
+```mermaid
+flowchart TB
+    order["☕ A coffee order (to go)"]
+
+    brew["<b>Brew</b>, once per order<br/><i>weigh the beans and grind them fine,<br/>heat the water and pull the shot,<br/>steam the milk and pour it slowly</i>"]
+
+    subgraph kitchen["Behind the counter (one barista)"]
+        direction TB
+        barista["The barista's hands"]
+        grinder["The burr grinder<br/><i>set to fine, cleaned daily</i>"]
+        water["Filtered water<br/><i>kept at ninety-two degrees</i>"]
+        machine["The espresso machine<br/><i>boiler · group head · steam wand · gauge<br/>drip tray · portafilter · tamper</i>"]
+        barista --> grinder --> machine
+        barista -. draws from .-> water
+        grinder -. draws from .-> water
+    end
+
+    pastry["Pastry case<br/><i>croissants, baked each morning</i>"]
+    till["The till<br/><i>take the order and the payment,<br/>print the receipt and a number</i>"]
+
+    subgraph counter["The pickup counter"]
+        direction LR
+        cups["Paper<br/>cups"]
+        milk["Milk jugs<br/>(oat / whole)"]
+        syrup["Syrups<br/>(vanilla)"]
+        napkins["Napkins, lids, sleeves,<br/>stirrers and sugar"]
+    end
+
+    order --> brew --> kitchen
+    till -. sends .-> brew
+    grinder <-->|asks for| pastry
+    machine --> cups & milk & syrup & napkins
+```
+
+- item
+
+  ```mermaid
+  pie
+    "a" : 1
+  ```
+
+> ```mermaid
+> flowchart TD
+>   a[broken --> b
+> ```
+
+```mermaid
+```
+
+<table><tr><td>
+
+```mermaid
+flowchart LR
+  x --> y
+```
+
+</td></tr></table>

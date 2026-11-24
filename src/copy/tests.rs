@@ -788,3 +788,33 @@ fn hidden_blocks_are_left_out() {
     .collect();
     assert_eq!(text, "One\n\nThree");
 }
+
+#[cfg(feature = "mermaid")]
+#[test]
+fn a_diagram_copies_as_its_fence() {
+    let src = "Before.\n\n```mermaid\nflowchart TD\n  a --> b\n```\n\nAfter.\n";
+    assert_eq!(
+        all(src),
+        "Before.\n\n```mermaid\nflowchart TD\n  a --> b\n```\n\nAfter."
+    );
+    // Any part of it: the whole of it.
+    assert_eq!(
+        between(src, "TD", "-->"),
+        "```mermaid\nflowchart TD\n  a --> b\n```"
+    );
+    // Its copy button copies the code.
+    let d = doc(src);
+    let Content::Text(code) = Content::code(&d, 1, 1) else {
+        panic!("a short copy is made at once")
+    };
+    assert_eq!(&*code, "flowchart TD\n  a --> b");
+}
+
+#[cfg(feature = "mermaid")]
+#[test]
+fn a_diagram_shown_as_code_copies_as_code() {
+    // Over the source cap: shown as its code (cut into chunks), copied as code is.
+    let body: String = (0..6000).map(|i| format!("  n{i} --> m{i}\n")).collect();
+    let src = format!("```mermaid\nflowchart TD\n{body}```\n");
+    assert_eq!(between(&src, "n5000 ", "m5000"), "n5000 --> m5000");
+}

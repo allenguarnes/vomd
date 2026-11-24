@@ -34,6 +34,9 @@ resvg = { version = "=0.46.0", default-features = false, features = ["text"], op
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"], optional = true } # svgz; usvg's
 # What usvg reads a style sheet with: the sheets' matching work is counted before usvg runs it.
 simplecss = { version = "0.2", default-features = false, optional = true }
+# Mermaid diagrams (vendored and patched, see [patch.crates-io]: their graphs laid out by dugong,
+# a port of Dagre).
+mermaid-svg = { version = "=0.7.0", optional = true }
 
 # The clipboard's display-server halves: the versions and features winit and softbuffer already
 # resolve to, so no new package is built.
@@ -76,7 +79,7 @@ name = "math_bench"
 required-features = ["math", "embed-fonts"]
 
 [features]
-default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find", "math", "highlight", "front-matter", "details", "html-tables"]
+default = ["images", "remote-images", "svg", "embed-fonts", "clipboard", "toc", "find", "math", "highlight", "front-matter", "details", "html-tables", "mermaid"]
 # Text selection and copy, and paste into the find bar. The X11 and Wayland clipboards use crates
 # that winit already brings in; the minimal build leaves all of it out.
 clipboard = ["dep:x11rb", "dep:wayland-client", "dep:wayland-backend", "dep:wayland-protocols"]
@@ -101,6 +104,9 @@ highlight = []
 images = ["dep:png", "dep:zune-jpeg", "dep:gif", "dep:image-webp"]
 # SVG and svgz images, with resvg (vendored, see [patch.crates-io]).
 svg = ["images", "dep:resvg", "dep:flate2", "dep:simplecss"]
+# Mermaid diagrams (```mermaid blocks), made by mermaid-svg and dugong (vendored) in the process
+# SVGs are drawn in, and drawn as SVGs. Without it, a diagram's block shows as code.
+mermaid = ["svg", "dep:mermaid-svg"]
 remote-images = ["images"] # no extra crates: uses system curl
 embed-fonts = []
 
@@ -121,6 +127,9 @@ image-webp = { path = "vendor/image-webp" } # 0.2.4, its lossless decoder's Huff
 resvg = { path = "vendor/resvg" } # 0.46.0, raster images drawn by a hook, and a cancel flag
 simplecss = { path = "vendor/simplecss" } # 0.2.2, an error's position made in constant time
 usvg = { path = "vendor/usvg" } # 0.46.0, numbers too large for an f32 leave out what they would unwrap
+mermaid-svg = { path = "vendor/mermaid-svg" } # 0.7.0, graphs laid out by dugong, VOMD's entry point
+dugong = { path = "vendor/dugong" } # 0.11.0, no serde
+dugong-graphlib = { path = "vendor/dugong-graphlib" } # 0.11.0, no serde
 
 [dev-dependencies]
 insta = "1"

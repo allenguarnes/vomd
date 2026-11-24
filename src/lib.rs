@@ -15,6 +15,8 @@ pub mod image;
 pub mod layout;
 #[cfg(feature = "math")]
 pub mod math;
+#[cfg(feature = "mermaid")]
+pub mod mermaid;
 pub mod nav;
 pub mod platform;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]

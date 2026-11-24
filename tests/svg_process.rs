@@ -674,3 +674,88 @@ fn a_turned_raster_image_is_as_big_and_as_centered_in_a_child() {
     }
     no_children_within(SANE);
 }
+
+// ---- Mermaid diagrams, made in the same kind of process ----------------------------------
+
+#[cfg(feature = "mermaid")]
+mod mermaid {
+    use super::*;
+    use vomd::mermaid::{Metrics, TEST_PANIC, make, make_as_maker, set_test_deadline};
+
+    const SRC: &str = "flowchart LR\n  a[Start] --> b{Ok?}\n  b -->|yes| c\n";
+
+    #[test]
+    fn diagrams_made_apart_are_made_as_here() {
+        let _serial = serial();
+        let m = Metrics::default();
+        assert_eq!(make_as_maker(SRC, false, &m), make(SRC, false, &m));
+        assert_eq!(make_as_maker(SRC, true, &m), make(SRC, true, &m));
+        let broken = "flowchart TD\n  a[x --> b\n";
+        assert_eq!(make_as_maker(broken, false, &m), make(broken, false, &m));
+        no_children_within(SANE);
+    }
+
+    #[test]
+    fn a_maker_past_its_deadline_is_killed() {
+        let _serial = serial();
+        set_svg_test(SVG_TEST_SPIN);
+        set_test_deadline(300);
+        let t = Instant::now();
+        let r = make_as_maker(SRC, false, &Metrics::default());
+        set_test_deadline(0);
+        set_svg_test(0);
+        assert_eq!(r, Err("the diagram took too long to make".to_owned()));
+        assert!(t.elapsed() < SANE);
+        no_children_within(SANE);
+    }
+
+    #[test]
+    fn a_maker_that_panics_costs_one_diagram() {
+        let _serial = serial();
+        set_svg_test(TEST_PANIC);
+        let r = make_as_maker(SRC, false, &Metrics::default());
+        set_svg_test(0);
+        assert_eq!(r, Err("the diagram couldn't be made".to_owned()));
+        no_children_within(SANE);
+    }
+
+    #[test]
+    fn the_deadline_holds_while_the_input_is_written() {
+        // A child that waits before it reads, and a job far bigger than a pipe holds: the
+        // write can't finish, and the deadline holds all the same.
+        let _serial = serial();
+        set_svg_test(vomd::image::MERMAID_TEST_STALL);
+        set_test_deadline(300);
+        let big = format!("flowchart TD\n  a[{}]\n", "x".repeat(4 << 20));
+        let t = Instant::now();
+        let r = make_as_maker(&big, false, &Metrics::default());
+        let took = t.elapsed();
+        set_test_deadline(0);
+        set_svg_test(0);
+        assert_eq!(r, Err("the diagram took too long to make".to_owned()));
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        no_children_within(SANE);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_maker_without_its_job_object_makes_nothing() {
+        let _serial = serial();
+        vomd::image::set_mermaid_test_no_job(true);
+        let r = make_as_maker(SRC, false, &Metrics::default());
+        vomd::image::set_mermaid_test_no_job(false);
+        assert_eq!(r, Err("the diagram couldn't be made".to_owned()));
+        no_children_within(SANE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_maker_out_of_memory_is_refused_for_memory() {
+        let _serial = serial();
+        set_svg_test(SVG_TEST_EAT);
+        let r = make_as_maker(SRC, false, &Metrics::default());
+        set_svg_test(0);
+        assert_eq!(r, Err("the diagram needs too much memory".to_owned()));
+        no_children_within(SANE);
+    }
+}

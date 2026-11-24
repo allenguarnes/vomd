@@ -1472,6 +1472,45 @@ impl Layout {
                     None => text(self, &mut out, &mut missing),
                 }
             }
+            // A diagram, while it loads and once it is made; as its code, with a line that
+            // says why, if it can't be.
+            #[cfg(feature = "mermaid")]
+            BlockKind::Code(hl) if hl.diagram != 0 => {
+                match self.diagram(
+                    doc,
+                    fonts,
+                    (i, hl.diagram),
+                    body,
+                    (indent, avail, gap),
+                    &mut out,
+                ) {
+                    Some(h) => h,
+                    None => {
+                        let h = self.code(
+                            doc,
+                            fonts,
+                            (i, last),
+                            indent,
+                            avail,
+                            gap,
+                            &mut out,
+                            &mut missing,
+                        );
+                        if last {
+                            h + self.diagram_note(
+                                doc,
+                                fonts,
+                                hl.diagram,
+                                body,
+                                (indent, avail, gap + h),
+                                &mut out,
+                            )
+                        } else {
+                            h
+                        }
+                    }
+                }
+            }
             BlockKind::Code(_) => self.code(
                 doc,
                 fonts,
@@ -1912,6 +1951,111 @@ impl Layout {
                 out.append_decor(&mark, s, indent, gap + top + baseline - mark_baseline);
             }
         }
+        h
+    }
+
+    /// A diagram's block (`id` its image) laid out as the image, centered in the column: its
+    /// height, or `None` if it is shown as its code (it can't be made, or drawn). The chunks
+    /// after the first of a long one show nothing.
+    #[cfg(feature = "mermaid")]
+    fn diagram(
+        &mut self,
+        doc: &Doc,
+        fonts: &Fonts,
+        (i, id): (usize, u32),
+        body: TextStyle,
+        (indent, avail, gap): (f32, f32, f32),
+        out: &mut BlockBox,
+    ) -> Option<f32> {
+        let slot = id.checked_sub(1)? as usize;
+        if self.images.get(slot) == Some(&None) {
+            let size = match (&mut self.probe, doc.images.get(slot)) {
+                (Some(probe), Some(img)) => probe(img),
+                _ => ImageSize::Alt,
+            };
+            self.images[slot] = Some(size);
+        }
+        if !matches!(
+            self.images.get(slot).copied().flatten(),
+            Some(ImageSize::Loading | ImageSize::Pixels(..))
+        ) {
+            return None;
+        }
+        let block = &doc.blocks[i];
+        if block.joined {
+            return Some(0.0);
+        }
+        let boxes = Boxes {
+            sizes: &self.images,
+            scale: self.params.scale,
+            em: self.em,
+            max_w: avail,
+        };
+        let (w, h) = boxes.size(id, [Want::Auto; 2])?;
+        let at = doc.block_spans(block).first().map_or(0, |s| s.start);
+        self.para.clear();
+        self.para.push_box(
+            InlineBox {
+                width: w,
+                ascent: h,
+                descent: 0.0,
+                id,
+            },
+            at,
+            body,
+        );
+        let pl = self
+            .ctx
+            .layout(fonts, &self.para, avail, Align::Center, BODY_LH);
+        let height = pl.height;
+        let styles = std::mem::take(&mut self.para.styles);
+        out.append(pl, &styles, indent, gap);
+        self.para.styles = styles;
+        Some(height)
+    }
+
+    /// The line under a diagram shown as its code: why it is. Its height.
+    #[cfg(feature = "mermaid")]
+    fn diagram_note(
+        &mut self,
+        doc: &Doc,
+        fonts: &Fonts,
+        id: u32,
+        body: TextStyle,
+        (indent, avail, top): (f32, f32, f32),
+        out: &mut BlockBox,
+    ) -> f32 {
+        let Some(img) = id.checked_sub(1).and_then(|i| doc.images.get(i as usize)) else {
+            return 0.0;
+        };
+        let note = crate::mermaid::note(&img.src).unwrap_or_else(|| {
+            match self.images.get(id as usize - 1).copied().flatten() {
+                Some(ImageSize::Refused(Refusal::Slow)) => {
+                    "Mermaid: the diagram is too slow to draw".to_owned()
+                }
+                Some(ImageSize::Refused(Refusal::Complex)) => {
+                    "Mermaid: the diagram is too complex to draw".to_owned()
+                }
+                Some(ImageSize::Refused(_)) => {
+                    "Mermaid: the diagram is too large to draw".to_owned()
+                }
+                _ => "Mermaid: the diagram couldn't be drawn".to_owned(),
+            }
+        });
+        let style = TextStyle {
+            role: Role::Muted,
+            size: body.size * 0.875,
+            ..body
+        };
+        self.para.clear();
+        self.para.push_synthetic(&note, img.start, style);
+        let pl = self
+            .ctx
+            .layout(fonts, &self.para, avail, Align::Start, BODY_LH);
+        let pad = 0.25 * self.em;
+        let h = pl.height + pad;
+        let s = out.push_style(style);
+        out.append_decor(&pl, s, indent, top + pad);
         h
     }
 

@@ -602,6 +602,13 @@ pub struct View {
     /// branch switches make it, doesn't cost the position).
     kept: Option<(Option<Place>, Anchor)>,
     images: Images,
+    /// Makes the document's Mermaid diagrams (see [`crate::mermaid`]).
+    #[cfg(feature = "mermaid")]
+    diagrams: crate::mermaid::Maker,
+    /// Which of the document's diagrams were shown as their code when Find last searched
+    /// (see [`View::poll_images`]).
+    #[cfg(feature = "mermaid")]
+    diagram_codes: Vec<bool>,
     /// A frame was painted since the images near the viewport were last asked for.
     images_dirty: bool,
     /// The window can't be seen (minimized, or covered whole): animations wait.
@@ -734,6 +741,10 @@ impl View {
             ctrl: false,
             kept: None,
             images: Images::default(),
+            #[cfg(feature = "mermaid")]
+            diagrams: crate::mermaid::Maker::default(),
+            #[cfg(feature = "mermaid")]
+            diagram_codes: Vec::new(),
             images_dirty: false,
             #[cfg(feature = "images")]
             hidden: false,
@@ -766,6 +777,9 @@ impl View {
         view.images.set_base(base);
         #[cfg(feature = "svg")]
         view.images.set_svg_fonts(view.fonts.svg_sources());
+        #[cfg(feature = "mermaid")]
+        view.diagrams
+            .set_metrics(crate::mermaid::Metrics::of(&view.fonts));
         view.attach_images();
         view
     }
@@ -853,6 +867,9 @@ impl View {
         if !doc.set_dark(dark) {
             return false;
         }
+        // A diagram that failed for a reason that may not hold now is tried again.
+        #[cfg(feature = "mermaid")]
+        crate::mermaid::forget_transient();
         // Remote images that weren't there to announce may be now.
         let none = self.remote_count == 0;
         self.attach_images();
@@ -920,6 +937,8 @@ impl View {
         let ok = self.fonts.set_family(mono, faces);
         #[cfg(feature = "svg")]
         self.images.set_svg_fonts(self.fonts.svg_sources());
+        #[cfg(feature = "mermaid")]
+        self.remake_diagrams();
         #[cfg(feature = "toc")]
         self.toc.forget_rows();
         self.layout.invalidate_all();
@@ -2422,9 +2441,62 @@ impl View {
 
     // ---- Images ---------------------------------------------------------------------------
 
+    /// Which of the document's diagrams are shown as their code.
+    #[cfg(feature = "mermaid")]
+    fn diagrams_as_code(&self) -> Vec<bool> {
+        self.doc
+            .images
+            .iter()
+            .filter(|i| i.diagram.is_some())
+            .map(|i| crate::mermaid::shown_as_code(&i.src))
+            .collect()
+    }
+
+    /// Diagrams made but that VOMD's image limits keep from being drawn are kept as failures
+    /// that say why, so they are copied and found as the code they are shown as.
+    #[cfg(feature = "mermaid")]
+    fn note_refused_diagrams(&mut self) {
+        for (i, img) in self.doc.images.iter().enumerate() {
+            if img.diagram.is_none() {
+                continue;
+            }
+            let why = match self.layout.image_size(i as u32 + 1) {
+                Some(ImageSize::Refused(crate::layout::Refusal::Slow)) => {
+                    "the diagram is too slow to draw"
+                }
+                Some(ImageSize::Refused(crate::layout::Refusal::Complex)) => {
+                    "the diagram is too complex to draw"
+                }
+                Some(ImageSize::Refused(_)) => "the diagram is too large to draw",
+                // (Not `Alt`: every image shows its alt text while the image tables wait for
+                // room, made diagrams too.)
+                _ => continue,
+            };
+            crate::mermaid::refused(&img.src, why);
+        }
+    }
+
+    /// The faces text is set in changed: diagrams are made again with them (as they are, until
+    /// then).
+    #[cfg(feature = "mermaid")]
+    fn remake_diagrams(&mut self) {
+        if self
+            .diagrams
+            .set_metrics(crate::mermaid::Metrics::of(&self.fonts))
+        {
+            self.diagrams.forget(&self.doc);
+            self.attach_images();
+            self.images_dirty = true;
+        }
+    }
+
     /// Hand the document and its new layout to the images: local sizes come from their files,
     /// remote ones from whether they're on.
     fn attach_images(&mut self) {
+        // The diagrams the document shows now (the theme's), made if they aren't: asked for
+        // first, so the images see them as being made (loading) rather than missing.
+        #[cfg(feature = "mermaid")]
+        self.diagrams.request(&self.doc);
         self.images.attach(&self.doc, &mut self.layout);
         self.remote_count = if self.images.policy() == RemoteImages::Never {
             0
@@ -2443,6 +2515,8 @@ impl View {
     /// How the image threads wake the event loop when a result is waiting for
     /// [`View::poll_images`].
     pub fn set_image_wake(&mut self, wake: ImageWake) {
+        #[cfg(feature = "mermaid")]
+        self.diagrams.set_wake(wake.clone());
         self.images.set_wake(wake);
     }
 
@@ -2551,8 +2625,30 @@ impl View {
     /// (the reading position is kept). Returns true if the window needs a repaint.
     pub fn poll_images(&mut self, now: Instant) -> bool {
         let no_curl = self.images.no_curl();
-        if !self.images.poll(&self.doc, &mut self.layout) {
+        // Diagrams made since: their images are attached again, with their sizes (or as code).
+        #[cfg(feature = "mermaid")]
+        let made = self.diagrams.take_finished() && {
+            self.attach_images();
+            self.images_dirty = true;
+            true
+        };
+        #[cfg(not(feature = "mermaid"))]
+        let made = false;
+        if !self.images.poll(&self.doc, &mut self.layout) && !made {
             return false;
+        }
+        // A diagram now shown as its code (or no longer), since the last poll that looked: its
+        // text is found from now on. (Kept in the view: the maker publishes a failure before
+        // the poll that takes it.)
+        #[cfg(feature = "mermaid")]
+        {
+            self.note_refused_diagrams();
+            let codes = self.diagrams_as_code();
+            if codes != self.diagram_codes {
+                self.diagram_codes = codes;
+                #[cfg(feature = "find")]
+                self.find_again();
+            }
         }
         #[cfg(feature = "images")]
         self.viewer_poll(now);
@@ -2585,6 +2681,26 @@ impl View {
             .flatten()
             .find(|s| s.image != 0 && (s.start..s.end.max(s.start + 1)).contains(&hit.doc))
             .map(|s| s.image)
+            .filter(|&id| self.image_shown(id))
+    }
+
+    /// Image `id` is shown as an image: not a diagram shown as its code (whose text names it,
+    /// for copying, but is no image to open or load).
+    fn image_shown(&self, id: u32) -> bool {
+        #[cfg(feature = "mermaid")]
+        if self
+            .doc
+            .images
+            .get(id as usize - 1)
+            .is_some_and(|i| i.diagram.is_some())
+        {
+            return matches!(
+                self.layout.image_size(id),
+                Some(ImageSize::Pixels(..) | ImageSize::Loading)
+            );
+        }
+        let _ = id;
+        true
     }
 
     /// The image at (`x`, `y`) that a click loads past VOMD's limits: a placeholder that says
@@ -2663,6 +2779,8 @@ impl View {
     fn open_doc(&mut self, doc: Doc, message: Option<String>) {
         #[cfg(feature = "images")]
         self.close_viewer();
+        #[cfg(feature = "mermaid")]
+        crate::mermaid::forget_transient();
         self.doc = self.themed(doc);
         self.message = message;
         #[cfg(feature = "details")]
@@ -2743,6 +2861,8 @@ impl View {
         } else {
             self.section_states()
         };
+        #[cfg(feature = "mermaid")]
+        crate::mermaid::forget_transient();
         self.doc = self.themed(doc);
         self.message = message;
         #[cfg(feature = "details")]

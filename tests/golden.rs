@@ -493,6 +493,14 @@ const FIND_CASES: &[FindCase] = &[
     },
 ];
 
+/// `mermaid.md` (the reference flowchart, a sequence diagram and a broken one, shown as its
+/// code with a note): name, logical width, scale, dark.
+#[cfg(feature = "mermaid")]
+const MERMAID_CASES: &[(&str, f32, f32, bool)] = &[
+    ("mermaid-light", 760.0, 1.0, false),
+    ("mermaid-dark", 760.0, 1.0, true),
+];
+
 /// An image: width, height and pixels.
 type Rendered = (usize, usize, Vec<u32>);
 
@@ -720,6 +728,56 @@ fn render_anim(scale: f32, dark: bool) -> Rendered {
         view.tick(now, Some(now));
         std::thread::sleep(Duration::from_millis(5));
         view.poll_images(Instant::now());
+    }
+    view.paint(&mut px, w as usize, Instant::now());
+    (w as usize, h as usize, px)
+}
+
+/// A [`MERMAID_CASES`] case painted: the whole document, once its diagrams are made and drawn.
+#[cfg(feature = "mermaid")]
+fn render_mermaid(width: f32, scale: f32, dark: bool) -> Rendered {
+    let src = std::fs::read_to_string(root().join("fixtures/mermaid.md")).unwrap();
+    let w = (width * scale).round() as u32;
+    let mut view = View::new(
+        Fonts::new().unwrap(),
+        Doc::parse(&src),
+        None,
+        (w, MAX_H as u32),
+        f64::from(scale),
+    );
+    view.set_theme_mode(if dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    });
+    let mut px = vec![0; w as usize * MAX_H];
+    let t = Instant::now();
+    // Two diagrams drawn (the third is code).
+    while view.image_stats().decoded < 2 {
+        assert!(t.elapsed() < Duration::from_secs(60), "never drawn");
+        view.ensure();
+        view.paint(&mut px, w as usize, Instant::now());
+        let now = Instant::now();
+        view.tick(now, Some(now));
+        std::thread::sleep(Duration::from_millis(5));
+        view.poll_images(Instant::now());
+    }
+    while !view.idle(Instant::now() + Duration::from_secs(1)) {}
+    view.ensure();
+    let h = (view.layout().total_height().ceil() as u32 + view.top_inset()).clamp(1, MAX_H as u32);
+    view.resize(w, h);
+    view.ensure();
+    let mut px = vec![0; w as usize * h as usize];
+    let t = Instant::now();
+    loop {
+        view.paint(&mut px, w as usize, Instant::now());
+        let now = Instant::now();
+        view.tick(now, Some(now));
+        if !view.poll_images(Instant::now()) && view.image_stats().decoded >= 2 {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(60), "never settled");
+        std::thread::sleep(Duration::from_millis(5));
     }
     view.paint(&mut px, w as usize, Instant::now());
     (w as usize, h as usize, px)
@@ -1046,6 +1104,12 @@ fn goldens() {
         VIEWER_CASES
             .iter()
             .map(|&(name, scale, dark, zoom)| (name, render_viewer(scale, dark, zoom))),
+    );
+    #[cfg(feature = "mermaid")]
+    let cases = cases.chain(
+        MERMAID_CASES
+            .iter()
+            .map(|&(name, width, scale, dark)| (name, render_mermaid(width, scale, dark))),
     );
     #[cfg(unix)]
     let cases = cases.chain(

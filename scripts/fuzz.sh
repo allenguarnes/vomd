@@ -2,9 +2,9 @@
 # Run a fuzz target (fuzz/fuzz_targets/) on the stable toolchain: libFuzzer with the same
 # coverage instrumentation cargo-fuzz uses, without a sanitizer (cargo-fuzz needs nightly for
 # ASan; CI's nightly job uses it).
-# Usage: scripts/fuzz.sh <doc|image|anim|layout|math|settings|svg|highlight|yaml> [seconds]
+# Usage: scripts/fuzz.sh <doc|image|anim|layout|math|settings|svg|highlight|yaml|mermaid> [seconds]
 set -euo pipefail
-usage="usage: scripts/fuzz.sh <doc|image|anim|layout|math|settings|svg|highlight|yaml> [seconds]"
+usage="usage: scripts/fuzz.sh <doc|image|anim|layout|math|settings|svg|highlight|yaml|mermaid> [seconds]"
 target=${1:?$usage}
 secs=${2:-60}
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,6 +21,7 @@ case $target in
     math) max_len=8200 ;; # a formula is at most 8 KiB (math::MAX_SOURCE), plus the mode byte
     highlight) max_len=16390 ;; # a block is lexed at most 16 KiB at a time, plus 6 header bytes
     yaml) max_len=65536 ;;
+    mermaid) max_len=51201 ;; # a diagram is at most 50 KiB (mermaid::MAX_SOURCE), plus the theme byte
     *) max_len=4096 ;;
 esac
 # An SVG that takes long to draw is what the `svg` target looks for.
@@ -41,6 +42,7 @@ mkdir -p "$corpus" "artifacts/$target"
 # Seeds: the fixtures for the Markdown targets, the images for `image` (the SVGs for `svg`, the
 # GIFs and WebPs for `anim`), and seeds/<target>/: the sample files of the settings, sample
 # formulas for `math`, a code sample per language for `highlight`, front matter for `yaml`,
+# a diagram of each type for `mermaid`,
 # Markdown with math, front matter, sections and HTML tables for `doc` and `layout`, and the
 # inputs of past findings (also run as tests). The seeds go in every run, so a finding is run
 # also from a corpus that was seeded before it.
@@ -51,7 +53,7 @@ elif [ "$target" = svg ] && [ -z "$(ls -A "$corpus")" ]; then
 elif [ "$target" = anim ] && [ -z "$(ls -A "$corpus")" ]; then
     cp "$root"/fixtures/images/*.gif "$root"/fixtures/images/*.webp "$corpus/"
 elif [ "$target" != settings ] && [ "$target" != math ] && [ "$target" != highlight ] &&
-    [ "$target" != yaml ] && [ -z "$(ls -A "$corpus")" ]; then
+    [ "$target" != yaml ] && [ "$target" != mermaid ] && [ -z "$(ls -A "$corpus")" ]; then
     for f in "$root"/fixtures/*.md; do
         if [ "$(stat -c %s "$f")" -le "$max_len" ]; then cp "$f" "$corpus/"; fi
     done

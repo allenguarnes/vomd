@@ -19,18 +19,24 @@ mod pkg;
 // measured; the default budget is a round 5.4 MB (about 150 KB of room, kept for the image
 // viewer, which took 20 KB of it in 1.10.0: 5,267,568 B), the smallest one the measured size plus
 // about 45 KB (1.7%), rounded up to 10 KB.
-const SIZE_BUDGET: [u64; 2] = [5_400_000, 2_650_000];
+// Raised for Mermaid diagrams (mermaid-svg and dugong, 1.12.0): 6,374,832 B measured, 1,000 KB
+// more than 1.11.0; the budget is that plus about 75 KB.
+const SIZE_BUDGET: [u64; 2] = [6_450_000, 2_650_000];
 /// The size budgets of the Windows (x86_64, MSVC) builds, which `size` and `dist` hold them to
 /// there: PE has no relocation tables to pack, and the C runtime is linked in.
 // The default budget: 4,768,256 B measured on Windows with front matter, recent files, sections
 // and HTML tables (1.11.0), plus about 30 KB, rounded to 0.1 MB.
-const WINDOWS_SIZE_BUDGET: [u64; 2] = [4_800_000, 2_000_000];
+// Raised for Mermaid diagrams (1.12.0): 5,797,888 B measured on Windows, 1,029 KB more than
+// 1.11.0; the budget is that plus about 100 KB.
+const WINDOWS_SIZE_BUDGET: [u64; 2] = [5_900_000, 2_000_000];
 /// The size budgets of the macOS (Apple Silicon) builds: Mach-O, signed ad hoc by the linker.
 // With the macOS code (clipboard, Open panel, files from Finder, SVG processes, live reload):
 // 3,752,432 B and 1,642,704 B measured. The default budget keeps about 150 KB of room for the
 // image viewer, as on Linux; the smallest one is the measured size plus about 1.7%, rounded up to
 // 10 KB.
-const MACOS_SIZE_BUDGET: [u64; 2] = [3_900_000, 1_680_000];
+// Raised for Mermaid diagrams (1.12.0): 4,585,104 B measured on macOS, 716 KB more than 1.11.0;
+// the budget is that plus about 115 KB.
+const MACOS_SIZE_BUDGET: [u64; 2] = [4_700_000, 1_680_000];
 
 /// The size budgets of the system this runs on.
 fn size_budget() -> [u64; 2] {

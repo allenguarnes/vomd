@@ -47,10 +47,21 @@ pub use exif::orientation as exif_orientation;
 /// Where an image comes from (the image viewer follows its image by it over a reload).
 #[cfg(feature = "images")]
 pub(crate) use forced::Origin;
+#[cfg(feature = "mermaid")]
+pub(crate) use svg::Refusal as SvgRefusal;
 /// The binary's allocator on Windows and macOS (see `svg::process::windows`, `::macos`).
 #[cfg(all(feature = "svg", any(windows, target_os = "macos")))]
 #[doc(hidden)]
 pub use svg::process::SvgChildAllocator;
+#[cfg(all(
+    feature = "mermaid",
+    any(target_os = "linux", windows, target_os = "macos")
+))]
+#[doc(hidden)]
+pub use svg::process::TEST_STALL as MERMAID_TEST_STALL;
+#[cfg(all(feature = "mermaid", windows))]
+#[doc(hidden)]
+pub use svg::process::set_test_no_job as set_mermaid_test_no_job;
 /// SVGs drawn in a process of their own (see `svg::process`).
 #[cfg(all(
     feature = "svg",
@@ -68,6 +79,13 @@ pub use svg::process::{
 pub use svg::process::{
     EAT as SVG_TEST_EAT, SPIN as SVG_TEST_SPIN, set_cpu_limit as set_svg_cpu_limit,
     set_test as set_svg_test,
+};
+#[cfg(all(
+    feature = "mermaid",
+    any(target_os = "linux", windows, target_os = "macos")
+))]
+pub(crate) use svg::process::{
+    MERMAID_ARG, MERMAID_STALL, program as svg_program, run_apart, test_mode,
 };
 
 /// Memory for decoded images (and fetched bytes), at most. Images painted in the
@@ -662,6 +680,11 @@ pub const MAX_SRC: usize = 16 << 10;
 /// (anything with a scheme), for network paths (see [`is_network`]), for a relative path
 /// without a base (a document read from stdin) and for a `src` longer than [`MAX_SRC`].
 pub fn local_path(src: &str, base: Option<&Path>) -> Option<PathBuf> {
+    // A Mermaid diagram's SVG, read from memory (see `crate::mermaid`).
+    #[cfg(feature = "mermaid")]
+    if let Some(path) = crate::mermaid::virtual_path(src) {
+        return Some(path);
+    }
     let src = src.trim();
     if src.is_empty() || src.len() > MAX_SRC || src.chars().any(char::is_control) {
         return None;
@@ -740,6 +763,28 @@ pub fn probe_file(path: &Path) -> Option<(u32, u32)> {
 /// The size layout gives the local image at `path`: its natural size, why it's over VOMD's
 /// limits, or its alt text (missing, unreadable, not a format [`decode`] reads).
 fn probe_size(path: &Path) -> ImageSize {
+    // A diagram: loading until it is made, its SVG's size once it is.
+    #[cfg(feature = "mermaid")]
+    if crate::mermaid::is_virtual(path) {
+        let Some(bytes) = crate::mermaid::bytes(path) else {
+            let src = path.to_str().unwrap_or_default().trim_start_matches('\0');
+            return if crate::mermaid::pending(src) {
+                ImageSize::Loading
+            } else {
+                ImageSize::Alt
+            };
+        };
+        return match info_of(&bytes) {
+            None => ImageSize::Alt,
+            Some(h) => match refusal(&h, &Limits::normal()) {
+                Some(why) => ImageSize::Refused(why),
+                None => {
+                    let (w, h) = h.shown();
+                    ImageSize::Pixels(w, h)
+                }
+            },
+        };
+    }
     let Some(h) = open_regular(path)
         .and_then(|f| header_info(&mut std::io::BufReader::with_capacity(4096, f)))
     else {
@@ -766,6 +811,11 @@ fn probe(img: &ImageRef, base: Option<&Path>) -> ImageSize {
 /// charged for: a file that grew since its header was read is refused before anything is
 /// allocated for it).
 fn read_file(path: &Path, limit: usize) -> Option<Vec<u8>> {
+    #[cfg(feature = "mermaid")]
+    if crate::mermaid::is_virtual(path) {
+        let bytes = crate::mermaid::bytes(path)?;
+        return (bytes.len() <= limit).then(|| bytes.to_vec());
+    }
     let file = open_regular(path)?;
     let len = file.metadata().ok()?.len().min(MAX_FILE) as usize;
     if len > limit {
@@ -941,10 +991,28 @@ impl FileInfo {
 
 /// The size and header of a local file, from its header (`None`: see [`probe_file`]).
 fn file_info(path: &Path) -> Option<FileInfo> {
+    #[cfg(feature = "mermaid")]
+    if crate::mermaid::is_virtual(path) {
+        let bytes = crate::mermaid::bytes(path)?;
+        let header = info_of(&bytes)?;
+        return Some(FileInfo {
+            len: bytes.len(),
+            header,
+        });
+    }
     let file = open_regular(path)?;
     let len = file.metadata().ok()?.len() as usize;
     let header = header_info(&mut std::io::BufReader::with_capacity(4096, file))?;
     Some(FileInfo { len, header })
+}
+
+/// A local image's file's stamp ([`crate::view::stamp`]); a diagram's, its SVG's.
+fn file_stamp(path: &Path) -> Option<crate::view::Stamp> {
+    #[cfg(feature = "mermaid")]
+    if crate::mermaid::is_virtual(path) {
+        return crate::mermaid::stamp(path);
+    }
+    crate::view::stamp(path)
 }
 
 /// What decoding an image already in memory to `w` × `h` holds, its bytes not included.
@@ -2944,7 +3012,7 @@ impl Worker {
             // (Before the file is read: a write meanwhile makes it another stamp, never the same.)
             #[cfg(feature = "images")]
             let stamp = match &job.source {
-                Source::File(path) => crate::view::stamp(path),
+                Source::File(path) => file_stamp(path),
                 Source::Bytes(_) => None,
             };
             let mut made = decode_job(&job, &mut state);
@@ -3412,6 +3480,17 @@ pub struct Images {
     svg_deadline: std::time::Duration,
     #[cfg(feature = "remote-images")]
     pub(crate) remote: crate::remote::Remote,
+}
+
+/// A diagram not made yet: nothing to read, until it is (its image is attached again then).
+fn diagram_pending(src: &str) -> bool {
+    #[cfg(feature = "mermaid")]
+    return crate::mermaid::pending(src);
+    #[cfg(not(feature = "mermaid"))]
+    {
+        let _ = src;
+        false
+    }
 }
 
 /// A key of the document that is going: local, and not carried ([`CARRIED`]).
@@ -4048,7 +4127,7 @@ impl Images {
         self.cache.retain(|s| {
             carried(&s.key).is_none_or(|id| {
                 matches!(srcs.get(id as usize - 1), Some(Src::File(src))
-                    if local_path(src, base).is_some_and(|p| crate::view::stamp(&p) == s.file))
+                    if local_path(src, base).is_some_and(|p| file_stamp(&p) == s.file))
             })
         });
         let slots = &self.cache.slots;
@@ -4146,6 +4225,7 @@ impl Images {
                         Src::Remote(img.src.clone())
                     } else if cfg!(feature = "images")
                         && local_path(&img.src, self.base.as_deref()).is_some()
+                        && !diagram_pending(&img.src)
                     {
                         // (Its path is worked out again when it is wanted, and not kept.)
                         Src::File(img.src.clone())

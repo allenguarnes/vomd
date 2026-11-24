@@ -1,0 +1,338 @@
+//! Flowchart node sizing/drawing and subgraph frame rendering.
+
+use std::collections::HashMap;
+
+use crate::parse::{FlowNode, FlowchartDiagram, NodeShape, Style};
+
+use crate::svg::builder::{fnum, split_label_lines, SvgBuilder};
+use crate::svg::interact::{close_click, open_click};
+use crate::svg::markup::strip_tags;
+use crate::svg::metrics::{font_scale, text_width};
+use crate::svg::style::resolve_style;
+use crate::svg::theme::Theme;
+
+use super::{CHAR_W, LINE_H, MIN_H, MIN_W, PAD_X, PAD_Y};
+
+// ---- node sizing & drawing -------------------------------------------------
+
+pub(super) fn node_size(n: &FlowNode, font_size: f64) -> (f64, f64) {
+    let lines = split_label_lines(&n.text);
+    let widest = lines
+        .iter()
+        .map(|l| text_width(&strip_tags(l), CHAR_W, font_size))
+        .fold(0.0_f64, f64::max);
+    let w = (widest + PAD_X * 2.0).max(MIN_W);
+    let h = (lines.len() as f64 * LINE_H * font_scale(font_size) + PAD_Y * 2.0).max(MIN_H);
+    match n.shape {
+        NodeShape::Circle
+        | NodeShape::DoubleCircle
+        | NodeShape::FilledCircle
+        | NodeShape::CrossedCircle => {
+            let d = w.max(h);
+            (d, d)
+        }
+        NodeShape::Rhombus | NodeShape::Hexagon => (w + PAD_X, h + PAD_Y),
+        NodeShape::Parallelogram
+        | NodeShape::ParallelogramAlt
+        | NodeShape::Trapezoid
+        | NodeShape::TrapezoidAlt => (w + 24.0, h),
+        NodeShape::Asymmetric => (w + 16.0, h),
+        // Triangles taper, so the label needs more room to sit inside them.
+        NodeShape::Triangle | NodeShape::FlippedTriangle => (w + h, h + PAD_Y),
+        NodeShape::Hourglass => (w, h + PAD_Y),
+        // End-cap ellipses eat horizontal room.
+        NodeShape::DirectAccessStorage => (w + 24.0, h),
+        _ => (w, h),
+    }
+}
+
+pub(super) fn draw_node(
+    svg: &mut SvgBuilder,
+    (cx, cy): (f64, f64),
+    (w, h): (f64, f64),
+    node: &FlowNode,
+    class_defs: &HashMap<String, Style>,
+    theme: &Theme,
+) {
+    if let Some(action) = &node.click {
+        open_click(svg, action);
+    }
+    let rs = resolve_style(class_defs, &node.classes, &node.style);
+    let flow_node_stroke = rs.stroke_or(&theme.flow_node_stroke);
+    let fill_attr = rs.shape_attrs(&theme.flow_node_fill, &theme.flow_node_stroke, "1.5");
+    let x = cx - w / 2.0;
+    let y = cy - h / 2.0;
+    let off = 12.0; // skew for parallelogram/trapezoid
+    match node.shape {
+        NodeShape::Rect => {
+            svg.rect(x, y, w, h, &format!("{fill_attr} rx=\"4\""));
+        }
+        NodeShape::Round => {
+            // Small corner radius — a rounded rect, not a pill (upstream `()`).
+            svg.rect(x, y, w, h, &format!("{fill_attr} rx=\"5\""));
+        }
+        NodeShape::Stadium => {
+            svg.rect(x, y, w, h, &format!("{fill_attr} rx=\"{}\"", h / 2.0));
+        }
+        NodeShape::Subroutine => {
+            svg.rect(x, y, w, h, &format!("{fill_attr} rx=\"2\""));
+            svg.line(
+                x + 6.0,
+                y,
+                x + 6.0,
+                y + h,
+                &format!("stroke=\"{flow_node_stroke}\" stroke-width=\"1\""),
+            );
+            svg.line(
+                x + w - 6.0,
+                y,
+                x + w - 6.0,
+                y + h,
+                &format!("stroke=\"{flow_node_stroke}\" stroke-width=\"1\""),
+            );
+        }
+        NodeShape::Cylinder => {
+            svg.rect(x, y + 8.0, w, h - 16.0, &fill_attr);
+            svg.path(
+                &format!(
+                    "M{} {} A{} {} 0 0 0 {} {} A{} {} 0 0 0 {} {}",
+                    fnum(x),
+                    fnum(y + 8.0),
+                    fnum(w / 2.0),
+                    fnum(8.0),
+                    fnum(x + w),
+                    fnum(y + 8.0),
+                    fnum(w / 2.0),
+                    fnum(8.0),
+                    fnum(x),
+                    fnum(y + 8.0)
+                ),
+                &fill_attr,
+            );
+            svg.path(
+                &format!(
+                    "M{} {} A{} {} 0 0 0 {} {}",
+                    fnum(x),
+                    fnum(y + h - 8.0),
+                    fnum(w / 2.0),
+                    fnum(8.0),
+                    fnum(x + w),
+                    fnum(y + h - 8.0)
+                ),
+                &format!("fill=\"none\" stroke=\"{flow_node_stroke}\" stroke-width=\"1.5\""),
+            );
+        }
+        NodeShape::Circle => {
+            let r = w.max(h) / 2.0;
+            svg.circle(cx, cy, r, &fill_attr);
+        }
+        NodeShape::DoubleCircle => {
+            let r = w.max(h) / 2.0;
+            svg.circle(cx, cy, r, &fill_attr);
+            svg.circle(cx, cy, r - 4.0, &fill_attr);
+        }
+        NodeShape::Rhombus => {
+            let d = format!(
+                "M{cx} {top}L{right} {cy}L{cx} {bot}L{left} {cy}Z",
+                cx = fnum(cx),
+                top = fnum(cy - h / 2.0),
+                right = fnum(cx + w / 2.0),
+                bot = fnum(cy + h / 2.0),
+                left = fnum(cx - w / 2.0)
+            );
+            svg.path(&d, &fill_attr);
+        }
+        NodeShape::Hexagon => {
+            let o = h / 4.0;
+            let d = format!(
+                "M{x1} {cy}L{x2} {top}L{x3} {top}L{x4} {cy}L{x3} {bot}L{x2} {bot}Z",
+                x1 = fnum(x),
+                x2 = fnum(x + o),
+                x3 = fnum(x + w - o),
+                x4 = fnum(x + w),
+                top = fnum(cy - h / 2.0),
+                bot = fnum(cy + h / 2.0),
+                cy = fnum(cy)
+            );
+            svg.path(&d, &fill_attr);
+        }
+        NodeShape::Parallelogram => {
+            // /  /  — top-left and bottom-right pushed in
+            let d = format!(
+                "M{} {} L{} {} L{} {} L{} {} Z",
+                fnum(x + off),
+                fnum(y),
+                fnum(x + w),
+                fnum(y),
+                fnum(x + w - off),
+                fnum(y + h),
+                fnum(x),
+                fnum(y + h)
+            );
+            svg.path(&d, &fill_attr);
+        }
+        NodeShape::ParallelogramAlt => {
+            // \  \  — top-right and bottom-left pushed in
+            let d = format!(
+                "M{} {} L{} {} L{} {} L{} {} Z",
+                fnum(x),
+                fnum(y),
+                fnum(x + w - off),
+                fnum(y),
+                fnum(x + w),
+                fnum(y + h),
+                fnum(x + off),
+                fnum(y + h)
+            );
+            svg.path(&d, &fill_attr);
+        }
+        NodeShape::Trapezoid => {
+            // /  \  — top narrower than bottom (manual input)
+            let d = format!(
+                "M{} {} L{} {} L{} {} L{} {} Z",
+                fnum(x + off),
+                fnum(y),
+                fnum(x + w - off),
+                fnum(y),
+                fnum(x + w),
+                fnum(y + h),
+                fnum(x),
+                fnum(y + h)
+            );
+            svg.path(&d, &fill_attr);
+        }
+        NodeShape::TrapezoidAlt => {
+            // \  /  — top wider than bottom (manual output)
+            let d = format!(
+                "M{} {} L{} {} L{} {} L{} {} Z",
+                fnum(x),
+                fnum(y),
+                fnum(x + w),
+                fnum(y),
+                fnum(x + w - off),
+                fnum(y + h),
+                fnum(x + off),
+                fnum(y + h)
+            );
+            svg.path(&d, &fill_attr);
+        }
+        NodeShape::Asymmetric => {
+            // >  ]  — flag with a concave notch on the LEFT edge and a straight
+            // vertical right edge (upstream `rect_left_inv_arrow`).
+            let d = format!(
+                "M{} {} L{} {} L{} {} L{} {} L{} {} Z",
+                fnum(x),
+                fnum(y),
+                fnum(x + w),
+                fnum(y),
+                fnum(x + w),
+                fnum(y + h),
+                fnum(x),
+                fnum(y + h),
+                fnum(x + off),
+                fnum(cy)
+            );
+            svg.path(&d, &fill_attr);
+        }
+        // Mermaid v11 `@{ shape: … }` geometries live in the sibling module.
+        other => super::shapes::draw(
+            svg,
+            other,
+            (x, y, w, h),
+            (cx, cy),
+            &fill_attr,
+            flow_node_stroke,
+        ),
+    }
+    let fg = rs.label_fill(&theme.fg);
+    let font = rs.font_size.as_deref();
+    draw_label(svg, (cx, cy), &node.text, fg, font, &rs.text_attrs());
+    if let Some(action) = &node.click {
+        close_click(svg, action);
+    }
+}
+
+fn draw_label(
+    svg: &mut SvgBuilder,
+    (cx, cy): (f64, f64),
+    text: &str,
+    fg: &str,
+    font_size: Option<&str>,
+    extra: &str,
+) {
+    let fs = match font_size {
+        Some(s) => format!(" font-size=\"{s}\""),
+        None => String::new(),
+    };
+    // Route the whole label through one `SvgBuilder::text` call: it stacks the
+    // lines as vertically-centered <tspan>s and carries an inline tag opened
+    // before a `<br>` across the break (#221). Splitting per line here would
+    // reset the open-tag stack at each line boundary.
+    svg.text(
+        cx,
+        cy + 5.0,
+        &format!("text-anchor=\"middle\" fill=\"{fg}\"{fs}{extra}"),
+        text,
+    );
+}
+
+// ---- subgraph frames -------------------------------------------------------
+
+pub(super) fn draw_subgraphs(
+    svg: &mut SvgBuilder,
+    d: &FlowchartDiagram,
+    boxes: &HashMap<String, (f64, f64, f64, f64)>,
+    theme: &Theme,
+) {
+    for sub in &d.subgraphs {
+        let Some(&(x0, y0, x1, y1)) = boxes.get(&sub.id) else {
+            continue;
+        };
+        // Themed cluster fill + solid border, overridable by a `style`/`class`
+        // on the subgraph id (upstream styles the cluster rect).
+        let rs = resolve_style(&d.class_defs, &sub.classes, &sub.style);
+        let frame = rs.shape_attrs(&theme.flow_cluster_fill, &theme.flow_cluster_stroke, "1");
+        svg.rect(x0, y0, x1 - x0, y1 - y0, &format!("{frame} rx=\"6\""));
+    }
+}
+
+/// VOMD: the subgraphs' titles, drawn over the edges, on the frame's fill, so an edge that
+/// crosses one doesn't cross it out.
+pub(super) fn draw_subgraph_titles(
+    svg: &mut SvgBuilder,
+    d: &FlowchartDiagram,
+    boxes: &HashMap<String, (f64, f64, f64, f64)>,
+    theme: &Theme,
+) {
+    let fg = &theme.fg;
+    for sub in &d.subgraphs {
+        let Some(&(x0, y0, x1, _)) = boxes.get(&sub.id) else {
+            continue;
+        };
+        let rs = resolve_style(&d.class_defs, &sub.classes, &sub.style);
+        let label = if sub.label.is_empty() {
+            sub.id.as_str()
+        } else {
+            sub.label.as_str()
+        };
+        let label_fill = rs.label_fill(fg);
+        let fill = rs.fill.as_deref().unwrap_or(&theme.flow_cluster_fill);
+        let w = crate::svg::metrics::text_width(label, 7.0, 13.0) + 8.0;
+        let cx = (x0 + x1) / 2.0;
+        svg.rect(
+            cx - w / 2.0,
+            y0 + 5.0,
+            w,
+            17.0,
+            &format!("fill=\"{fill}\" stroke=\"none\""),
+        );
+        // Upstream draws the cluster title in normal weight, set inside the frame
+        // below the top border rather than bold sitting on it (#331).
+        svg.text(
+            cx,
+            y0 + 18.0,
+            &format!("text-anchor=\"middle\" fill=\"{label_fill}\" font-size=\"13\""),
+            label,
+        );
+    }
+}

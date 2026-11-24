@@ -622,3 +622,19 @@ fn formulas_are_found_by_their_source() {
     assert!(texts("a $x$ b", "a $x").is_empty());
     assert_eq!(texts("a $x$ b", "a x b"), ["a x b"]);
 }
+
+#[cfg(feature = "mermaid")]
+#[test]
+fn a_diagrams_source_isnt_searched() {
+    let doc =
+        Doc::parse("needle\n\n```mermaid\nflowchart TD\n  needle --> b\n```\n\n```\nneedle\n```\n");
+    assert_eq!(search(&doc, "needle").matches.len(), 2);
+}
+
+#[cfg(feature = "mermaid")]
+#[test]
+fn a_diagram_shown_as_code_is_searched() {
+    let body: String = (0..6000).map(|i| format!("  n{i} --> m{i}\n")).collect();
+    let doc = Doc::parse(&format!("```mermaid\nflowchart TD\n{body}```\n"));
+    assert_eq!(search(&doc, "n5000 ").matches.len(), 1);
+}

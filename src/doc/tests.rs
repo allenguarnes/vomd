@@ -158,7 +158,16 @@ fn check_invariants(doc: &Doc) {
         assert!(doc.text.is_char_boundary(span.end as usize));
         assert!(span.link as usize <= doc.links.len());
         assert!(span.image as usize <= doc.images.len());
-        assert_eq!(span.image != 0, span.style & style::IMAGE != 0);
+        // (A diagram's code names its image too.)
+        #[cfg(feature = "mermaid")]
+        let diagram = span.style & style::CODE != 0
+            && doc
+                .images
+                .get((span.image as usize).wrapping_sub(1))
+                .is_some_and(|i| i.diagram.is_some());
+        #[cfg(not(feature = "mermaid"))]
+        let diagram = false;
+        assert_eq!(span.image != 0, span.style & style::IMAGE != 0 || diagram);
     }
     for block in &doc.blocks {
         assert!(block.spans.start <= block.spans.end);
@@ -4976,6 +4985,7 @@ fn a_code_block_costs_no_more_than_a_table_row() {
 
 #[cfg(feature = "highlight")]
 #[test]
+#[allow(clippy::needless_update)] // (with `mermaid`, `Hl` has more)
 fn a_fence_names_its_language() {
     use crate::highlight::find;
     let doc = Doc::parse(
@@ -4990,7 +5000,12 @@ fn a_fence_names_its_language() {
             _ => None,
         })
         .collect();
-    let code = |lang| Some(Hl { lang });
+    let code = |lang| {
+        Some(Hl {
+            lang,
+            ..Hl::default()
+        })
+    };
     let math = if cfg!(feature = "math") {
         None
     } else {
@@ -5011,6 +5026,7 @@ fn a_fence_names_its_language() {
 
 #[cfg(feature = "highlight")]
 #[test]
+#[allow(clippy::needless_update)] // (with `mermaid`, `Hl` has more)
 fn a_highlighted_blocks_chunks_keep_its_language_and_text() {
     // (Where the lexer is at the start of each chunk is the layout's: see its test
     // `a_highlighted_blocks_chunks_start_where_the_lexer_is`.)
@@ -5024,10 +5040,96 @@ fn a_highlighted_blocks_chunks_keep_its_language_and_text() {
         &doc.text[spans[0].start as usize..spans[spans.len() - 1].end as usize]
     };
     for b in &doc.blocks {
-        assert_eq!(b.kind, BlockKind::Code(Hl { lang }));
+        assert_eq!(
+            b.kind,
+            BlockKind::Code(Hl {
+                lang,
+                ..Hl::default()
+            })
+        );
     }
     let all: String = doc.blocks.iter().map(text).collect();
     assert_eq!(all, code.trim_end_matches('\n'));
+}
+
+#[cfg(feature = "mermaid")]
+#[test]
+fn a_mermaid_fence_is_a_diagram_kept_as_its_code() {
+    let src = "Before.\n\n```mermaid\nflowchart TD\n  a --> b\n```\n\nAfter.\n";
+    let doc = Doc::parse(src);
+    check_invariants(&doc);
+    assert_eq!(doc.images.len(), 1);
+    let img = &doc.images[0];
+    assert_eq!(img.diagram.as_deref(), Some("flowchart TD\n  a --> b"));
+    assert!(crate::mermaid::is_diagram(&img.src));
+    // A name for each theme, switched as a `<picture>`'s.
+    let theme = img.theme.as_ref().expect("a pair");
+    assert_eq!(theme[0], img.src);
+    assert_ne!(theme[1], img.src);
+    let b = &doc.blocks[1];
+    let BlockKind::Code(hl) = b.kind else {
+        panic!("{:?}", b.kind)
+    };
+    assert_eq!(hl.diagram, 1);
+    // Its code is the block's text, its first span names the image.
+    let spans = doc.block_spans(b);
+    assert_eq!(spans[0].image, 1);
+    assert_eq!(doc.span_text(&spans[0]), "flowchart TD\n  a --> b");
+    assert_eq!(img.start, spans[0].start);
+    let mut dark = Doc::parse(src);
+    assert!(dark.set_dark(true));
+    assert_eq!(dark.images[0].src, theme[1]);
+}
+
+#[cfg(feature = "mermaid")]
+#[test]
+fn other_fences_stay_code() {
+    // An empty diagram, another language, `mermaid` not first, an indented block.
+    for src in [
+        "```mermaid\n```\n",
+        "```mermaid\n  \n```\n",
+        "```mermaidx\ngraph TD\n```\n",
+        "```text mermaid\ngraph TD\n```\n",
+        "    graph TD\n",
+    ] {
+        let doc = Doc::parse(src);
+        check_invariants(&doc);
+        assert!(doc.images.is_empty(), "{src:?}");
+    }
+    // The first word of the info string, as GitHub has it.
+    assert_eq!(
+        Doc::parse("```mermaid title\ngraph TD\n```\n").images.len(),
+        1
+    );
+    assert_eq!(Doc::parse("~~~mermaid\ngraph TD\n~~~\n").images.len(), 1);
+}
+
+#[cfg(feature = "mermaid")]
+#[test]
+fn a_long_diagram_is_chunked_and_one_too_long_says_so() {
+    let body: String = (0..1500)
+        .map(|i| format!("  n{i} --> n{}\n", i + 1))
+        .collect();
+    let doc = Doc::parse(&format!("```mermaid\nflowchart TD\n{body}```\n"));
+    check_invariants(&doc);
+    assert!(doc.blocks.len() > 1, "cut into chunks");
+    for b in &doc.blocks {
+        assert!(matches!(b.kind, BlockKind::Code(hl) if hl.diagram == 1));
+    }
+    let big: String = (0..5000)
+        .map(|i| format!("  n{i} --> n{}\n", i + 1))
+        .collect();
+    let doc = Doc::parse(&format!("```mermaid\nflowchart TD\n{big}```\n"));
+    let note = crate::mermaid::note(&doc.images[0].src).unwrap();
+    assert!(note.contains("too large"), "{note}");
+}
+
+#[cfg(not(feature = "mermaid"))]
+#[test]
+fn without_mermaid_a_diagram_is_code() {
+    let doc = Doc::parse("```mermaid\nflowchart TD\n  a --> b\n```\n");
+    assert!(doc.images.is_empty());
+    assert!(matches!(doc.blocks[0].kind, BlockKind::Code(_)));
 }
 
 /// `<details>` and HTML `<table>`s.

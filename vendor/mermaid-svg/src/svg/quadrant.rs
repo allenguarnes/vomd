@@ -1,0 +1,384 @@
+//! Quadrant chart renderer. 0..1 square divided into 4 quadrants with
+//! background tints, axis-end labels, and scatter points.
+
+use crate::parse::QuadrantDiagram;
+
+use super::builder::{fnum, SvgBuilder};
+use super::theme::Theme;
+
+const PAD: f64 = 40.0;
+const SIZE: f64 = 500.0;
+const TITLE_GAP: f64 = 32.0;
+/// Default scatter-point radius when neither the point nor config sets one.
+const POINT_RADIUS: f64 = 5.0;
+
+pub(crate) fn render(d: &QuadrantDiagram, theme: &Theme) -> String {
+    let fg = &theme.fg;
+
+    // `config.quadrantChart.chartWidth`/`chartHeight` override the plot size.
+    let chart_w = d.chart_width.unwrap_or(SIZE);
+    let chart_h = d.chart_height.unwrap_or(SIZE);
+    let default_radius = d.point_radius.unwrap_or(POINT_RADIUS);
+
+    let title_h = if d.title.is_some() { TITLE_GAP } else { 0.0 };
+    let width = PAD * 2.0 + chart_w + 60.0;
+    let height = PAD * 2.0 + chart_h + title_h + 30.0;
+    let chart_left = PAD + 30.0;
+    let chart_top = PAD + title_h;
+
+    let mut svg = SvgBuilder::new(width, height).theme(theme);
+
+    if let Some(t) = &d.title {
+        svg.text(
+            width / 2.0,
+            PAD + 18.0,
+            &format!("text-anchor=\"middle\" fill=\"{fg}\" font-size=\"18\" font-weight=\"bold\""),
+            t,
+        );
+    }
+
+    let half_w = chart_w / 2.0;
+    let half_h = chart_h / 2.0;
+    // Thin light-lavender border/dividers (upstream's `primaryBorderColor`),
+    // reusing the theme's primary node stroke rather than the old near-black
+    // heavy frame (#316).
+    let border = &theme.flow_node_stroke;
+    // Quadrant backgrounds + labels (q2 top-left, q1 top-right, q3 bottom-left,
+    // q4 bottom-right). Fill is the `quadrant{N}Fill` themeVariable when set,
+    // else the per-theme tint — all four are shades of one primary-color family.
+    let qrects = [
+        (
+            d.q2.as_deref(),
+            chart_left,
+            chart_top,
+            theme.quadrant_fill(2),
+        ),
+        (
+            d.q1.as_deref(),
+            chart_left + half_w,
+            chart_top,
+            theme.quadrant_fill(1),
+        ),
+        (
+            d.q3.as_deref(),
+            chart_left,
+            chart_top + half_h,
+            theme.quadrant_fill(3),
+        ),
+        (
+            d.q4.as_deref(),
+            chart_left + half_w,
+            chart_top + half_h,
+            theme.quadrant_fill(4),
+        ),
+    ];
+    for (label, x, y, color) in qrects {
+        svg.rect(x, y, half_w, half_h, &format!("fill=\"{color}\""));
+        if let Some(l) = label {
+            svg.text(
+                x + half_w / 2.0,
+                y + 18.0,
+                &format!("text-anchor=\"middle\" fill=\"{fg}\" font-size=\"13\""),
+                l,
+            );
+        }
+    }
+
+    // Outer border + midlines.
+    svg.rect(
+        chart_left,
+        chart_top,
+        chart_w,
+        chart_h,
+        &format!("fill=\"none\" stroke=\"{border}\" stroke-width=\"1\""),
+    );
+    svg.line(
+        chart_left + half_w,
+        chart_top,
+        chart_left + half_w,
+        chart_top + chart_h,
+        &format!("stroke=\"{border}\" stroke-width=\"1\""),
+    );
+    svg.line(
+        chart_left,
+        chart_top + half_h,
+        chart_left + chart_w,
+        chart_top + half_h,
+        &format!("stroke=\"{border}\" stroke-width=\"1\""),
+    );
+
+    // X-axis labels: centered under each horizontal half, matching upstream
+    // (which places the left label under the left half and the right label
+    // under the right half rather than jamming them into the outer corners).
+    let x_label_y = chart_top + chart_h + 22.0;
+    if let Some(l) = &d.x_axis_left {
+        svg.text(
+            chart_left + half_w / 2.0,
+            x_label_y,
+            &format!("text-anchor=\"middle\" fill=\"{fg}\" font-size=\"12\""),
+            l,
+        );
+    }
+    if let Some(r) = &d.x_axis_right {
+        svg.text(
+            chart_left + half_w * 1.5,
+            x_label_y,
+            &format!("text-anchor=\"middle\" fill=\"{fg}\" font-size=\"12\""),
+            r,
+        );
+    }
+    // Y-axis labels: rotated -90° and centered along each vertical half inside
+    // the left margin (upstream draws them vertically). Drawn horizontally with
+    // `text-anchor="end"` they were as wide as the text and clipped off the left
+    // edge of the viewBox (#243). The baseline sits at `Y_LABEL_X`; the rotated
+    // text only extends by its (font) height, so it stays well within [0, x].
+    const Y_LABEL_X: f64 = PAD / 2.0;
+    if let Some(t) = &d.y_axis_top {
+        let cy = chart_top + half_h / 2.0;
+        svg.text(
+            Y_LABEL_X,
+            cy,
+            &format!(
+                "text-anchor=\"middle\" fill=\"{fg}\" font-size=\"12\" transform=\"rotate(-90 {} {})\"",
+                fnum(Y_LABEL_X),
+                fnum(cy)
+            ),
+            t,
+        );
+    }
+    if let Some(b) = &d.y_axis_bottom {
+        let cy = chart_top + half_h * 1.5;
+        svg.text(
+            Y_LABEL_X,
+            cy,
+            &format!(
+                "text-anchor=\"middle\" fill=\"{fg}\" font-size=\"12\" transform=\"rotate(-90 {} {})\"",
+                fnum(Y_LABEL_X),
+                fnum(cy)
+            ),
+            b,
+        );
+    }
+
+    // Points.
+    for p in &d.points {
+        let px = chart_left + p.x.clamp(0.0, 1.0) * chart_w;
+        let py = chart_top + (1.0 - p.y.clamp(0.0, 1.0)) * chart_h;
+
+        // Resolve styling: class defaults first, then per-point overrides.
+        // Upstream renders solid near-black dots (theme `fg`), not the pale
+        // categorical tints the old palette lookup produced (#316).
+        let class = p.class_name.as_deref().and_then(|name| d.classes.get(name));
+        let radius = p
+            .radius
+            .or_else(|| class.and_then(|c| c.radius))
+            .unwrap_or(default_radius);
+        let fill = p
+            .color
+            .clone()
+            .or_else(|| class.and_then(|c| c.color.clone()))
+            .unwrap_or_else(|| fg.to_string());
+        let stroke = p
+            .stroke_color
+            .clone()
+            .or_else(|| class.and_then(|c| c.stroke_color.clone()))
+            .unwrap_or_else(|| "#fff".to_string());
+        let stroke_width = p
+            .stroke_width
+            .clone()
+            .or_else(|| class.and_then(|c| c.stroke_width.clone()))
+            .unwrap_or_else(|| "1.5".to_string());
+
+        svg.circle(
+            px,
+            py,
+            radius,
+            &format!("fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{stroke_width}\""),
+        );
+        // Label centered below the dot (upstream), rather than jammed to its
+        // right where it collided with and crossed the outer chart border (#316).
+        svg.text(
+            px,
+            py + radius + 13.0,
+            &format!("text-anchor=\"middle\" fill=\"{fg}\" font-size=\"11\""),
+            &p.label,
+        );
+    }
+
+    svg.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::QuadrantPoint;
+
+    #[test]
+    fn produces_svg() {
+        let d = QuadrantDiagram {
+            title: Some("Chart".into()),
+            x_axis_left: Some("Low".into()),
+            x_axis_right: Some("High".into()),
+            y_axis_bottom: Some("L".into()),
+            y_axis_top: Some("H".into()),
+            q1: Some("Q1".into()),
+            q2: Some("Q2".into()),
+            q3: Some("Q3".into()),
+            q4: Some("Q4".into()),
+            points: vec![QuadrantPoint {
+                label: "A".into(),
+                x: 0.3,
+                y: 0.6,
+                radius: None,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                class_name: None,
+            }],
+            ..Default::default()
+        };
+        let svg = render(&d, &Theme::default());
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains(">Chart<"));
+        assert!(svg.contains(">A<"));
+        assert!(svg.contains(">Q1<"));
+        // Quadrant names use upstream regular weight, not bold (#332); the
+        // title keeps its bold weight, matching upstream.
+        assert!(!svg.contains("font-weight=\"bold\">Q1<"));
+        assert!(svg.contains("font-weight=\"bold\">Chart</text>"));
+    }
+
+    #[test]
+    fn default_fills_one_family_points_near_black_labels_centered() {
+        // #316: all four quadrant tints are one lavender family (not distinct
+        // categorical hues), points default to solid near-black (theme fg), and
+        // labels sit centered below the dot rather than jammed to its right.
+        let d = QuadrantDiagram {
+            q1: Some("Q1".into()),
+            q2: Some("Q2".into()),
+            q3: Some("Q3".into()),
+            q4: Some("Q4".into()),
+            points: vec![QuadrantPoint {
+                label: "P".into(),
+                x: 0.9,
+                y: 0.4,
+                radius: None,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                class_name: None,
+            }],
+            ..Default::default()
+        };
+        let svg = render(&d, &Theme::default());
+        for fill in ["#ECECFF", "#F1F1FF", "#F6F6FF", "#FBFBFF"] {
+            assert!(svg.contains(&format!("fill=\"{fill}\"")), "missing {fill}");
+        }
+        // Point uses the theme foreground (near-black), not a pale palette tint.
+        assert!(svg.contains("fill=\"#333\" stroke=\"#fff\""));
+        // Label is centered below the dot.
+        assert!(svg.contains("text-anchor=\"middle\" fill=\"#333\" font-size=\"11\">P<"));
+    }
+
+    #[test]
+    fn honors_radius_and_color() {
+        let d = QuadrantDiagram {
+            points: vec![QuadrantPoint {
+                label: "A".into(),
+                x: 0.3,
+                y: 0.6,
+                radius: Some(12.0),
+                color: Some("#ff0000".into()),
+                stroke_color: Some("#00ff00".into()),
+                stroke_width: Some("3px".into()),
+                class_name: None,
+            }],
+            ..Default::default()
+        };
+        let svg = render(&d, &Theme::default());
+        assert!(svg.contains("r=\"12\""));
+        assert!(svg.contains("fill=\"#ff0000\""));
+        assert!(svg.contains("stroke=\"#00ff00\""));
+        assert!(svg.contains("stroke-width=\"3px\""));
+    }
+
+    #[test]
+    fn honors_chart_size_and_point_radius() {
+        let d = QuadrantDiagram {
+            chart_width: Some(300.0),
+            chart_height: Some(300.0),
+            point_radius: Some(10.0),
+            points: vec![QuadrantPoint {
+                label: "A".into(),
+                x: 0.0,
+                y: 0.0,
+                radius: None,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                class_name: None,
+            }],
+            ..Default::default()
+        };
+        let svg = render(&d, &Theme::default());
+        // width = PAD*2 + 300 + 60 = 440, height = PAD*2 + 300 + 30 = 410.
+        assert!(svg.contains("viewBox=\"0 0 440 410\""));
+        assert!(svg.contains("r=\"10\""));
+    }
+
+    #[test]
+    fn unconfigured_defaults_match_upstream_500_square_radius_5() {
+        // With no config, the plot is a 500×500 square and points default to
+        // radius 5, matching upstream Mermaid (#227).
+        let d = QuadrantDiagram {
+            points: vec![QuadrantPoint {
+                label: "A".into(),
+                x: 0.5,
+                y: 0.5,
+                radius: None,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                class_name: None,
+            }],
+            ..Default::default()
+        };
+        let svg = render(&d, &Theme::default());
+        // width = PAD*2 + 500 + 60 = 640, height = PAD*2 + 500 + 30 = 610.
+        assert!(svg.contains("viewBox=\"0 0 640 610\""));
+        assert!(svg.contains("r=\"5\""));
+    }
+
+    #[test]
+    fn y_axis_labels_rotated_and_inside_viewbox() {
+        // Long y-axis labels used to render horizontally with `text-anchor="end"`
+        // near the left edge, spilling off-canvas (x < 0) and clipping (#243).
+        // They must now be rotated -90° and stay fully inside the viewBox.
+        let d = QuadrantDiagram {
+            y_axis_top: Some("High Engagement".into()),
+            y_axis_bottom: Some("Low Engagement".into()),
+            ..Default::default()
+        };
+        let svg = render(&d, &Theme::default());
+        assert_eq!(svg.matches("transform=\"rotate(-90 ").count(), 2);
+        // No text (nor any element) is placed at a negative x coordinate.
+        assert!(
+            !svg.contains("x=\"-"),
+            "label extends outside the viewBox: {svg}"
+        );
+    }
+
+    #[test]
+    fn honors_quadrant_fill_theme_variables() {
+        let mut theme = Theme::default();
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("quadrant1Fill".to_string(), "#ff0000".to_string());
+        theme.apply_theme_variables(&vars);
+        let d = QuadrantDiagram {
+            q1: Some("Q1".into()),
+            ..Default::default()
+        };
+        let svg = render(&d, &theme);
+        assert!(svg.contains("fill=\"#ff0000\""));
+    }
+}

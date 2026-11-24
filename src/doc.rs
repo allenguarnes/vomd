@@ -184,6 +184,11 @@ pub enum BlockKind {
 pub struct Hl {
     #[cfg(feature = "highlight")]
     pub lang: u8,
+    /// A ```` ```mermaid ```` block: its diagram's image (1-based into [`Doc::images`], whose
+    /// `diagram` is the source), which every chunk of it has; 0 for other code. The first span
+    /// of its first chunk has the image too (where it is found, like an image's alt text).
+    #[cfg(feature = "mermaid")]
+    pub diagram: u32,
 }
 
 /// Decoration drawn before the first line of a block.
@@ -333,6 +338,9 @@ pub struct ImageRef {
     /// dark theme's images, and `src` is the one [`Doc::set_dark`] chose (the light one when
     /// parsed).
     pub theme: Option<Box<[Arc<str>; 2]>>,
+    /// A Mermaid diagram's source: the image is made of it (see [`crate::mermaid`]).
+    #[cfg(feature = "mermaid")]
+    pub diagram: Option<Arc<str>>,
 }
 
 /// A side of an image's box as an `<img>`'s `width` or `height` gives it.
@@ -793,6 +801,12 @@ struct Builder {
     slug_suffix: HashMap<String, u32>,
     /// Range of the last block's entry in `Doc::quote_lists`, for sharing.
     quote_pool: Range<u32>,
+    /// The text of the ```` ```mermaid ```` block open now (a code block meanwhile).
+    #[cfg(feature = "mermaid")]
+    mermaid_fence: Option<String>,
+    /// The diagrams made so far (see [`crate::mermaid::MAX_DIAGRAMS`]).
+    #[cfg(feature = "mermaid")]
+    mermaid_count: usize,
     /// The text of the ```` ```math ```` block open now.
     #[cfg(feature = "math")]
     math_fence: Option<String>,
@@ -889,6 +903,10 @@ impl Builder {
             quote_pool: 0..0,
             #[cfg(feature = "math")]
             math_fence: None,
+            #[cfg(feature = "mermaid")]
+            mermaid_fence: None,
+            #[cfg(feature = "mermaid")]
+            mermaid_count: 0,
             #[cfg(feature = "math")]
             after_display: false,
             depth: 0,
@@ -1056,6 +1074,11 @@ impl Builder {
             Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough)
                 if self.hidden_styles.pop() == Some(true) => {}
             Event::Start(tag) => self.start(tag),
+            #[cfg(feature = "mermaid")]
+            Event::End(TagEnd::CodeBlock) if self.mermaid_fence.is_some() => {
+                self.end_mermaid_fence();
+                self.end(TagEnd::CodeBlock);
+            }
             #[cfg(feature = "math")]
             Event::End(TagEnd::CodeBlock) if self.math_fence.is_some() => {
                 #[cfg(feature = "html-tables")]
@@ -1082,7 +1105,13 @@ impl Builder {
                     fence.push_str(&s);
                 }
             }
-            Event::Text(s) if self.code_block() => self.text(&s, style::CODE, 0),
+            Event::Text(s) if self.code_block() => {
+                #[cfg(feature = "mermaid")]
+                if let Some(fence) = &mut self.mermaid_fence {
+                    fence.push_str(&s);
+                }
+                self.text(&s, style::CODE, 0)
+            }
             Event::Text(s) if self.link() != 0 => self.text(&s, 0, 0),
             Event::Text(s) => {
                 let start = self.pending.len();
@@ -1161,6 +1190,21 @@ impl Builder {
                 self.close();
                 self.flush_marker();
                 self.open(BlockKind::Code(code_hl(kind)));
+                // GitHub's diagrams: the info string's first word is `mermaid`. In a table's
+                // cell (an HTML table) a fence is the cell's code, as other code is.
+                #[cfg(feature = "mermaid")]
+                if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind
+                    && info.split_whitespace().next() == Some("mermaid")
+                    && matches!(
+                        self.open,
+                        Some(Open {
+                            kind: BlockKind::Code(_),
+                            ..
+                        })
+                    )
+                {
+                    self.mermaid_fence = Some(String::new());
+                }
             }
             Tag::HtmlBlock => {
                 self.close();
@@ -1904,8 +1948,53 @@ impl Builder {
             start,
             want,
             theme,
+            #[cfg(feature = "mermaid")]
+            diagram: None,
         };
         push_id(&mut self.doc.images, img)
+    }
+
+    /// The end of a ```` ```mermaid ```` block (still open, as code): it becomes a diagram,
+    /// an image of its source (see [`crate::mermaid`]) that its first span and its kind name.
+    /// An empty one stays code.
+    #[cfg(feature = "mermaid")]
+    fn end_mermaid_fence(&mut self) {
+        let Some(mut src) = self.mermaid_fence.take() else {
+            return;
+        };
+        if src.ends_with('\n') {
+            src.pop();
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let first = open.span_start as usize;
+        if src.trim().is_empty() || first >= self.doc.spans.len() {
+            return;
+        }
+        let [light, dark] = crate::mermaid::srcs_nth(&src, self.mermaid_count);
+        self.mermaid_count += 1;
+        let src_light: Arc<str> = light.into();
+        let theme =
+            (src_light.as_ref() != dark).then(|| Box::new([src_light.clone(), dark.into()]));
+        let img = ImageRef {
+            remote: false,
+            src: src_light,
+            start: self.doc.spans[first].start,
+            want: [Want::Auto; 2],
+            theme,
+            diagram: Some(src.into()),
+        };
+        let id = push_id(&mut self.doc.images, img);
+        if id == 0 {
+            return;
+        }
+        if let BlockKind::Code(hl) = &mut open.kind {
+            hl.diagram = id;
+        }
+        self.doc.spans[first].image = id;
+        // The span stays apart from the text after it.
+        self.merge_floor = self.doc.spans.len();
     }
 
     fn end_image(&mut self) {
@@ -2805,6 +2894,9 @@ fn code_hl(kind: &pulldown_cmark::CodeBlockKind) -> Hl {
     #[cfg(feature = "highlight")]
     if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind {
         let lang = crate::highlight::find(info).unwrap_or(0);
+        #[cfg(feature = "mermaid")]
+        return Hl { lang, diagram: 0 };
+        #[cfg(not(feature = "mermaid"))]
         return Hl { lang };
     }
     let _ = kind;
