@@ -221,8 +221,9 @@ fn stroke_outline(
         }
         None => path,
     };
-    // A path that can't be stroked or moved isn't drawn by tiny-skia.
-    match path.stroke(stroke, res_scale).and_then(|o| o.transform(ts)) {
+    // A path that can't be stroked or moved isn't drawn by tiny-skia. (VOMD: coarser where a
+    // stroke of a cubic is too wide for an `f32` to hold the stroker's tolerance.)
+    match usvg::stroke_path(path, stroke, res_scale).and_then(|o| o.transform(ts)) {
         Some(moved) => device(moved, width, height),
         None => Drawing::Nothing,
     }

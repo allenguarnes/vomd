@@ -29,6 +29,13 @@ and versions follow [Semantic Versioning](https://semver.org/).
   showed as empty boxes. On a machine with Inter or JetBrains Mono installed, characters their
   built-in copies leave out (Cyrillic and Greek, for example) are shown in the installed copy
   first, in the document's text too.
+- A paragraph or a loose list item that starts with an HTML tag and a space (`<b> bold`)
+  showed the space, where a tight list item didn't (and a document over 1 MB, parsed in parts,
+  could show either). Neither shows it now, nor does a heading or a table cell. A code span at
+  the start of a tight list item (`` ` a` ``) keeps the space in it.
+- An SVG with a very wide stroke of curves (over half a million pixels, such as a width of a
+  billion) no longer takes seconds to draw. One up to about two million pixels wide is drawn
+  within a pixel; a wider one is refused as too complex, with its alt text shown.
 
 ## [1.11.0] - 2026-11-22
 

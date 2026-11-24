@@ -40,6 +40,24 @@ face has left undrawn.
   kind). The stroke's box is made of the path less its subpaths with a quad or cubic over 1e18
   on both axes (none left: it takes the bounding box, as when the stroke can't be made); resvg
   strokes the same remaining path.
+- **A very wide stroke of a cubic** (`tree/mod.rs`, `stroke_path`, used by
+  `calculate_stroke_bbox` and by resvg's `geom.rs` in place of `Path::stroke`): the stroker
+  splits a cubic until its offset is within `1 / (4 * res_scale)`, checked in `f32`; the offset
+  is the unit normal times half the width, and with half the width over about 2²² at the scale
+  the normal's rounding alone is more than that, so it splits to its recursion limit, wherever
+  the curve is: up to 16 million points for one cubic (1.8 s), and a path of 40 cubics 10⁹ wide
+  took a second to stroke and a second more for its box (the `svg` fuzz target, a timeout). A
+  subpath with a cubic whose half width times the scale is over 2¹⁸ (`STROKE_RADIUS`) is stroked
+  on its own at the scale that brings it to 2¹⁸: a tolerance of a millionth of half the width
+  (2⁻²⁰ of it) in place of a quarter of a pixel, so that edge may be off by up to that
+  (`half width × res_scale / 2²⁰` pixels: a quarter of a pixel at the limit, 477 at 10⁹ wide,
+  enough to leave a wedge out of an edge that shows). `stroke_error` gives that tolerance (nominal,
+  not a proven distance: a shear can make it up to √2 more, and both outlines round) for a
+  path, width and scale (0 where the stroke is tiny-skia's), and VOMD refuses an SVG with a
+  stroke over a pixel off at the scale it is drawn (`MAX_STROKE_ERROR` in `src/image/svg.rs`).
+  Every other path is stroked as it was, whole, to the same points, how far out it is or not;
+  of 5,040 cubics of five shapes and every size, place, width and scale, those at the limit made
+  at most 112,000 points (13 ms).
 - **An infinite value bounded** (`parser/mod.rs`, `f32_bound`): the saturation of `feColorMatrix`
   (`values="1e300"`) and a gradient stop's `offset` are infinite once an `f32`, and the
   `debug_assert!(val.is_finite())` stopped them where debug assertions are on. Only `NaN`
@@ -95,7 +113,9 @@ face has left undrawn.
 
 To upgrade: copy the new version's `src/` (without `main.rs`) and licenses here, apply the same
 changes, and run VOMD's SVG tests (`cargo test --lib image::svg`), whose
-`extreme_numbers_in_shapes_are_drawn_or_refused` draws each of the cases above except the last,
+`extreme_numbers_in_shapes_are_drawn_or_refused` draws each of the cases above except the very
+wide stroke, which `a_wide_stroke_of_cubics_far_out_is_cheap` and
+`a_wide_stroke_whose_edge_shows_is_drawn_right_or_refused` draw, and the last,
 which `a_pattern_that_paints_with_itself_by_inheritance_is_drawn_without_it` and
 `a_cycle_of_patterns_that_fans_out_is_converted_once_each` draw, and the fallback's, which
 `a_skin_tone_sequence_is_drawn_as_one_glyph`,

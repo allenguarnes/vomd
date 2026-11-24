@@ -106,13 +106,14 @@ file. The changes, marked `VOMD` in the code:
     window anyway). A path whose box is wider or taller than `f32::MAX` isn't reached: usvg can't
     measure it, and it is drawn blank as before.
   - A stroke is made first, as `Pixmap::stroke_path` does (dashed, then stroked in the path's own
-    units with the transform's resolution scale; the joins and curves of a wide stroke reach much
-    further than its width says, so its outline is what is measured), then moved, then handled as
-    a fill. Cost: none that shows: that is the work tiny-skia does (it clones the outline once
-    more). A stroke at most a pixel wide after the transform (a width of 0 too; an
-    anti-aliased one only, bar the width of 0) is a hairline: tiny-skia draws it along the path,
-    each segment clipped to ±32767 in floating point first, and `geom::is_hairline` repeats its
-    `treat_as_hairline`; it is passed as it is.
+    units with the transform's resolution scale, by `usvg::stroke_path`, which strokes a subpath
+    with a cubic more coarsely when it is too wide for an `f32` to hold the stroker's tolerance;
+    the joins and curves of a wide stroke reach much further than its width says, so its outline
+    is what is measured), then moved, then handled as a fill. Cost: none that shows: that is the
+    work tiny-skia does (it clones the outline once more). A stroke at most a pixel wide after
+    the transform (a width of 0 too; an anti-aliased one only, bar the width of 0) is a
+    hairline: tiny-skia draws it along the path, each segment clipped to ±32767 in floating point
+    first, and `geom::is_hairline` repeats its `treat_as_hairline`; it is passed as it is.
   - A raster image and the region of a mask are rectangles drawn through a transform, which
     tiny-skia scans as a path (`fill_rect` with a transform is `fill_path` of the rectangle;
     `Mask::fill_path`): `image.rs` (`raster_images::draw`) and `mask.rs` (`apply`) go through

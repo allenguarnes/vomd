@@ -29,7 +29,7 @@ fn an_html_cell_tag_in_a_markdown_row_is_text() {
         16 + usize::from(data[0]) * 8,
     );
     let doc = parsed("<table><tr><td x\n\n| <td> a | b |\n|---|---|\n| c | d |\n");
-    assert_eq!(texts(&doc)[1..], [" a|b", "c|d"]);
+    assert_eq!(texts(&doc)[1..], ["a|b", "c|d"]);
 }
 
 /// The blocks' texts, a line each (a row's cells apart by `|`).

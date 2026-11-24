@@ -739,6 +739,8 @@ struct Builder {
     open: Option<Open>,
     /// Spans at or after this index may be merged with the next text; protects cell boundaries.
     merge_floor: usize,
+    /// The spans before the open table cell's (see `text`).
+    cell_start: usize,
     bold: usize,
     italic: usize,
     strike: usize,
@@ -870,6 +872,7 @@ impl Builder {
             },
             open: None,
             merge_floor: 0,
+            cell_start: 0,
             bold: 0,
             italic: 0,
             strike: 0,
@@ -1333,6 +1336,7 @@ impl Builder {
                 // An unclosed tag in a cell doesn't go on in the next one.
                 self.end_inline_html();
                 self.merge_floor = self.doc.spans.len();
+                self.cell_start = self.doc.spans.len();
             }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
@@ -1547,8 +1551,24 @@ impl Builder {
             s
         };
         // A paragraph that starts after a tag ended the one before it (`</table>`,
-        // `</details>` in the middle of a line) has no space in front.
-        let s = if self.open.is_none() {
+        // `</details>` in the middle of a line) has no space in front. Nor has one whose text
+        // starts after inline HTML that shows nothing (`<e> r`): a tight item's text comes with
+        // no paragraph open, a loose item's in one, and a list cut into segments may be read
+        // either way. A heading or a table cell starts alike. Code (`` ` a` ``, `<code> a`)
+        // keeps its space.
+        let starts = extra_style == 0
+            && self.style() & style::CODE == 0
+            && match &self.open {
+                None => true,
+                Some(o) => match o.kind {
+                    BlockKind::Paragraph | BlockKind::Heading(_) => {
+                        o.span_start as usize == self.doc.spans.len()
+                    }
+                    BlockKind::TableRow { .. } => self.cell_start == self.doc.spans.len(),
+                    _ => false,
+                },
+            };
+        let s = if starts {
             s.trim_start_matches([' ', '\t'])
         } else {
             s

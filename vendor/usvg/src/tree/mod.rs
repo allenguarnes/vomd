@@ -1437,7 +1437,8 @@ impl Path {
         let path = without_big_curves(path, true)?;
 
         // Expensive, but there is not much we can do about it.
-        if let Some(stroked_path) = path.stroke(&stroke, 1.0) {
+        // VOMD: coarser where a stroke of a cubic is too wide for its tolerance (`stroke_path`).
+        if let Some(stroked_path) = stroke_path(&path, &stroke, 1.0) {
             return stroked_path.compute_tight_bounds();
         }
 
@@ -1542,6 +1543,95 @@ pub fn without_big_curves(
         return Some(Cow::Borrowed(path));
     }
     kept.finish().map(Cow::Owned)
+}
+
+/// How wide a stroke of a cubic can be, half its width times the resolution scale, and still be
+/// stroked to tiny-skia's tolerance (VOMD). The stroker splits a cubic until the offset curve is
+/// within `1 / (4 * res_scale)` of where it should be, and checks that in `f32`: the offset is
+/// the unit normal times half the width, and the normal's rounding times a half-width over about
+/// 2²² (at the scale) is more than that, so the check keeps failing and the stroker splits to its
+/// recursion limit, wherever the curve is. A cubic stroked 10⁷ wide made up to 16 million points
+/// (1.8 s) at a resolution scale of 10; a path of 40 of them, 10⁹ wide, took a second to stroke
+/// and as long again for its box (a fuzz finding). Of 5,040 cubics of five shapes, size 1 to
+/// 10⁵, 0 to 10⁹ from the origin, stroked 100 to 10⁹ wide at 0.1 to 10, those at or under this
+/// made at most 112,000 points (13 ms), as tiny-skia made them; quads and lines don't do it.
+const STROKE_RADIUS: f32 = (1u32 << 18) as f32;
+
+/// The resolution scale to stroke a subpath at `width`, `res_scale` asked for: for one with a
+/// cubic, no finer than one that keeps half the width times the scale within [`STROKE_RADIUS`],
+/// a tolerance of a millionth of half the width. Any other stroke has the scale asked for.
+fn stroke_scale(cubic: bool, width: f32, res_scale: f32) -> f32 {
+    let most = STROKE_RADIUS / (width / 2.0);
+    if cubic && most > 0.0 && most < res_scale {
+        most
+    } else {
+        res_scale
+    }
+}
+
+/// How far, in pixels at `res_scale`, [`stroke_path`] may put an edge of `path`'s stroke from
+/// where `path.stroke(stroke, res_scale)` puts it (VOMD): 0 where it is that stroke, else the
+/// coarser tolerance at the scale of [`stroke_scale`], half the width times `res_scale` over
+/// 2²⁰. A caller that draws the outline can refuse a stroke whose error would show. This is
+/// the stroker's nominal tolerance, not a proven bound: `res_scale` is tiny-skia's (the longest
+/// row of the transform), which a shear can exceed by up to √2, and either outline also rounds.
+#[doc(hidden)]
+pub fn stroke_error(path: &tiny_skia_path::Path, width: f32, res_scale: f32) -> f32 {
+    let cubic = path.verbs().contains(&tiny_skia_path::PathVerb::Cubic);
+    let scale = stroke_scale(cubic, width, res_scale);
+    if scale == res_scale {
+        0.0
+    } else {
+        res_scale / (4.0 * scale)
+    }
+}
+
+/// `path.stroke(stroke, res_scale)`, with each subpath that has a cubic stroked on its own at
+/// the scale of [`stroke_scale`] when that stroke is too wide for the scale asked for (VOMD).
+/// The stroker makes the outline of each subpath apart from the others, so the rest is the same
+/// outline.
+#[doc(hidden)]
+pub fn stroke_path(
+    path: &tiny_skia_path::Path,
+    stroke: &tiny_skia_path::Stroke,
+    res_scale: f32,
+) -> Option<tiny_skia_path::Path> {
+    use tiny_skia_path::{PathBuilder, PathVerb};
+    let cubic = path.verbs().contains(&PathVerb::Cubic);
+    if stroke_scale(cubic, stroke.width, res_scale) == res_scale {
+        return path.stroke(stroke, res_scale);
+    }
+    let mut out = PathBuilder::new();
+    let mut sub = PathBuilder::new();
+    let mut cubic = false;
+    let mut flush = |sub: &mut PathBuilder, cubic: bool| {
+        let Some(done) = core::mem::replace(sub, PathBuilder::new()).finish() else {
+            return;
+        };
+        let scale = stroke_scale(cubic, stroke.width, res_scale);
+        if let Some(outline) = done.stroke(stroke, scale) {
+            out.push_path(&outline);
+        }
+    };
+    for seg in path.segments() {
+        use tiny_skia_path::PathSegment as S;
+        match seg {
+            S::MoveTo(p) => {
+                flush(&mut sub, cubic);
+                cubic = false;
+                sub.move_to(p.x, p.y);
+            }
+            S::LineTo(p) => sub.line_to(p.x, p.y),
+            S::QuadTo(c, p) => sub.quad_to(c.x, c.y, p.x, p.y),
+            S::CubicTo(c1, c2, p) => {
+                cubic = true;
+                sub.cubic_to(c1.x, c1.y, c2.x, c2.y, p.x, p.y);
+            }
+            S::Close => sub.close(),
+        }
+    }
+    flush(&mut sub, cubic);
+    out.finish()
 }
 
 /// An embedded image kind.

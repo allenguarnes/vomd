@@ -2028,6 +2028,47 @@ fn segmented_parse_keeps_an_html_block_after_a_fence_left_open_in_a_list_item() 
     }
 }
 
+/// Text after inline HTML that shows nothing (`<e> r`) has no space in front in a loose item (in
+/// a paragraph) as in a tight one (no paragraph open): a list cut into segments is read either
+/// way. The `doc` fuzz target found it (`<details>` and `</summary>` in loose items). A heading
+/// and a table cell start alike; code (a span or `<code>`) keeps the space in it, wherever it is.
+#[test]
+fn text_after_inline_html_starts_alike_in_tight_and_loose_items() {
+    for src in [
+        "- <e> r\n- x\n",
+        "- <e> r\n\n- x\n",
+        "<e> r\n",
+        "# <e> r\n",
+        "| <e> r |\n|-|\n",
+    ] {
+        let doc = Doc::parse_whole(src);
+        assert_eq!(doc.span_text(&doc.spans[0]), "r", "{src:?}");
+    }
+    for src in [
+        "` a` b\n",
+        "- ` a` b\n- x\n",
+        "- ` a` b\n\n- x\n",
+        "# ` a` b\n",
+        "<code> a</code> b\n",
+        "- <code> a</code> b\n- x\n",
+        "- <code> a</code> b\n\n- x\n",
+    ] {
+        let doc = Doc::parse_whole(src);
+        assert_eq!(doc.span_text(&doc.spans[0]), " a", "{src:?}");
+    }
+    let src = format!(
+        "- <e> r\n\n- <b> s</b>\n\n- ` a` b\n\n- <code> d</code>\n\n- ` c`\n- x\n\n{}",
+        "- x\n\n".repeat(20)
+    );
+    for budget in 1..=200 {
+        assert_same("inline HTML starts a loose item", &src, budget);
+    }
+    let data = include_bytes!("../../fuzz/seeds/doc/inline-html-starts-a-loose-item.bin");
+    let src = String::from_utf8_lossy(&data[1..]);
+    let (whole, parts) = Doc::fuzz_segments(&src, 16 + usize::from(data[0]) * 8).unwrap();
+    assert!(whole == parts);
+}
+
 /// Every input of a past fuzz finding (fuzz/seeds/doc/), at every segment size the target picks.
 #[test]
 fn segmented_parse_of_every_fuzz_seed_matches() {

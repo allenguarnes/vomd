@@ -2789,6 +2789,10 @@ pub(super) fn render_part(
     if caps.work && a.work > MAX_WORK {
         return Rendered::Refused(Refusal::Slow);
     }
+    // Forced or not: more work would not make it right (see `usvg::stroke_path`).
+    if a.inexact {
+        return Rendered::Refused(Refusal::Complex);
+    }
     need.draw = need.draw.max(a.draw);
     need.layers = need.layers.max(layers.min(u32::MAX as usize) as u32);
     need.pixmaps = need.pixmaps.max(a.pixmaps.min(u32::MAX as usize) as u32);
@@ -2872,6 +2876,10 @@ pub(super) struct Analysis {
     /// ([`whole_cost`]): a charge of the image, not of the canvas (it is part of
     /// [`SvgCost::raster`]).
     pub nearest: usize,
+    /// A stroke is so wide that its outline would be made more coarsely than
+    /// [`MAX_STROKE_ERROR`] (`usvg::stroke_error`): what is drawn would be wrong, so it is
+    /// refused.
+    pub inexact: bool,
 }
 
 /// Pixmaps held at once: bytes, and how many.
@@ -2898,6 +2906,8 @@ struct Walk {
     work: f64,
     /// [`Analysis::nearest`].
     nearest: usize,
+    /// [`Analysis::inexact`].
+    inexact: bool,
 }
 
 impl Analysis {
@@ -2914,6 +2924,7 @@ impl Analysis {
             draw: 0,
             work: 0.0,
             nearest: 0,
+            inexact: false,
         };
         let Peak(peak, pixmaps) = walk.group(tree.root(), transform, (w, h));
         Analysis {
@@ -2922,6 +2933,7 @@ impl Analysis {
             draw: walk.draw,
             work: walk.work,
             nearest: walk.nearest,
+            inexact: walk.inexact,
         }
     }
 }
@@ -3000,6 +3012,12 @@ impl Walk {
         };
         self.draw = self.draw.max(points.saturating_mul(per_point));
         self.work += path_work(p, transform, target);
+        // resvg strokes at the transform's resolution scale (`geom.rs`, `stroke_outline`).
+        if let Some(stroke) = p.stroke() {
+            let res = tiny_skia::PathStroker::compute_resolution_scale(&transform);
+            let error = usvg::stroke_error(p.data(), stroke.width().get(), res);
+            self.inexact |= error > MAX_STROKE_ERROR || error.is_nan();
+        }
     }
 
     /// A pattern's tile, rendered at the transform's scale, and what rendering it holds.
@@ -3168,6 +3186,12 @@ impl Walk {
     }
 }
 
+/// The most a stroke's edge may be off, in pixels, for it to be drawn ([`Analysis::inexact`]):
+/// usvg strokes a cubic coarsely when half its width at the scale is over 2¹⁸, about a quarter
+/// of a pixel off there, up to a pixel at 2²⁰ (a stroke about 2 million pixels wide); a wider one
+/// would leave gaps or bulges where its edge is seen. It is refused, as one too complex. The
+/// error is usvg's nominal tolerance ([`usvg::stroke_error`]), so "a pixel" is approximate.
+const MAX_STROKE_ERROR: f32 = 1.0;
 /// A job whose drawing is more work than this ([`Analysis::work`]) is refused: about 0.3 s.
 pub(super) const MAX_WORK: f64 = 3e8;
 /// What a pixel of a layer or pattern tile costs to make and draw.

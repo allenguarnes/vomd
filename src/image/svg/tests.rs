@@ -2279,10 +2279,17 @@ fn a_path_far_from_the_canvas_is_clipped_and_drawn() {
         rgba(b.data[(y * w + x) as usize])
     };
     let (red, blue, none) = ([255, 0, 0, 255], [0, 0, 0xFF, 255], [0, 0, 0, 0]);
-    // Covering the canvas from far off: a wide curve stroke, a large scale, a position far above
-    // (the fuzz finding, a stroke of 2³¹, is a seed: its outline is too coarse an `f32` to say).
+    // Covering the canvas from far off: a large scale, a position far above (the fuzz finding,
+    // a stroke of 2³¹, is a seed: its outline is too coarse an `f32` to say). A curve stroked
+    // 6.9×10¹¹ wide, which was drawn, is now refused: usvg strokes it coarsely, up to 3×10⁵
+    // pixels off, and its butt caps cross the canvas
+    // (`a_wide_stroke_whose_edge_shows_is_drawn_right_or_refused`).
+    let wide = "<svg xmlns='http://www.w3.org/2000/svg' width='60' height='40'><path d='M0 0 C20 40 60 -40 10 30' fill='none' stroke='red' stroke-width='686107850000' stroke-linejoin='miter-clip'/></svg>";
+    assert!(matches!(
+        rendered_in(wide, &Caps::NORMAL).0,
+        Rendered::Refused(Refusal::Complex)
+    ));
     for far in [
-        "<path d='M0 0 C20 40 60 -40 10 30' fill='none' stroke='red' stroke-width='686107850000' stroke-linejoin='miter-clip'/>",
         "<g transform='scale(1e9)'><rect x='-1' y='-1' width='2' height='2' fill='red'/></g>",
         "<rect y='-2e9' width='60' height='4e9' fill='red'/>",
     ] {
@@ -2613,6 +2620,166 @@ fn an_edge_with_both_ends_far_out_is_cut_where_its_line_is() {
             assert!(at(a, b, c) == reference, "{mode} {a} {b} {c}");
         }
     }
+}
+
+/// A very wide stroke of a cubic was split to the stroker's recursion limit: an `f32` can't
+/// hold its tolerance against that width (`usvg::stroke_path`). The `svg` fuzz target found 40
+/// cubics stroked 10⁹ wide that took a second to stroke and as long again for the stroke's
+/// box; 160 took 15 s. A stroke made that coarsely is refused in milliseconds, forced or not
+/// (see `a_wide_stroke_whose_edge_shows_is_drawn_right_or_refused`); a stroke under the limit
+/// (`usvg::STROKE_RADIUS`), far out or not, and the subpaths without a cubic of a path beside
+/// a wide one, are stroked as tiny-skia strokes them.
+#[test]
+fn a_wide_stroke_of_cubics_far_out_is_cheap() {
+    let sub = "M-1e3-2e3C-1e3-600-3e3-600-3e3-2e3S-1e3-3400-1e3-2e3Z";
+    let svg = |width: &str, d: &str| {
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='60' height='40'><path d='{d}' stroke='red' stroke-width='{width}'/></svg>"
+        )
+    };
+    let wide = svg("1073741823", &sub.repeat(160));
+    for caps in [
+        Caps::NORMAL,
+        Caps::of(&super::super::Limits::forced(1 << 30)),
+    ] {
+        let (r, took) = rendered_in(&wide, &caps);
+        assert!(matches!(r, Rendered::Refused(Refusal::Complex)));
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+    let seed = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/seeds/svg/stroke-cubics-a-billion-wide.svg"
+    ))
+    .unwrap();
+    let start = Instant::now();
+    drawn_at_the_fuzz_sizes(&seed);
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+    // Under the limit, a stroke is made as tiny-skia makes it: near the origin, and far out
+    // and moved into view (it was cheap there too).
+    let d = |x: f32| {
+        format!(
+            "M{} 10 C{} 0 {} 40 {} 30",
+            x + 10.0,
+            x + 50.0,
+            x + 50.0,
+            x + 10.0
+        )
+    };
+    for (x, width, res) in [
+        (0.0, "3", 8.0),
+        (0.0, "40", 1.0),
+        (0.0, "1e4", 8.0),
+        (0.0, "5e5", 1.0),
+        (4.5e6, "40", 1.0),
+        (2e6, "100", 1.0),
+        (3e5, "60", 4.0),
+        (1.5e6, "300", 1.0),
+        (1e7, "50", 1.0),
+    ] {
+        let tree = usvg::Tree::from_str(&svg(width, &d(x)), &usvg::Options::default()).unwrap();
+        let usvg::Node::Path(p) = &tree.root().children()[0] else {
+            panic!()
+        };
+        let stroke = p.stroke().unwrap().to_tiny_skia();
+        let ours = usvg::stroke_path(p.data(), &stroke, res).unwrap();
+        assert!(
+            ours == p.data().stroke(&stroke, res).unwrap(),
+            "{x} {width} {res}"
+        );
+    }
+    // A subpath with a cubic is stroked on its own, the one before it as it was.
+    let near = "M10 10 L50 10 Q60 20 50 30";
+    let tree = usvg::Tree::from_str(
+        &svg("1e7", &format!("{near} M1e7 1e7 C2e7 1e7 2e7 2e7 1e7 2e7")),
+        &usvg::Options::default(),
+    )
+    .unwrap();
+    let usvg::Node::Path(p) = &tree.root().children()[0] else {
+        panic!()
+    };
+    let stroke = p.stroke().unwrap().to_tiny_skia();
+    let ours = usvg::stroke_path(p.data(), &stroke, 1.0).unwrap();
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(10.0, 10.0);
+    pb.line_to(50.0, 10.0);
+    pb.quad_to(60.0, 20.0, 50.0, 30.0);
+    let alone = pb.finish().unwrap().stroke(&stroke, 1.0).unwrap();
+    assert_eq!(&ours.points()[..alone.points().len()], alone.points());
+    assert!(ours.points().len() < 100_000, "{}", ours.points().len());
+}
+
+/// A stroke of cubics so wide that usvg strokes it coarsely (`usvg::stroke_path`) is drawn only
+/// while its edge is off by at most [`MAX_STROKE_ERROR`] pixels, else refused (a review found
+/// a ring 10⁹ wide whose inner edge, 32 pixels from the corner, came out a wedge: 1,552 pixels
+/// of 4,096 wrong). A ring 6×10⁵ wide is drawn as tiny-skia strokes it, and its inner edge where
+/// it is.
+#[test]
+fn a_wide_stroke_whose_edge_shows_is_drawn_right_or_refused() {
+    let ring = |width: f32, off: f32| {
+        let r = width / 2.0 + off;
+        let k = r * 0.552_284_8;
+        format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><path d='M{r} 0 C{r} {k} {k} {r} 0 {r} C-{k} {r} -{r} {k} -{r} 0 C-{r} -{k} -{k} -{r} 0 -{r} C{k} -{r} {r} -{k} {r} 0 Z' fill='none' stroke='red' stroke-width='{width}'/></svg>"
+        )
+    };
+    for (width, off) in [(1e9, 32.0), (1e8, 32.0), (3e6, 32.0)] {
+        let (r, took) = rendered_in(&ring(width, off), &Caps::NORMAL);
+        assert!(
+            matches!(r, Rendered::Refused(Refusal::Complex)),
+            "{width} {off}"
+        );
+        assert!(took < Duration::from_millis(500), "{took:?}");
+    }
+    let src = ring(6e5, 32.0);
+    let b = decode(src.as_bytes(), 64, 64).unwrap();
+    // The hole of radius 32 about the corner is clear; the rest is red.
+    let red = 0xffff_0000;
+    for (x, y, want) in [
+        (4, 4, 0),
+        (20, 20, 0),
+        (30, 4, 0),
+        (40, 4, red),
+        (48, 4, red),
+        (60, 4, red),
+        (4, 60, red),
+        (40, 40, red),
+    ] {
+        assert_eq!(b.data[y * 64 + x], want, "{x},{y}");
+    }
+    // The coarse outline is where tiny-skia's is, to within a pixel.
+    let tree = usvg::Tree::from_str(&src, &usvg::Options::default()).unwrap();
+    let usvg::Node::Path(p) = &tree.root().children()[0] else {
+        panic!()
+    };
+    let stroke = p.stroke().unwrap().to_tiny_skia();
+    let fill = |outline: &tiny_skia::Path| {
+        let mut px = tiny_skia::Pixmap::new(64, 64).unwrap();
+        px.fill_path(
+            outline,
+            &tiny_skia::Paint::default(),
+            tiny_skia::FillRule::Winding,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+        px.data()
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .copied()
+            .collect::<Vec<u8>>()
+    };
+    let ours = fill(&usvg::stroke_path(p.data(), &stroke, 1.0).unwrap());
+    let theirs = fill(&p.data().stroke(&stroke, 1.0).unwrap());
+    let off = ours
+        .iter()
+        .zip(&theirs)
+        .filter(|(a, b)| a.abs_diff(**b) > 64)
+        .count();
+    assert!(off <= 64, "{off}");
 }
 
 /// A path is stroked as it was, less the subpaths that have a curve too big for tiny-skia's
