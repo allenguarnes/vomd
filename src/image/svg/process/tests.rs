@@ -11,6 +11,8 @@ fn a_job_is_read_as_it_was_written() {
         layers: 33,
         pixmaps: 2,
         raster: 7 << 20,
+        measured: true,
+        unguessed: true,
     };
     let fonts = crate::fonts::Fonts::new().unwrap().svg_sources();
     let mut job = Vec::new();

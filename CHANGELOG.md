@@ -3,6 +3,21 @@
 All notable changes to VOMD. The format follows [Keep a Changelog](https://keepachangelog.com/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- A Mermaid diagram, or an SVG image, shown large on a HiDPI screen (a mind map at 120 % on a
+  2× screen, for example) was refused as too large: an SVG not drawn yet was charged room for
+  drawing layers it doesn't have, two whole pictures' worth. It is charged what it measures
+  now, and such a diagram is drawn. One really over VOMD's image limits still shows as its
+  code, and its note now says *click to draw it anyway*: a click draws it past the limits, as
+  for an image.
+- On Omarchy, switching between a dark and a light theme showed GitHub's colours of the old
+  mode for up to a second before the new theme's. The page follows the Omarchy theme's mode at
+  once now (with `theme = system`), pictures and diagrams with it.
+- The image viewer showed a Mermaid diagram's whole source in a box over the picture, as if it
+  were the image's caption. A diagram has no caption there now.
+
 ## [1.12.0] - 2026-11-25
 
 ### Added

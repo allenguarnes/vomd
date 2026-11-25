@@ -272,7 +272,8 @@ On macOS, use `⌘` where the table says `Ctrl`; `⌘R` reloads, `⌘↑` `⌘�
 **With the mouse:** drag to select, double-click for a word, triple-click for a paragraph, and
 `Shift`+click to extend. Hover a code block for its copy button. Click an image to open it in the
 image viewer, or an image marked *click to load* to load it past VOMD's limits (hold `Ctrl` if
-the image is a link, `⌘` on macOS, for either). On Linux, selected text can also be pasted with a
+the image is a link, `⌘` on macOS, for either). A Mermaid diagram over those limits shows as its
+code, and a click on the line under it draws it anyway. On Linux, selected text can also be pasted with a
 middle click.
 
 **In the image viewer:** drag or scroll to move around, `Ctrl` + wheel (or pinch) or `+` `-` to
@@ -336,8 +337,9 @@ VOMD makes no network requests of its own.
 - No screen reader support.
 - Mermaid: sankey, requirement, C4, block, architecture, packet, radar, kanban and treemap
   diagrams show as code, with a note, as does a diagram that can't be read (the note says
-  where), one over 50 KB, too complex to lay out or too large to draw, those after a
-  document's first 100, and those past 64 MB of diagrams in all. Diagrams are pictures: no
+  where), one over 50 KB, too complex to lay out or too slow to draw, those after a
+  document's first 100, and those past 64 MB of diagrams in all. One over VOMD's image limits
+  shows as code until a click on its note draws it anyway. Diagrams are pictures: no
   clicks, links or tooltips, no FontAwesome icons (`fa:fa-…` shows as text), no Markdown or
   HTML in labels but `<b>`, `<i>` and `<br>`, and labels don't wrap. Layouts follow
   Mermaid's (the same layered layout) but aren't identical to GitHub's. Find doesn't search

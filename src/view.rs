@@ -813,9 +813,12 @@ impl View {
         (self.hidpi * f64::from(self.zoom) / 100.0) as f32
     }
 
+    /// Whether the dark theme is on. Under `system`, an Omarchy theme says: Omarchy sets the
+    /// system's scheme from it itself, but only after it has moved the new theme in, and the
+    /// two disagreeing in between showed GitHub's colors of the old mode.
     pub fn dark(&self) -> bool {
         match self.theme {
-            ThemeMode::System => self.system_dark,
+            ThemeMode::System => self.omarchy.map_or(self.system_dark, |(dark, _)| dark),
             ThemeMode::Light => false,
             ThemeMode::Dark => true,
         }
@@ -832,9 +835,12 @@ impl View {
 
     /// Omarchy's theme was (re)read. Returns true if the colors on screen change.
     pub fn set_omarchy(&mut self, omarchy: Option<(bool, Theme)>) -> bool {
-        let before = self.palette();
+        let before = (self.palette(), self.dark());
         self.omarchy = omarchy;
-        self.palette() != before
+        if self.dark() != before.1 {
+            self.follow_theme();
+        }
+        (self.palette(), self.dark()) != before
     }
 
     /// The OS theme changed (or was first read). Returns true if the colors on screen change.
@@ -1683,10 +1689,15 @@ impl View {
                 .is_some_and(|id| self.images.blocked(id));
         let force = if free { self.forceable_at(x, y) } else { None };
         let open = free && force.is_none() && self.open_at(x, y).is_some();
+        // (A diagram's line says it itself.)
+        #[cfg(feature = "mermaid")]
+        let shown = force.filter(|_| self.diagram_note_at(x, y).is_none());
+        #[cfg(not(feature = "mermaid"))]
+        let shown = force;
         let hover_note = if blocked {
             Some(BLOCKED_NOTE)
         } else {
-            force.map(|id| {
+            shown.map(|id| {
                 if self.images.partial(id) {
                     PARTIAL_NOTE
                 } else {
@@ -1771,7 +1782,7 @@ impl View {
         if let Some(id) = self.pressed_image.take() {
             self.ensure_content();
             if self.forceable_at(x, y) == Some(id) {
-                self.images.force(id, &self.doc, &mut self.layout);
+                self.force_image(id);
             } else if self.open_at(x, y) == Some(id) {
                 #[cfg(feature = "images")]
                 self.open_viewer(id, self.pressed_at, Instant::now());
@@ -2479,26 +2490,43 @@ impl View {
     }
 
     /// Diagrams made but that VOMD's image limits keep from being drawn are kept as failures
-    /// that say why, so they are copied and found as the code they are shown as.
+    /// that say why, so they are copied and found as the code they are shown as. One only over
+    /// the memory an image may take keeps its SVG, for a click on its line that draws it anyway
+    /// (as an image's placeholder does); one too slow or too complex to draw doesn't.
     #[cfg(feature = "mermaid")]
     fn note_refused_diagrams(&mut self) {
+        use crate::layout::Refusal;
+        // The blocks whose line changed (it says something else, or takes a click now) are
+        // laid out again: the layout keeps the line it made.
+        let mut changed = Vec::new();
         for (i, img) in self.doc.images.iter().enumerate() {
             if img.diagram.is_none() {
                 continue;
             }
             let why = match self.layout.image_size(i as u32 + 1) {
-                Some(ImageSize::Refused(crate::layout::Refusal::Slow)) => {
-                    "the diagram is too slow to draw"
+                Some(ImageSize::Refused(Refusal::Slow)) => "the diagram is too slow to draw",
+                Some(ImageSize::Refused(Refusal::Complex)) => "the diagram is too complex to draw",
+                // Drawn anyway, and that failed too.
+                Some(ImageSize::Refused(Refusal::Ceiling(_))) => {
+                    "the diagram is too large to draw, even past VOMD's image limits"
                 }
-                Some(ImageSize::Refused(crate::layout::Refusal::Complex)) => {
-                    "the diagram is too complex to draw"
+                Some(ImageSize::Refused(Refusal::Failed)) => "the diagram couldn't be drawn",
+                Some(ImageSize::Refused(_)) => {
+                    if crate::mermaid::over(&img.src) {
+                        changed.push(i as u32 + 1);
+                    }
+                    continue;
                 }
-                Some(ImageSize::Refused(_)) => "the diagram is too large to draw",
                 // (Not `Alt`: every image shows its alt text while the image tables wait for
                 // room, made diagrams too.)
                 _ => continue,
             };
-            crate::mermaid::refused(&img.src, why);
+            if crate::mermaid::refused(&img.src, why) {
+                changed.push(i as u32 + 1);
+            }
+        }
+        for id in changed {
+            self.layout.image_again(&self.doc, id);
         }
     }
 
@@ -2747,14 +2775,48 @@ impl View {
     }
 
     /// The image at (`x`, `y`) that a click loads past VOMD's limits: a placeholder that says
-    /// so, or an SVG drawn without some of its embedded images.
+    /// so, an SVG drawn without some of its embedded images, or the line under a diagram over
+    /// the limits.
     fn forceable_at(&self, x: f64, y: f64) -> Option<u32> {
+        #[cfg(feature = "mermaid")]
+        if let Some(id) = self.diagram_note_at(x, y) {
+            return Some(id);
+        }
         let id = self.image_at(x, y)?;
         let refused = matches!(
             self.layout.image_size(id),
             Some(ImageSize::Refused(why)) if why.forceable()
         );
         (refused || self.images.partial(id)).then_some(id)
+    }
+
+    /// The diagram over VOMD's image limits whose line is at window point (`x`, `y`).
+    #[cfg(feature = "mermaid")]
+    fn diagram_note_at(&self, x: f64, y: f64) -> Option<u32> {
+        if self.message.is_some() || !self.in_area(x, y) {
+            return None;
+        }
+        // (Only while the store says so: the layout may be one behind it.)
+        self.layout
+            .diagram_note_at(self.doc_x(x) as f32, self.doc_y(y) as f32)
+            .filter(|&id| {
+                (self.doc.images.get(id as usize - 1))
+                    .is_some_and(|img| crate::mermaid::is_over(&img.src))
+            })
+    }
+
+    /// Load image `id` past VOMD's limits (a click on its placeholder, or a diagram's line).
+    fn force_image(&mut self, id: u32) {
+        // A diagram over the limits is a diagram again (its code until then), and the images
+        // are attached again: one shown as its code had no image to load.
+        #[cfg(feature = "mermaid")]
+        if let Some(img) = self.doc.images.get(id as usize - 1)
+            && img.diagram.is_some()
+            && crate::mermaid::force(&img.src)
+        {
+            self.attach_images();
+        }
+        self.images.force(id, &self.doc, &mut self.layout);
     }
 
     /// The image at (`x`, `y`) that a click opens in the viewer ([`View::openable_at`]).

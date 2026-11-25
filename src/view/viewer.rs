@@ -834,9 +834,14 @@ impl View {
         (crate::layout::BlockBox::from_para(pl, &para.styles), w, h)
     }
 
-    /// Image `id`'s alt text, if it says more than the file's name.
-    fn viewer_alt(&self, id: u32) -> Option<String> {
+    /// Image `id`'s alt text, if it says more than the file's name. A diagram has none: its
+    /// text is its source (kept for copy and find), not a caption.
+    pub(super) fn viewer_alt(&self, id: u32) -> Option<String> {
         let img = self.doc.images.get(id.checked_sub(1)? as usize)?;
+        #[cfg(feature = "mermaid")]
+        if img.diagram.is_some() {
+            return None;
+        }
         let mut alt = String::new();
         for block in &self.doc.blocks {
             let cells = self.doc.row_cells(block).map(|(_, spans)| spans);

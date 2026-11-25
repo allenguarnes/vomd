@@ -769,6 +769,95 @@ mod with_fonts {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The viewer's caption is an image's alt text, never a diagram's source.
+    #[cfg(all(feature = "images", feature = "mermaid"))]
+    #[test]
+    fn a_diagram_has_no_viewer_caption() {
+        let v = view(
+            "![A logo](l.png)\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n![l](l.png)\n",
+            400,
+            300,
+        );
+        assert!(v.doc().images[1].diagram.is_some());
+        assert_eq!(v.viewer_alt(1).as_deref(), Some("A logo"));
+        assert_eq!(v.viewer_alt(2), None, "the diagram's source isn't shown");
+        assert_eq!(v.viewer_alt(3), None, "the file's name says as much");
+    }
+
+    /// Under `system`, an Omarchy theme's mode is the mode: `omarchy-theme-set` moves the new
+    /// theme in before it sets the system's scheme, and in between GitHub's colors of the old
+    /// mode showed. `T`'s other modes keep GitHub's colors for the mode that isn't Omarchy's,
+    /// and the `<picture>` images switch with the colors.
+    #[test]
+    fn an_omarchy_theme_sets_the_mode() {
+        let now = Instant::now();
+        let dir = picture_dir("omarchy");
+        let mut v = View::with_base(
+            Fonts::new().unwrap(),
+            Doc::parse(PICTURE),
+            None,
+            (400, 300),
+            1.0,
+            Some(dir.clone()),
+        );
+        v.ensure();
+        let src = |v: &View| v.doc().images[0].src.to_string();
+        let night = Theme {
+            bg: 0x1a1b26,
+            ..DARK
+        };
+        let rose = Theme {
+            bg: 0xfaf4ed,
+            ..LIGHT
+        };
+        // Tokyo Night under a dark system.
+        assert!(v.set_system_dark(true));
+        assert!(v.set_omarchy(Some((true, night))));
+        assert!(v.dark() && v.palette() == night);
+        // Rose Pine moved in: its colors and light images at once…
+        assert!(v.set_omarchy(Some((false, rose))));
+        assert!(
+            !v.dark() && v.palette() == rose,
+            "light before the system says so"
+        );
+        assert_eq!(src(&v), "l.png");
+        // …and the system's scheme following later changes nothing.
+        assert!(!v.set_system_dark(false));
+        assert!(v.palette() == rose);
+        // A light system and a dark Omarchy theme moved in.
+        assert!(v.set_omarchy(Some((true, night))));
+        assert!(v.dark() && v.palette() == night);
+        assert_eq!(src(&v), "d.png");
+        assert!(!v.set_system_dark(true));
+        // A theme of the same mode: new colors, no new images.
+        let storm = Theme {
+            bg: 0x24283b,
+            ..DARK
+        };
+        assert!(v.set_omarchy(Some((true, storm))));
+        assert!(v.palette() == storm);
+        // T: light (GitHub's: the Omarchy theme is dark), dark (Omarchy's), system.
+        v.apply(Action::CycleTheme, now);
+        assert!(!v.dark() && v.palette() == LIGHT);
+        assert_eq!(src(&v), "l.png");
+        v.apply(Action::CycleTheme, now);
+        assert!(v.dark() && v.palette() == storm);
+        v.apply(Action::CycleTheme, now);
+        assert_eq!(v.theme_mode(), ThemeMode::System);
+        assert!(v.dark() && v.palette() == storm);
+        // An explicit mode ignores Omarchy's mode, only taking its colors when they match.
+        v.set_theme_mode(ThemeMode::Light);
+        assert!(!v.set_omarchy(Some((true, night))), "still GitHub's light");
+        assert!(v.set_omarchy(Some((false, rose))));
+        assert!(!v.dark() && v.palette() == rose);
+        // Without Omarchy the system decides again.
+        v.set_theme_mode(ThemeMode::System);
+        assert!(v.set_omarchy(None));
+        assert!(v.dark() && v.palette() == DARK, "the system is dark");
+        assert_eq!(src(&v), "d.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// While the clipboard holds a large lazy copy of the document, a theme change can't swap
     /// the picture's image: it does when the copy is let go, without another theme change.
     #[cfg(all(feature = "clipboard", feature = "images"))]
@@ -4444,6 +4533,135 @@ mod with_fonts {
         v.release_toolbar(mx, my);
         paints_in_part_as_whole(&mut v, "dropdown");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mind map of about 663 × 653 at 4× fills the column, past the image budget: shown as its
+    /// code, with a line under it that offers to draw it anyway, which a click on it does.
+    #[cfg(all(feature = "images", feature = "mermaid"))]
+    #[test]
+    fn a_click_draws_a_diagram_past_the_limits() {
+        let src = "```mermaid\nmindmap\n  root((Forced))\n    Images\n      PNG\n      SVG\n      \
+                   GIF\n    Text\n      Math\n      Code\n        Rust\n        Python\n    \
+                   Diagrams\n      Mermaid\n      Flowchart\n```\n";
+        let (w, h) = (3200, 2400);
+        let mut v = View::new(Fonts::new().unwrap(), Doc::parse(src), None, (w, h), 4.0);
+        let now = Instant::now();
+        frame(&mut v, now);
+        let diagram = v.doc().images[0].src.clone();
+        // The window point of the diagram's clickable line, if the layout has one.
+        let line_at = |v: &View| {
+            let l = v.layout();
+            let (i, [_, y0, _, y1]) = (l.geoms().iter().enumerate())
+                .find_map(|(i, g)| Some((i, g.content.as_ref()?.note.filter(|n| n.0 == 1)?.1)))?;
+            let y = f64::from(l.y(i) + (y0 + y1) / 2.0) - v.scroll() + f64::from(v.top_inset);
+            (0..w / 4)
+                .map(|x| (f64::from(x * 4), y))
+                .find(|&(x, y)| v.forceable_at(x, y) == Some(1))
+        };
+        // Polled until the refusal is noted and its line laid out. (The store is the tests'
+        // all: another test's theme switch may forget the refusal meanwhile, as a theme switch
+        // does, without this view attaching its images again: it is noted again.)
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let noted = |v: &mut View| loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out: {:?} {:?}",
+                v.layout().image_size(1),
+                crate::mermaid::note(&diagram)
+            );
+            v.poll_images(Instant::now());
+            v.note_refused_diagrams();
+            frame(v, Instant::now());
+            if crate::mermaid::is_over(&diagram)
+                && let Some(at) = line_at(v)
+            {
+                return at;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let at = noted(&mut v);
+        assert!(crate::mermaid::shown_as_code(&diagram));
+        assert!(matches!(
+            v.layout().image_size(1),
+            Some(ImageSize::Refused(Refusal::Memory(_)))
+        ));
+        // The line takes the click; the code doesn't.
+        assert_eq!(v.forceable_at(at.0, at.1 - 60.0), None, "the code");
+        v.hover(at.0, at.1);
+        assert!(v.over_force());
+        assert_eq!(v.hover_note, None, "the line says it");
+        // The refusal forgotten and the block laid out without the line, then noted again: the
+        // line is laid out again, and takes the click.
+        crate::mermaid::force(&diagram);
+        v.layout.image_again(&v.doc, 1);
+        frame(&mut v, Instant::now());
+        assert_eq!(line_at(&v), None);
+        assert_eq!(v.forceable_at(at.0, at.1), None);
+        let at = noted(&mut v);
+        // A click on it draws the diagram. (Unless the refusal was forgotten under the pointer
+        // meanwhile: then it is noted, and clicked, again.)
+        let mut at = at;
+        loop {
+            v.press(at.0, at.1, now);
+            assert_eq!(v.click(at.0, at.1), None);
+            if matches!(v.layout().image_size(1), Some(ImageSize::Pixels(..))) {
+                break;
+            }
+            at = noted(&mut v);
+        }
+        assert!(!crate::mermaid::is_over(&diagram));
+        assert!(!crate::mermaid::shown_as_code(&diagram));
+        while !v.images.shown(1) {
+            assert!(
+                Instant::now() < deadline,
+                "not drawn: {:?} {} {}",
+                v.layout().image_size(1),
+                v.images.forcing(),
+                v.images.forced_loads()
+            );
+            v.poll_images(Instant::now());
+            frame(&mut v, Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!crate::mermaid::shown_as_code(&diagram), "drawn");
+        assert_eq!(v.images.forced_loads(), 1);
+    }
+
+    /// A diagram too slow or too complex to draw is its code with a line that says so, and a
+    /// click doesn't draw it anyway (nor one whose load past the limits failed).
+    #[cfg(all(feature = "images", feature = "mermaid"))]
+    #[test]
+    fn a_slow_or_complex_diagram_is_not_forceable() {
+        for (n, (why, note)) in [
+            (Refusal::Slow, "Mermaid: the diagram is too slow to draw"),
+            (
+                Refusal::Complex,
+                "Mermaid: the diagram is too complex to draw",
+            ),
+            (
+                Refusal::Ceiling(1 << 30),
+                "Mermaid: the diagram is too large to draw, even past VOMD's image limits",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let src = format!("```mermaid\nflowchart LR\n  NotForceable{n} --> Either\n```\n");
+            let mut v = view(&src, 600, 400);
+            let diagram = v.doc().images[0].src.clone();
+            wait_images(&mut v, |v| v.images.shown(1));
+            v.layout.set_image(&v.doc, 1, ImageSize::Refused(why));
+            v.note_refused_diagrams();
+            assert!(!crate::mermaid::is_over(&diagram), "{why:?}");
+            assert_eq!(crate::mermaid::note(&diagram).as_deref(), Some(note));
+            frame(&mut v, Instant::now());
+            assert!(
+                (0..75)
+                    .flat_map(|x| (0..50).map(move |y| (f64::from(x * 8), f64::from(y * 8))))
+                    .all(|(x, y)| v.forceable_at(x, y).is_none()),
+                "{why:?}"
+            );
+        }
     }
 
     /// An image over VOMD's limits says why and "click to load" in its placeholder (not text of

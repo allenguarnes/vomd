@@ -730,23 +730,64 @@ fn margin(w: u32, h: u32) -> usize {
 
 /// `svg`, with what the first job is charged for in place of what no job has measured yet.
 fn known(svg: &SvgCost) -> SvgCost {
-    if svg.parse > 0 {
+    if svg.parse > 0 && svg.measured {
         return *svg;
     }
     SvgCost {
-        parse: guess_parse(svg.xml as usize, svg.gz),
-        layers: svg.layers.max(GUESS_LAYERS),
+        parse: if svg.parse > 0 {
+            svg.parse
+        } else {
+            guess_parse(svg.xml as usize, svg.gz)
+        },
+        layers: if svg.unguessed {
+            svg.layers
+        } else {
+            svg.layers.max(GUESS_LAYERS)
+        },
         pixmaps: svg.pixmaps.max(GUESS_PIXMAPS),
         draw: svg.draw.max(GUESS_DRAW),
         ..*svg
     }
 }
 
+/// [`known`] for a box of `w` × `h`: the layers guessed are what badges and logos measured, and
+/// they are left out where they would refuse the SVG, its cost with them being over the cache's
+/// budget: they are a guess, not what the SVG holds (most hold no layer at all), and one over the
+/// budget would refuse it before a job could measure it. The job measures what rendering holds
+/// before it draws anything, and asks for more if it needs it. (Kept where the SVG is over the
+/// budget without them too, for what parsing holds, but where the box's pixmaps with them are:
+/// a job then asks for more than its charge whatever parsing finds.)
+fn known_at(svg: &SvgCost, w: u32, h: u32) -> SvgCost {
+    let mut k = known(svg);
+    if !svg.measured && drop_guess(&k, svg.layers, |c| cost_of(c, w, h)) {
+        k.layers = svg.layers;
+    }
+    k
+}
+
+/// Whether the layers guessed in `k` (beyond `layers`) are left out ([`known_at`]), `cost` being
+/// what `k` costs.
+fn drop_guess(k: &SvgCost, layers: u32, cost: impl Fn(&SvgCost) -> usize) -> bool {
+    let without = SvgCost { layers, ..*k };
+    let pixmaps = SvgCost {
+        parse: 0,
+        draw: 0,
+        raster: 0,
+        ..*k
+    };
+    let over = |c: &SvgCost| cost(c) > super::CACHE_BYTES;
+    over(&pixmaps) || (over(k) && !over(&without))
+}
+
 /// What decoding an SVG to `w` × `h` holds (see `decode_cost`), by what is known of it: parsing,
 /// drawing its largest path, its largest embedded raster image, the canvas and the result it is
 /// copied to, and the layers rendering holds beside them.
 pub(super) fn cost(svg: &SvgCost, w: u32, h: u32) -> usize {
-    let svg = known(svg);
+    cost_of(&known_at(svg, w, h), w, h)
+}
+
+/// [`cost`] of what is known (or guessed) of an SVG.
+fn cost_of(svg: &SvgCost, w: u32, h: u32) -> usize {
     let canvas = w as usize * h as usize * 4;
     svg.parse
         .saturating_add(svg.draw)
@@ -757,13 +798,18 @@ pub(super) fn cost(svg: &SvgCost, w: u32, h: u32) -> usize {
 }
 
 /// What decoding an SVG holds for each pixel of its box besides its result twice, and for each
-/// pixel of its sides (see `image::pixel_cost`): its layers, and their margins.
-pub(super) fn box_costs(svg: &SvgCost) -> (u32, u32) {
-    let svg = known(svg);
-    (
-        (svg.layers.saturating_mul(4)).div_ceil(LAYER_UNITS),
-        svg.pixmaps.saturating_mul(80),
-    )
+/// pixel of its sides (see `image::pixel_cost`): its layers, and their margins. And how much of
+/// the first is the layers guessed for one not measured yet, which [`known_at`]'s rule leaves out
+/// for a box too large for them (`image::unfetched_cost` follows it): 0 once measured.
+pub(super) fn box_costs(svg: &SvgCost) -> (u32, u32, u32) {
+    let k = known(svg);
+    let per_px = |layers: u32| (layers.saturating_mul(4)).div_ceil(LAYER_UNITS);
+    let guess = if svg.measured {
+        0
+    } else {
+        per_px(k.layers) - per_px(svg.layers)
+    };
+    (per_px(k.layers), k.pixmaps.saturating_mul(80), guess)
 }
 
 /// What usvg makes for something besides what the file holds, and holds a copy of for each use of
@@ -2730,10 +2776,11 @@ pub(super) fn render_part(
     cancel: &AtomicBool,
     fonts: &mut Fonts,
 ) -> Rendered {
-    let svg = known(svg);
+    let raw = *svg;
+    let svg = known_at(svg, w, h);
     fonts.missing.clear();
     // What parsing may hold: the charge, less the rest of it.
-    let rest = cost(&svg, w, h) - svg.parse;
+    let rest = cost_of(&svg, w, h) - svg.parse;
     let mut inflated = Vec::new();
     let Some(xml) = xml_of(bytes, &svg, &mut inflated, caps.xml) else {
         return Rendered::Refused(Refusal::Broken);
@@ -2753,10 +2800,12 @@ pub(super) fn render_part(
     if let Some(why) = b.refused {
         return Rendered::Refused(why);
     }
+    // What parsing holds is recorded; what rendering holds only once it is measured (below),
+    // not the guesses of `known_at`, which are made again for the next job's box.
     let mut need = SvgCost {
         parse: b.parse.max(svg.parse),
         raster: b.raster.max(svg.raster),
-        ..svg
+        ..raw
     };
     if b.over {
         return Rendered::Need(need);
@@ -2793,9 +2842,21 @@ pub(super) fn render_part(
     if a.inexact {
         return Rendered::Refused(Refusal::Complex);
     }
-    need.draw = need.draw.max(a.draw);
-    need.layers = need.layers.max(layers.min(u32::MAX as usize) as u32);
-    need.pixmaps = need.pixmaps.max(a.pixmaps.min(u32::MAX as usize) as u32);
+    // What rendering holds, measured, takes the place of what was guessed; once measured, the
+    // most of what each box measured is kept (two boxes of one SVG, the page's and the
+    // viewer's, would otherwise take turns, a job asking again each time).
+    let (layers, pixmaps) = (
+        layers.min(u32::MAX as usize) as u32,
+        a.pixmaps.min(u32::MAX as usize) as u32,
+    );
+    if raw.measured {
+        need.draw = raw.draw.max(a.draw);
+        need.layers = raw.layers.max(layers);
+        need.pixmaps = raw.pixmaps.max(pixmaps);
+    } else {
+        (need.draw, need.layers, need.pixmaps) = (a.draw, layers, pixmaps);
+    }
+    need.measured = true;
     if cost(&need, w, h) > charge {
         return Rendered::Need(need);
     }

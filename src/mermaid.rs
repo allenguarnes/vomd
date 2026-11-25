@@ -141,6 +141,9 @@ struct Store {
     /// The diagrams each maker's document shows ([`Maker::request`]): never evicted, and a
     /// job for one no longer shown is dropped.
     shown: HashMap<usize, HashSet<u64>>,
+    /// Diagrams made but over VOMD's image limits ([`over`]): shown as their code, their SVG
+    /// kept for a click that draws them anyway.
+    over: HashSet<u64>,
 }
 
 impl Store {
@@ -149,6 +152,7 @@ impl Store {
     }
 
     fn remove(&mut self, key: u64) {
+        self.over.remove(&key);
         if let Some((State::Done(b, _), _)) = self.map.remove(&key) {
             self.bytes -= b.len();
         }
@@ -252,10 +256,14 @@ pub fn note(src: &str) -> Option<String> {
         Name::Many(n) => Some(format!(
             "Mermaid: only a document's first {n} diagrams are drawn"
         )),
-        Name::Diagram(key) => match &store().map.get(&key)?.0 {
-            State::Failed(why, _) => Some(format!("Mermaid: {why}")),
-            _ => None,
-        },
+        Name::Diagram(key) => {
+            let s = store();
+            match &s.map.get(&key)?.0 {
+                State::Failed(why, _) => Some(format!("Mermaid: {why}")),
+                State::Done(..) if s.over.contains(&key) => Some(OVER_NOTE.into()),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -278,6 +286,43 @@ pub fn refused(src: &str, why: &str) -> bool {
     }
     s.put(key, State::Failed(why.into(), true));
     true
+}
+
+/// The line under a diagram over VOMD's image limits ([`over`]), as an image's placeholder
+/// says it.
+pub const OVER_NOTE: &str =
+    "Mermaid: the diagram is over VOMD's image limits · click to draw it anyway";
+
+/// The diagram `src` names was made, but is over VOMD's image limits for its size (a refusal
+/// a click overrides, as an image's): it is shown as its code with a line that offers to draw
+/// it anyway ([`OVER_NOTE`]), and its SVG is kept for that. Until [`force`], a reload or a
+/// theme switch. Returns true if it is now (it wasn't: a made diagram).
+pub fn over(src: &str) -> bool {
+    let Some(Name::Diagram(key)) = name(src) else {
+        return false;
+    };
+    let mut s = store();
+    if !matches!(s.map.get(&key), Some((State::Done(..), _))) {
+        return false;
+    }
+    s.over.insert(key)
+}
+
+/// Whether the diagram `src` names is over VOMD's image limits ([`over`]).
+pub fn is_over(src: &str) -> bool {
+    match name(src) {
+        Some(Name::Diagram(key)) => store().over.contains(&key),
+        _ => false,
+    }
+}
+
+/// The diagram `src` names is drawn past VOMD's image limits (a click on its line): it is a
+/// diagram again. Returns true if it was over them.
+pub fn force(src: &str) -> bool {
+    match name(src) {
+        Some(Name::Diagram(key)) => store().over.remove(&key),
+        _ => false,
+    }
 }
 
 // ---- Text widths ---------------------------------------------------------------------------
@@ -761,6 +806,7 @@ pub fn forget_transient() {
     let mut s = store();
     s.map
         .retain(|_, (st, _)| !matches!(st, State::Failed(_, true)));
+    s.over.clear();
 }
 
 // ---- The maker -----------------------------------------------------------------------------

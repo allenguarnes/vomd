@@ -1076,7 +1076,8 @@ fn a_turned_image_is_charged_its_copy() {
                 let (sw, sh) = header.shown();
                 let source = header_cost(&header);
                 assert!(
-                    unfetched_cost(source, (0, 0), (sw, sh), w, h) >= decode_cost(&header, w, h)
+                    unfetched_cost(source, false, (0, 0, 0), (sw, sh), w, h)
+                        >= decode_cost(&header, w, h)
                 );
             }
         }
@@ -2925,6 +2926,7 @@ fn a_decoded_result_evicts_a_body_let_in_earlier_in_the_poll() {
         w: side,
         h: side,
         cost: pc,
+        svg: None,
     };
     let shared: Shared = Arc::default();
     {
@@ -3060,6 +3062,7 @@ fn the_worker_lets_go_of_a_body_before_it_sends_the_result() {
         w: 40,
         h: 30,
         cost: 40 * 30 * 4,
+        svg: None,
     }]);
     let Ok(Done::Decoded {
         bitmap, worker: w, ..
@@ -3088,6 +3091,7 @@ fn replacing_the_queue_returns_what_the_running_job_holds() {
         w: 40,
         h: 30,
         cost: 12_345,
+        svg: None,
     };
     worker.set(vec![job()]);
     // The result is not taken: the job is held until it is.
@@ -3114,6 +3118,7 @@ fn a_file_that_changed_since_it_was_sized_is_refused() {
         w: 40,
         h: 30,
         cost,
+        svg: None,
     };
     let cost = file_info(&path).unwrap().cost(40, 30);
     assert!(
@@ -10140,4 +10145,261 @@ fn only_the_viewers_current_decode_asks_for_it_again() {
     // (A load past the limits takes the same rule.)
     assert!(images.stale(1, &[], true) && !images.stale(1, &[], false));
     assert!(!images.stale(2, &[], true));
+}
+
+/// A remote SVG of one shape shown at 1700 × 1324 (a 707 × 551 picture at 120 % on a 2×
+/// screen) is admitted and drawn, as a local one is: what its record charges, its body gone or
+/// not, leaves out the layers guessed for an SVG not measured yet where they would put its
+/// pixmaps over the budget, until a job measures them, and the first measurement replaces them.
+#[cfg(all(feature = "remote-images", feature = "svg"))]
+#[test]
+fn a_remote_svg_at_a_hidpi_size_is_drawn() {
+    let url: Arc<str> = Arc::from("https://x.y/big.svg");
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"706.834\" height=\"550.83\" viewBox=\"0 0 706.834 550.83\"><rect x=\"10\" y=\"10\" width=\"300\" height=\"200\" fill=\"#c00\"/></svg>";
+    let doc = Doc::parse(&format!("![a]({url})"));
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_test_body(Arc::new(move |_| Some(svg.as_bytes().to_vec())));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let (w, h) = (1700, 1324);
+    let t = Instant::now();
+    loop {
+        assert!(t.elapsed() < Duration::from_secs(30), "never drawn");
+        images.begin_frame();
+        images.request(&[(1, w, h)], 1);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+        assert!(
+            !matches!(layout.image_size(1), Some(ImageSize::Refused(_))),
+            "{:?}",
+            layout.image_size(1)
+        );
+        if images
+            .cache
+            .pixels(&Key::Remote(url.clone()), w, h)
+            .is_some()
+        {
+            break;
+        }
+    }
+    // The record, as when the body has gone: within the budget at this size, the guess still
+    // charged at a small one.
+    let (per_px, per_side, guess) = images.remote.box_costs(&url);
+    assert!(guess > 0 && per_px >= guess);
+    let source = images.remote.source_cost(&url).unwrap();
+    let canvas = w as usize * h as usize * 4;
+    let unfetched = unfetched_cost(source, true, (per_px, per_side, guess), (707, 551), w, h);
+    assert!(unfetched <= CACHE_BYTES, "{unfetched}");
+    assert!(unfetched < 2 * canvas + (4 << 20), "{unfetched}");
+    let small = unfetched_cost(
+        source,
+        true,
+        (per_px, per_side, guess),
+        (707, 551),
+        256,
+        256,
+    );
+    assert!(small >= unfetched_cost(source, true, (per_px, 0, 0), (707, 551), 256, 256));
+    // A job's measurement replaces the guess; later ones only add to it.
+    images.remote.remeasure(&url, source, (0, 80, 0));
+    assert_eq!(images.remote.box_costs(&url), (0, 80, 0));
+    images.remote.remeasure(&url, source, (8, 40, 0));
+    assert_eq!(images.remote.box_costs(&url), (8, 80, 0));
+}
+
+/// An SVG measured at one box is drawn at a smaller one: the worker charges it what its record
+/// says (what the job measured), as the main thread did, not the first job's guess from the
+/// header read again, which may be more (it showed its alt text).
+#[cfg(feature = "svg")]
+#[test]
+fn a_measured_svg_is_drawn_at_a_smaller_box() {
+    use crate::render::Pixels;
+    let dir = scratch("svg-smaller");
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"706.834\" height=\"550.83\" viewBox=\"0 0 706.834 550.83\"><g opacity=\"0.5\"><rect x=\"10\" y=\"10\" width=\"300\" height=\"200\" fill=\"#c00\"/><rect x=\"100\" y=\"100\" width=\"300\" height=\"200\" fill=\"#00c\"/></g></svg>";
+    std::fs::write(dir.join("a.svg"), svg).unwrap();
+    let (doc, mut layout, mut images) = forced_page(&dir, "![a](a.svg)");
+    for (w, h) in [(1700, 1324), (1370, 1067), (1700, 1324)] {
+        pump(&doc, &mut layout, &mut images, &[(1, w, h)], |i, l| {
+            assert!(
+                !matches!(
+                    l.image_size(1),
+                    Some(ImageSize::Refused(_) | ImageSize::Alt)
+                ),
+                "at {w}×{h}: {:?}",
+                l.image_size(1)
+            );
+            i.pixels(1, w, h).is_some_and(|b| b.width == w)
+        });
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fresh SVG of one shape is drawn at either side of where the guessed layers alone fitted
+/// (its pixmaps with them within the budget, the whole not): they are left out wherever they
+/// would refuse it.
+#[cfg(feature = "svg")]
+#[test]
+fn a_fresh_svg_is_drawn_either_side_of_the_guess() {
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\"><rect width=\"50\" height=\"50\" fill=\"#c00\"/></svg>";
+    let header = info_of(svg.as_bytes()).unwrap();
+    for side in [1400, 1425, 1429, 1450, 1900] {
+        assert!(
+            decode_cost(&header, side, side) <= CACHE_BYTES,
+            "{side}: {}",
+            decode_cost(&header, side, side)
+        );
+        let b = decode(svg.as_bytes(), side, side).unwrap();
+        assert_eq!(b.width, side);
+        // A remote one's record, its body gone, says as much.
+        #[cfg(feature = "remote-images")]
+        {
+            let costs = box_costs(svg.as_bytes());
+            let source = source_cost(svg.as_bytes());
+            let unfetched = unfetched_cost(source, true, costs, (100, 100), side, side);
+            assert!(unfetched <= CACHE_BYTES, "{side}: {unfetched}");
+        }
+    }
+    // Small boxes are still charged the guess.
+    assert!(decode_cost(&header, 256, 256) >= 4 * 256 * 256 * 4);
+}
+
+/// What decides whether an SVG no job has measured is drawn is what it is charged with all that
+/// goes with it (its file's bytes, its path, the records beside it): the layers guessed for it
+/// are left out where those would refuse it, so a pixel more doesn't draw what a pixel less
+/// refused.
+#[cfg(feature = "svg")]
+#[test]
+fn a_pixel_more_or_less_is_drawn_alike() {
+    use crate::render::Pixels;
+    let dir = scratch("svg-pixel");
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"950\" height=\"1000\"><rect width=\"50\" height=\"50\" fill=\"#c00\"/></svg>";
+    // A box at which it is still charged the guess, with room for its file's bytes and a path;
+    // the file's name long enough that its decode with the file and its path fits the budget by a
+    // few bytes, which the records beside them don't (the reviewer's 1385 × 1458 for its file);
+    // and the box a pixel taller, where the guess isn't charged.
+    let header = info_of(svg.as_bytes()).unwrap();
+    let short = path_cost(&Source::File(dir.join("a.svg")));
+    let (w, h, room) = (1000..2000)
+        .find_map(|w| {
+            let h = (1000..2000)
+                .rev()
+                .find(|&h| decode_cost(&header, w, h) > CACHE_BYTES - (64 << 10))?;
+            let room = CACHE_BYTES - decode_cost(&header, w, h).min(CACHE_BYTES) - svg.len();
+            (room > short + 16 && room < short + 200).then_some((w, h, room))
+        })
+        .unwrap();
+    assert!(
+        decode_cost(&header, w, h + 1) < decode_cost(&header, w, h),
+        "dropped above"
+    );
+    let name = format!("{}.svg", "a".repeat(room - short - 8 + 1));
+    let path = dir.join(&name);
+    assert_eq!(room - path_cost(&Source::File(path.clone())), 8);
+    std::fs::write(&path, svg).unwrap();
+    for (w, h) in [(w, h), (w, h + 1)] {
+        let (doc, mut layout, mut images) = forced_page(&dir, &format!("![a]({name})"));
+        pump(&doc, &mut layout, &mut images, &[(1, w, h)], |i, l| {
+            assert!(
+                !matches!(
+                    l.image_size(1),
+                    Some(ImageSize::Refused(_) | ImageSize::Alt)
+                ),
+                "at {w}×{h}: {:?}",
+                l.image_size(1)
+            );
+            i.pixels(1, w, h).is_some_and(|b| b.height == h)
+        });
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The remote SVG `svg` at `url` asked for at `w` × `h` (a fresh [`Images`]): drawn, never refused.
+#[cfg(all(feature = "remote-images", feature = "svg"))]
+fn remote_svg_drawn(svg: &'static str, url: &str, (w, h): (u32, u32)) {
+    let url: Arc<str> = Arc::from(url);
+    let doc = Doc::parse(&format!("![a]({url})"));
+    let mut layout = Layout::new(&doc, crate::layout::Params::default());
+    let mut images = Images::default();
+    images.set_test_body(Arc::new(move |_| Some(svg.as_bytes().to_vec())));
+    images.attach(&doc, &mut layout);
+    images.set_remote(true, &doc, &mut layout);
+    let t = Instant::now();
+    loop {
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "never drawn at {w}×{h}"
+        );
+        images.begin_frame();
+        images.request(&[(1, w, h)], 1);
+        std::thread::sleep(Duration::from_millis(2));
+        images.poll(&doc, &mut layout);
+        assert!(
+            !matches!(
+                layout.image_size(1),
+                Some(ImageSize::Refused(_) | ImageSize::Alt)
+            ),
+            "at {w}×{h}: {:?}",
+            layout.image_size(1)
+        );
+        if images
+            .cache
+            .pixels(&Key::Remote(url.clone()), w, h)
+            .is_some()
+        {
+            return;
+        }
+    }
+}
+
+/// The admission of a remote SVG's body charges its decode as its request will: without the
+/// layers guessed for it where they would refuse it (with the body, its URL and the records
+/// beside it), so a pixel more doesn't draw what a pixel less refused (the reviewer's
+/// 1318 × 1532, for its URL).
+#[cfg(all(feature = "remote-images", feature = "svg"))]
+#[test]
+fn a_remote_svg_a_pixel_more_or_less_is_drawn_alike() {
+    const SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"950\" height=\"1000\"><rect width=\"50\" height=\"50\" fill=\"#c00\"/></svg>";
+    let header = info_of(SVG.as_bytes()).unwrap();
+    let body: Bytes = Arc::new(SVG.as_bytes().to_vec());
+    let short = Slot::bytes_cost("https://x.y/a.svg", &body);
+    // A box at which it is still charged the guess, with room for its body beside it; the URL
+    // long enough that the body and the decode fit the budget by a few bytes, which the records
+    // beside them don't; and the box a pixel taller, where the guess isn't charged.
+    let (w, h, room) = (1000..2000)
+        .find_map(|w| {
+            let h = (1000..2000)
+                .rev()
+                .find(|&h| decode_cost(&header, w, h) > CACHE_BYTES - (64 << 10))?;
+            let room = CACHE_BYTES - decode_cost(&header, w, h).min(CACHE_BYTES);
+            (room > short + 16 && room < short + 200).then_some((w, h, room))
+        })
+        .unwrap();
+    assert!(
+        decode_cost(&header, w, h + 1) < decode_cost(&header, w, h),
+        "dropped above"
+    );
+    let url = format!("https://x.y/{}.svg", "a".repeat(room - short - 8 + 1));
+    assert_eq!(room - Slot::bytes_cost(&url, &body), 8);
+    for size in [(w, h), (w, h + 1)] {
+        remote_svg_drawn(SVG, &url, size);
+    }
+}
+
+/// What the record of a remote SVG charges when its body has gone has nothing for resampling
+/// (an SVG is drawn to its box): at 1994 × 1994, where its decode fits the budget, so does that.
+#[cfg(all(feature = "remote-images", feature = "svg"))]
+#[test]
+fn a_remote_svgs_record_charges_no_resampling() {
+    const SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"950\" height=\"1000\"><rect width=\"50\" height=\"50\" fill=\"#c00\"/></svg>";
+    let header = info_of(SVG.as_bytes()).unwrap();
+    let side = 1994;
+    let decode = decode_cost(&header, side, side);
+    assert!(decode <= CACHE_BYTES, "{decode}");
+    let costs = box_costs(SVG.as_bytes());
+    let source = source_cost(SVG.as_bytes());
+    let record = unfetched_cost(source, true, costs, (950, 1000), side, side);
+    assert!(record <= CACHE_BYTES, "{record}");
+    assert!(record < unfetched_cost(source, false, costs, (950, 1000), side, side));
+    remote_svg_drawn(SVG, "https://x.y/b.svg", (side, side));
 }

@@ -796,6 +796,11 @@ pub(crate) struct Record {
     pub kib: u32,
     pub per_px: u32,
     pub per_side: u32,
+    /// How much of `per_px` is the layers guessed for an SVG no job has measured yet (0 once
+    /// one has): see `image::unfetched_cost`.
+    pub guess_px: u32,
+    /// It is an SVG (drawn to the box, not resampled).
+    pub svg: bool,
 }
 
 /// What fetching found of a URL ([`Remote::sizes`]).
@@ -867,22 +872,36 @@ impl Remote {
 
     /// What decoding the image fetched for `url` holds for each pixel of its box besides its
     /// result twice, and for each pixel of its sides (see [`Record`]).
-    pub(crate) fn box_costs(&self, url: &str) -> (u32, u32) {
+    pub(crate) fn box_costs(&self, url: &str) -> (u32, u32, u32) {
         self.sizes
             .get(url)
             .and_then(|r| r.ok())
-            .map_or((0, 0), |r| (r.per_px, r.per_side))
+            .map_or((0, 0, 0), |r| (r.per_px, r.per_side, r.guess_px))
+    }
+
+    /// Whether the image fetched for `url` is an SVG.
+    pub(crate) fn is_svg(&self, url: &str) -> bool {
+        matches!(self.sizes.get(url), Some(Ok(r)) if r.svg)
     }
 
     /// A job of the SVG fetched for `url` found it holds more than its record said: what it
     /// holds whatever the box (`source`), and for each pixel of it and of its sides, which only
-    /// grow.
+    /// grow; the first that measured its layers (`guess` 0) takes the place of the guess.
     #[cfg(feature = "svg")]
-    pub(crate) fn remeasure(&mut self, url: &str, source: usize, (per_px, per_side): (u32, u32)) {
+    pub(crate) fn remeasure(
+        &mut self,
+        url: &str,
+        source: usize,
+        (per_px, per_side, guess): (u32, u32, u32),
+    ) {
         if let Some(Ok(r)) = self.sizes.get_mut(url) {
             r.kib = r.kib.max(kib(source));
-            r.per_px = r.per_px.max(per_px);
-            r.per_side = r.per_side.max(per_side);
+            if guess == 0 && r.guess_px > 0 {
+                (r.per_px, r.per_side, r.guess_px) = (per_px, per_side, 0);
+            } else {
+                r.per_px = r.per_px.max(per_px);
+                r.per_side = r.per_side.max(per_side);
+            }
         }
     }
 
@@ -927,13 +946,15 @@ impl Remote {
     ) -> Option<Bytes> {
         match result {
             Ok((bytes, w, h)) => {
-                let (per_px, per_side) = image::box_costs(&bytes);
+                let (per_px, per_side, guess_px) = image::box_costs(&bytes);
                 let record = Record {
                     w,
                     h,
                     kib: kib(image::source_cost(&bytes)),
                     per_px,
                     per_side,
+                    guess_px,
+                    svg: image::is_svg_bytes(&bytes),
                 };
                 self.record(url, Ok(record), own);
                 Some(bytes)

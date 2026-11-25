@@ -3177,3 +3177,165 @@ fn color_glyphs_are_counted_once_each() {
     let doc = roxmltree::Document::parse(&text).unwrap();
     assert_eq!(color_glyphs(&doc, &fonts.get().unwrap()), 1);
 }
+
+/// The box of a 707 × 551 diagram at 120 % on a 2× screen, and a larger one.
+const AT_120: (u32, u32) = (1700, 1324);
+const LARGER: (u32, u32) = (2400, 1870);
+
+/// An SVG with one shape, the size of a mind map Mermaid made.
+const ONE_RECT: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"706.834\" height=\"550.83\" viewBox=\"0 0 706.834 550.83\"><rect x=\"10\" y=\"10\" width=\"300\" height=\"200\" fill=\"#c00\"/></svg>";
+
+/// [`super::super::decode_why`] within the cache's limits: the bitmap's size, or the refusal.
+fn decoded(svg: &[u8], (w, h): (u32, u32)) -> Result<(u32, u32), Option<super::super::Refusal>> {
+    super::super::decode_why(
+        svg,
+        w,
+        h,
+        super::super::Sampling::Area,
+        &Limits::normal(),
+        &NO_CANCEL,
+        &mut Fonts::default(),
+    )
+    .map(|b| (b.width, b.height))
+}
+
+/// What an SVG that holds no layer is charged at `w` × `h` is its canvas and its result, its
+/// parsing and the margins of the pixmaps guessed: the layers guessed for one not measured yet
+/// (two canvases, what badges hold) aren't charged where they would be over the budget, so
+/// that a job can measure it. At 1700 × 1324 it is drawn; at 2400 × 1870 two canvases alone are
+/// over the budget, and it is refused for memory (a click draws it anyway), by what it needs.
+#[test]
+fn a_large_box_is_charged_what_the_svg_holds() {
+    let h = info_of(ONE_RECT.as_bytes()).unwrap();
+    for (w, ht) in [AT_120, LARGER] {
+        let canvas = w as usize * ht as usize * 4;
+        let charged = cost(&h.svg, w, ht);
+        assert!(charged >= 2 * canvas, "{w}×{ht}: {charged}");
+        assert!(charged < 2 * canvas + (2 << 20), "{w}×{ht}: {charged}");
+        // Measured, it holds no layer.
+        let tree = tree_of(ONE_RECT.as_bytes());
+        let a = Analysis::of(&tree, fit(&tree, w, ht), w, ht);
+        assert_eq!((a.peak, a.pixmaps), (0, 0));
+    }
+    // Small boxes are still charged the guess.
+    assert!(cost(&h.svg, 256, 256) >= 4 * 256 * 256 * 4);
+    assert!(cost(&h.svg, AT_120.0, AT_120.1) <= CACHE_BYTES);
+    assert_eq!(decoded(ONE_RECT.as_bytes(), AT_120), Ok(AT_120));
+    let canvas = LARGER.0 as usize * LARGER.1 as usize * 4;
+    match decoded(ONE_RECT.as_bytes(), LARGER) {
+        Err(Some(super::super::Refusal::Memory(n))) => {
+            let n = n as usize;
+            assert!(n > CACHE_BYTES && n < 2 * canvas + (2 << 20), "{n}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// What a job records of an SVG is what it measured: a guess of the first job's (layers, the
+/// pixmaps' margins, a path's drawing) isn't kept as what it holds, to be charged at every
+/// size after.
+#[test]
+fn a_guess_is_not_recorded_as_measured() {
+    let h = info_of(ONE_RECT.as_bytes()).unwrap();
+    // Parsing over what it was charged: what it needs, and nothing was measured but that.
+    let Rendered::Need(need) = render(
+        ONE_RECT.as_bytes(),
+        &h.svg,
+        (256, 256),
+        1,
+        &NO_CANCEL,
+        &mut Fonts::default(),
+    ) else {
+        panic!("drawn for nothing");
+    };
+    assert!(need.parse > 0);
+    assert_eq!(
+        (need.layers, need.pixmaps, need.draw, need.measured),
+        (0, 0, 0, false)
+    );
+    // Then measured whole: no layer, no pixmap.
+    let charge = cost(&need, 256, 256);
+    match render(
+        ONE_RECT.as_bytes(),
+        &need,
+        (256, 256),
+        charge,
+        &NO_CANCEL,
+        &mut Fonts::default(),
+    ) {
+        Rendered::Pixels(..) => {}
+        Rendered::Need(n) => {
+            assert_eq!((n.layers, n.pixmaps), (0, 0), "{n:?}");
+        }
+        _ => panic!("not drawn"),
+    }
+    let canvas = AT_120.0 as usize * AT_120.1 as usize * 4;
+    assert!(cost(&need, AT_120.0, AT_120.1) < 2 * canvas + (2 << 20));
+}
+
+/// A Mermaid mind map (with its nodes' drop shadows) of about 663 × 653 is drawn at
+/// 1700 × 1324, and refused for memory at 2400 × 1870, by what it measured it needs.
+#[cfg(feature = "mermaid")]
+#[test]
+fn a_mind_map_is_drawn_at_a_hidpi_size() {
+    let svg = crate::mermaid::make(
+        "mindmap\n  root((VOMD))\n    Images\n      PNG\n      SVG\n      GIF\n    Text\n      Math\n      \
+         Code\n        Rust\n        Python\n    Diagrams\n      Mermaid\n      Flowchart\n",
+        false,
+        &crate::mermaid::Metrics::default(),
+    )
+    .unwrap();
+    assert!(svg.contains("feDropShadow"));
+    assert_eq!(decoded(svg.as_bytes(), AT_120), Ok(AT_120));
+    let canvas = LARGER.0 as usize * LARGER.1 as usize * 4;
+    match decoded(svg.as_bytes(), LARGER) {
+        Err(Some(super::super::Refusal::Memory(n))) => {
+            let n = n as usize;
+            assert!(n > CACHE_BYTES && n < 2 * canvas + (4 << 20), "{n}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Once a job has measured an SVG, what a later one measures only adds to it, field by field:
+/// two boxes of one SVG (the page's and the image viewer's) don't take turns at the record, a job
+/// asking again each time. Until then, the first measurement replaces the guesses.
+#[test]
+fn what_was_measured_only_grows() {
+    let h = info_of(ONE_RECT.as_bytes()).unwrap();
+    let Rendered::Need(parsed) = render(
+        ONE_RECT.as_bytes(),
+        &h.svg,
+        (256, 256),
+        1,
+        &NO_CANCEL,
+        &mut Fonts::default(),
+    ) else {
+        panic!("drawn for nothing");
+    };
+    assert!(!parsed.measured);
+    // Measured before at another box with layers this one doesn't have, and no path drawn:
+    // charged that, the job finds a path to draw, and asks for more without losing the layers.
+    let record = SvgCost {
+        measured: true,
+        layers: 3 * LAYER_UNITS,
+        pixmaps: 2,
+        draw: 0,
+        ..parsed
+    };
+    let charge = cost(&record, 256, 256);
+    let Rendered::Need(need) = render(
+        ONE_RECT.as_bytes(),
+        &record,
+        (256, 256),
+        charge,
+        &NO_CANCEL,
+        &mut Fonts::default(),
+    ) else {
+        panic!("drawn without its path's charge");
+    };
+    assert!(need.measured);
+    assert_eq!((need.layers, need.pixmaps), (3 * LAYER_UNITS, 2));
+    assert!(need.draw > 0);
+    assert!(cost(&need, 256, 256) > charge);
+}

@@ -193,6 +193,12 @@ pub(crate) struct SvgCost {
     pixmaps: u32,
     /// What decoding its largest embedded raster image holds besides its pixels.
     raster: usize,
+    /// `draw`, `layers` and `pixmaps` are what a job measured, not what the first job guesses:
+    /// a job may find that parsing needs more before it gets to rendering.
+    measured: bool,
+    /// The layers guessed for it aren't charged ([`svg::cost`]): they alone kept it from being
+    /// admitted ([`Images::unguess`]), and a job measures what it holds.
+    unguessed: bool,
 }
 
 /// What a decode is allowed: the limits of [`Limits::normal`] keep every image within the
@@ -773,14 +779,18 @@ fn probe_size(path: &Path) -> ImageSize {
     // A diagram: loading until it is made, its SVG's size once it is.
     #[cfg(feature = "mermaid")]
     if crate::mermaid::is_virtual(path) {
+        let src = path.to_str().unwrap_or_default().trim_start_matches('\0');
         let Some(bytes) = crate::mermaid::bytes(path) else {
-            let src = path.to_str().unwrap_or_default().trim_start_matches('\0');
             return if crate::mermaid::pending(src) {
                 ImageSize::Loading
             } else {
                 ImageSize::Alt
             };
         };
+        // Over the limits at the size it was asked for: its code, until a click draws it.
+        if crate::mermaid::is_over(src) {
+            return ImageSize::Refused(Refusal::Memory(0));
+        }
         return match info_of(&bytes) {
             None => ImageSize::Alt,
             Some(h) => match refusal(&h, &Limits::normal()) {
@@ -934,17 +944,24 @@ pub(crate) fn source_cost(bytes: &[u8]) -> usize {
     info_of(bytes).map_or(0, |h| header_cost(&h))
 }
 
+/// Whether `bytes` are an SVG's.
+#[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
+pub(crate) fn is_svg_bytes(bytes: &[u8]) -> bool {
+    info_of(bytes).is_some_and(|h| is_svg(&h))
+}
+
 /// What decoding the image `bytes` holds for each pixel of its box besides its result twice
 /// (which [`unfetched_cost`] counts), and for each pixel of its sides: an SVG's layers and their
-/// margins (see [`svg::cost`]); nothing for a raster image, or if it isn't one.
+/// margins (see [`svg::cost`]), and how much of the first is a guess (`svg::box_costs`); nothing
+/// for a raster image, or if it isn't one.
 #[cfg_attr(not(feature = "remote-images"), allow(dead_code))]
-pub(crate) fn box_costs(bytes: &[u8]) -> (u32, u32) {
+pub(crate) fn box_costs(bytes: &[u8]) -> (u32, u32, u32) {
     #[cfg(feature = "svg")]
     if let Some(h) = info_of(bytes).filter(|h| h.format == Format::Svg) {
         return svg::box_costs(&h.svg);
     }
     let _ = bytes;
-    (0, 0)
+    (0, 0, 0)
 }
 
 /// What a GIF's decoder holds however small the image: its LZW tables and buffers, the read
@@ -2885,6 +2902,29 @@ pub(crate) struct Job {
     h: u32,
     /// What it holds while it runs, its result included: see [`decode_cost`].
     cost: usize,
+    /// A local SVG's cost as its record has it, which `cost` was worked out from: what a job
+    /// measured, which the header read again doesn't know ([`job_header`]).
+    #[cfg_attr(not(feature = "svg"), allow(dead_code))]
+    svg: Option<SvgCost>,
+}
+
+/// The header of `job`'s `bytes`, with what its record says an SVG holds if the file is the one
+/// recorded (as far as its header tells: the same XML), so that the worker charges it what the
+/// main thread did: a cost measured at one box may be less than the first job's guess at another.
+#[cfg(feature = "images")]
+fn job_header(bytes: &[u8], job: &Job) -> Option<Header> {
+    #[cfg_attr(not(feature = "svg"), allow(unused_mut))]
+    let mut header = info_of(bytes)?;
+    #[cfg(not(feature = "svg"))]
+    let _ = job;
+    #[cfg(feature = "svg")]
+    if let Some(svg) = job.svg
+        && header.format == Format::Svg
+        && (svg.xml, svg.gz) == (header.svg.xml, header.svg.gz)
+    {
+        header.svg = svg;
+    }
+    Some(header)
 }
 
 /// What the worker threads send back.
@@ -3276,7 +3316,7 @@ fn decode_job(job: &Job, state: &mut WorkerState) -> Made {
             let Some(mut bytes) = read_file(path, held) else {
                 return Made::default();
             };
-            let Some(cost) = bytes_cost(&bytes, job.w, job.h) else {
+            let Some(cost) = job_header(&bytes, job).map(|h| decode_cost(&h, job.w, job.h)) else {
                 return Made::default();
             };
             if bytes.len().saturating_add(cost) > job.cost {
@@ -3297,7 +3337,7 @@ fn decode_job(job: &Job, state: &mut WorkerState) -> Made {
 #[cfg(feature = "images")]
 fn decode_in(bytes: &[u8], job: &Job, room: usize, state: &mut WorkerState) -> Made {
     #[cfg(feature = "svg")]
-    if let Some(header) = info_of(bytes).filter(|h| h.format == Format::Svg) {
+    if let Some(header) = job_header(bytes, job).filter(|h| h.format == Format::Svg) {
         let rendered = svg::draw(
             bytes,
             &header.svg,
@@ -3616,20 +3656,40 @@ fn body_cost(key: &Key, source: &Source) -> usize {
 /// a copy), and `per_px` more a pixel of the box and `per_side` a pixel of its sides (an SVG's
 /// layers: [`box_costs`]): no less than
 /// what it holds when the body is there, so that deciding whether an image is wanted doesn't
-/// change with whether its body is cached.
+/// change with whether its body is cached. The layers guessed for an SVG not measured yet
+/// (`guess` of `per_px`) are left out where `svg::cost` leaves them out: where the box's pixmaps
+/// with them are over the budget, or the whole is and wouldn't be without them.
 #[cfg(feature = "remote-images")]
 fn unfetched_cost(
     source: usize,
-    (per_px, per_side): (u32, u32),
+    svg: bool,
+    (per_px, per_side, guess): (u32, u32, u32),
     (sw, sh): (u32, u32),
     w: u32,
     h: u32,
 ) -> usize {
     let pixels = w as usize * h as usize;
-    source
-        .saturating_add(resample_cost(sw, sh, w, h).max(resample_cost(sh, sw, h, w)))
-        .saturating_add(pixels.saturating_mul(per_px as usize + 8))
-        .saturating_add((w as usize + h as usize).saturating_mul(per_side as usize))
+    let pixmaps = |per_px: u32| {
+        pixels
+            .saturating_mul(per_px as usize + 8)
+            .saturating_add((w as usize + h as usize).saturating_mul(per_side as usize))
+    };
+    // (An SVG is drawn to the box: nothing is resampled.)
+    let resample = if svg {
+        0
+    } else {
+        resample_cost(sw, sh, w, h).max(resample_cost(sh, sw, h, w))
+    };
+    let all = |per_px: u32| {
+        source
+            .saturating_add(resample)
+            .saturating_add(pixmaps(per_px))
+    };
+    let without = per_px.saturating_sub(guess);
+    let drop = guess > 0
+        && (pixmaps(per_px) > CACHE_BYTES
+            || (all(per_px) > CACHE_BYTES && all(without) <= CACHE_BYTES));
+    all(if drop { without } else { per_px })
 }
 
 /// What the copy of a local file's path a job carries holds (see [`Worker::bookkeeping_of`]).
@@ -3948,6 +4008,25 @@ impl Images {
     #[doc(hidden)]
     pub fn set_svg_deadline(&mut self, deadline: std::time::Duration) {
         self.svg_deadline = deadline;
+    }
+
+    /// Whether local image `id` is an SVG charged the layers guessed for one no job has measured.
+    fn guessed(&self, id: u32) -> bool {
+        #[cfg(feature = "svg")]
+        if let Some(Some(info)) = self.costs.get(&id) {
+            let svg = &info.header.svg;
+            return info.header.format == Format::Svg && !svg.measured && !svg.unguessed;
+        }
+        let _ = id;
+        false
+    }
+
+    /// Local image `id`, a [`Images::guessed`] SVG, isn't charged the layers guessed for it from
+    /// now on ([`SvgCost::unguessed`]).
+    fn unguess(&mut self, id: u32) {
+        if let Some(Some(info)) = self.costs.get_mut(&id) {
+            info.header.svg.unguessed = true;
+        }
     }
 
     /// Whether the image of `key` is an SVG, as far as is known: a local one's header, a remote
@@ -4668,6 +4747,13 @@ impl Images {
     /// not known until it is fetched (the result alone is counted till then). Doesn't mark
     /// anything used.
     fn cost(&mut self, id: u32, w: u32, h: u32) -> usize {
+        self.cost_as(id, w, h, false)
+    }
+
+    /// [`Images::cost`]; with `unguessed`, a remote SVG no job has measured is charged without the
+    /// layers guessed for it ([`SvgCost::unguessed`]).
+    fn cost_as(&mut self, id: u32, w: u32, h: u32, unguessed: bool) -> usize {
+        let _ = unguessed;
         let result = w as usize * h as usize * 4;
         match self.src(id).clone() {
             // The path is worked out for the lookup of the file's header, and dropped.
@@ -4688,15 +4774,22 @@ impl Images {
                 let unfetched = || match self.remote.size(&url) {
                     Some(Some((sw, sh))) => {
                         let source = self.remote.source_cost(&url).unwrap_or(0);
-                        let box_costs = self.remote.box_costs(&url);
-                        Some(unfetched_cost(source, box_costs, (sw, sh), w, h))
+                        let (per_px, per_side, guess) = self.remote.box_costs(&url);
+                        let box_costs = if unguessed {
+                            (per_px - guess, per_side, 0)
+                        } else {
+                            (per_px, per_side, guess)
+                        };
+                        let svg = self.remote.is_svg(&url);
+                        Some(unfetched_cost(source, svg, box_costs, (sw, sh), w, h))
                     }
                     _ => None,
                 };
                 match self.cache.peek_bytes(&url).and_then(|b| info_of(b)) {
                     // What a job of an SVG measured is in its record, not in its bytes.
                     #[cfg(feature = "svg")]
-                    Some(header) if header.format == Format::Svg => {
+                    Some(mut header) if header.format == Format::Svg => {
+                        header.svg.unguessed |= unguessed;
                         decode_cost(&header, w, h).max(unfetched().unwrap_or(0))
                     }
                     Some(header) => decode_cost(&header, w, h),
@@ -5033,6 +5126,37 @@ impl Images {
                 },
                 _ => continue,
             };
+            // A local SVG no job has measured that is refused only for the layers guessed for it
+            // (with what is charged beside its decode) is charged without them: they are a guess,
+            // and its job measures what it holds before it draws.
+            let refused = |images: &mut Images, cost: usize| {
+                let own = cost
+                    .saturating_add(body_cost(&key, &source))
+                    .saturating_add(path_cost(&source));
+                #[cfg(feature = "svg")]
+                let svg = cost > images.cache.cap && images.is_svg(&key);
+                #[cfg(not(feature = "svg"))]
+                let svg = false;
+                (own <= images.cache.cap && !images.fits_bookkeeping(own)) || svg
+            };
+            // (A remote one's, for this request: its job is charged as much, `unguessed`.)
+            #[cfg_attr(not(feature = "remote-images"), allow(unused_mut))]
+            let mut unguessed = false;
+            let cost = match key {
+                Key::Local(local) if !cached && self.guessed(local) && refused(self, cost) => {
+                    self.unguess(local);
+                    self.cost(id, w, h)
+                }
+                #[cfg(feature = "remote-images")]
+                Key::Remote(ref url)
+                    if !cached && self.remote.is_svg(url) && refused(self, cost) =>
+                {
+                    let lower = self.cost_as(id, w, h, true);
+                    unguessed = lower < cost;
+                    lower
+                }
+                _ => cost,
+            };
             // A decode that fits the cache by itself but not beside what the document's images
             // cost to keep (their sources, URLs and records) can't run in the budget at all, and
             // is not tried: the image shows its alt text. (One bigger than the cache by itself is
@@ -5111,6 +5235,28 @@ impl Images {
             }
             // (The path the job carries is held by the queue from now on, beside the old queue's:
             // it is in the allowance of the request, [`Images::request_fit`].)
+            #[cfg(not(feature = "svg"))]
+            let svg = None;
+            #[cfg(feature = "svg")]
+            let svg = match &key {
+                Key::Local(id) => self
+                    .costs
+                    .get(id)
+                    .copied()
+                    .flatten()
+                    .map(|info| info.header)
+                    .filter(|h| h.format == Format::Svg)
+                    .map(|h| h.svg),
+                Key::Remote(_) => match &source {
+                    Source::Bytes(body) if unguessed => info_of(body).map(|h| SvgCost {
+                        unguessed: true,
+                        ..h.svg
+                    }),
+                    _ => None,
+                },
+            };
+            #[cfg(not(feature = "svg"))]
+            let _ = unguessed;
             jobs.push(Job {
                 doc_gen: self.doc_gen,
                 key,
@@ -5118,6 +5264,7 @@ impl Images {
                 w,
                 h,
                 cost,
+                svg,
             });
         }
         // (One asked for before that is still in view and still to come stays, asked for again
@@ -6015,6 +6162,14 @@ impl Images {
     /// (the box is known when it is asked for, and the reserve is made then).
     #[cfg(feature = "remote-images")]
     fn decode_estimate(&self, url: &Arc<str>, bytes: &Bytes) -> usize {
+        self.decode_estimate_as(url, bytes, false)
+    }
+
+    /// [`Images::decode_estimate`]; with `unguessed`, an SVG no job has measured is charged
+    /// without the layers guessed for it.
+    #[cfg(feature = "remote-images")]
+    fn decode_estimate_as(&self, url: &Arc<str>, bytes: &Bytes, unguessed: bool) -> usize {
+        let _ = unguessed;
         // A body fetched again for its animation isn't decoded (its still is cached): what reading
         // it holds is charged by `start_anim`. (A key left in `fetched` whose still was evicted
         // since is fetched for the image.)
@@ -6022,9 +6177,14 @@ impl Images {
         if self.cache.has_url(url) && self.anims.is_fetched(url) {
             return 0;
         }
-        let Some(header) = info_of(bytes) else {
+        #[cfg_attr(not(feature = "svg"), allow(unused_mut))]
+        let Some(mut header) = info_of(bytes) else {
             return 0;
         };
+        #[cfg(feature = "svg")]
+        if header.format == Format::Svg {
+            header.svg.unguessed |= unguessed;
+        }
         let (w, h) = match self.in_view.iter().find(|(u, ..)| u == url) {
             Some(&(_, w, h)) => (w, h),
             None => {
@@ -6048,9 +6208,17 @@ impl Images {
         // The decode of an image in view that fits the cache by itself but not beside the
         // bookkeeping has no room to wait for (one bigger than the cache by itself is let in
         // alone, `admit_alone`).
-        let own = cost.saturating_add(decode);
+        let mut own = cost.saturating_add(decode);
+        let mut decode = decode;
         if in_view && own <= self.cache.cap && !self.fits_bookkeeping(own) {
-            return Admit::Refuse;
+            // An SVG no job has measured, refused for the layers guessed for it, is charged
+            // without them, as its request will charge its job ([`Images::cost_as`]).
+            let lower = self.decode_estimate_as(url, bytes, true);
+            own = cost.saturating_add(lower);
+            if lower == decode || (own <= self.cache.cap && !self.fits_bookkeeping(own)) {
+                return Admit::Refuse;
+            }
+            decode = lower;
         }
         // Whatever the fetchers hold now (they may be held off, and hold nothing): a body let in
         // is protected, and stays when they are let go on, so it has to fit beside all they may take.
@@ -7086,12 +7254,13 @@ impl Images {
             return ImageSize::Refused(why);
         }
         match origin {
-            forced::Origin::File(path) => open_regular(path)
-                .and_then(|f| header_info(&mut std::io::BufReader::with_capacity(4096, f)))
-                .map_or(ImageSize::Refused(Refusal::Failed), |h| {
-                    let (w, h) = h.shown();
+            // (A diagram's SVG is no file's: `file_info` reads it where it is kept.)
+            forced::Origin::File(path) => {
+                file_info(path).map_or(ImageSize::Refused(Refusal::Failed), |i| {
+                    let (w, h) = i.header.shown();
                     ImageSize::Pixels(w, h)
-                }),
+                })
+            }
             forced::Origin::Url(url) => self
                 .forced
                 .natural(url)
@@ -7269,6 +7438,11 @@ impl Images {
     /// last ones), not its placeholder.
     #[cfg(feature = "images")]
     pub(crate) fn shown(&self, id: u32) -> bool {
+        // (Pixels loaded past the limits are shown whatever the tables say: they may wait for
+        // room to be built.)
+        if (self.forced_ids.iter()).any(|(i, o)| *i == id && self.forced.has_pixels(o)) {
+            return true;
+        }
         let Some(key) = self.key(id) else {
             return false;
         };
@@ -7276,7 +7450,6 @@ impl Images {
             .slots
             .iter()
             .any(|s| s.key == key && s.pixels().is_some())
-            || (self.forced_ids.iter()).any(|(i, o)| *i == id && self.forced.has_pixels(o))
     }
 
     /// Decode image `id` for the image viewer at `size`, or the part `crop` says of it at its

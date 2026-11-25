@@ -221,6 +221,10 @@ pub struct BlockBox {
     /// selected and copied along with the block's start.
     #[cfg(feature = "clipboard")]
     pub decor: Option<[f32; 4]>,
+    /// The line under a diagram over VOMD's image limits, which a click draws anyway: its
+    /// image, and its box (`x0, y0, x1, y1`).
+    #[cfg(feature = "mermaid")]
+    pub note: Option<(u32, [f32; 4])>,
 }
 
 impl BlockBox {
@@ -894,6 +898,14 @@ impl Layout {
         }
     }
 
+    /// Image `id`'s block is laid out again, its size the same (a diagram's line under its code
+    /// says something else).
+    pub fn image_again(&mut self, doc: &Doc, id: u32) {
+        if self.image_size(id).is_some() {
+            self.invalidate_image(doc, id);
+        }
+    }
+
     /// The size image `id` was laid out with, if its block was measured.
     pub fn image_size(&self, id: u32) -> Option<ImageSize> {
         *self.images.get(id.checked_sub(1)? as usize)?
@@ -1253,6 +1265,17 @@ impl Layout {
             }
         }
         None
+    }
+
+    /// The diagram whose line at (`x`, `y`) (document coordinates, as [`Layout::hit`]) a click
+    /// draws past VOMD's image limits.
+    #[cfg(feature = "mermaid")]
+    pub fn diagram_note_at(&self, x: f32, y: f32) -> Option<u32> {
+        let i = self.range(y, y + f32::EPSILON).start;
+        let content = self.geoms.get(i)?.content.as_ref()?;
+        let (lx, ly) = (x - self.col_x, y - self.y(i));
+        let (id, [x0, y0, x1, y1]) = content.note?;
+        (x0 <= lx && lx < x1 && y0 <= ly && ly < y1).then_some(id)
     }
 
     // ---- Measuring --------------------------------------------------------------------
@@ -2054,6 +2077,10 @@ impl Layout {
             .layout(fonts, &self.para, avail, Align::Start, BODY_LH);
         let pad = 0.25 * self.em;
         let h = pl.height + pad;
+        if crate::mermaid::is_over(&img.src) {
+            let (x0, y0) = (indent, top + pad);
+            out.note = Some((id, [x0, y0, x0 + pl.width, y0 + pl.height]));
+        }
         let s = out.push_style(style);
         out.append_decor(&pl, s, indent, top + pad);
         h

@@ -518,7 +518,8 @@ const FILE: u8 = 1;
 
 fn put_cost(out: &mut Vec<u8>, c: &SvgCost) {
     out.extend_from_slice(&c.xml.to_le_bytes());
-    out.push(u8::from(c.gz));
+    // (The flags share a byte.)
+    out.push(u8::from(c.gz) | u8::from(c.measured) << 1 | u8::from(c.unguessed) << 2);
     out.extend_from_slice(&(c.parse as u64).to_le_bytes());
     out.extend_from_slice(&(c.draw as u64).to_le_bytes());
     out.extend_from_slice(&c.layers.to_le_bytes());
@@ -534,7 +535,9 @@ fn get_cost(b: &[u8; COST_BYTES]) -> SvgCost {
     };
     SvgCost {
         xml: u32_at(0),
-        gz: b[4] != 0,
+        gz: b[4] & 1 != 0,
+        measured: b[4] & 2 != 0,
+        unguessed: b[4] & 4 != 0,
         parse: usize_at(5),
         draw: usize_at(13),
         layers: u32_at(21),
